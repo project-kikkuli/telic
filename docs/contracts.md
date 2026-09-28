@@ -129,9 +129,25 @@ silently turns into `undefined`) is an error. Interfaces and object type aliases
 with scalar fields are records. `as` and `!` are rejected: they hide exactly
 what telic checks.
 
-**Both.** Lists are values: `ys = xs` followed by a mutation would create an
-alias the model can't track, so it's rejected (copy with `xs[:]` /
-`xs.slice()`). Distinct list arguments are assumed not to alias. A callee that
+**Both.** Lists are values. Binding a name to an existing list (`ys = xs`,
+`ys = xs if c else zs`, `ys, k = xs, 0`) would create an alias the model can't
+track, so it's rejected. Only a fresh list (a literal, a slice copy, or a call
+result) can be bound. Copy with `xs[:]` / `xs.slice()`. A function may not
+return one of its list parameters, and the same list may not be passed twice to
+a function that mutates a list parameter. A loop may not iterate over a list
+that its body changes, directly or through a call.
+
+`a or b` / `a || b` must have boolean operands when used as a value, because
+both languages return an operand there, not a boolean. In a condition,
+truthiness applies as usual. A variable that is assigned on only some paths
+cannot be read afterwards. Builtins rebound in the module (`def abs(...)`,
+`from x import round`) are not treated as builtins. Records must be immutable
+(`@dataclass(frozen=True)` without custom dunder methods, or `NamedTuple`).
+
+In TypeScript, `var` is rejected (use `let`/`const`), a declaration may not
+shadow an outer variable, and `const` bindings cannot be reassigned. Only a
+top-level conjunct `Number.isInteger(p)` of a `@requires` makes `p` an
+integer. Distinct list arguments are assumed not to alias. A callee that
 mutates a list parameter is modelled at the call site: the argument gets fresh
 contents constrained by the callee's `@ensures` (with `old`). `print` and
 `console.*` are ignored.

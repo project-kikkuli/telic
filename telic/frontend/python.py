@@ -71,6 +71,7 @@ class PythonFrontend:
         self.module.assumptions = list(PY_ASSUMPTIONS)
         self.contract_lines: list[ContractLine] = []
         self.signatures: dict[str, tuple[list[ir.Param], ir.Type]] = {}
+        self.bound: set[str] = set()
 
     # -- entry --------------------------------------------------------------
 
@@ -86,6 +87,19 @@ class PythonFrontend:
             self.module.problems.append((str(e), ir.Loc(e.line, e.col)))
             return self.module
 
+        # Names bound at module level shadow builtins of the same name.
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    self.bound.add((a.asname or a.name).split(".")[0])
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            self.bound.add(n.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.bound.add(node.name)
         # Records first, then signatures, then bodies: calls may be forward.
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -157,16 +171,19 @@ class PythonFrontend:
     # -- declarations -------------------------------------------------------
 
     def _record(self, node: ast.ClassDef) -> None:
-        is_dc = any(
-            (isinstance(d, ast.Name) and d.id == "dataclass")
-            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "dataclass")
-            or (isinstance(d, ast.Attribute) and d.attr == "dataclass")
-            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "dataclass")
-            for d in node.decorator_list
-        )
+        def frozen_dataclass(d: ast.expr) -> bool:
+            if not isinstance(d, ast.Call):
+                return False
+            f = d.func
+            named = (isinstance(f, ast.Name) and f.id == "dataclass") or (isinstance(f, ast.Attribute) and f.attr == "dataclass")
+            return named and any(k.arg == "frozen" and isinstance(k.value, ast.Constant) and k.value.value is True for k in d.keywords)
+
+        is_dc = any(frozen_dataclass(d) for d in node.decorator_list)
         is_nt = any(isinstance(b, ast.Name) and b.id == "NamedTuple" for b in node.bases)
         if not (is_dc or is_nt):
-            return
+            return  # mutable classes are not records
+        if any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name.startswith("__") for st in node.body):
+            return  # custom construction (__post_init__, __init__, ...) is not modelled
         fields: list[tuple[str, ir.Type]] = []
         for stmt in node.body:
             if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
@@ -197,7 +214,10 @@ class PythonFrontend:
             base = ann.value
             name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else None
             if name in {"list", "List", "Sequence"}:
-                return ir.TList(self.type_of_annotation(ann.slice))
+                elem = self.type_of_annotation(ann.slice)
+                if isinstance(elem, ir.TList):
+                    raise LowerError("nested lists are not supported yet", ann)
+                return ir.TList(elem)
         raise LowerError(f"unsupported type annotation '{ast.unparse(ann)}'", ann)
 
     def _signature(self, node: ast.FunctionDef) -> tuple[list[ir.Param], ir.Type]:
@@ -228,6 +248,7 @@ class FunctionLowerer:
             cl for cl in fe.contract_lines if node.lineno <= cl.line <= (node.end_lineno or node.lineno)
         ]
         self.current_intents: list[str] = []
+        self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args}
 
     # -- contract comment association ------------------------------------
 
@@ -340,9 +361,12 @@ class FunctionLowerer:
         except SyntaxError as e:
             raise LowerError(f"cannot parse '@{kind}' as a Python expression: {e.msg}", line=cl.line)
         el = ExprLowerer(self, spec=True, result_ty=result_ty, line_offset=cl.line, col_offset=cl.payload_col - 1)
-        e = el.expr(tree.body)
         if expect == ir.BOOL:
-            e = el.truthy(e, tree.body)
+            e = el.cond(tree.body)
+        else:
+            e = el.expr(tree.body)
+        if expect == ir.BOOL:
+            pass
         elif not isinstance(e.ty, ir.TInt):
             raise LowerError(f"'@{kind}' must be an int expression", line=cl.line)
         loc = ir.Loc(cl.line, cl.payload_col, cl.payload_col + len(text) if "\n" not in text else 0)
@@ -414,8 +438,7 @@ class FunctionLowerer:
         return ExprLowerer(self).expr(e, expect)
 
     def cond(self, e: ast.expr) -> ir.Expr:
-        el = ExprLowerer(self)
-        return el.truthy(el.expr(e), e)
+        return ExprLowerer(self).cond(e)
 
     def declare(self, name: str, ty: ir.Type, node: ast.AST) -> None:
         old = self.env.get(name)
@@ -471,9 +494,12 @@ class FunctionLowerer:
                 return  # docstring / bare string
             if isinstance(v, ast.Call):
                 f = v.func
-                if isinstance(f, ast.Name) and f.id in IGNORED_CALLS:
-                    return
-                if isinstance(f, ast.Attribute) and f.attr in IGNORED_ATTR_CALLS and isinstance(f.value, ast.Name) and f.value.id in {"logger", "logging", "log"}:
+                logging_call = (isinstance(f, ast.Name) and f.id in IGNORED_CALLS and f.id not in self.fe.bound) or (
+                    isinstance(f, ast.Attribute) and f.attr in IGNORED_ATTR_CALLS and isinstance(f.value, ast.Name) and f.value.id in {"logger", "logging", "log"}
+                )
+                if logging_call:
+                    # Output is ignored, but its arguments are still evaluated.
+                    yield from self._effects_of(list(v.args) + [k.value for k in v.keywords], loc)
                     return
                 if isinstance(f, ast.Attribute) and f.attr == "append" and isinstance(f.value, ast.Name):
                     name = f.value.id
@@ -499,6 +525,7 @@ class FunctionLowerer:
             if s.value is None:
                 return
             val = self.coerce(self.expr(s.value, ty), ty)
+            self._no_alias(s.target.id, val, s)
             self._check_assignable(s.target.id, ty, val, s)
             yield ir.Assign(loc, s.target.id, val)
             return
@@ -543,6 +570,9 @@ class FunctionLowerer:
                     raise LowerError("function returns a value but is annotated '-> None' (or has no return annotation)", s)
                 if val.ty != self.fn.ret:
                     raise LowerError(f"returns {val.ty} but is annotated to return {self.fn.ret}", s)
+                if isinstance(val.ty, ir.TList) and not fresh_list(val):
+                    if not (isinstance(val, ir.Var) and all(p.name != val.name for p in self.fn.params)):
+                        raise LowerError("returning a list parameter (or an alias of one) would let the caller alias it; return a copy (xs[:])", s)
                 yield ir.Return(loc, val)
             return
         if isinstance(s, ast.Break):
@@ -563,6 +593,19 @@ class FunctionLowerer:
             return
         raise LowerError(f"unsupported statement: {type(s).__name__}", s)
 
+    def _effects_of(self, args: list[ast.expr], loc: ir.Loc):
+        """Evaluate the expressions inside logging arguments (f-string holes
+        included) for their effects and crashes; the formatting is ignored."""
+        for a in args:
+            parts = [fv.value for fv in a.values if isinstance(fv, ast.FormattedValue)] if isinstance(a, ast.JoinedStr) else [a]
+            for part in parts:
+                try:
+                    yield ir.ExprStmt(loc, self.expr(part))
+                except LowerError:
+                    if any(isinstance(n, ast.Call) for n in ast.walk(part)):
+                        raise
+                    # pure formatting of something telic does not model: no effect
+
     def _check_assignable(self, name: str, ty: ir.Type, val: ir.Expr, node: ast.AST) -> None:
         if val.ty != ty and not (isinstance(ty, ir.TList) and isinstance(val.ty, ir.TList) and val.ty.elem == ir.NONE):
             raise LowerError(f"cannot assign {val.ty} to '{name}' of type {ty}", node)
@@ -578,11 +621,7 @@ class FunctionLowerer:
             val = self.expr(value, known)
             if known is not None:
                 val = self.coerce(val, known)
-            if isinstance(val.ty, ir.TList) and isinstance(value, ast.Name):
-                raise LowerError(
-                    f"'{name} = {value.id}' would alias a list; telic models lists as values, so copy explicitly with '{value.id}[:]'",
-                    s,
-                )
+            self._no_alias(name, val, s)
             self.declare(name, val.ty, s)
             ty = self.env[name]
             val = self.coerce(val, ty)
@@ -607,6 +646,8 @@ class FunctionLowerer:
             temps = []
             for v in value.elts:
                 val = self.expr(v)
+                if isinstance(val.ty, ir.TList) and not fresh_list(val):
+                    raise LowerError("tuple assignment of an existing list would alias it; copy it explicitly (xs[:])", s)
                 t = self.fresh("tuple")
                 self.env[t] = val.ty
                 temps.append(t)
@@ -618,8 +659,21 @@ class FunctionLowerer:
             return
         raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
 
+    def _no_alias(self, name: str, val: ir.Expr, node: ast.AST) -> None:
+        if not isinstance(val.ty, ir.TList):
+            return
+        if any(p.name == name for p in self.fn.params):
+            raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it, or copy it to a new name)", node)
+        if not fresh_list(val):
+            raise LowerError(
+                f"'{name} = ...' would alias an existing list; telic models lists as values, so copy explicitly (xs[:])",
+                node,
+            )
+
     def _assign_tmp(self, name: str, tmp: str, s: ast.stmt, loc: ir.Loc):
         ty = self.env[tmp]
+        if isinstance(ty, ir.TList) and any(p.name == name for p in self.fn.params):
+            raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it, or copy it to a new name)", s)
         self.declare(name, ty, s)
         yield ir.Assign(loc, name, self.coerce(ir.Var(ty, loc, tmp), self.env[name]))
 
@@ -644,6 +698,10 @@ class FunctionLowerer:
                 if not index_name.isidentifier():
                     raise LowerError("'@index' takes a single name", line=cl.line)
         it = s.iter
+        if index_name is not None and (index_name in self.env or index_name in self.stored_names):
+            raise LowerError(f"'@index {index_name}' names an existing variable; pick a fresh name", s)
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id in ("range", "enumerate") and it.func.id in self.fe.bound:
+            raise LowerError(f"'{it.func.id}' is rebound in this module, so telic cannot assume the builtin", s)
         # range(...)
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
             if not isinstance(s.target, ast.Name):
@@ -696,6 +754,22 @@ class FunctionLowerer:
         yield ir.ForEach(loc, elem, idx, seq, invs, body, idx_visible=idx_visible or index_name is not None)
 
 
+def fresh_list(e: ir.Expr) -> bool:
+    """A list-valued expression that denotes a new list object (so binding it
+    to a name creates no alias): a literal, a slice copy, or a call (callees
+    may not return their list parameters)."""
+    if isinstance(e, (ir.ListLit, ir.Call)):
+        return True
+    if isinstance(e, ir.Builtin) and e.name == "slice":
+        return True
+    if isinstance(e, ir.Ite):
+        return fresh_list(e.then) and fresh_list(e.orelse)
+    return False
+
+
+BUILTINS = {"len", "abs", "min", "max", "sum", "float", "int", "round", "bool", "all", "any", "range", "enumerate", "print"}
+
+
 def _as_load(target: ast.expr) -> ast.expr:
     node = ast.parse(ast.unparse(target), mode="eval").body
     ast.copy_location(node, target)
@@ -735,6 +809,18 @@ class ExprLowerer:
         if name in self.fl.env:
             return self.fl.env[name]
         raise self.err(f"unknown name '{name}'", node)
+
+    def cond(self, n: ast.expr) -> ir.Expr:
+        """Lower an expression used only for its truth value, where Python's
+        truthiness applies (if/while/assert/not, and/or operands there)."""
+        if isinstance(n, ast.BoolOp):
+            op = "and" if isinstance(n.op, ast.And) else "or"
+            vals = [self.cond(v) for v in n.values]
+            out = vals[0]
+            for v in vals[1:]:
+                out = ir.Binary(ir.BOOL, self.loc(n), op, out, v)
+            return out
+        return self.truthy(self.expr(n), n)
 
     def truthy(self, e: ir.Expr, node: ast.AST) -> ir.Expr:
         t = e.ty
@@ -779,7 +865,7 @@ class ExprLowerer:
         if isinstance(n, ast.UnaryOp):
             a = self.expr(n.operand)
             if isinstance(n.op, ast.Not):
-                return ir.Unary(ir.BOOL, loc, "not", self.truthy(a, n.operand))
+                return ir.Unary(ir.BOOL, loc, "not", self.cond(n.operand))
             if isinstance(n.op, ast.USub):
                 if not ir.is_numeric(a.ty):
                     raise self.err(f"cannot negate {a.ty}", n)
@@ -792,8 +878,11 @@ class ExprLowerer:
         if isinstance(n, ast.BinOp):
             return self.binop(n, loc)
         if isinstance(n, ast.BoolOp):
+            # As a value, `a or b` is one of its operands, not a bool.
             op = "and" if isinstance(n.op, ast.And) else "or"
-            vals = [self.truthy(self.expr(v), v) for v in n.values]
+            vals = [self.expr(v) for v in n.values]
+            if not all(isinstance(v.ty, ir.TBool) for v in vals):
+                raise self.err(f"'{op}' on non-bool values returns an operand, not a bool; compare explicitly", n)
             out = vals[0]
             for v in vals[1:]:
                 out = ir.Binary(ir.BOOL, loc, op, out, v)
@@ -801,7 +890,7 @@ class ExprLowerer:
         if isinstance(n, ast.Compare):
             return self.compare(n, loc)
         if isinstance(n, ast.IfExp):
-            c = self.truthy(self.expr(n.test), n.test)
+            c = self.cond(n.test)
             a = self.expr(n.body, expect)
             b = self.expr(n.orelse, expect)
             if a.ty != b.ty:
@@ -947,14 +1036,19 @@ class ExprLowerer:
         if not isinstance(f, ast.Name):
             raise self.err("unsupported call", n)
         name = f.id
+        if name in self.fl.fe.signatures:
+            return self.user_call(n, loc, name)
+        if name in BUILTINS and name in self.fl.fe.bound:
+            raise self.err(f"'{name}' is rebound in this module, so telic cannot assume the builtin", n)
         if self.spec and name == "old":
             if self.result_ty is None:
                 raise self.err("old(...) is only allowed in '@ensures'", n)
             (x,) = self._args(n, 1)
             return ir.Old(x.ty, loc, x)
         if self.spec and name == "implies":
-            a, b = self._args(n, 2)
-            return ir.Binary(ir.BOOL, loc, "implies", self.truthy(a, n), self.truthy(b, n))
+            if len(n.args) != 2:
+                raise self.err("implies() takes two arguments", n)
+            return ir.Binary(ir.BOOL, loc, "implies", self.cond(n.args[0]), self.cond(n.args[1]))
         if name in ("all", "any"):
             return self.quant(n, loc, "forall" if name == "all" else "exists")
         if name == "len":
@@ -1023,9 +1117,14 @@ class ExprLowerer:
                 if vals[fname].ty != fty:
                     raise self.err(f"field '{fname}' of {name} expects {fty}, got {vals[fname].ty}", n)
             return ir.RecordLit(rec, loc, tuple((f, vals[f]) for f, _ in rec.fields))
+        return self.user_call(n, loc, name)
+
+    def user_call(self, n: ast.Call, loc: ir.Loc, name: str) -> ir.Expr:
         sig = self.fl.fe.signatures.get(name)
         if sig is None:
             raise self.err(f"call to '{name}', which telic cannot see (define it in a checked file with a contract)", n)
+        if n.keywords:
+            raise self.err("keyword arguments are only supported for record constructors", n)
         params, ret = sig
         if len(n.args) != len(params):
             raise self.err(f"'{name}' takes {len(params)} arguments, got {len(n.args)}", n)
@@ -1084,9 +1183,9 @@ class ExprLowerer:
                 hi = ir.Builtin(ir.INT, loc, "len", (seq,))
                 self.bound[idx] = ir.INT
                 self.bound[elem] = seq.ty.elem
-            body = self.truthy(self.expr(g.elt), g.elt)
+            body = self.cond(g.elt)
             for cond in gen.ifs:
-                c = self.truthy(self.expr(cond), cond)
+                c = self.cond(cond)
                 body = ir.Binary(ir.BOOL, loc, "implies" if kind == "forall" else "and", c, body)
             return ir.Quant(ir.BOOL, loc, kind, idx, lo, hi, body, elem, seq)
         finally:

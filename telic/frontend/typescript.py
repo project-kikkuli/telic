@@ -146,7 +146,7 @@ def _stmt(d: dict[str, Any]) -> ir.Stmt:
     if k == "While":
         return ir.While(loc, _expr(d["cond"]), tuple(_clause(c) for c in d["invariants"]), _clause(d.get("decreases")), _stmts(d["body"]), _stmts(d.get("step") or []))  # type: ignore[arg-type]
     if k == "ForRange":
-        return ir.ForRange(loc, d["var"], _expr(d["lo"]), _expr(d["hi"]), tuple(_clause(c) for c in d["invariants"]), _stmts(d["body"]))  # type: ignore[arg-type]
+        return ir.ForRange(loc, d["var"], _expr(d["lo"]), _expr(d["hi"]), tuple(_clause(c) for c in d["invariants"]), _stmts(d["body"]), bool(d.get("reeval")))  # type: ignore[arg-type]
     if k == "ForEach":
         return ir.ForEach(loc, d["elem"], d["idx"], _expr(d["seq"]), tuple(_clause(c) for c in d["invariants"]), _stmts(d["body"]), bool(d.get("idx_visible")))  # type: ignore[arg-type]
     if k == "Return":

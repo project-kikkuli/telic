@@ -227,6 +227,7 @@ class VCGen:
         self.inputs: list[tuple[str, Val]] = []
         self.assumptions: list[tuple[ir.Loc, str]] = []
         self.definitional_mode = False
+        self.raise_paths: list[list[L.Term]] = []
         self.loop_notes: list[tuple[int, str]] = []
 
     # -- naming -----------------------------------------------------------
@@ -420,18 +421,20 @@ class VCGen:
             st.alive = False
             return st
         if isinstance(s, ir.AssertStmt):
-            ctx = self.ctx(st)
+            # A native assert runs (with effects); an '@assert' comment never does.
+            ctx = self.ctx(st) if s.native else self.ctx(st, spec=True)
             g = self.ev(s.clause.expr, ctx)
             what = "assert" if s.native else "@assert"
             self.oblige("assert", ctx, g, s.clause.loc, f"{what} {s.clause.text}", clause=s.clause)
             st.facts.append(g)
             return st
         if isinstance(s, ir.AssumeStmt):
-            g = self.ev(s.clause.expr, self.ctx(st))
+            g = self.ev(s.clause.expr, self.ctx(st, spec=True))
             st.facts.append(g)
             self.assumptions.append((s.clause.loc, s.clause.text))
             return st
         if isinstance(s, ir.Raise):
+            self.raise_paths.append(list(st.facts))
             ctx = self.ctx(st)
             if self.fn.raises:
                 ectx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
@@ -469,10 +472,7 @@ class VCGen:
         for name in names:
             vals = [s.env.get(name) for s in live]
             if any(v is None for v in vals):
-                ty = self.fn.locals.get(name)
-                if ty is None:
-                    continue
-                vals = [v if v is not None else self.fresh(f"{name}?", ty) for v in vals]
+                continue  # possibly unbound: reading it later is an error, not a guess
             if all(v == vals[0] for v in vals):
                 env[name] = vals[0]  # type: ignore[assignment]
                 continue
@@ -562,7 +562,7 @@ class VCGen:
     def loop_while(self, s: ir.While, st: State) -> State:
         invs = self.invariants_for(s.loc.line, s.invariants)
         self.check_invs(invs, st, "inv.entry", s.loc)
-        names, appends = self.modified(list(s.body) + list(s.step))
+        names, appends = self.modified(list(s.body) + list(s.step) + [ir.ExprStmt(s.loc, s.cond)])
         head = self.havoc(st, names, appends)
         self.assume_invs(invs, head)
         c = self.ev(s.cond, self.ctx(head))
@@ -654,19 +654,49 @@ class VCGen:
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.var] = k
 
+        if s.reeval:
+            self._bound_fixed(s.hi, s.body, s.loc)
         out = self._counted_loop(s, st, lo_v, hi_v, s.var, bind)
-        last = L.sub(hi_v, L.ONE)
-        if prior is None:
-            prior = self.fresh(s.var, ir.INT)
-        # After a range loop that ran to completion, var == hi - 1 (Python).
         out.env.pop(f"{s.var}$k", None)
-        out.env[s.var] = L.ite(L.lt(lo_v, hi_v), last, prior) if not _has_break(s.body) else self.fresh(s.var, ir.INT)
+        if prior is None:
+            out.env.pop(s.var, None)  # bound only if the loop ran: reading it is an error
+        elif _has_break(s.body) or s.var in ir.assigned_names(s.body):
+            out.env[s.var] = self.fresh(s.var, ir.INT)
+        else:
+            # After a completed range loop the variable holds hi - 1 (Python).
+            out.env[s.var] = L.ite(L.lt(lo_v, hi_v), L.sub(hi_v, L.ONE), prior)
         return out
+
+    def _bound_fixed(self, hi: ir.Expr, body, loc: ir.Loc) -> None:
+        """JavaScript re-evaluates a for-loop condition every iteration; the
+        counted-loop model needs its bound to stay put."""
+        names, appends = self.modified(body)
+
+        def changed(e: ir.Expr) -> set[str]:
+            # len(xs) is fixed if the body only writes elements of xs
+            if isinstance(e, ir.Builtin) and e.name == "len" and isinstance(e.args[0], ir.Var):
+                v = e.args[0].name
+                return {v} if v in appends else set()
+            if isinstance(e, ir.Var):
+                return {e.name} & names
+            out: set[str] = set()
+            for child in _children(e):
+                out |= changed(child)
+            return out
+
+        bad = changed(hi)
+        if bad:
+            raise VCError(f"the loop bound depends on {', '.join(sorted(bad))}, which the loop body changes", loc)
 
     def loop_each(self, s: ir.ForEach, st: State) -> State:
         ctx = self.ctx(st)
         seq = self.ev(s.seq, ctx)
         assert isinstance(seq, ListVal)
+        names, _ = self.modified(s.body)
+        seq_vars = {x.name for x in ir.walk_expr(s.seq) if isinstance(x, ir.Var)}
+        if names & seq_vars:
+            raise VCError(f"the loop body changes {', '.join(sorted(names & seq_vars))} while iterating over it", s.loc)
+        before = set(st.env)
 
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.elem] = seq.at(k)
@@ -675,8 +705,10 @@ class VCGen:
         out = self._counted_loop(s, st, L.ZERO, seq.len, s.idx, bind)
         out.env.pop(f"{s.idx}$k", None)
         for name in (s.elem, s.idx):
-            if name in self.fn.locals:
+            if name in before and name in self.fn.locals:
                 out.env[name] = self.fresh(name, self.fn.locals[name])
+            else:
+                out.env.pop(name, None)
         return out
 
     # -- expressions ------------------------------------------------------
@@ -927,6 +959,14 @@ class VCGen:
             raise VCError(f"unknown function '{e.func}'", e.loc)
         fn = callee.fn
         args = [self.ev(a, ctx) for a in e.args]
+        # A list argument is a reference: a later argument that mutates the
+        # same list changes what the callee sees. Re-read list variables.
+        if ctx.state is not None:
+            args = [ctx.state.env.get(a_e.name, a) if isinstance(a_e, ir.Var) and isinstance(a, ListVal) else a for a_e, a in zip(e.args, args)]
+        muts = self.program.mutated.get(callee.key, set())
+        list_vars = [a_e.name for a_e, p in zip(e.args, fn.params) if isinstance(a_e, ir.Var) and isinstance(p.ty, ir.TList)]
+        if muts and len(list_vars) != len(set(list_vars)):
+            raise VCError(f"the same list is passed twice to '{fn.name}', which mutates a list parameter; the two parameters would alias", e.loc)
         pmap: dict[str, Val] = {p.name: a for p, a in zip(fn.params, args)}
         definitional = callee.key in self.program.definitional
         if ctx.spec and not definitional:
@@ -962,7 +1002,6 @@ class VCGen:
             r = self.fresh(f"{fn.name}()", fn.ret)
         # Mutated list arguments get fresh contents.
         post = dict(pmap)
-        muts = self.program.mutated.get(callee.key, set())
         if muts and ctx.state is not None:
             for p, a_expr in zip(fn.params, e.args):
                 if p.name in muts:
@@ -1052,6 +1091,21 @@ def _expr_text(clause: ir.Clause | None, e: ir.Expr) -> str:
     from .render_expr import render
 
     return render(e)
+
+
+def _children(e: ir.Expr) -> list[ir.Expr]:
+    direct: list[ir.Expr] = []
+    for name in ("arg", "left", "right", "cond", "then", "orelse", "expr", "seq", "idx", "obj", "lo", "hi", "body"):
+        v = getattr(e, name, None)
+        if isinstance(v, ir.Expr):
+            direct.append(v)
+    for name in ("args", "elems"):
+        for v in getattr(e, name, ()) or ():
+            if isinstance(v, ir.Expr):
+                direct.append(v)
+    if isinstance(e, ir.RecordLit):
+        direct.extend(v for _, v in e.fields)
+    return direct
 
 
 def _has_break(stmts) -> bool:

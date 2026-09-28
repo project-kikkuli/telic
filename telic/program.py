@@ -158,7 +158,7 @@ class Program:
         cand: set[str] = set()
         for key, ref in self.funcs.items():
             fn = ref.fn
-            if fn.unsupported or fn.trusted or fn.ret == ir.NONE:
+            if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, ir.TList):
                 continue
             ok = True
             for s in ir.walk_stmts(fn.body):
@@ -183,7 +183,7 @@ class Program:
         used: set[str] = set()
         for name, keys in by_name.items():
             for key in keys:
-                if len(keys) == 1:
+                if len(keys) == 1 and not name.startswith(("seqsum", "seqcount", "Telic")):
                     cand = name
                 else:
                     stem = re.sub(r"\W", "_", self.funcs[key].module.path.rsplit("/", 1)[-1])

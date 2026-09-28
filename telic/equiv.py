@@ -94,9 +94,10 @@ def _has_loops(fn: ir.Function) -> bool:
     return any(isinstance(s, (ir.While, ir.ForRange, ir.ForEach)) for s in ir.walk_stmts(fn.body))
 
 
-def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple[L.Term, list[L.Term]]:
+def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple[L.Term, list[L.Term], L.Term]:
     """The function's result as one term over ``inputs`` (loop-free only),
-    plus its preconditions over the same inputs."""
+    its preconditions over the same inputs, and the condition under which it
+    raises instead of returning."""
     g = VCGen(program, ref, inputs=inputs)
     g.definitional_mode = True
     env = dict(inputs)
@@ -113,7 +114,8 @@ def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple
         body = L.ite(L.and_(*ex.facts), ex.value, body)  # type: ignore[arg-type]
     if isinstance(body, ListVal):
         raise Incomparable("comparing list results symbolically is not supported yet")
-    return body, reqs
+    raises = L.or_(*[L.and_(*facts) for facts in g.raise_paths])
+    return body, reqs, raises
 
 
 def _coerce_pair(ra: L.Term, rb: L.Term) -> tuple[L.Term, L.Term]:
@@ -236,8 +238,8 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
     rep.explanation = explain_difference(a.fn, b.fn, notes)
     if not _has_loops(a.fn) and not _has_loops(b.fn) and not a.fn.unsupported and not b.fn.unsupported:
         try:
-            ra, reqa = result_term(program, a, ina)
-            rb, reqb = result_term(program, b, inb)
+            ra, reqa, xa = result_term(program, a, ina)
+            rb, reqb, xb = result_term(program, b, inb)
             ra, rb = _coerce_pair(ra, rb)
             hyps = reqa + reqb
             for _, v in shown:
@@ -251,7 +253,8 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
                 site=None,
                 message=f"{a.fn.name} and {b.fn.name} agree",
                 hyps=hyps,
-                goal=L.eq(ra, rb),
+                # same outcome: both raise, or neither does and the values agree
+                goal=L.and_(L.eq(xa, xb), L.implies(L.not_(xa), L.eq(ra, rb))),
                 inputs=shown,
             )
             res = solve(ob, theory, timeout_ms)

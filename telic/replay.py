@@ -152,52 +152,77 @@ EXPECTED = {
 }
 
 
+def _same(text: str, clause) -> bool:
+    return clause is not None and " ".join(str(text).split()) == clause.text
+
+
+def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
+    """Does what happened at runtime demonstrate *this* obligation failing?"""
+    k = ob.kind
+    v, crash = out.get("violation"), out.get("crash")
+    if k == "ensures":
+        return v == "ensures" and out.get("func") == fn.name and _same(out.get("text", ""), ob.clause)
+    if k == "call":
+        return v == "requires" and out.get("func") != fn.name and _same(out.get("text", ""), ob.clause)
+    if k in ("inv.entry", "inv.step"):
+        return v == "invariant" and _same(out.get("text", ""), ob.clause)
+    if k == "assert":
+        return (v in ("assert", "assume") and _same(out.get("text", ""), ob.clause)) or crash == "AssertionError"
+    if k == "div":
+        return crash == "ZeroDivisionError" or (lang == "typescript" and bool(out.get("nonfinite")))
+    if k == "index":
+        return crash == "IndexError" or bool(out.get("oob"))
+    if k == "raise":
+        return crash is not None and crash not in ("RecursionError",)
+    if k == "raises":
+        return "returned_repr" in out
+    if k == "return":
+        return bool(out.get("returned_is_none")) and "returned_repr" in out
+    return False
+
+
+def describe(out: dict[str, Any], runtime: str) -> str:
+    if "violation" in out:
+        kind, text, where = out["violation"], out.get("text", ""), out.get("func", "")
+        if kind == "ensures":
+            return f"{runtime}: {out.get('detail') or 'returned'}; '{text}' is false"
+        if kind == "requires":
+            return f"{runtime}: called {where}() violating '@requires {text}'"
+        if kind == "invariant":
+            return f"{runtime}: invariant '{text}' is false at runtime -- the invariant itself is wrong"
+        return f"{runtime}: '@{kind} {text}' failed" + (f" at line {out.get('line')}" if out.get("line") else "")
+    if "crash" in out:
+        line = out.get("line")
+        at = f" at line {line}" if line else ""
+        msg = out.get("msg") or ""
+        return f"{runtime}: {out['crash']}{': ' + msg if msg else ''}{at}"
+    if out.get("returned_is_none"):
+        return f"{runtime}: fell off the end and returned {out.get('returned_repr')}"
+    return f"{runtime}: returned {out.get('returned_repr')}"
+
+
 def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool, str, str | None]:
-    """(confirmed, summary, violation)."""
+    """(confirmed, summary, violation). Confirmed only if the runtime failure
+    is this obligation's failure: same clause, same kind of crash."""
     runtime = "node" if lang == "typescript" else "python"
     if out.get("timeout"):
         if ob.kind == "variant":
-            return True, f"{runtime}: did not terminate within {TIMEOUT_S:.0f}s", "timeout"
-        return False, f"{runtime}: timed out after {TIMEOUT_S:.0f}s", "timeout"
+            return False, f"{runtime}: still running after {TIMEOUT_S:.0f}s (consistent with non-termination, not proof of it)", None
+        return False, f"{runtime}: timed out after {TIMEOUT_S:.0f}s", None
     if "harness_error" in out:
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
-    ret = out.get("returned_repr")
-    if "violation" in out:
-        kind, text, where = out["violation"], out.get("text", ""), out.get("func", "")
-        detail = out.get("detail", "")
-        if kind == "requires" and where == fn.name and ob.kind != "call":
-            return False, f"{runtime}: the model violates '@requires {text}' (telic model mismatch; please report)", None
-        what = f"@{kind} {text}"
-        if kind == "ensures":
-            msg = f"{runtime}: {detail or 'returned'}; '{text}' is false"
-        elif kind == "requires":
-            msg = f"{runtime}: called {where}() violating '@requires {text}'"
-        elif kind == "invariant":
-            msg = f"{runtime}: invariant '{text}' is false at runtime -- the invariant itself is wrong"
-        else:
-            msg = f"{runtime}: '{what}' failed at line {out.get('line')}"
-        return True, msg, what
-    if "crash" in out:
-        exc = out["crash"]
-        line = out.get("line")
-        at = f" at line {line}" if line else ""
-        if ob.kind == "raise":
-            return True, f"{runtime}: raised {exc}{at}", exc
-        if lang == "typescript" and ob.kind == "index":
-            return True, f"{runtime}: {out.get('msg') or exc}{at}", exc
-        return True, f"{runtime}: {exc}: {out.get('msg', '')}{at}".rstrip(": "), exc
-    if "returned_repr" in out:
-        if ob.kind == "return" and out.get("returned_is_none"):
-            return True, f"{runtime}: fell off the end and returned {ret}", "missing return"
-        if lang == "typescript" and out.get("oob"):
-            return True, f"{runtime}: read past the end of an array (got undefined){'; returned ' + ret if ret else ''}", "undefined read"
-        if lang == "typescript" and ob.kind == "div" and out.get("nonfinite"):
-            return True, f"{runtime}: returned {ret}", "division by zero"
-        loop_state = any("@" in c.name for h in ob.hyps for c in _consts(h))
-        if ob.kind in ("inv.step", "variant") or loop_state:
-            return False, f"{runtime}: returned {ret} without violating anything -- the state behind this counterexample is unreachable; a loop invariant is too weak to rule it out", None
-        return False, f"{runtime}: returned {ret} without violating anything", None
-    return False, "no result", None
+    if out.get("violation") == "requires" and out.get("func") == fn.name and ob.kind != "call":
+        return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
+    summary = describe(out, runtime)
+    if matches(ob, out, fn, lang):
+        what = out.get("violation") or out.get("crash") or ob.kind
+        return True, summary, str(what)
+    if "violation" in out or "crash" in out:
+        return False, f"{summary} -- a real failure, but a different one from this obligation", None
+    loop_state = any("@" in c.name for h in ob.hyps for c in _consts(h))
+    if ob.kind in ("inv.step", "variant") or loop_state:
+        return False, f"{summary} without violating anything -- the state behind this counterexample is unreachable; a loop invariant is too weak to rule it out", None
+    return False, f"{summary} without violating anything", None
 
 
 def _consts(t):
@@ -216,6 +241,10 @@ def replay_verdicts(program: Program, rep) -> None:
     full = os.path.join(root, path) if root and not os.path.isabs(path) else path
     for v in rep.verdicts:
         if v.status != "refuted" or not v.model and fn.params:
+            continue
+        if v.reason.startswith("the model's list input is too large"):
+            v.replay = Replay(False, False, v.reason)
+            v.status = "unconfirmed"
             continue
         args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
         try:

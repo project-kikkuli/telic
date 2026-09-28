@@ -226,7 +226,11 @@ telic is explicit about its trusted base, and prints it (`telic check -v`):
 - **The theory lemmas** Z3 gets about sums and counts. They are proved in Lean in
   [`telic/lean/Theory.lean`](telic/lean/Theory.lean), and the test suite
   re-checks that file.
-- **The frontends and VC generator**, which are ordinary code and have tests.
+- **The frontends and VC generator**, which are ordinary code. Besides unit
+  tests and verdict corpora, they carry an adversarial suite
+  (`tests/cases/soundness/`): programs built to trick telic into proving false
+  claims (aliasing, block scoping, mutation through calls, shadowed builtins,
+  proofs that try to escape their theorem). None of them may prove.
 - Anything marked `@trusted` or `@assume`, listed in every report.
 
 Counterexamples never rely on trust, because each one is executed before it's

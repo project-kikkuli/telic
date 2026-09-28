@@ -418,9 +418,6 @@ class Attempt:
     name: str
     statement: str
     proof: str
-    first_line: int = 0
-    last_line: int = 0
-    print_line: int = 0
 
 
 @dataclass
@@ -430,45 +427,68 @@ class AttemptResult:
     axioms: list[str] = field(default_factory=list)
 
 
-def check_attempts(lean: str, defs_text: str, attempts: list[Attempt]) -> tuple[list[AttemptResult], LeanRun]:
-    """Elaborate many theorems in one Lean process; attribute messages back."""
-    lines = PRELUDE.format(heartbeats=HEARTBEATS).splitlines() + [""] + defs_text.splitlines() + [""]
-    for at in attempts:
-        at.first_line = len(lines) + 1
-        body = at.proof.strip("\n")
-        block = f"theorem {at.name}{at.statement} := by\n" + "\n".join("  " + l if l.strip() else l for l in body.splitlines())
-        lines += block.splitlines()
-        at.last_line = len(lines)
-        lines.append(f"#print axioms {at.name}")
-        at.print_line = len(lines)
-        lines.append("")
-    run = run_lean(lean, "\n".join(lines) + "\n")
-    defs_end = len(PRELUDE.format(heartbeats=HEARTBEATS).splitlines()) + 1 + len(defs_text.splitlines()) + 1
-    def_errors = [m for m in run.messages if m.severity == "error" and m.line <= defs_end]
-    results = []
-    for at in attempts:
-        r = AttemptResult(True)
-        if def_errors:
+COMMAND_RE = re.compile(
+    r"^\s*(axiom|theorem|lemma|def|abbrev|instance|example|namespace|section|end|open|set_option|attribute|"
+    r"macro|macro_rules|syntax|elab|elab_rules|notation|infix|infixl|infixr|prefix|postfix|universe|variable|import|"
+    r"opaque|structure|class|inductive|mutual|noncomputable|private|protected|partial|unsafe|initialize|"
+    r"builtin_initialize|export|local|scoped|deriving|declare_syntax_cat|run_cmd|run_elab|run_meta)\b|^\s*(@\[|#[a-z_])",
+    re.M,
+)
+
+
+def proof_is_tactics_only(proof: str) -> str | None:
+    """A proof must be a tactic block. A line that starts a Lean command
+    could end the theorem and add declarations (an axiom, a namespace that
+    hides the real theorem from the audit), so such proofs are refused."""
+    m = COMMAND_RE.search(proof)
+    if m:
+        return f"proof text may only contain tactics; line starting with '{m.group(0).strip()}' is a Lean command"
+    return None
+
+
+def _check_one(lean: str, defs_text: str, at: Attempt) -> AttemptResult:
+    bad = proof_is_tactics_only(at.proof)
+    if bad:
+        return AttemptResult(False, [bad])
+    pre = PRELUDE.format(heartbeats=HEARTBEATS)
+    body = "\n".join("  " + l if l.strip() else l for l in at.proof.strip("\n").splitlines())
+    text = f"{pre}\n{defs_text}\n\ntheorem {at.name}{at.statement} := by\n{body}\n\n#print axioms _root_.{at.name}\n"
+    run = run_lean(lean, text)
+    r = AttemptResult(True)
+    if run.error and not run.messages:
+        return AttemptResult(False, [run.error])
+    audited = False
+    for m in run.messages:
+        # Every error anywhere in the file counts: nothing may fail around the proof.
+        if m.severity == "error":
             r.ok = False
-            r.errors = [f"(definitions) line {m.line}: {m.text}" for m in def_errors]
-        for m in run.messages:
-            if at.first_line <= m.line <= at.last_line and m.severity == "error":
-                r.ok = False
-                r.errors.append(m.text)
-            if at.first_line <= m.line <= at.last_line and m.severity == "warning" and "sorry" in m.text:
-                r.ok = False
-                r.errors.append(m.text)
-            if m.line == at.print_line and "depends on axioms" in m.text:
-                r.axioms = re.findall(r"[\w.]+", m.text.split(":", 1)[1])
-        if run.error and not run.messages:
+            r.errors.append(m.text)
+        elif m.severity == "warning" and "sorry" in m.text:
             r.ok = False
-            r.errors.append(run.error)
-        bad = [a for a in r.axioms if a not in STANDARD_AXIOMS]
-        if bad:
-            r.ok = False
-            r.errors.append(f"proof depends on non-standard axioms: {', '.join(bad)}")
-        results.append(r)
-    return results, run
+            r.errors.append(m.text)
+        if f"'{at.name}' depends on axioms" in m.text:
+            audited = True
+            r.axioms = re.findall(r"[\w.]+", m.text.split(":", 1)[1])
+        elif f"'{at.name}' does not depend on any axioms" in m.text:
+            audited = True
+    if r.ok and not audited:
+        r.ok = False
+        r.errors.append("could not audit the axioms of the proved theorem")
+    bad_axioms = [a for a in r.axioms if a not in STANDARD_AXIOMS]
+    if bad_axioms:
+        r.ok = False
+        r.errors.append(f"proof depends on non-standard axioms: {', '.join(bad_axioms)}")
+    return r
+
+
+def check_attempts(lean: str, defs_text: str, attempts: list[Attempt]) -> tuple[list[AttemptResult], None]:
+    """Check each proof in its own Lean file (in parallel), so one proof can
+    never see, or interfere with, another."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(attempts)))) as pool:
+        results = list(pool.map(lambda at: _check_one(lean, defs_text, at), attempts))
+    return results, None
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +599,7 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
         groups.setdefault(defs_text, []).append(len(attempts) - 1)
     for defs_text, idxs in groups.items():
         batch = [attempts[i][1] for i in idxs]
-        results, run = check_attempts(lean, validated_defs(lean, defs_text), batch)
+        results, _ = check_attempts(lean, validated_defs(lean, defs_text), batch)
         for i, res in zip(idxs, results):
             v, at, h, how = attempts[i]
             if res.ok:
@@ -697,6 +717,8 @@ Hints:
   `have e : a = b := by omega` then `rw [e]` before applying a lemma.
 
 Reply with ONLY the tactic proof inside one ```lean code block (the text that goes after `:= by`), nothing else.
+The proof must be tactics only: no top-level commands (no `theorem`, `lemma`, `open ... in`, `set_option`,
+`namespace`, `#print`); state helper facts with `have` inside the proof.
 {feedback}"""
 
 

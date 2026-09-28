@@ -255,7 +255,7 @@ class ModuleLowerer {
     if (ts.isTypeReferenceNode(tn) && ts.isIdentifier(tn.typeName)) {
       const n = tn.typeName.text;
       if ((n === "Array" || n === "ReadonlyArray") && tn.typeArguments && tn.typeArguments.length === 1) return listOf(this.typeOf(tn.typeArguments[0]));
-      if (["int", "Int", "integer", "Integer"].includes(n) && this.aliases[n]) return INT;
+      if (["int", "Int", "integer", "Integer"].includes(n) && this.aliases[n] && this.aliases[n].kind === ts.SyntaxKind.NumberKeyword) return INT;
       if (this.module.records[n]) return this.module.records[n];
       if (this.aliases[n]) return this.typeOf(this.aliases[n], intHint);
       throw new LowerError(`unsupported type '${n}'`, this.line(tn));
@@ -293,10 +293,22 @@ class ModuleLowerer {
     const node = f.node;
     const cls = this.functionContracts(f);
     // integrality hints from @requires: Number.isInteger(p) / isSafeInteger(p)
+    // Only a top-level conjunct `Number.isInteger(p)` makes p an integer:
+    // under `!` or `||` it guarantees nothing.
     const ints = new Set();
     for (const cl of cls) {
       if (cl.keyword !== "requires") continue;
-      for (const m of cl.payload.matchAll(/Number\.is(?:Safe)?Integer\(\s*([A-Za-z_$][\w$]*)\s*\)/g)) ints.add(m[1]);
+      const src = ts.createSourceFile("r.ts", "(" + cl.payload + "\n)", ts.ScriptTarget.Latest, true);
+      const st = src.statements[0];
+      if (!st || !ts.isExpressionStatement(st)) continue;
+      const conj = (e) => {
+        while (ts.isParenthesizedExpression(e)) e = e.expression;
+        if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) return conj(e.left).concat(conj(e.right));
+        return [e];
+      };
+      for (const c of conj(st.expression)) {
+        if (ts.isCallExpression(c) && c.arguments.length === 1 && ts.isIdentifier(c.arguments[0]) && ts.isPropertyAccessExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "Number" && ["isInteger", "isSafeInteger"].includes(c.expression.name.text)) ints.add(c.arguments[0].text);
+      }
     }
     const params = [];
     for (const p of node.parameters) {
@@ -350,6 +362,15 @@ class FunctionLowerer {
     this.env = {};
     this.probe = probe;
     this.tmp = 0;
+    this.scopes = [new Map(this.sig.params.map((p) => [p.name, p.name]))];
+    this.usedIr = new Set(this.sig.params.map((p) => p.name));
+    this.consts = new Set();
+    this.srcNames = new Set();
+    const collect = (n) => {
+      if (ts.isIdentifier(n)) this.srcNames.add(n.text);
+      ts.forEachChild(n, collect);
+    };
+    if (f.node.body) collect(f.node.body);
     this.unsupported = [];
     this.intents = [];
     this.currentIntents = [];
@@ -560,6 +581,10 @@ class FunctionLowerer {
     );
   }
 
+  blockBody(block) {
+    return this.block(block.statements, block);
+  }
+
   block(stmts, block) {
     const out = [];
     const pending = block ? this.blockContracts(block, stmts) : [];
@@ -596,8 +621,46 @@ class FunctionLowerer {
   }
 
   inner(s) {
-    if (ts.isBlock(s)) return this.block(s.statements, s);
-    return this.stmt(s);
+    return this.scoped(() => (ts.isBlock(s) ? this.blockBody(s) : this.stmt(s)));
+  }
+
+  // -- scopes ------------------------------------------------------------
+  // JavaScript `let`/`const` are block-scoped. Every declaration gets a
+  // unique IR name, lookups walk the scope chain, and shadowing an outer
+  // name is rejected (it is legal JS, but an easy way to fool a reader).
+
+  scoped(f) {
+    this.scopes.push(new Map());
+    try {
+      return f();
+    } finally {
+      this.scopes.pop();
+    }
+  }
+
+  resolve(name) {
+    for (let i = this.scopes.length - 1; i >= 0; i--) if (this.scopes[i].has(name)) return this.scopes[i].get(name);
+    return null;
+  }
+
+  bindLocal(name, ty, node) {
+    if (this.resolve(name) !== null) throw this.err(`'${name}' shadows a variable of the same name; telic requires distinct names`, node);
+    let ir = name;
+    if (this.usedIr.has(ir)) {
+      let k = 2;
+      while (this.usedIr.has(`${name}$${k}`)) k++;
+      ir = `${name}$${k}`;
+    }
+    this.usedIr.add(ir);
+    this.scopes[this.scopes.length - 1].set(name, ir);
+    this.env[ir] = ty;
+    return ir;
+  }
+
+  varOf(name, node) {
+    const ir = this.resolve(name);
+    if (ir === null) throw this.err(`unknown variable '${name}'`, node);
+    return ir;
   }
 
   declare(name, ty, node) {
@@ -614,6 +677,19 @@ class FunctionLowerer {
     if (ty && ty.k === "real" && e.ty.k === "int") return { e: "Builtin", ty: REAL, loc: e.loc, name: "to_real", args: [e] };
     if (ty && ty.k === "list" && e.e === "ListLit" && e.elems.length === 0) return { ...e, ty };
     return e;
+  }
+
+  // A list-valued expression that denotes a new array (binding it creates no alias).
+  freshList(e) {
+    if (e.e === "ListLit" || e.e === "Call") return true;
+    if (e.e === "Builtin" && e.name === "slice") return true;
+    if (e.e === "Ite") return this.freshList(e.then) && this.freshList(e.orelse);
+    return false;
+  }
+
+  noAlias(name, v, node) {
+    if (v.ty.k !== "list") return;
+    if (!this.freshList(v)) throw this.err(`'${name} = ...' would alias an existing array; telic models arrays as values, so copy with .slice()`, node);
   }
 
   loopContracts(s) {
@@ -648,20 +724,44 @@ class FunctionLowerer {
     return { invs, dec, index };
   }
 
-  assignTo(name, valueNode, node, op = null) {
+  assignTo(srcName, valueNode, node, op = null) {
     const loc = this.ml.loc(node);
+    const name = this.varOf(srcName, node);
     const known = this.env[name];
-    if (!known) throw this.err(`assignment to undeclared variable '${name}'`, node);
-    if (this.sig.params.some((p) => p.name === name) && known.k === "list") throw this.err(`rebinding array parameter '${name}' is not supported`, node);
+    if (this.sig.params.some((p) => p.name === name) && known.k === "list") throw this.err(`rebinding array parameter '${srcName}' is not supported`, node);
+    if (this.consts.has(name)) throw this.err(`cannot assign to const '${srcName}'`, node);
     let v = this.expr(valueNode, known);
     if (op) {
       const cur = { e: "Var", ty: known, loc, name };
       v = this.arith(op, cur, v, node);
     }
     v = this.coerce(v, known);
-    if (v.ty.k === "list" && valueNode && ts.isIdentifier(valueNode)) throw this.err(`'${name} = ${valueNode.text}' would alias an array; copy with '${valueNode.text}.slice()'`, node);
-    if (!tyEq(v.ty, known) && !(known.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none")) throw this.err(`cannot assign ${tyStr(v.ty)} to '${name}' of type ${tyStr(known)}`, node);
+    this.noAlias(srcName, v, node);
+    if (!tyEq(v.ty, known) && !(known.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none")) throw this.err(`cannot assign ${tyStr(v.ty)} to '${srcName}' of type ${tyStr(known)}`, node);
     return [{ s: "Assign", loc, name, value: v }];
+  }
+
+  // console.* output is ignored, but its arguments are still evaluated.
+  logEffects(args, loc) {
+    const out = [];
+    for (const a of args) {
+      const parts = ts.isTemplateExpression(a) ? a.templateSpans.map((sp) => sp.expression) : [a];
+      for (const part of parts) {
+        try {
+          out.push({ s: "ExprStmt", loc, expr: this.expr(part) });
+        } catch (e) {
+          if (!(e instanceof LowerError)) throw e;
+          let hasCall = false;
+          const walk = (n) => {
+            if (ts.isCallExpression(n) || ts.isNewExpression(n)) hasCall = true;
+            ts.forEachChild(n, walk);
+          };
+          walk(part);
+          if (hasCall) throw e;
+        }
+      }
+    }
+    return out;
   }
 
   exprStatement(e, node) {
@@ -674,9 +774,9 @@ class FunctionLowerer {
       if (k === K.EqualsToken || ops[k]) {
         if (ts.isIdentifier(e.left)) return this.assignTo(e.left.text, e.right, node, ops[k] || null);
         if (ts.isElementAccessExpression(e.left) && ts.isIdentifier(e.left.expression)) {
-          const name = e.left.expression.text;
+          const name = this.varOf(e.left.expression.text, node);
           const t = this.env[name];
-          if (!t || t.k !== "list") throw this.err(`'${name}[...] = ...' needs '${name}' to be an array`, node);
+          if (!t || t.k !== "list") throw this.err(`'${e.left.expression.text}[...] = ...' needs an array`, node);
           const idx = this.index(e.left.argumentExpression);
           let v = this.expr(e.right, t.elem);
           if (ops[k]) v = this.arith(ops[k], { e: "Index", ty: t.elem, loc, seq: { e: "Var", ty: t, loc, name }, idx, wrap: false }, v, node);
@@ -689,20 +789,21 @@ class FunctionLowerer {
     }
     if ((ts.isPostfixUnaryExpression(e) || ts.isPrefixUnaryExpression(e)) && (e.operator === K.PlusPlusToken || e.operator === K.MinusMinusToken)) {
       if (!ts.isIdentifier(e.operand)) throw this.err("++/-- is supported on variables only", node);
-      const name = e.operand.text;
+      const name = this.varOf(e.operand.text, node);
+      if (this.consts.has(name)) throw this.err(`cannot assign to const '${e.operand.text}'`, node);
       const t = this.env[name];
-      if (!isNum(t)) throw this.err(`'${name}' is not a number`, node);
+      if (!isNum(t)) throw this.err(`'${e.operand.text}' is not a number`, node);
       const one = { e: "Lit", ty: t, loc, value: 1 };
       const cur = { e: "Var", ty: t, loc, name };
       return [{ s: "Assign", loc, name, value: { e: "Binary", ty: t, loc, op: e.operator === K.PlusPlusToken ? "add" : "sub", left: cur, right: one } }];
     }
     if (ts.isCallExpression(e)) {
       const c = e.expression;
-      if (ts.isPropertyAccessExpression(c) && ts.isIdentifier(c.expression) && c.expression.text === "console") return [];
+      if (ts.isPropertyAccessExpression(c) && ts.isIdentifier(c.expression) && c.expression.text === "console" && this.resolve("console") === null) return this.logEffects(e.arguments, loc);
       if (ts.isPropertyAccessExpression(c) && c.name.text === "push" && ts.isIdentifier(c.expression)) {
-        const name = c.expression.text;
+        const name = this.varOf(c.expression.text, node);
         let t = this.env[name];
-        if (!t || t.k !== "list") throw this.err(`'${name}.push' needs '${name}' to be an array`, node);
+        if (!t || t.k !== "list") throw this.err(`'${c.expression.text}.push' needs an array`, node);
         if (e.arguments.length !== 1) throw this.err("push takes one argument here", node);
         const v0 = this.expr(e.arguments[0], t.elem.k === "none" ? null : t.elem);
         if (t.elem.k === "none") {
@@ -717,36 +818,41 @@ class FunctionLowerer {
     throw this.err(`unsupported expression statement '${e.getText(this.ml.sf).slice(0, 40)}'`, node);
   }
 
+  varDecls(list, node, loc) {
+    if (!(list.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) throw this.err("'var' is function-scoped and hoisted; use let or const", node);
+    const isConst = !!(list.flags & ts.NodeFlags.Const);
+    const out = [];
+    for (const d of list.declarations) {
+      if (!ts.isIdentifier(d.name)) throw this.err("destructuring is not supported", node);
+      const src = d.name.text;
+      let ty = d.type ? this.ml.typeOf(d.type, this.intSet.has(src)) : null;
+      if (ty && ty.k === "real" && this.intSet.has(src)) ty = INT;
+      if (!d.initializer) {
+        if (!ty) throw this.err(`'${src}' needs a type or an initializer`, node);
+        this.bindLocal(src, ty, node);
+        continue;
+      }
+      let v = this.expr(d.initializer, ty);
+      if (!ty) {
+        ty = v.ty;
+        if (ty.k === "int" && !this.intSet.has(src)) ty = REAL;
+      }
+      v = this.coerce(v, ty);
+      if (!tyEq(v.ty, ty) && !(ty.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none")) throw this.err(`'${src}' is declared ${tyStr(ty)} but initialized with ${tyStr(v.ty)}`, node);
+      this.noAlias(src, v, node);
+      const name = this.bindLocal(src, ty, node);
+      if (isConst) this.consts.add(name);
+      out.push({ s: "Assign", loc, name, value: v });
+    }
+    return out;
+  }
+
   _stmt(s) {
     const K = ts.SyntaxKind;
     const loc = this.ml.loc(s);
     if (ts.isEmptyStatement(s)) return [];
-    if (ts.isBlock(s)) return this.block(s.statements, s);
-    if (ts.isVariableStatement(s)) {
-      const out = [];
-      for (const d of s.declarationList.declarations) {
-        if (!ts.isIdentifier(d.name)) throw this.err("destructuring is not supported", s);
-        const name = d.name.text;
-        let ty = d.type ? this.ml.typeOf(d.type, this.intSet.has(name)) : null;
-        if (ty && ty.k === "real" && this.intSet.has(name)) ty = INT;
-        if (!d.initializer) {
-          if (!ty) throw this.err(`'${name}' needs a type or an initializer`, s);
-          this.declare(name, ty, s);
-          continue;
-        }
-        let v = this.expr(d.initializer, ty);
-        if (!ty) {
-          ty = v.ty;
-          if (ty.k === "int" && !this.intSet.has(name)) ty = REAL;
-          if (ty.k === "list" && ty.elem.k === "none") ty = ty; // refined by push
-        }
-        if (v.ty.k === "list" && ts.isIdentifier(d.initializer)) throw this.err(`'${name} = ${d.initializer.text}' would alias an array; copy with '${d.initializer.text}.slice()'`, s);
-        this.declare(name, ty, s);
-        v = this.coerce(v, this.env[name]);
-        out.push({ s: "Assign", loc, name, value: v });
-      }
-      return out;
-    }
+    if (ts.isBlock(s)) return this.scoped(() => this.blockBody(s));
+    if (ts.isVariableStatement(s)) return this.varDecls(s.declarationList, s, loc);
     if (ts.isExpressionStatement(s)) return this.exprStatement(s.expression, s);
     if (ts.isIfStatement(s)) {
       const c = this.cond(s.expression);
@@ -762,30 +868,14 @@ class FunctionLowerer {
       if (index) throw this.err("'@index' only applies to for-of loops", s);
       return [{ s: "While", loc, cond: c, invariants: invs, decreases: dec, body, step: [] }];
     }
-    if (ts.isForStatement(s)) return this.forStmt(s, loc);
-    if (ts.isForOfStatement(s)) {
-      const cls = this.loopContracts(s);
-      const d = s.initializer;
-      if (!(ts.isVariableDeclarationList(d) && d.declarations.length === 1 && ts.isIdentifier(d.declarations[0].name))) throw this.err("use 'for (const x of xs)'", s);
-      const elem = d.declarations[0].name.text;
-      const seq = this.expr(s.expression);
-      if (seq.ty.k !== "list") throw this.err("for-of needs an array", s);
-      let index = null;
-      for (const cl of cls) if (cl.keyword === "index") index = cl.payload.trim();
-      const idx = index || `i$${++this.tmp}`;
-      this.declare(idx, INT, s);
-      this.declare(elem, seq.ty.elem, s);
-      const body = this.inner(s.statement);
-      if (ts.isIdentifier(s.expression) && assigned(body).has(s.expression.text)) throw this.err(`loop body modifies '${s.expression.text}' while iterating over it`, s);
-      const { invs, dec } = this.loopClauses(cls);
-      if (dec) throw this.err("a for-of loop terminates by construction; remove '@decreases'", s);
-      return [{ s: "ForEach", loc, elem, idx, seq, invariants: invs, body, idx_visible: !!index }];
-    }
+    if (ts.isForStatement(s)) return this.scoped(() => this.forStmt(s, loc));
+    if (ts.isForOfStatement(s)) return this.scoped(() => this.forOf(s, loc));
     if (ts.isReturnStatement(s)) {
       if (!s.expression) return [{ s: "Return", loc, value: null }];
       if (this.sig.ret.k === "none") throw this.err("function returns a value but is declared void", s);
       const v = this.coerce(this.expr(s.expression, this.sig.ret), this.sig.ret);
       if (!tyEq(v.ty, this.sig.ret)) throw this.err(`returns ${tyStr(v.ty)} but is declared to return ${tyStr(this.sig.ret)}`, s);
+      if (v.ty.k === "list" && !this.freshList(v) && !(v.e === "Var" && !this.sig.params.some((p) => p.name === v.name))) throw this.err("returning an array parameter (or an alias of one) would let the caller alias it; return a copy with .slice()", s);
       return [{ s: "Return", loc, value: v }];
     }
     if (s.kind === K.BreakStatement) {
@@ -800,42 +890,60 @@ class FunctionLowerer {
     throw this.err(`unsupported statement: ${K[s.kind]}`, s);
   }
 
+  forOf(s, loc) {
+    const cls = this.loopContracts(s);
+    const d = s.initializer;
+    if (!(ts.isVariableDeclarationList(d) && d.declarations.length === 1 && ts.isIdentifier(d.declarations[0].name))) throw this.err("use 'for (const x of xs)'", s);
+    if (!(d.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) throw this.err("'var' is function-scoped and hoisted; use let or const", s);
+    const seq = this.expr(s.expression);
+    if (seq.ty.k !== "list") throw this.err("for-of needs an array", s);
+    let index = null;
+    for (const cl of cls) if (cl.keyword === "index") index = cl.payload.trim();
+    if (index && (this.resolve(index) !== null || this.srcNames.has(index))) throw this.err(`'@index ${index}' names an existing variable; pick a fresh name`, s);
+    const idx = index ? this.bindLocal(index, INT, s) : `i$${++this.tmp}`;
+    if (!index) this.env[idx] = INT;
+    const elem = this.bindLocal(d.declarations[0].name.text, seq.ty.elem, s);
+    const body = this.inner(s.statement);
+    const { invs, dec } = this.loopClauses(cls);
+    if (dec) throw this.err("a for-of loop terminates by construction; remove '@decreases'", s);
+    return [{ s: "ForEach", loc, elem, idx, seq, invariants: invs, body, idx_visible: !!index }];
+  }
+
   forStmt(s, loc) {
     const K = ts.SyntaxKind;
     const cls = this.loopContracts(s);
-    // Canonical counted loop: for (let i = lo; i < hi; i++) with i and hi's
-    // variables untouched by the body  ==>  ForRange (same semantics).
     const init = s.initializer, cond = s.condition, inc = s.incrementor;
-    if (init && ts.isVariableDeclarationList(init) && init.declarations.length === 1 && ts.isIdentifier(init.declarations[0].name) && init.declarations[0].initializer && cond && inc && ts.isBinaryExpression(cond) && cond.operatorToken.kind === K.LessThanToken && ts.isIdentifier(cond.left) && cond.left.text === init.declarations[0].name.text) {
+    // Canonical counted loop: for (let i = lo; i < hi; i++) over integers,
+    // with i untouched by the body  ==>  ForRange. JavaScript re-evaluates
+    // `hi` every iteration, so the IR marks it and the verifier requires
+    // that nothing the body does can change it.
+    if (init && ts.isVariableDeclarationList(init) && init.flags & ts.NodeFlags.Let && init.declarations.length === 1 && ts.isIdentifier(init.declarations[0].name) && init.declarations[0].initializer && !init.declarations[0].type && cond && inc && ts.isBinaryExpression(cond) && cond.operatorToken.kind === K.LessThanToken && ts.isIdentifier(cond.left) && cond.left.text === init.declarations[0].name.text) {
       const v = cond.left.text;
       const isInc =
         ((ts.isPostfixUnaryExpression(inc) || ts.isPrefixUnaryExpression(inc)) && inc.operator === K.PlusPlusToken && ts.isIdentifier(inc.operand) && inc.operand.text === v) ||
         (ts.isBinaryExpression(inc) && inc.operatorToken.kind === K.PlusEqualsToken && ts.isIdentifier(inc.left) && inc.left.text === v && ts.isNumericLiteral(inc.right) && inc.right.text === "1");
-      if (isInc) {
-        const lo = this.expr(init.declarations[0].initializer);
-        const hiNode = cond.right;
-        const hi = this.expr(hiNode);
-        if (lo.ty.k === "int" && hi.ty.k === "int") {
-          this.declare(v, INT, s);
+      const lo = isInc ? this.expr(init.declarations[0].initializer) : null;
+      if (isInc && lo.ty.k === "int") {
+        const irv = this.bindLocal(v, INT, s);
+        const hi = this.expr(cond.right);
+        if (hi.ty.k === "int") {
           const body = this.inner(s.statement);
-          const mod = assigned(body);
-          const hiVars = new Set(varsIn(hi));
-          if (!mod.has(v) && ![...hiVars].some((x) => mod.has(x))) {
+          if (!assigned(body).has(irv)) {
             const { invs, dec } = this.loopClauses(cls);
             if (dec) throw this.err("this counted loop terminates by construction; remove '@decreases'", s);
-            return [{ s: "ForRange", loc, var: v, lo, hi, invariants: invs, body }];
+            return [{ s: "ForRange", loc, var: irv, lo, hi, invariants: invs, body, reeval: true }];
           }
-          // fall through to the general form
           const { invs, dec } = this.loopClauses(cls);
           const c = this.cond(cond);
           const step = this.exprStatement(inc, inc);
-          return [{ s: "Assign", loc, name: v, value: lo }, { s: "While", loc, cond: c, invariants: invs, decreases: dec, body, step }];
+          return [{ s: "Assign", loc, name: irv, value: lo }, { s: "While", loc, cond: c, invariants: invs, decreases: dec, body, step }];
         }
+        throw this.err("the loop bound must be an integer", s);
       }
     }
     const out = [];
     if (init) {
-      if (ts.isVariableDeclarationList(init)) out.push(...this._stmt(ts.factory.createVariableStatement(undefined, init)).map((x) => ({ ...x, loc })));
+      if (ts.isVariableDeclarationList(init)) out.push(...this.varDecls(init, s, loc));
       else out.push(...this.exprStatement(init, s));
     }
     const c = cond ? this.cond(cond) : { e: "Lit", ty: BOOL, loc, value: true };
@@ -850,11 +958,24 @@ class FunctionLowerer {
 
   lookup(name, node) {
     if (this.bound && name in this.bound) return this.bound[name];
-    if (name in this.env) return this.env[name];
+    const ir = this.resolve(name);
+    if (ir !== null) return this.env[ir];
     throw this.err(`unknown name '${name}'`, this.nline(node));
   }
 
+  irName(name) {
+    if (this.bound && name in this.bound) return name;
+    return this.resolve(name) ?? name;
+  }
+
+  // An expression used only for its truth value: JavaScript truthiness
+  // applies to &&, || and ! operands here, and nowhere else.
   cond(n) {
+    const K = ts.SyntaxKind;
+    if (ts.isParenthesizedExpression(n)) return this.cond(n.expression);
+    if (ts.isBinaryExpression(n) && (n.operatorToken.kind === K.AmpersandAmpersandToken || n.operatorToken.kind === K.BarBarToken)) {
+      return { e: "Binary", ty: BOOL, loc: this.nloc(n), op: n.operatorToken.kind === K.AmpersandAmpersandToken ? "and" : "or", left: this.cond(n.left), right: this.cond(n.right) };
+    }
     return this.truthy(this.expr(n), n);
   }
 
@@ -907,11 +1028,11 @@ class FunctionLowerer {
         if (this.resultTy.k === "none") throw this.err("'result' used but the function returns nothing", this.nline(n));
         return { e: "Result", ty: this.resultTy, loc };
       }
-      return { e: "Var", ty: this.lookup(n.text, n), loc, name: n.text };
+      return { e: "Var", ty: this.lookup(n.text, n), loc, name: this.irName(n.text) };
     }
     if (ts.isPrefixUnaryExpression(n)) {
+      if (n.operator === K.ExclamationToken) return { e: "Unary", ty: BOOL, loc, op: "not", arg: this.cond(n.operand) };
       const a = this.expr(n.operand);
-      if (n.operator === K.ExclamationToken) return { e: "Unary", ty: BOOL, loc, op: "not", arg: this.truthy(a, n.operand) };
       if (n.operator === K.MinusToken) {
         if (!isNum(a.ty)) throw this.err(`cannot negate ${tyStr(a.ty)}`, this.nline(n));
         if (a.e === "Lit") return a.frac ? { ...a, loc, frac: [-a.frac[0], a.frac[1]] } : { ...a, loc, value: -a.value };
@@ -969,7 +1090,7 @@ class FunctionLowerer {
         } else if (ts.isShorthandPropertyAssignment(p)) {
           const ft = expect.fields.find((f) => f[0] === p.name.text);
           if (!ft) throw this.err(`${expect.name} has no field '${p.name.text}'`, this.nline(p));
-          vals[p.name.text] = this.coerce({ e: "Var", ty: this.lookup(p.name.text, p), loc, name: p.name.text }, ft[1]);
+          vals[p.name.text] = this.coerce({ e: "Var", ty: this.lookup(p.name.text, p), loc, name: this.irName(p.name.text) }, ft[1]);
         } else throw this.err("unsupported object literal member", this.nline(p));
       }
       const missing = expect.fields.filter((f) => !(f[0] in vals)).map((f) => f[0]);
@@ -984,7 +1105,9 @@ class FunctionLowerer {
     const K = ts.SyntaxKind;
     const k = n.operatorToken.kind;
     if (k === K.AmpersandAmpersandToken || k === K.BarBarToken) {
-      const a = this.cond(n.left), b = this.cond(n.right);
+      // As a value, `a || b` is one of its operands, not a boolean.
+      const a = this.expr(n.left), b = this.expr(n.right);
+      if (a.ty.k !== "bool" || b.ty.k !== "bool") throw this.err(`'${k === K.BarBarToken ? "||" : "&&"}' on non-boolean values returns an operand, not a boolean; compare explicitly`, this.nline(n));
       return { e: "Binary", ty: BOOL, loc, op: k === K.AmpersandAmpersandToken ? "and" : "or", left: a, right: b };
     }
     const cmp = { [K.LessThanToken]: "lt", [K.LessThanEqualsToken]: "le", [K.GreaterThanToken]: "gt", [K.GreaterThanEqualsToken]: "ge", [K.EqualsEqualsEqualsToken]: "eq", [K.ExclamationEqualsEqualsToken]: "ne", [K.EqualsEqualsToken]: "eq", [K.ExclamationEqualsToken]: "ne" };

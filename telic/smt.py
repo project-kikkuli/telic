@@ -200,7 +200,7 @@ class Z3Encoder:
         v = model.eval(self.term(t), model_completion=True)
         return to_python(v)
 
-    def list_value(self, model: z3.ModelRef, v: ListVal, cap: int = 64) -> list[Any]:
+    def list_value(self, model: z3.ModelRef, v: ListVal, cap: int = 256) -> list[Any]:
         n = self.value(model, v.len)
         if not isinstance(n, int):
             return []
@@ -278,6 +278,7 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
     if r == z3.sat:
         m = s.model()
         model = {name: decode(enc, m, v) for name, v in ob.inputs}
+        too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
         state: dict[str, Any] = {}
         input_consts = set()
         for _, v in ob.inputs:
@@ -294,5 +295,8 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
                 pass
         # A model is only trustworthy if quantifiers did not force an
         # incomplete answer; Z3 reports that as 'unknown', not 'sat'.
-        return SmtResult("refuted", dt, model=model, state=state)
+        res = SmtResult("refuted", dt, model=model, state=state)
+        if too_big:
+            res.reason = "the model's list input is too large to replay"
+        return res
     return SmtResult("unknown", dt, reason=s.reason_unknown() or "unknown")

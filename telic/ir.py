@@ -302,6 +302,7 @@ class ForRange(Stmt):
     hi: Expr
     invariants: tuple[Clause, ...]
     body: tuple[Stmt, ...]
+    reeval: bool = False  # JS: the bound is re-evaluated every iteration
 
 
 @dataclass(frozen=True)
@@ -488,6 +489,8 @@ def stmt_exprs(s: Stmt):
         yield s.value
     elif isinstance(s, ExprStmt):
         yield s.expr
+    elif isinstance(s, AssertStmt) and s.native:
+        yield s.clause.expr  # a native assert executes, effects included
 
 
 def assigned_names(stmts: Any) -> set[str]:

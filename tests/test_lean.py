@@ -132,3 +132,18 @@ def test_extract_proof_keeps_inner_have_blocks():
     assert extract_proof(reply) == "have k : 1 = 1 := by\n  rfl\nexact k"
     full = "```lean\ntheorem x : True := by\n  trivial\n```"
     assert extract_proof(full).strip() == "trivial"
+
+
+@needs_lean
+def test_proof_cannot_escape_its_theorem():
+    from telic.lean import Attempt, check_attempts
+
+    lean = find_lean()
+    # a false statement "proved" by opening a namespace and redefining the name
+    trick = "exact cheat.elim\nnamespace Foo\ntheorem vc_b : True := trivial"
+    (r,), _ = check_attempts(lean, "", [Attempt("vc_b", " (x : Int) : x = x + 1", trick)])
+    assert not r.ok and "Lean command" in r.errors[0]
+    (r2,), _ = check_attempts(lean, "", [Attempt("vc_c", " (x : Int) : x = x + 1", "  native_decide")])
+    assert not r2.ok
+    (r3,), _ = check_attempts(lean, "", [Attempt("vc_d", " (x : Int) (h : 0 < x) : 0 ≤ x", "omega")])
+    assert r3.ok and not r3.errors
