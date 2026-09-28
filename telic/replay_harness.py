@@ -11,16 +11,33 @@ import traceback
 from fractions import Fraction
 from typing import Any
 
+from telic.runtime import show
 
-def decode(v: Any, module: Any) -> Any:
+
+def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
+    """JSON -> Python values. Objects with the same reference decode to the
+    same Python object, so aliasing in a counterexample is reproduced."""
+    memo = {} if memo is None else memo
     if isinstance(v, list):
-        return [decode(x, module) for x in v]
+        return [decode(x, module, memo) for x in v]
+    if isinstance(v, dict) and "__object__" in v:
+        key = (v["__object__"], v.get("ref"))
+        obj = memo.get(key)
+        if obj is None:
+            cls = getattr(module, v["__object__"])
+            obj = object.__new__(cls)
+            memo[key] = obj
+        for k, x in (v.get("fields") or {}).items():
+            object.__setattr__(obj, k, decode(x, module, memo))
+        return obj
+    if isinstance(v, dict) and "__dict__" in v:
+        return {decode(k, module, memo): decode(x, module, memo) for k, x in v["__dict__"]}
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return float(Fraction(n, d))
     if isinstance(v, dict) and "__record__" in v:
         cls = getattr(module, v["__record__"])
-        return cls(**{k: decode(x, module) for k, x in v["fields"].items()})
+        return cls(**{k: decode(x, module, memo) for k, x in v["fields"].items()})
     return v
 
 
@@ -57,6 +74,17 @@ def gen(ty: dict, rnd, module: Any, depth: int = 0) -> Any:
     if k == "record":
         cls = getattr(module, ty["name"])
         return cls(**{f: gen(t, rnd, module, depth + 1) for f, t in ty["fields"]})
+    if k == "option":
+        return None if rnd.random() < 0.25 else gen(ty["inner"], rnd, module, depth)
+    if k == "dict":
+        n = rnd.choice([0, 1, 1, 2, 3])
+        return {gen(ty["key"], rnd, module, depth + 1): gen(ty["val"], rnd, module, depth + 1) for _ in range(n)}
+    if k == "class":
+        cls = getattr(module, ty["name"])
+        obj = object.__new__(cls)
+        for f, t in ty.get("fields") or []:
+            object.__setattr__(obj, f, gen(t, rnd, module, depth + 1))
+        return obj
     return None
 
 
@@ -143,7 +171,7 @@ def fuzz(fn: Any, types: list, n: int, module: Any, ContractViolation: Any, fnam
             continue
         accepted += 1
         args, out = shrink(fn, args, out, module, ContractViolation, fname)
-        out.update({"found": True, "args_repr": repr(tuple(args))[1:-1].rstrip(","), "tried": accepted})
+        out.update({"found": True, "args_repr": ", ".join(show(a) for a in args), "tried": accepted})
         return out
     return {"found": False, "tried": accepted}
 
@@ -156,18 +184,22 @@ def main() -> None:
     sys.path.insert(0, __import__("os").path.dirname(path))
     try:
         mod = load_instrumented(path, "__telic_target__")
-        fn = getattr(mod, req["func"])
-        args = [decode(a, mod) for a in req.get("args", [])]
+        fn = mod
+        for part in req["func"].split("."):
+            fn = getattr(fn, part)
+        memo: dict = {}
+        args = [decode(a, mod, memo) for a in req.get("args", [])]
     except Exception as e:
         print(json.dumps({"harness_error": f"{type(e).__name__}: {e}"}))
         return
     if "batch" in req:
         results = []
         for raw in req["batch"]:
-            args = [decode(a, mod) for a in raw]
+            memo = {}
+            args = [decode(a, mod, memo) for a in raw]
             try:
                 r = fn(*args)
-                results.append({"ok": True, "value": to_json(r), "repr": repr(r)})
+                results.append({"ok": True, "value": to_json(r), "repr": show(r)})
             except ContractViolation as e:
                 if e.kind == "requires" and e.func == req["func"]:
                     results.append({"rejected": True})
@@ -182,7 +214,7 @@ def main() -> None:
         return
     try:
         r = fn(*args)
-        print(json.dumps({"returned_repr": repr(r), "returned_is_none": r is None}))
+        print(json.dumps({"returned_repr": show(r), "returned_is_none": r is None}))
     except ContractViolation as e:
         print(json.dumps({"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}))
     except RecursionError:

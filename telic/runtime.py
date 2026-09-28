@@ -22,7 +22,7 @@ from typing import Any
 
 from . import ir
 
-RUNTIME_NAME = "__telic_rt"
+RUNTIME_NAME = "__telic_rt__"
 
 
 class ContractViolation(AssertionError):
@@ -51,8 +51,32 @@ def snapshot(v: Any) -> Any:
     return copy.deepcopy(v)
 
 
+def show(v: Any, depth: int = 0) -> str:
+    """repr, but objects show their fields instead of an address."""
+    if isinstance(v, list):
+        return "[" + ", ".join(show(x, depth + 1) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{show(k)}: {show(x, depth + 1)}" for k, x in v.items()) + "}"
+    d = getattr(v, "__dict__", None)
+    if d is not None and not isinstance(v, type) and type(v).__repr__ is object.__repr__ and not hasattr(v, "__dataclass_fields__"):
+        if depth > 2:
+            return f"<{type(v).__name__}>"
+        return f"<{type(v).__name__} " + " ".join(f"{k}={show(x, depth + 1)}" for k, x in d.items()) + ">"
+    return repr(v)
+
+
+def check_written(objs: list, invs: dict, func: str) -> None:
+    seen: set[int] = set()
+    for o in objs:
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        for text, line, pred in invs.get(type(o).__name__, ()):
+            check(pred(o), "class.inv", text, line, func)
+
+
 def _rt_namespace() -> types.SimpleNamespace:
-    return types.SimpleNamespace(check=check, implies=implies, snapshot=snapshot, ContractViolation=ContractViolation)
+    return types.SimpleNamespace(check=check, implies=implies, snapshot=snapshot, show=show, check_written=check_written, ContractViolation=ContractViolation)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +132,8 @@ def _stmt_lists(node: ast.AST):
 
 
 class FunctionInstrumenter:
-    def __init__(self, fn_ir: ir.Function, node: ast.FunctionDef):
+    def __init__(self, fn_ir: ir.Function, node: ast.FunctionDef, classes: dict[str, ir.ClassDecl] | None = None):
+        self.classes = classes or {}
         self.fn = fn_ir
         self.node = node
         self.loops = {}
@@ -135,9 +160,19 @@ class FunctionInstrumenter:
         # Snapshot scalar parameters: @ensures sees their entry values.
         mapping = {"result": "__telic_r"}
         for p in fn.params:
-            if not isinstance(p.ty, ir.TList):
+            if not isinstance(p.ty, (ir.TList, ir.TDict)):
                 pre.append(ast.Assign(targets=[ast.Name(id=f"__telic_p_{p.name}", ctx=ast.Store())], value=ast.Name(id=p.name, ctx=ast.Load())))
                 mapping[p.name] = f"__telic_p_{p.name}"
+        # Objects passed in must satisfy their class invariants (except the
+        # object a constructor is building); they must again on return.
+        inv_post: list[ast.stmt] = []
+        for i, p in enumerate(fn.params):
+            if isinstance(p.ty, ir.TClass) and p.ty.name in self.classes:
+                for inv in self.classes[p.ty.name].invariants:
+                    e, _ = self.spec(inv, {"self": p.name})
+                    if not (i == 0 and fn.name.endswith(".__init__")):
+                        pre.append(_check_stmt(e, "requires", inv, name))
+                    inv_post.append(_check_stmt(copy.deepcopy(e), "class.inv", inv, name))
         for r in fn.requires:
             e, _ = self.spec(r)
             pre.append(_check_stmt(e, "requires", r, name))
@@ -162,9 +197,31 @@ class FunctionInstrumenter:
                     )
                 )
             e = _Rename(renum).visit(e)
-            detail = ast.JoinedStr([ast.Constant("returned "), ast.FormattedValue(ast.Name(id="__telic_r", ctx=ast.Load()), ord("r"))])
+            shown = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="show", ctx=ast.Load()), args=[ast.Name(id="__telic_r", ctx=ast.Load())], keywords=[])
+            detail = ast.JoinedStr([ast.Constant("returned "), ast.FormattedValue(shown, -1)])
             post_checks.append(_check_stmt(e, "ensures", en, name, detail))
-        self.post_checks = post_checks
+        self.track_writes = any(isinstance(st, ir.FieldAssign) for st in ir.walk_stmts(fn.body)) and any(c.invariants for c in self.classes.values())
+        if self.track_writes:
+            pre.append(ast.Assign(targets=[ast.Name(id="__telic_w__", ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load())))
+            inv_post.append(ast.Expr(ast.Call(
+                func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="check_written", ctx=ast.Load()),
+                args=[ast.Name(id="__telic_w__", ctx=ast.Load()), ast.Name(id="__telic_invs__", ctx=ast.Load()), ast.Constant(name)],
+                keywords=[],
+            )))
+        # Loop invariants may mention old(...): snapshot those on entry too.
+        self.inv_exprs: dict[int, ast.expr] = {}
+        for loop in self.loops.values():
+            for inv in loop.invariants:
+                e, olds = self.spec(inv)
+                renum = {}
+                for i, o in enumerate(olds):
+                    nm = f"__telic_old{old_k}"
+                    renum[f"__telic_old{i}"] = nm
+                    old_k += 1
+                    pre.append(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="snapshot", ctx=ast.Load()), args=[o], keywords=[])))
+                self.inv_exprs[id(inv)] = _Rename(renum).visit(e)
+        self.post_checks = post_checks + inv_post
+        post_checks = self.post_checks
         self._instrument_block(self.node, "body")
         body = self.node.body
         # docstring stays first
@@ -199,6 +256,16 @@ class FunctionInstrumenter:
         return out
 
     def _stmt(self, s: ast.stmt) -> list[ast.stmt]:
+        tgts = s.targets if isinstance(s, ast.Assign) else [s.target] if isinstance(s, (ast.AugAssign, ast.AnnAssign)) else []
+        if self.track_writes and any(isinstance(t, ast.Attribute) for t in tgts):
+            # remember objects whose fields this function writes: their
+            # class invariants are checked when it returns
+            rec = [
+                ast.Expr(ast.Call(func=ast.Attribute(value=ast.Name(id="__telic_w__", ctx=ast.Load()), attr="append", ctx=ast.Load()), args=[copy.deepcopy(t.value)], keywords=[]))
+                for t in tgts
+                if isinstance(t, ast.Attribute)
+            ]
+            return [s] + rec
         if isinstance(s, ast.Return):
             val = s.value if s.value is not None else ast.Constant(None)
             assign = ast.Assign(targets=[ast.Name(id="__telic_r", ctx=ast.Store())], value=val)
@@ -218,7 +285,7 @@ class FunctionInstrumenter:
     def _loop(self, s: ast.stmt, loop) -> list[ast.stmt]:
         checks = []
         for inv in loop.invariants:
-            e, _ = self.spec(inv)
+            e = self.inv_exprs.get(id(inv)) or self.spec(inv)[0]
             checks.append((inv, e))
         top = [_check_stmt(copy.deepcopy(e), "invariant", inv, self.fn.name) for inv, e in checks]
         prelude: list[ast.stmt] = []
@@ -267,15 +334,30 @@ class FunctionInstrumenter:
 
 def instrument_source(source: str, module: ir.Module, filename: str = "<telic>") -> ast.Module:
     tree = ast.parse(source, filename=filename)
+    targets: list[tuple[ast.FunctionDef, str]] = []
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in module.functions:
-            fn = module.functions[node.name]
+        if isinstance(node, ast.FunctionDef):
+            targets.append((node, node.name))
+        elif isinstance(node, ast.ClassDef):
+            targets.extend((sub, f"{node.name}.{sub.name}") for sub in node.body if isinstance(sub, ast.FunctionDef))
+    for node, key in targets:
+        if key in module.functions:
+            fn = module.functions[key]
             if fn.unsupported and not (fn.requires or fn.ensures):
                 continue
             try:
-                FunctionInstrumenter(fn, node).run()
+                FunctionInstrumenter(fn, node, module.classes).run()
             except SyntaxError:
                 continue
+    # Class invariants as predicates, for objects written through non-parameters.
+    entries = []
+    for cname, decl in module.classes.items():
+        preds = []
+        for inv in decl.invariants:
+            lam = ast.Lambda(args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="self")], kwonlyargs=[], kw_defaults=[], defaults=[]), body=_Specs().visit(_parse_clause(inv.text)))
+            preds.append(ast.Tuple(elts=[ast.Constant(inv.text), ast.Constant(inv.loc.line), lam], ctx=ast.Load()))
+        entries.append((ast.Constant(cname), ast.List(elts=preds, ctx=ast.Load())))
+    tree.body.append(ast.Assign(targets=[ast.Name(id="__telic_invs__", ctx=ast.Store())], value=ast.Dict(keys=[k for k, _ in entries], values=[v for _, v in entries])))
     tree.body.insert(0, ast.ImportFrom(module="telic.runtime", names=[ast.alias(name="_rt_namespace")], level=0))
     tree.body.insert(1, ast.Assign(targets=[ast.Name(id=RUNTIME_NAME, ctx=ast.Store())], value=ast.Call(func=ast.Name(id="_rt_namespace", ctx=ast.Load()), args=[], keywords=[])))
     # keep `from __future__` imports first

@@ -71,7 +71,15 @@ class PythonFrontend:
         self.module.assumptions = list(PY_ASSUMPTIONS)
         self.contract_lines: list[ContractLine] = []
         self.signatures: dict[str, tuple[list[ir.Param], ir.Type]] = {}
+        self.defaults: dict[str, dict[str, ast.expr]] = {}
+        self.kwonly: dict[str, set[str]] = {}
         self.bound: set[str] = set()
+        self.class_names: set[str] = set()
+        self.properties: set[str] = set()  # 'C.name' for @property methods
+        self.dataclass_defaults: dict[str, dict[str, ast.expr]] = {}
+        self.dataclasses: set[str] = set()
+        self.custom_eq: dict[str, bool] = {}
+        self.custom_bool: dict[str, bool] = {}
 
     # -- entry --------------------------------------------------------------
 
@@ -100,20 +108,52 @@ class PythonFrontend:
                             self.bound.add(n.id)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.bound.add(node.name)
-        # Records first, then signatures, then bodies: calls may be forward.
+        # Records and classes first, then signatures, then bodies: calls may be forward.
+        classes: list[ast.ClassDef] = []
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 self._record(node)
+                if node.name not in self.module.records:
+                    self.class_names.add(node.name)
+                    classes.append(node)
+        for node in classes:
+            try:
+                self._class_fields(node)
+            except LowerError as e:
+                self.class_names.discard(node.name)
+                self.module.problems.append((f"class {node.name}: {e}", ir.Loc(e.line or node.lineno)))
+        classes = [c for c in classes if c.name in self.module.classes]
+        methods: list[tuple[ast.FunctionDef, str]] = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 try:
                     self.signatures[node.name] = self._signature(node)
                 except LowerError as e:
                     self.module.problems.append((f"{node.name}: {e}", ir.Loc(e.line)))
+        for c in classes:
+            for sub in c.body:
+                if not isinstance(sub, ast.FunctionDef):
+                    continue
+                decos = {_decorator_name(d) for d in sub.decorator_list}
+                key = f"{c.name}.{sub.name}"
+                try:
+                    if decos - {"property", "staticmethod"}:
+                        raise LowerError(f"decorator @{sorted(decos - {'property', 'staticmethod'})[0]} is not modelled", sub)
+                    self.signatures[key] = self._signature(sub, c.name, static="staticmethod" in decos)
+                    if "property" in decos:
+                        self.properties.add(key)
+                    methods.append((sub, c.name))
+                except LowerError as e:
+                    self.module.problems.append((f"{key}: {e}", ir.Loc(e.line or sub.lineno)))
+        for c in classes:
+            self._class_invariants(c)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in self.signatures:
                 fn = FunctionLowerer(self, node).lower()
                 self.module.functions[fn.name] = fn
+        for node, cname in methods:
+            fn = FunctionLowerer(self, node, cname).lower()
+            self.module.functions[fn.name] = fn
 
         # Module-level intent declarations (anything not consumed by a function).
         for cl in self.contract_lines:
@@ -137,11 +177,11 @@ class PythonFrontend:
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 for sub in node.body:
-                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        spans.append((min([sub.lineno] + [d.lineno for d in sub.decorator_list]) - 3, sub.end_lineno or sub.lineno, f"methods are not checked yet ('{node.name}.{sub.name}'); telic checks top-level functions"))
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}.{sub.name}" not in self.signatures:
+                        spans.append((min([sub.lineno] + [d.lineno for d in sub.decorator_list]) - 3, sub.end_lineno or sub.lineno, f"'{node.name}.{sub.name}' is not checked (see the problem reported for it or its class)"))
             elif isinstance(node, ast.AsyncFunctionDef):
                 spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"async functions are not checked yet ('{node.name}')"))
-            elif isinstance(node, ast.FunctionDef) and node not in tree.body:
+            elif isinstance(node, ast.FunctionDef) and node not in tree.body and not any(node is m for m, _ in methods):
                 spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"nested functions are not checked yet ('{node.name}')"))
         reported: set[str] = set()
         for cl in self.contract_lines:
@@ -196,6 +236,89 @@ class PythonFrontend:
                 fields.append((stmt.target.id, t))
         self.module.records[node.name] = ir.TRecord(node.name, tuple(fields))
 
+    def _class_fields(self, node: ast.ClassDef) -> None:
+        """Fields of a mutable class: class-level annotations (dataclass
+        style) plus 'self.x = ...' assignments in __init__."""
+        if any(not (isinstance(b, ast.Name) and b.id == "object") for b in node.bases) or node.keywords:
+            raise LowerError("inheritance is not modelled yet", node)
+        decos = {_decorator_name(d) for d in node.decorator_list}
+        if decos - {"dataclass"}:
+            raise LowerError(f"class decorator @{sorted(decos - {'dataclass'})[0]} is not modelled", node)
+        is_dc = "dataclass" in decos
+        magic = {st.name for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))} & {"__setattr__", "__getattr__", "__getattribute__", "__delattr__", "__new__", "__init_subclass__", "__class_getitem__"}
+        if magic:
+            raise LowerError(f"{sorted(magic)[0]} changes what attribute access means; not modelled", node)
+        if any(isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__slots__" for t in st.targets) for st in node.body):
+            pass  # __slots__ only restricts attributes; fields are still fields
+        fields: list[tuple[str, ir.Type]] = []
+        defaults: dict[str, ast.expr] = {}
+        for st in node.body:
+            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                if isinstance(st.annotation, ast.Name) and st.annotation.id == "ClassVar" or (isinstance(st.annotation, ast.Subscript) and _decorator_name(st.annotation.value) == "ClassVar"):
+                    continue
+                fields.append((st.target.id, self.type_of_annotation(st.annotation)))
+                if st.value is not None:
+                    if not _simple_default(st.value):
+                        if isinstance(st.value, ast.Call) and _decorator_name(st.value.func) == "field":
+                            raise LowerError("dataclasses.field(...) defaults are not modelled yet", st)
+                        raise LowerError(f"default of field '{st.target.id}' must be a literal", st)
+                    defaults[st.target.id] = st.value
+            elif isinstance(st, ast.Assign) and not (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "__slots__"):
+                raise LowerError("class attributes other than annotated fields are not modelled", st)
+        init = next((st for st in node.body if isinstance(st, ast.FunctionDef) and st.name == "__init__"), None)
+        if init is not None:
+            ann = {a.arg: a.annotation for a in init.args.args[1:]}
+            me = init.args.args[0].arg if init.args.args else "self"
+            known = {f for f, _ in fields}
+            for st in ast.walk(init):
+                tgt, tann, val = None, None, None
+                if isinstance(st, ast.AnnAssign):
+                    tgt, tann, val = st.target, st.annotation, st.value
+                elif isinstance(st, ast.Assign) and len(st.targets) == 1:
+                    tgt, val = st.targets[0], st.value
+                if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == me):
+                    continue
+                if tgt.attr in known:
+                    continue
+                if tann is not None:
+                    ty = self.type_of_annotation(tann)
+                elif isinstance(val, ast.Name) and ann.get(val.id) is not None:
+                    ty = self.type_of_annotation(ann[val.id])
+                elif isinstance(val, ast.Constant) and type(val.value) in (int, float, str, bool):
+                    ty = {int: ir.INT, float: ir.REAL, str: ir.STR, bool: ir.BOOL}[type(val.value)]
+                else:
+                    raise LowerError(f"annotate the field: 'self.{tgt.attr}: <type> = ...'", st)
+                fields.append((tgt.attr, ty))
+                known.add(tgt.attr)
+        elif not is_dc and fields:
+            pass  # annotated fields, no constructor: set after construction
+        self.module.classes[node.name] = ir.ClassDecl(node.name, fields, [], ir.Loc(node.lineno, node.col_offset))
+        if is_dc:
+            self.dataclasses.add(node.name)
+        dunders = {st.name for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.custom_eq[node.name] = "__eq__" in dunders
+        self.custom_bool[node.name] = bool(dunders & {"__bool__", "__len__"})
+        if is_dc and init is None:
+            self.dataclass_defaults[node.name] = defaults
+
+    def _class_invariants(self, node: ast.ClassDef) -> None:
+        decl = self.module.classes[node.name]
+        methods = [(min([m.lineno] + [d.lineno for d in m.decorator_list]) - 1, m.end_lineno or m.lineno) for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        lo, hi = node.lineno, node.end_lineno or node.lineno
+        stub = _ClassScope(self, node.name)
+        for cl in self.contract_lines:
+            if cl.consumed or not (lo <= cl.line <= hi) or cl.keyword != "invariant":
+                continue
+            if any(a + 1 < cl.line <= b for a, b in methods):
+                continue  # inside a method: a loop invariant
+            cl.consumed = True
+            try:
+                c = stub.clause(cl, "invariant", tuple(cl.tags))
+                _own_fields_only(c.expr, node.name, cl.line)
+                decl.invariants.append(c)
+            except (LowerError, ContractSyntaxError) as e:
+                self.module.problems.append((f"class {node.name}: invariant: {e}", ir.Loc(cl.line, cl.col)))
+
     def type_of_annotation(self, ann: ast.expr | None) -> ir.Type:
         if ann is None:
             raise LowerError("missing type annotation")
@@ -209,7 +332,12 @@ class PythonFrontend:
                 return simple[ann.id]
             if ann.id in self.module.records:
                 return self.module.records[ann.id]
+            if ann.id in self.class_names:
+                return ir.TClass(ann.id)
             raise LowerError(f"unsupported type '{ann.id}'", ann)
+        if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+            parts = _union_parts(ann)
+            return self._union([self.type_of_annotation(x) for x in parts], ann)
         if isinstance(ann, ast.Subscript):
             base = ann.value
             name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else None
@@ -218,17 +346,62 @@ class PythonFrontend:
                 if isinstance(elem, ir.TList):
                     raise LowerError("nested lists are not supported yet", ann)
                 return ir.TList(elem)
+            if name == "Optional":
+                return self._union([self.type_of_annotation(ann.slice), ir.NONE], ann)
+            if name == "Union":
+                elts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+                return self._union([self.type_of_annotation(x) for x in elts], ann)
+            if name in {"dict", "Dict", "Mapping", "MutableMapping"}:
+                if not (isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2):
+                    raise LowerError("dict types need a key and a value type", ann)
+                k = self.type_of_annotation(ann.slice.elts[0])
+                v = self.type_of_annotation(ann.slice.elts[1])
+                if not isinstance(k, (ir.TInt, ir.TStr, ir.TBool)):
+                    raise LowerError(f"dict keys of type {k} are not supported (use int, str or bool)", ann)
+                if isinstance(v, (ir.TList, ir.TDict, ir.TOption)):
+                    raise LowerError(f"dict values of type {v} are not supported yet", ann)
+                return ir.TDict(k, v)
         raise LowerError(f"unsupported type annotation '{ast.unparse(ann)}'", ann)
 
-    def _signature(self, node: ast.FunctionDef) -> tuple[list[ir.Param], ir.Type]:
+    def _union(self, ts: list[ir.Type], node: ast.AST) -> ir.Type:
+        rest = [t for t in ts if t != ir.NONE]
+        if len(rest) != 1:
+            raise LowerError("unions other than 'T | None' are not supported", node)
+        if len(rest) == len(ts):
+            return rest[0]
+        inner = rest[0]
+        if isinstance(inner, (ir.TList, ir.TDict, ir.TOption)):
+            raise LowerError(f"'{inner} | None' is not supported yet", node)
+        return ir.TOption(inner)
+
+    def _signature(self, node: ast.FunctionDef, cls: str | None = None, static: bool = False) -> tuple[list[ir.Param], ir.Type]:
         a = node.args
-        if a.vararg or a.kwarg or a.kwonlyargs or a.posonlyargs or a.defaults:
-            raise LowerError("only plain positional parameters without defaults are supported", node)
+        if a.vararg or a.kwarg or a.posonlyargs:
+            raise LowerError("*args, **kwargs and positional-only parameters are not supported", node)
         params = []
-        for arg in a.args:
+        args = list(a.args) + list(a.kwonlyargs)
+        for i, arg in enumerate(args):
+            if i == 0 and cls is not None and not static:
+                if arg.annotation is not None and not (isinstance(arg.annotation, ast.Name) and arg.annotation.id in (cls, "Self")):
+                    raise LowerError(f"'{arg.arg}' of a method of {cls} must be the instance", arg)
+                params.append(ir.Param(arg.arg, ir.TClass(cls)))
+                continue
             if arg.annotation is None:
                 raise LowerError(f"parameter '{arg.arg}' needs a type annotation", arg)
             params.append(ir.Param(arg.arg, self.type_of_annotation(arg.annotation)))
+        # Default values, by parameter name: substituted at call sites.
+        key = f"{cls}.{node.name}" if cls else node.name
+        defaults: dict[str, ast.expr] = {}
+        for arg, d in zip(a.args[len(a.args) - len(a.defaults):], a.defaults):
+            defaults[arg.arg] = d
+        for arg, d in zip(a.kwonlyargs, a.kw_defaults):
+            if d is not None:
+                defaults[arg.arg] = d
+        for name, d in defaults.items():
+            if not _simple_default(d):
+                raise LowerError(f"default of '{name}' must be a literal (a mutable or computed default is evaluated once, at definition time)", d)
+        self.defaults[key] = defaults
+        self.kwonly[key] = {x.arg for x in a.kwonlyargs}
         ret = self.type_of_annotation(node.returns) if node.returns is not None else ir.NONE
         return params, ret
 
@@ -237,9 +410,11 @@ class PythonFrontend:
 
 
 class FunctionLowerer:
-    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef):
+    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef, cls: str | None = None):
         self.fe = fe
         self.node = node
+        self.cls = cls
+        self.key = f"{cls}.{node.name}" if cls else node.name
         self.env: dict[str, ir.Type] = {}
         self.fn: ir.Function
         self.tmp = 0
@@ -248,7 +423,7 @@ class FunctionLowerer:
             cl for cl in fe.contract_lines if node.lineno <= cl.line <= (node.end_lineno or node.lineno)
         ]
         self.current_intents: list[str] = []
-        self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args}
+        self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args + node.args.kwonlyargs}
 
     # -- contract comment association ------------------------------------
 
@@ -285,16 +460,16 @@ class FunctionLowerer:
 
     def lower(self) -> ir.Function:
         node = self.node
-        params, ret = self.fe.signatures[node.name]
+        params, ret = self.fe.signatures[self.key]
         seg = ast.get_source_segment(self.fe.source, node) or ""
         self.fn = ir.Function(
-            name=node.name,
+            name=self.key,
             loc=ir.Loc(node.lineno, node.col_offset),
             end_line=node.end_lineno or node.lineno,
             params=params,
             ret=ret,
             source=seg,
-            exported=not node.name.startswith("_"),
+            exported=not node.name.startswith("_") or node.name == "__init__",
         )
         for p in params:
             self.env[p.name] = p.ty
@@ -361,6 +536,7 @@ class FunctionLowerer:
         except SyntaxError as e:
             raise LowerError(f"cannot parse '@{kind}' as a Python expression: {e.msg}", line=cl.line)
         el = ExprLowerer(self, spec=True, result_ty=result_ty, line_offset=cl.line, col_offset=cl.payload_col - 1)
+        el.allow_old = kind == "invariant" and not isinstance(self, _ClassScope)
         if expect == ir.BOOL:
             e = el.cond(tree.body)
         else:
@@ -445,6 +621,11 @@ class FunctionLowerer:
         if old is None:
             self.env[name] = ty
         elif old != ty:
+            if isinstance(old, ir.TOption) and ty in (old.inner, ir.NONE):
+                return
+            if old == ir.NONE and not isinstance(ty, (ir.TList, ir.TDict, ir.TOption)):
+                self.env[name] = ir.TOption(ty)  # 'x = None' then 'x = 5'
+                return
             if isinstance(old, ir.TReal) and isinstance(ty, ir.TInt):
                 return  # int value stored in a float variable: promoted on assignment
             if isinstance(old, ir.TList) and isinstance(ty, ir.TList) and ty.elem == ir.NONE:
@@ -452,6 +633,17 @@ class FunctionLowerer:
             raise LowerError(f"variable '{name}' changes type from {old} to {ty}; telic requires one type per variable", node)
 
     def coerce(self, e: ir.Expr, ty: ir.Type) -> ir.Expr:
+        if isinstance(ty, ir.TOption):
+            if e.ty == ir.NONE:
+                return ir.Lit(ty, e.loc, None)
+            if not isinstance(e.ty, ir.TOption):
+                return ir.Builtin(ty, e.loc, "some", (self.coerce(e, ty.inner),))
+            return e
+        if isinstance(e.ty, ir.TOption) and ty != ir.NONE:
+            # Using an optional where a value is needed: prove it is not None.
+            return self.coerce(ir.Builtin(e.ty.inner, e.loc, "unwrap", (e,)), ty)
+        if isinstance(ty, ir.TDict) and isinstance(e, ir.Builtin) and e.name == "dict_lit" and not e.args:
+            return ir.Builtin(ty, e.loc, "dict_lit", ())
         if isinstance(ty, ir.TReal) and isinstance(e.ty, ir.TInt):
             return ir.Builtin(ir.REAL, e.loc, "to_real", (e,))
         if isinstance(ty, ir.TList) and isinstance(e, ir.ListLit) and not e.elems:
@@ -501,6 +693,14 @@ class FunctionLowerer:
                     # Output is ignored, but its arguments are still evaluated.
                     yield from self._effects_of(list(v.args) + [k.value for k in v.keywords], loc)
                     return
+                if isinstance(f, ast.Attribute) and f.attr == "append" and isinstance(f.value, ast.Attribute):
+                    fld = self.expr(f.value)
+                    if isinstance(fld, ir.Field) and isinstance(fld.obj.ty, ir.TClass) and isinstance(fld.ty, ir.TList):
+                        if len(v.args) != 1:
+                            raise LowerError("append takes one argument", s)
+                        val = self.coerce(self.expr(v.args[0], fld.ty.elem), fld.ty.elem)
+                        yield ir.FieldAssign(loc, fld.obj, fld.obj.ty.name, fld.name, ir.Builtin(fld.ty, loc, "list_append", (fld, val)))
+                        return
                 if isinstance(f, ast.Attribute) and f.attr == "append" and isinstance(f.value, ast.Name):
                     name = f.value.id
                     t = self.env.get(name)
@@ -517,6 +717,11 @@ class FunctionLowerer:
                 yield ir.ExprStmt(loc, self.expr(v))
                 return
             raise LowerError("expression statement has no effect", s)
+        if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Attribute):
+            if s.value is None:
+                return
+            yield from self._assign(s.target, s.value, s, loc)
+            return
         if isinstance(s, ast.AnnAssign):
             if not isinstance(s.target, ast.Name):
                 raise LowerError("annotated assignment target must be a name", s)
@@ -570,9 +775,9 @@ class FunctionLowerer:
                     raise LowerError("function returns a value but is annotated '-> None' (or has no return annotation)", s)
                 if val.ty != self.fn.ret:
                     raise LowerError(f"returns {val.ty} but is annotated to return {self.fn.ret}", s)
-                if isinstance(val.ty, ir.TList) and not fresh_list(val):
+                if isinstance(val.ty, (ir.TList, ir.TDict)) and not fresh_list(val):
                     if not (isinstance(val, ir.Var) and all(p.name != val.name for p in self.fn.params)):
-                        raise LowerError("returning a list parameter (or an alias of one) would let the caller alias it; return a copy (xs[:])", s)
+                        raise LowerError("returning a list or dict parameter, or a field holding one, (or an alias of one) would let the caller alias it; return a copy (xs[:])", s)
                 yield ir.Return(loc, val)
             return
         if isinstance(s, ast.Break):
@@ -586,6 +791,21 @@ class FunctionLowerer:
             text = ast.get_source_segment(self.fe.source, s.test) or ast.unparse(s.test)
             clause = ir.Clause("assert", c, _loc(s.test), " ".join(text.split()))
             yield ir.AssertStmt(loc, clause, native=True)
+            return
+        if isinstance(s, ast.Delete):
+            for t in s.targets:
+                if not (isinstance(t, ast.Subscript) and not isinstance(t.slice, ast.Slice)):
+                    raise LowerError("only 'del d[k]' on a dict is supported", s)
+                container = self.expr(t.value)
+                if not isinstance(container.ty, ir.TDict):
+                    raise LowerError("only 'del d[k]' on a dict is supported", s)
+                k = self.coerce(self.expr(t.slice), container.ty.key)
+                if isinstance(container, ir.Var):
+                    yield ir.DictDel(loc, container.name, k)
+                elif isinstance(container, ir.Field) and isinstance(container.obj.ty, ir.TClass):
+                    yield ir.FieldAssign(loc, container.obj, container.obj.ty.name, container.name, ir.Builtin(container.ty, loc, "dict_del", (container, k)))
+                else:
+                    raise LowerError("'del' needs a dict variable or field", s)
             return
         if isinstance(s, ast.Raise):
             what = ast.unparse(s.exc) if s.exc is not None else "exception"
@@ -628,6 +848,51 @@ class FunctionLowerer:
             self._check_assignable(name, ty, val, s)
             yield ir.Assign(loc, name, val)
             return
+        if isinstance(target, ast.Attribute):
+            obj = self.expr(target.value)
+            if isinstance(obj.ty, ir.TOption):
+                obj = self.coerce(obj, obj.ty.inner)
+            if isinstance(obj.ty, ir.TRecord):
+                raise LowerError(f"{obj.ty.name} is frozen; build a new one with dataclasses.replace or the constructor", s)
+            if not isinstance(obj.ty, ir.TClass):
+                raise LowerError(f"cannot assign an attribute of {obj.ty}", s)
+            decl = self.fe.module.classes[obj.ty.name]
+            ft = decl.field_type(target.attr)
+            if ft is None:
+                raise LowerError(f"{obj.ty.name} has no field '{target.attr}' (declare it in the class or __init__)", s)
+            val = self.coerce(self.expr(value, ft), ft)
+            self._check_assignable(f"{obj.ty.name}.{target.attr}", ft, val, s)
+            if isinstance(ft, (ir.TList, ir.TDict)) and not fresh_list(val):
+                raise LowerError(f"storing an existing {ft} in a field would alias it; store a copy", s)
+            yield ir.FieldAssign(loc, obj, obj.ty.name, target.attr, val)
+            return
+        if isinstance(target, ast.Subscript) and not isinstance(target.slice, ast.Slice) and isinstance(target.value, ast.Attribute):
+            fld = self.expr(target.value)
+            if isinstance(fld, ir.Field) and isinstance(fld.obj.ty, ir.TClass) and isinstance(fld.ty, (ir.TList, ir.TDict)):
+                if isinstance(fld.ty, ir.TDict):
+                    k = self.coerce(self.expr(target.slice), fld.ty.key)
+                    val = self.coerce(self.expr(value, fld.ty.val), fld.ty.val)
+                    new_v = ir.Builtin(fld.ty, loc, "dict_set", (fld, k, val))
+                else:
+                    i = self.expr(target.slice)
+                    if not isinstance(i.ty, ir.TInt):
+                        raise LowerError("list index must be an int", s)
+                    val = self.coerce(self.expr(value, fld.ty.elem), fld.ty.elem)
+                    new_v = ir.Builtin(fld.ty, loc, "list_set", (fld, i, val))
+                yield ir.FieldAssign(loc, fld.obj, fld.obj.ty.name, fld.name, new_v)
+                return
+            raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and not isinstance(target.slice, ast.Slice) and isinstance(self.env.get(target.value.id), ir.TDict):
+            name = target.value.id
+            dt = self.env[name]
+            assert isinstance(dt, ir.TDict)
+            k = self.coerce(self.expr(target.slice), dt.key)
+            if k.ty != dt.key:
+                raise LowerError(f"key of '{name}' must be {dt.key}, got {k.ty}", s)
+            val = self.coerce(self.expr(value, dt.val), dt.val)
+            self._check_assignable(f"{name}[...]", dt.val, val, s)
+            yield ir.IndexAssign(loc, name, k, val, wrap=False)
+            return
         if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and not isinstance(target.slice, ast.Slice):
             name = target.value.id
             t = self.env.get(name)
@@ -660,7 +925,7 @@ class FunctionLowerer:
         raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
 
     def _no_alias(self, name: str, val: ir.Expr, node: ast.AST) -> None:
-        if not isinstance(val.ty, ir.TList):
+        if not isinstance(val.ty, (ir.TList, ir.TDict)):
             return
         if any(p.name == name for p in self.fn.params):
             raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it, or copy it to a new name)", node)
@@ -754,17 +1019,75 @@ class FunctionLowerer:
         yield ir.ForEach(loc, elem, idx, seq, invs, body, idx_visible=idx_visible or index_name is not None)
 
 
+class _ClassScope(FunctionLowerer):
+    """Where class invariants are lowered: only 'self' is in scope."""
+
+    def __init__(self, fe: PythonFrontend, cls: str):
+        self.fe = fe
+        self.cls = cls
+        self.key = cls
+        self.env = {"self": ir.TClass(cls)}
+        self.tmp = 0
+        self.current_intents = []
+        self.local_contracts = []
+        self.stored_names = set()
+
+
 def fresh_list(e: ir.Expr) -> bool:
     """A list-valued expression that denotes a new list object (so binding it
     to a name creates no alias): a literal, a slice copy, or a call (callees
     may not return their list parameters)."""
     if isinstance(e, (ir.ListLit, ir.Call)):
         return True
-    if isinstance(e, ir.Builtin) and e.name == "slice":
+    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy"):
         return True
     if isinstance(e, ir.Ite):
         return fresh_list(e.then) and fresh_list(e.orelse)
     return False
+
+
+def _own_fields_only(e: ir.Expr, cls: str, line: int) -> None:
+    """A class invariant may only read the object's own fields: otherwise
+    code that never touches the object could break it unnoticed."""
+    for sub in ir.walk_expr(e):
+        if isinstance(sub, ir.Field) and isinstance(sub.obj.ty, ir.TClass) and not (isinstance(sub.obj, ir.Var) and sub.obj.name == "self"):
+            raise LowerError(f"a class invariant may only read fields of 'self', not of other objects", line=line)
+        if isinstance(sub, ir.Call) and any(isinstance(a.ty, ir.TClass) for a in sub.args):
+            raise LowerError("a class invariant may not call methods (they could read other objects); write the condition on self's fields", line=line)
+
+
+def _join_optional(a: ir.Type, b: ir.Type) -> ir.Type | None:
+    """The optional type covering both (None and T, or T? and T)."""
+    for x, y in ((a, b), (b, a)):
+        if isinstance(x, ir.TOption) and (y == x.inner or y == ir.NONE):
+            return x
+        if x == ir.NONE and not isinstance(y, (ir.TList, ir.TDict, ir.TOption)) and y != ir.NONE:
+            return ir.TOption(y)
+    return None
+
+
+def _union_parts(n: ast.expr) -> list[ast.expr]:
+    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+        return _union_parts(n.left) + _union_parts(n.right)
+    return [n]
+
+
+def _simple_default(d: ast.expr) -> bool:
+    if isinstance(d, ast.Constant):
+        return True
+    if isinstance(d, ast.UnaryOp) and isinstance(d.op, (ast.USub, ast.UAdd)) and isinstance(d.operand, ast.Constant):
+        return True
+    return False
+
+
+def _decorator_name(d: ast.expr) -> str:
+    if isinstance(d, ast.Call):
+        d = d.func
+    if isinstance(d, ast.Name):
+        return d.id
+    if isinstance(d, ast.Attribute):
+        return d.attr
+    return "?"
 
 
 BUILTINS = {"len", "abs", "min", "max", "sum", "float", "int", "round", "bool", "all", "any", "range", "enumerate", "print"}
@@ -793,6 +1116,7 @@ class ExprLowerer:
         self.line_offset = line_offset
         self.col_offset = col_offset
         self.bound: dict[str, ir.Type] = {}
+        self.allow_old = False
 
     def loc(self, node: ast.AST) -> ir.Loc:
         if self.line_offset:
@@ -834,9 +1158,25 @@ class ExprLowerer:
             return ir.Binary(ir.BOOL, e.loc, "gt", ir.Builtin(ir.INT, e.loc, "len", (e,)), ir.Lit(ir.INT, e.loc, 0))
         if isinstance(t, ir.TStr):
             return ir.Binary(ir.BOOL, e.loc, "ne", e, ir.Lit(ir.STR, e.loc, ""))
+        if isinstance(t, ir.TOption):
+            present = ir.Unary(ir.BOOL, e.loc, "not", ir.Builtin(ir.BOOL, e.loc, "is_none", (e,)))
+            if isinstance(t.inner, ir.TRecord) or (isinstance(t.inner, ir.TClass) and not self.fl.fe.custom_bool.get(t.inner.name)):
+                return present
+            return ir.Binary(ir.BOOL, e.loc, "and", present, self.truthy(ir.Builtin(t.inner, e.loc, "unwrap", (e,)), node))
+        if isinstance(t, ir.TClass) and self.fl.fe.custom_bool.get(t.name):
+            raise self.err(f"{t.name} defines __bool__/__len__; its truth value is not modelled", node)
+        if isinstance(t, (ir.TClass, ir.TRecord)):
+            return ir.Lit(ir.BOOL, e.loc, True)
         raise self.err(f"cannot use a {t} as a condition", node)
 
+    def need(self, e: ir.Expr) -> ir.Expr:
+        """An optional used as a plain value: unwrap it (and prove it present)."""
+        if isinstance(e.ty, ir.TOption):
+            return ir.Builtin(e.ty.inner, e.loc, "unwrap", (e,))
+        return e
+
     def numeric_pair(self, a: ir.Expr, b: ir.Expr, node: ast.AST) -> tuple[ir.Expr, ir.Expr, ir.Type]:
+        a, b = self.need(a), self.need(b)
         if not (ir.is_numeric(a.ty) and ir.is_numeric(b.ty)):
             raise self.err(f"arithmetic on {a.ty} and {b.ty}", node)
         if isinstance(a.ty, ir.TReal) or isinstance(b.ty, ir.TReal):
@@ -855,6 +1195,8 @@ class ExprLowerer:
                 return ir.Lit(ir.REAL, loc, Fraction(repr(v)))
             if isinstance(v, str):
                 return ir.Lit(ir.STR, loc, v)
+            if v is None:
+                return ir.Lit(expect if isinstance(expect, ir.TOption) else ir.NONE, loc, None)
             raise self.err(f"unsupported constant {v!r}", n)
         if isinstance(n, ast.Name):
             if self.spec and n.id == "result" and self.result_ty is not None and n.id not in self.bound:
@@ -863,7 +1205,7 @@ class ExprLowerer:
                 return ir.Result(self.result_ty, loc)
             return ir.Var(self.lookup(n.id, n), loc, n.id)
         if isinstance(n, ast.UnaryOp):
-            a = self.expr(n.operand)
+            a = self.need(self.expr(n.operand)) if not isinstance(n.op, ast.Not) else ir.Lit(ir.BOOL, loc, True)
             if isinstance(n.op, ast.Not):
                 return ir.Unary(ir.BOOL, loc, "not", self.cond(n.operand))
             if isinstance(n.op, ast.USub):
@@ -894,7 +1236,10 @@ class ExprLowerer:
             a = self.expr(n.body, expect)
             b = self.expr(n.orelse, expect)
             if a.ty != b.ty:
-                if ir.is_numeric(a.ty) and ir.is_numeric(b.ty):
+                opt = _join_optional(a.ty, b.ty)
+                if opt is not None:
+                    a, b = self.fl.coerce(a, opt), self.fl.coerce(b, opt)
+                elif ir.is_numeric(a.ty) and ir.is_numeric(b.ty):
                     a, b, _ = self.numeric_pair(a, b, n)
                 else:
                     raise self.err(f"conditional branches have types {a.ty} and {b.ty}", n)
@@ -902,7 +1247,12 @@ class ExprLowerer:
         if isinstance(n, ast.Call):
             return self.call(n, loc, expect)
         if isinstance(n, ast.Subscript):
-            seq = self.expr(n.value)
+            seq = self.need(self.expr(n.value))
+            if isinstance(seq.ty, ir.TDict) and not isinstance(n.slice, ast.Slice):
+                k = self.fl.coerce(self.expr(n.slice), seq.ty.key)
+                if k.ty != seq.ty.key:
+                    raise self.err(f"key must be {seq.ty.key}, got {k.ty}", n)
+                return ir.Index(seq.ty.val, loc, seq, k, wrap=False)
             if not isinstance(seq.ty, ir.TList):
                 raise self.err(f"cannot index a {seq.ty}", n)
             if isinstance(n.slice, ast.Slice):
@@ -919,7 +1269,15 @@ class ExprLowerer:
                 raise self.err("list index must be an int", n)
             return ir.Index(seq.ty.elem, loc, seq, idx, wrap=True)
         if isinstance(n, ast.Attribute):
-            obj = self.expr(n.value)
+            obj = self.need(self.expr(n.value))
+            if isinstance(obj.ty, ir.TClass):
+                key = f"{obj.ty.name}.{n.attr}"
+                if key in self.fl.fe.properties:
+                    return self.method_call(key, obj, [], [], n, loc)
+                ft = self.fl.fe.module.classes[obj.ty.name].field_type(n.attr)
+                if ft is None:
+                    raise self.err(f"{obj.ty.name} has no field '{n.attr}'", n)
+                return ir.Field(ft, loc, obj, n.attr)
             if isinstance(obj.ty, ir.TRecord):
                 ft = obj.ty.field_type(n.attr)
                 if ft is None:
@@ -939,6 +1297,24 @@ class ExprLowerer:
             if any(e.ty != t for e in elems):
                 raise self.err("list elements must all have one type", n)
             return ir.ListLit(ir.TList(t), loc, tuple(elems))
+        if isinstance(n, ast.Dict):
+            if any(k is None for k in n.keys):
+                raise self.err("'**' in dict literals is not supported", n)
+            ks = [self.expr(k) for k in n.keys]  # type: ignore[arg-type]
+            vs = [self.expr(v) for v in n.values]
+            if isinstance(expect, ir.TDict):
+                dt = expect
+            elif ks:
+                dt = ir.TDict(ks[0].ty, vs[0].ty)
+            else:
+                return ir.Builtin(ir.TDict(ir.NONE, ir.NONE), loc, "dict_lit", ())
+            args: list[ir.Expr] = []
+            for k, v in zip(ks, vs):
+                k2, v2 = self.fl.coerce(k, dt.key), self.fl.coerce(v, dt.val)
+                if k2.ty != dt.key or v2.ty != dt.val:
+                    raise self.err(f"dict entries must be {dt.key}: {dt.val}", n)
+                args += [k2, v2]
+            return ir.Builtin(dt, loc, "dict_lit", tuple(args))
         if isinstance(n, (ast.GeneratorExp, ast.ListComp)):
             raise self.err("comprehensions are only supported inside all(...) / any(...)", n)
         raise self.err(f"unsupported expression: {type(n).__name__}", n)
@@ -984,6 +1360,48 @@ class ExprLowerer:
         left = self.expr(n.left)
         for op, rnode in zip(n.ops, n.comparators):
             right = self.expr(rnode)
+            if (isinstance(op, (ast.Is, ast.IsNot)) and ir.NONE in (left.ty, right.ty) or isinstance(op, (ast.Is, ast.IsNot)) and not (isinstance(left.ty, ir.TClass) and left.ty == right.ty)) or (isinstance(op, (ast.Eq, ast.NotEq)) and ir.NONE in (left.ty, right.ty)):
+                other = left if right.ty == ir.NONE else right if left.ty == ir.NONE else None
+                if other is None:
+                    raise self.err("'is' is only supported against None", n)
+                if other.ty == ir.NONE:
+                    c = ir.Lit(ir.BOOL, loc, True)
+                elif isinstance(other.ty, ir.TOption):
+                    c = ir.Builtin(ir.BOOL, loc, "is_none", (other,))
+                else:
+                    c = ir.Lit(ir.BOOL, loc, False)  # a non-optional value is never None
+                if isinstance(op, (ast.IsNot, ast.NotEq)):
+                    c = ir.Unary(ir.BOOL, loc, "not", c)
+                parts.append(c)
+                left = right
+                continue
+            if isinstance(left.ty, ir.TClass) or isinstance(right.ty, ir.TClass):
+                if not isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) or left.ty != right.ty:
+                    raise self.err(f"unsupported comparison of {left.ty} with {right.ty}", n)
+                c = self.object_eq(left, right, isinstance(op, (ast.Is, ast.IsNot)), n, loc)
+                parts.append(ir.Unary(ir.BOOL, loc, "not", c) if isinstance(op, (ast.NotEq, ast.IsNot)) else c)
+                left = right
+                continue
+            if isinstance(op, (ast.In, ast.NotIn)) and isinstance(right.ty, (ir.TDict, ir.TOption)):
+                d = self.need(right)
+                if not isinstance(d.ty, ir.TDict):
+                    raise self.err("'in' needs a list or dict on the right", n)
+                k = self.fl.coerce(left, d.ty.key)
+                if k.ty != d.ty.key:
+                    raise self.err(f"'in' compares {left.ty} against keys of {d.ty}", n)
+                c = ir.Builtin(ir.BOOL, loc, "dict_has", (d, k))
+                if isinstance(op, ast.NotIn):
+                    c = ir.Unary(ir.BOOL, loc, "not", c)
+                parts.append(c)
+                left = right
+                continue
+            if isinstance(op, (ast.Eq, ast.NotEq)) and (isinstance(left.ty, ir.TOption) or isinstance(right.ty, ir.TOption)):
+                opt = _join_optional(left.ty, right.ty) or (left.ty if left.ty == right.ty else None)
+                if opt is None:
+                    raise self.err(f"comparing {left.ty} with {right.ty}", n)
+                parts.append(ir.Binary(ir.BOOL, loc, "eq" if isinstance(op, ast.Eq) else "ne", self.fl.coerce(left, opt), self.fl.coerce(right, opt)))
+                left = right
+                continue
             if isinstance(op, (ast.In, ast.NotIn)):
                 if not isinstance(right.ty, ir.TList):
                     raise self.err("'in' needs a list on the right", n)
@@ -997,12 +1415,16 @@ class ExprLowerer:
             elif type(op) in _CMP:
                 name = _CMP[type(op)]
                 l2, r2 = left, right
-                if ir.is_numeric(left.ty) and ir.is_numeric(right.ty):
-                    l2, r2, _ = self.numeric_pair(left, right, n)
-                elif left.ty != right.ty:
+                if name not in ("eq", "ne"):
+                    l2, r2 = self.need(left), self.need(right)
+                if ir.is_numeric(l2.ty) and ir.is_numeric(r2.ty):
+                    l2, r2, _ = self.numeric_pair(l2, r2, n)
+                elif l2.ty != r2.ty:
                     raise self.err(f"comparing {left.ty} with {right.ty}", n)
-                elif name not in ("eq", "ne") and not ir.is_numeric(left.ty):
-                    raise self.err(f"ordering comparison on {left.ty} is not supported", n)
+                elif name not in ("eq", "ne") and not ir.is_numeric(l2.ty):
+                    raise self.err(f"ordering comparison on {l2.ty} is not supported", n)
+                elif isinstance(l2.ty, (ir.TDict,)):
+                    raise self.err("comparing whole dicts is not supported", n)
                 parts.append(ir.Binary(ir.BOOL, loc, name, l2, r2))
             else:
                 raise self.err(f"unsupported comparison {type(op).__name__}", n)
@@ -1012,12 +1434,66 @@ class ExprLowerer:
             out = ir.Binary(ir.BOOL, loc, "and", out, p)
         return out
 
+    def object_eq(self, a: ir.Expr, b: ir.Expr, identity: bool, n: ast.AST, loc: ir.Loc) -> ir.Expr:
+        """``is`` compares references. ``==`` does too for plain classes, but
+        a @dataclass compares its fields, and a custom __eq__ is unknown."""
+        fe = self.fl.fe
+        cls = a.ty.name  # type: ignore[union-attr]
+        if identity:
+            return ir.Binary(ir.BOOL, loc, "eq", a, b)
+        if f"{cls}.__eq__" in fe.signatures or fe.custom_eq.get(cls):
+            raise self.err(f"{cls} defines __eq__, which telic does not model; compare fields explicitly", n)
+        if cls not in fe.dataclasses:
+            return ir.Binary(ir.BOOL, loc, "eq", a, b)
+        out: ir.Expr = ir.Lit(ir.BOOL, loc, True)
+        for fname, fty in fe.module.classes[cls].fields:
+            if isinstance(fty, (ir.TClass, ir.TDict)):
+                raise self.err(f"== on {cls} compares field '{fname}' structurally, which is not modelled; compare fields explicitly", n)
+            eq = ir.Binary(ir.BOOL, loc, "eq", ir.Field(fty, loc, a, fname), ir.Field(fty, loc, b, fname))
+            out = eq if isinstance(out, ir.Lit) else ir.Binary(ir.BOOL, loc, "and", out, eq)
+        return out
+
     # -- calls ----------------------------------------------------------
 
     def call(self, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
-        if n.keywords and not (isinstance(n.func, ast.Name) and n.func.id in self.fl.fe.module.records):
-            raise self.err("keyword arguments are only supported for record constructors", n)
         f = n.func
+        fe = self.fl.fe
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.class_names and f.value.id not in self.fl.env:
+            key = f"{f.value.id}.{f.attr}"  # a static method
+            if key not in fe.signatures:
+                raise self.err(f"'{key}' is not a checked static method", n)
+            return self.method_call(key, None, n.args, n.keywords, n, loc)
+        if isinstance(f, ast.Attribute) and not (isinstance(f.value, ast.Name) and f.value.id == "math"):
+            obj = self.expr(f.value)
+            if isinstance(obj.ty, ir.TOption) and isinstance(obj.ty.inner, (ir.TClass, ir.TDict)):
+                obj = self.need(obj)
+            if isinstance(obj.ty, ir.TClass):
+                key = f"{obj.ty.name}.{f.attr}"
+                if key not in fe.signatures or key in fe.properties:
+                    raise self.err(f"{obj.ty.name} has no checked method '{f.attr}'", n)
+                return self.method_call(key, obj, n.args, n.keywords, n, loc)
+            if isinstance(obj.ty, ir.TDict):
+                if n.keywords:
+                    raise self.err("keyword arguments to dict methods are not supported", n)
+                if f.attr == "get":
+                    args = [self.expr(a) for a in n.args]
+                    if len(args) not in (1, 2):
+                        raise self.err("d.get(k) or d.get(k, default)", n)
+                    k = self.fl.coerce(args[0], obj.ty.key)
+                    if len(args) == 1:
+                        return ir.Builtin(ir.TOption(obj.ty.val), loc, "dict_get_opt", (obj, k))
+                    dv = args[1]
+                    if dv.ty == ir.NONE:
+                        return ir.Builtin(ir.TOption(obj.ty.val), loc, "dict_get_opt", (obj, k))
+                    dv = self.fl.coerce(dv, obj.ty.val)
+                    if dv.ty != obj.ty.val:
+                        raise self.err(f"default of d.get must be {obj.ty.val}", n)
+                    return ir.Builtin(obj.ty.val, loc, "dict_get_or", (obj, k, dv))
+                if f.attr == "copy" and not n.args:
+                    return ir.Builtin(obj.ty, loc, "dict_copy", (obj,))
+                raise self.err(f"dict method '.{f.attr}(...)' is not supported yet", n)
+        if n.keywords and not (isinstance(n.func, ast.Name) and (n.func.id in fe.module.records or n.func.id in fe.signatures or n.func.id in fe.class_names)):
+            raise self.err("keyword arguments are only supported for checked functions and constructors", n)
         if isinstance(f, ast.Attribute):
             if isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr in ("floor", "ceil", "trunc"):
                 (x,) = self._args(n, 1)
@@ -1036,13 +1512,18 @@ class ExprLowerer:
         if not isinstance(f, ast.Name):
             raise self.err("unsupported call", n)
         name = f.id
+        if name in fe.class_names and name not in self.fl.env:
+            return self.new(name, n, loc)
+        if name == "dict" and name not in fe.bound and not n.args and not n.keywords:
+            dt = expect if isinstance(expect, ir.TDict) else ir.TDict(ir.NONE, ir.NONE)
+            return ir.Builtin(dt, loc, "dict_lit", ())
         if name in self.fl.fe.signatures:
             return self.user_call(n, loc, name)
         if name in BUILTINS and name in self.fl.fe.bound:
             raise self.err(f"'{name}' is rebound in this module, so telic cannot assume the builtin", n)
         if self.spec and name == "old":
-            if self.result_ty is None:
-                raise self.err("old(...) is only allowed in '@ensures'", n)
+            if self.result_ty is None and not self.allow_old:
+                raise self.err("old(...) is only allowed in '@ensures' and loop invariants", n)
             (x,) = self._args(n, 1)
             return ir.Old(x.ty, loc, x)
         if self.spec and name == "implies":
@@ -1123,18 +1604,72 @@ class ExprLowerer:
         sig = self.fl.fe.signatures.get(name)
         if sig is None:
             raise self.err(f"call to '{name}', which telic cannot see (define it in a checked file with a contract)", n)
-        if n.keywords:
-            raise self.err("keyword arguments are only supported for record constructors", n)
         params, ret = sig
-        if len(n.args) != len(params):
-            raise self.err(f"'{name}' takes {len(params)} arguments, got {len(n.args)}", n)
-        args = []
-        for p, a in zip(params, n.args):
+        args = self.bind_args(name, params, n.args, n.keywords, n)
+        return ir.Call(ret, loc, name, tuple(args))
+
+    def bind_args(self, key: str, params: list[ir.Param], pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST) -> list[ir.Expr]:
+        """Match positional and keyword arguments to parameters, filling in
+        defaults; then lower and type-check each argument."""
+        fe = self.fl.fe
+        defaults = fe.defaults.get(key, {})
+        kwonly = fe.kwonly.get(key, set())
+        chosen: dict[str, ast.expr] = {}
+        positional = [p for p in params if p.name not in kwonly]
+        if any(isinstance(a, ast.Starred) for a in pos) or any(k.arg is None for k in kws):
+            raise self.err("*args / **kwargs at call sites are not supported", n)
+        if len(pos) > len(positional):
+            raise self.err(f"'{key}' takes {len(positional)} positional arguments, got {len(pos)}", n)
+        for p, a in zip(positional, pos):
+            chosen[p.name] = a
+        names = {p.name for p in params}
+        for k in kws:
+            if k.arg not in names:
+                raise self.err(f"'{key}' has no parameter '{k.arg}'", n)
+            if k.arg in chosen:
+                raise self.err(f"'{key}' got two values for '{k.arg}'", n)
+            chosen[k.arg] = k.value  # type: ignore[index]
+        out = []
+        for p in params:
+            a = chosen.get(p.name, defaults.get(p.name))
+            if a is None:
+                raise self.err(f"'{key}' is missing argument '{p.name}'", n)
             v = self.fl.coerce(self.expr(a, p.ty), p.ty)
             if v.ty != p.ty and not (isinstance(p.ty, ir.TList) and isinstance(v.ty, ir.TList) and v.ty.elem == ir.NONE):
-                raise self.err(f"argument '{p.name}' of '{name}' expects {p.ty}, got {v.ty}", n)
-            args.append(v)
-        return ir.Call(ret, loc, name, tuple(args))
+                raise self.err(f"argument '{p.name}' of '{key}' expects {p.ty}, got {v.ty}", n)
+            out.append(v)
+        return out
+
+    def method_call(self, key: str, obj: ir.Expr | None, pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST, loc: ir.Loc) -> ir.Expr:
+        params, ret = self.fl.fe.signatures[key]
+        if obj is None:
+            return ir.Call(ret, loc, key, tuple(self.bind_args(key, params, pos, kws, n)))
+        rest = self.bind_args(key, params[1:], pos, kws, n)
+        return ir.Call(ret, loc, key, (obj, *rest))
+
+    def new(self, cls: str, n: ast.Call, loc: ir.Loc) -> ir.Expr:
+        fe = self.fl.fe
+        if self.spec:
+            raise self.err("specifications cannot create objects", n)
+        init = f"{cls}.__init__"
+        if init in fe.signatures:
+            params, _ = fe.signatures[init]
+            args = self.bind_args(init, params[1:], n.args, n.keywords, n)
+        elif cls in fe.dataclass_defaults:
+            decl = fe.module.classes[cls]
+            params = [ir.Param(f, t) for f, t in decl.fields]
+            fe.defaults.setdefault(f"{cls}()", fe.dataclass_defaults[cls])
+            args = self.bind_args(f"{cls}()", params, n.args, n.keywords, n)
+            for (fname, fty), a in zip(decl.fields, args):
+                if isinstance(fty, (ir.TList, ir.TDict)) and not fresh_list(a):
+                    raise self.err(f"passing an existing {fty} as field '{fname}' would alias it; pass a copy", n)
+        else:
+            if n.args or n.keywords:
+                raise self.err(f"{cls} has no __init__ taking arguments", n)
+            args = []
+            if fe.module.classes[cls].fields:
+                raise self.err(f"{cls} has fields but no __init__ to set them; add one (or make it a @dataclass)", n)
+        return ir.New(ir.TClass(cls), loc, cls, tuple(args))
 
     def _args(self, n: ast.Call, k: int) -> list[ir.Expr]:
         if len(n.args) != k:

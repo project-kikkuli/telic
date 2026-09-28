@@ -130,11 +130,11 @@ class Program:
 
     def _mutation(self) -> None:
         for key, ref in self.funcs.items():
-            params = {p.name for p in ref.fn.params if isinstance(p.ty, ir.TList)}
+            params = {p.name for p in ref.fn.params if isinstance(p.ty, (ir.TList, ir.TDict))}
             muts: set[str] = set()
             apps: set[str] = set()
             for s in ir.walk_stmts(ref.fn.body):
-                if isinstance(s, (ir.IndexAssign, ir.Append)) and s.name in params:
+                if isinstance(s, (ir.IndexAssign, ir.Append, ir.DictDel)) and s.name in params:
                     muts.add(s.name)
                     if isinstance(s, ir.Append):
                         apps.add(s.name)
@@ -145,7 +145,7 @@ class Program:
         while changed:
             changed = False
             for key, ref in self.funcs.items():
-                params = {p.name for p in ref.fn.params if isinstance(p.ty, ir.TList)}
+                params = {p.name for p in ref.fn.params if isinstance(p.ty, (ir.TList, ir.TDict))}
                 for s in ir.walk_stmts(ref.fn.body):
                     for e in ir.stmt_exprs(s):
                         for sub in ir.walk_expr(e):
@@ -201,6 +201,9 @@ class Program:
                             decl = self.classes.get(sub.cls)
                             for fname, _ in decl.fields if decl else []:
                                 w.setdefault(f"{sub.cls}.{fname}", set()).add("@new")
+                            post = self.resolve(self.class_module.get(sub.cls, ref.module), f"{sub.cls}.__post_init__")
+                            if post is not None:
+                                cs.append((post.key, (), True))
             direct_w[key], direct_r[key], calls[key] = w, r, cs
         self.heap_writes = {k: {f: set(t) for f, t in v.items()} for k, v in direct_w.items()}
         self.heap_reads = {k: set(v) for k, v in direct_r.items()}

@@ -27,7 +27,29 @@ TIMEOUT_S = 5.0
 PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
+def _encode_any(v: Any) -> Any:
+    """Encode a decoded model value whose static type is not at hand."""
+    if isinstance(v, dict) and "__class__" in v:
+        fields = None if v.get("__stub__") else {k: _encode_any(x) for k, x in v.items() if not k.startswith("__")}
+        return {"__object__": v["__class__"], "ref": v.get("__ref__"), "fields": fields}
+    if isinstance(v, Fraction):
+        return {"__real__": [v.numerator, v.denominator]}
+    if isinstance(v, list):
+        return [_encode_any(x) for x in v]
+    if isinstance(v, dict):
+        return {"__dict__": [[k, _encode_any(x)] for k, x in v.items()]}
+    return v
+
+
 def encode_value(v: Any, ty: ir.Type) -> Any:
+    if isinstance(ty, ir.TOption):
+        return None if v is None else encode_value(v, ty.inner)
+    if isinstance(ty, ir.TClass):
+        if isinstance(v, dict) and "__class__" in v:
+            return _encode_any(v)
+        return {"__object__": ty.name, "ref": v, "fields": None}
+    if isinstance(ty, ir.TDict):
+        return {"__dict__": [[encode_value(k, ty.key), encode_value(x, ty.val)] for k, x in (v or {}).items()]}
     if isinstance(ty, ir.TList):
         return [encode_value(x, ty.elem) for x in (v or [])]
     if isinstance(ty, ir.TRecord):
@@ -45,7 +67,25 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     return v
 
 
-def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python") -> str:
+def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names: dict | None = None, label: str | None = None) -> str:
+    """``names`` maps object references already shown to how to refer to
+    them, so aliasing and cycles are visible: ``f(a=<Box v=0 next=a>, b=a)``."""
+    if v is None:
+        return "None" if lang == "python" else "null"
+    if isinstance(v, dict) and "__object__" in v:
+        names = {} if names is None else names
+        key = (v["__object__"], v["ref"])
+        if key in names:
+            return names[key]
+        if v["fields"] is None:
+            return f"<{v['__object__']} #{v['ref']}>"
+        names[key] = label or f"#{v['ref']}"
+        tag = v["__object__"] if label else f"{v['__object__']} #{v['ref']}"
+        inner = " ".join(f"{k}={format_value(x, None, lang, names)}" for k, x in v["fields"].items())
+        return f"<{tag} {inner}>" if inner else f"<{tag}>"
+    if isinstance(v, dict) and "__dict__" in v:
+        inner = ", ".join(f"{format_value(k, None, lang)}: {format_value(x, None, lang)}" for k, x in v["__dict__"])
+        return "{" + inner + "}"
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return format_value(Fraction(n, d), ir.REAL, lang)
@@ -64,25 +104,44 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python") -> str
         return "true" if v else "false"
     if isinstance(v, list):
         inner_ty = ty.elem if isinstance(ty, ir.TList) else None
-        return "[" + ", ".join(format_value(x, inner_ty, lang) for x in v) + "]"
+        return "[" + ", ".join(format_value(x, inner_ty, lang, names) for x in v) + "]"
     if isinstance(v, str):
         return json.dumps(v) if lang != "python" else repr(v)
     return str(v)
 
 
 def call_text(fn: ir.Function, model: dict[str, Any], lang: str, names: bool = True) -> str:
+    params = fn.params
+    head = fn.name
+    shown: dict = {}  # object reference -> how it is referred to
+
+    def fmt(p: ir.Param) -> str:
+        return format_value(encode_value(model.get(p.name), p.ty), p.ty, lang, shown, label=p.name)
+
+    if "." in fn.name and params and isinstance(params[0].ty, ir.TClass) and params[0].ty.name == fn.name.split(".")[0]:
+        # a method: show it called on the receiver
+        head = f"{fmt(params[0])}.{fn.name.split('.', 1)[1]}"
+        params = params[1:]
     args = []
-    for p in fn.params:
-        v = format_value(encode_value(model.get(p.name), p.ty), p.ty, lang)
-        if names and len(fn.params) > 1:
+    for p in params:
+        v = fmt(p)
+        if names and (len(params) > 1 or isinstance(p.ty, (ir.TClass, ir.TOption))):
             v = f"{p.name}={v}" if lang == "python" else f"{p.name}: {v}"
         args.append(v)
-    return f"{fn.name}({', '.join(args)})"
+    return f"{head}({', '.join(args)})"
 
 
-def type_desc(ty: ir.Type) -> dict[str, Any]:
+def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth: int = 0) -> dict[str, Any]:
+    if isinstance(ty, ir.TOption):
+        return {"k": "option", "inner": type_desc(ty.inner, classes, depth)}
+    if isinstance(ty, ir.TDict):
+        return {"k": "dict", "key": type_desc(ty.key), "val": type_desc(ty.val, classes, depth + 1)}
+    if isinstance(ty, ir.TClass):
+        decl = (classes or {}).get(ty.name)
+        fields = [[f, type_desc(t, classes, depth + 1)] for f, t in decl.fields] if decl is not None and depth < 3 else None
+        return {"k": "class", "name": ty.name, "fields": fields}
     if isinstance(ty, ir.TList):
-        return {"k": "list", "elem": type_desc(ty.elem)}
+        return {"k": "list", "elem": type_desc(ty.elem, classes, depth + 1)}
     if isinstance(ty, ir.TRecord):
         return {"k": "record", "name": ty.name, "fields": [[n, type_desc(t)] for n, t in ty.fields]}
     return {"k": str(ty)}
@@ -134,7 +193,8 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
 
 
 def fuzz(path: str, fn: ir.Function, lang: str, n: int = FUZZ_INPUTS, module: ir.Module | None = None) -> dict[str, Any]:
-    extra: dict[str, Any] = {"fuzz": n, "types": [type_desc(p.ty) for p in fn.params]}
+    classes = module.classes if module is not None else {}
+    extra: dict[str, Any] = {"fuzz": n, "types": [type_desc(p.ty, classes) for p in fn.params]}
     if lang == "typescript":
         extra["contracts"] = ts_contracts(module)
     runner = run_python if lang == "python" else run_typescript
@@ -149,6 +209,9 @@ EXPECTED = {
     "assert": ("violation", "assert"),
     "div": ("crash", "ZeroDivisionError"),
     "index": ("crash", "IndexError"),
+    "none": ("crash", "TypeError"),
+    "key": ("crash", "KeyError"),
+    "class.inv": ("violation", "class.inv"),
 }
 
 
@@ -172,6 +235,12 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
         return crash == "ZeroDivisionError" or (lang == "typescript" and bool(out.get("nonfinite")))
     if k == "index":
         return crash == "IndexError" or bool(out.get("oob"))
+    if k == "none":
+        return crash in ("TypeError", "AttributeError") and ("NoneType" in str(out.get("msg", "")) or "None" in str(out.get("msg", "")))
+    if k == "key":
+        return crash == "KeyError" or bool(out.get("missing_key"))
+    if k == "class.inv":
+        return v == "class.inv" and out.get("func") == fn.name and _same(out.get("text", ""), ob.clause)
     if k == "raise":
         return crash is not None and crash not in ("RecursionError",)
     if k == "raises":
@@ -188,6 +257,8 @@ def describe(out: dict[str, Any], runtime: str) -> str:
             return f"{runtime}: {out.get('detail') or 'returned'}; '{text}' is false"
         if kind == "requires":
             return f"{runtime}: called {where}() violating '@requires {text}'"
+        if kind == "class.inv":
+            return f"{runtime}: class invariant '{text}' is false when {where.split('.')[-1]}() returns"
         if kind == "invariant":
             return f"{runtime}: invariant '{text}' is false at runtime -- the invariant itself is wrong"
         return f"{runtime}: '@{kind} {text}' failed" + (f" at line {out.get('line')}" if out.get("line") else "")

@@ -285,10 +285,17 @@ def assert_bad(x: int) -> int:
     return y
 
 
-# expect: unsupported
+# expect: proved
 def uses_dict(x: int) -> int:
+    #@ ensures result == x
     d = {"a": x}
     return d["a"]
+
+
+# expect: refuted
+def uses_dict_missing(x: int) -> int:
+    d = {"a": x}
+    return d["b"]
 
 
 # expect: proved

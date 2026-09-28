@@ -212,6 +212,16 @@ class Z3Encoder:
         return out
 
 
+def _lit(k: Any, sort: L.Sort | None) -> L.Term:
+    if isinstance(k, bool):
+        return L.BoolV(k)
+    if isinstance(k, int):
+        return L.IntV(k)
+    if isinstance(k, str):
+        return L.StrV(k)
+    raise ValueError(k)
+
+
 def to_python(v: z3.ExprRef) -> Any:
     if z3.is_int_value(v):
         return v.as_long()
@@ -230,9 +240,49 @@ def to_python(v: z3.ExprRef) -> Any:
     return str(v)
 
 
+def array_entries(v: z3.ExprRef) -> tuple[list[tuple[Any, Any]], Any]:
+    """Explicit entries and default of an array value from a model."""
+    entries: list[tuple[Any, Any]] = []
+    seen = set()
+    while True:
+        if z3.is_store(v):
+            k, x = to_python(v.arg(1)), to_python(v.arg(2))
+            if k not in seen:
+                seen.add(k)
+                entries.append((k, x))
+            v = v.arg(0)
+        elif z3.is_K(v):
+            return entries, to_python(v.arg(0))
+        elif z3.is_lambda(v) or z3.is_quantifier(v):
+            return entries, None
+        else:
+            return entries, None
+
+
 def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any:
+    from .vcgen import DictVal, ObjVal, OptVal
+
     if isinstance(val, ListVal):
         return [x for x in enc.list_value(model, val)]
+    if isinstance(val, OptVal):
+        if enc.value(model, val.some) is not True:
+            return None
+        return decode(enc, model, val.val)
+    if isinstance(val, ObjVal):
+        out: dict[str, Any] = {"__class__": val.cls, "__ref__": enc.value(model, val.ref)}
+        if val.fields is None:
+            out["__stub__"] = True
+            return out
+        for fname, fv in val.fields:
+            out[fname] = decode(enc, model, fv)
+        return out
+    if isinstance(val, DictVal):
+        has = model.eval(enc.term(val.has), model_completion=True)
+        entries, default = array_entries(has)
+        keys = [k for k, x in entries if x is True]
+        return {k: enc.value(model, L.select(val.vals, _lit(k, val.has.sort.index))) for k in keys}
+    if not isinstance(val, L.Term):
+        return str(val)
     if val.sort.name == "Rec":
         out = {}
         for fname, _ in val.sort.fields:
@@ -286,8 +336,10 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
         for _, v in ob.inputs:
             if isinstance(v, ListVal):
                 input_consts |= {v.arr, v.len}
-            else:
+            elif isinstance(v, L.Term):
                 input_consts.add(v)
+            else:
+                input_consts |= set(getattr(v, "__dict__", {}).values()) if hasattr(v, "__dict__") else set()
         for c in sorted(set().union(*(L.consts(t) for t in terms)), key=lambda c: c.name):
             if c in input_consts or "!" in c.name or c.sort.name in ("Array", "Rec"):
                 continue

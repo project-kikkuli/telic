@@ -357,7 +357,7 @@ class Renderer:
         else:
             if solver_cex and v.status in ("refuted", "unconfirmed"):
                 out.append(f"   {p.bold(pad('counterexample', 16))}{solver_cex}")
-                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith("()")}
+                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith("()") and "@new" not in k and not k.startswith(("alloc@",))}
                 if interesting and v.status == "unconfirmed":
                     st = ", ".join(f"{k.split('@')[0]}={fmt_state_value(val)}" for k, val in list(interesting.items())[:6])
                     out.append(f"   {p.dim(pad('loop state', 16))}{p.dim(st)}")

@@ -69,6 +69,16 @@ class DictVal:
     ty: ir.TDict
 
 
+@dataclass(frozen=True)
+class ObjVal:
+    """How an object input is shown in a counterexample: its reference and
+    its field values at entry (only used for decoding models)."""
+
+    ref: L.Term
+    cls: str
+    fields: tuple[tuple[str, "Val"], ...] | None  # None: beyond the shown depth
+
+
 Val = Union[L.Term, ListVal, OptVal, DictVal]
 NONE_V = L.Const("None", L.Sort("None"))
 
@@ -309,6 +319,8 @@ class VCGen:
         self.assumptions: list[tuple[ir.Loc, str]] = []
         self.definitional_mode = False
         self.raise_paths: list[list[L.Term]] = []
+        # (path condition, object, class, where) for every field write
+        self.written: list[tuple[L.Term, L.Term, str, ir.Loc]] = []
         self.loop_notes: list[tuple[int, str]] = []
 
     # -- naming -----------------------------------------------------------
@@ -426,7 +438,7 @@ class VCGen:
         for p in fn.params:
             v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
             env[p.name] = v
-            self.inputs.append((p.name, v))
+            self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
             if isinstance(v, ListVal):
                 facts.append(L.le(L.ZERO, v.len))
             facts.extend(self.alloc_facts(v, p.ty, env))
@@ -462,6 +474,17 @@ class VCGen:
         for k, v in kw.items():
             setattr(c, k, v)
         return c
+
+    def input_view(self, v: Val, ty: ir.Type, env: dict[str, Val], depth: int):
+        if isinstance(ty, ir.TClass) and depth <= 0:
+            return ObjVal(v, ty.name, None)  # type: ignore[arg-type]
+        if isinstance(ty, ir.TClass) and not (self.is_init and not self.inputs):
+            decl = self.program.classes[ty.name]
+            fs = tuple((f, self.input_view(self.heap_read(env, ty.name, f, v), fty, env, depth - 1)) for f, fty in decl.fields)  # type: ignore[arg-type]
+            return ObjVal(v, ty.name, fs)  # type: ignore[arg-type]
+        if isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TClass) and isinstance(v, OptVal):
+            return OptVal(v.some, self.input_view(v.val, ty.inner, env, depth), ty)  # type: ignore[arg-type]
+        return v
 
     @property
     def is_init(self) -> bool:
@@ -512,6 +535,16 @@ class VCGen:
                     ctx = Ctx(base=st.facts, env=ex.env, module=self.module, spec=True)
                     for inv, t in self.class_invariants(p.ty.name, ref, ex.env, st.facts):  # type: ignore[arg-type]
                         self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' on return", site=ex.loc, clause=inv)
+            # ... and so must every other object it wrote a field of.
+            param_refs = {self.entry[p.name] for p in fn.params if isinstance(p.ty, ir.TClass)}
+            seen: set = set()
+            for pc, ref, cls, wloc in self.written:
+                if ref in param_refs or (ref, cls) in seen:
+                    continue
+                seen.add((ref, cls))
+                ctx = Ctx(base=st.facts, env=ex.env, module=self.module, spec=True)
+                for inv, t in self.class_invariants(cls, ref, ex.env, st.facts):
+                    self.oblige("class.inv", ctx, L.implies(pc, t), inv.loc, f"invariant of {cls} ('{inv.text}') holds on return for the object written at line {wloc.line}", site=ex.loc, clause=inv)
             if fn.raises:
                 ctx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ctx) for r in fn.raises])
@@ -543,6 +576,7 @@ class VCGen:
             ref = self.ev(s.obj, ctx)
             v = coerce(self.ev(s.value, ctx), self.program.classes[s.cls].field_type(s.field))
             self.heap_write(st.env, s.cls, s.field, ref, v)  # type: ignore[arg-type]
+            self.written.append((L.and_(*st.facts), ref, s.cls, s.loc))  # type: ignore[arg-type]
             return st
         if isinstance(s, ir.DictDel):
             d = st.env[s.name]
@@ -689,6 +723,10 @@ class VCGen:
                         if decl is not None and self._init_key(sub.cls) is None:
                             for f, _ in decl.fields:
                                 names.update(k for k, _ in self.heap_keys(sub.cls, f))
+                            post = self.program.resolve(self.program.class_module[sub.cls], f"{sub.cls}.__post_init__")
+                            for cls_field in self.program.heap_writes.get(post.key if post else "", {}):
+                                c, f = cls_field.split(".", 1)
+                                names.update(k for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Call):
                         tgt = self.program.resolve(self.module, sub.func)
                         if tgt is None:
@@ -748,7 +786,7 @@ class VCGen:
         if env_override:
             env.update(env_override)
         for inv in invs:
-            ctx = Ctx(base=st.facts, env=env, module=self.module, state=None, spec=True)
+            ctx = Ctx(base=st.facts, env=env, module=self.module, state=None, spec=True, old_env=self.entry)
             g = self.ev(inv.expr, ctx.sub(label="invariant"))
             what = "holds on entry" if kind == "inv.entry" else "is preserved"
             self.oblige(kind, ctx, g, inv.loc, f"loop invariant '{inv.text}' {what}", site=site, clause=inv)
@@ -758,7 +796,7 @@ class VCGen:
         if env_override:
             env.update(env_override)
         for inv in invs:
-            ctx = Ctx(base=st.facts, env=env, module=self.module, spec=True, quiet=True)
+            ctx = Ctx(base=st.facts, env=env, module=self.module, spec=True, quiet=True, old_env=self.entry)
             st.facts.append(self.ev(inv.expr, ctx))
 
     def run_iteration(self, body, st: State) -> tuple[State, LoopFrame]:
@@ -1151,6 +1189,27 @@ class VCGen:
                 return o
             self.oblige("none", ctx, o.some, e.loc, f"'{_expr_name(e.args[0])}' is not None here")
             return o.val
+        if name == "dict_copy":
+            return args[0]  # dicts are values in the model; aliasing is excluded
+        if name == "list_append":
+            xs, v = args
+            assert isinstance(xs, ListVal)
+            return ListVal(L.store(xs.arr, L.add(xs.off, xs.len), v), xs.off, L.add(xs.len, L.ONE), xs.ty)  # type: ignore[arg-type]
+        if name == "list_set":
+            xs, i, v = args
+            assert isinstance(xs, ListVal)
+            j = self.index_of(xs, i, True, ctx, e.loc, _expr_name(e.args[0]))  # type: ignore[arg-type]
+            return ListVal(L.store(xs.arr, L.add(xs.off, j), v), xs.off, xs.len, xs.ty)  # type: ignore[arg-type]
+        if name == "dict_set":
+            d, k, v = args
+            assert isinstance(d, DictVal)
+            v = coerce(v, d.ty.val)
+            return DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
+        if name == "dict_del":
+            d, k = args
+            assert isinstance(d, DictVal)
+            self.oblige("key", ctx, L.select(d.has, k), e.loc, f"key being deleted from '{_expr_name(e.args[0])}' is present")  # type: ignore[arg-type]
+            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
         if name in ("dict_has", "dict_get_opt", "dict_get_or"):
             d, k = args[0], args[1]
             assert isinstance(d, DictVal)
@@ -1249,9 +1308,14 @@ class VCGen:
         if init is not None:
             self.call(self.program.ref(init), [r] + args, [None] + list(e.args), ctx, e.loc, new_self=True)
             return r
-        # Generated constructor (dataclass-style): fields in declaration order.
+        # Generated constructor (dataclass-style): fields in declaration order,
+        # then __post_init__ if there is one.
         for (fname, _), v in zip(decl.fields, args):
             self.heap_write(env, e.cls, fname, r, v)
+        post = self.program.resolve(self.program.class_module[e.cls], f"{e.cls}.__post_init__")
+        if post is not None:
+            self.call(post, [r], [None], ctx, e.loc, new_self=True)
+            return r
         for inv, t in self.class_invariants(e.cls, r, env, ctx.base):
             self.oblige("class.inv", ctx, t, inv.loc, f"new {e.cls} satisfies its invariant '{inv.text}'", site=e.loc, clause=inv)
             ctx.assume(t)
@@ -1264,7 +1328,7 @@ class VCGen:
         if ctx.state is not None:
             args = [ctx.state.env.get(a_e.name, a) if isinstance(a_e, ir.Var) and isinstance(a, (ListVal, DictVal)) else a for a_e, a in zip(arg_exprs, args)]
         muts = self.program.mutated.get(callee.key, set())
-        list_vars = [a_e.name for a_e, p in zip(arg_exprs, fn.params) if isinstance(a_e, ir.Var) and isinstance(p.ty, ir.TList)]
+        list_vars = [a_e.name for a_e, p in zip(arg_exprs, fn.params) if isinstance(a_e, ir.Var) and isinstance(p.ty, (ir.TList, ir.TDict))]
         if muts and len(list_vars) != len(set(list_vars)):
             raise VCError(f"the same list is passed twice to '{fn.name}', which mutates a list parameter; the two parameters would alias", loc)
         for p, a_e in zip(fn.params, arg_exprs):
@@ -1307,6 +1371,11 @@ class VCGen:
             env = ctx.state.env
             # Mutated list arguments get fresh contents.
             for p, a_expr in zip(fn.params, arg_exprs):
+                if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
+                    nd = self.fresh(a_expr.name, p.ty)
+                    env[a_expr.name] = nd
+                    post[p.name] = nd
+                    continue
                 if p.name in muts and isinstance(a_expr, ir.Var):
                     old = env[a_expr.name]
                     assert isinstance(old, ListVal)
