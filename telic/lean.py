@@ -129,7 +129,7 @@ def lean_sort(s: L.Sort) -> str:
         return "String"
     if s.name == "Array":
         assert s.elem is not None
-        return f"(Int → {lean_sort(s.elem)})"
+        return f"({lean_sort(L.index_sort(s))} → {lean_sort(s.elem)})"
     if s.name == "Rec":
         return s.rec or "Rec"
     raise LeanUnsupported(f"no Lean type for {s}")
@@ -214,6 +214,8 @@ class LeanPrinter:
             return f"{self.t(a[0], 101)} {self.t(a[1], 101)}", 90
         if op == "store":
             return f"Telic.upd {self.t(a[0], 101)} {self.t(a[1], 101)} {self.t(a[2], 101)}", 90
+        if op == "K":
+            return f"(fun _ => {self.t(a[0])})", 100
         if op.startswith("field:"):
             return f"{self.t(a[0], 101)}.{op[6:]}", 100
         if op.startswith("mk:"):
@@ -227,10 +229,10 @@ open Classical
 
 namespace Telic
 /-- Functional array update. -/
-def upd {{α : Type}} (a : Int → α) (i : Int) (v : α) : Int → α := fun j => if j = i then v else a j
-@[simp] theorem upd_same {{α : Type}} (a : Int → α) (i : Int) (v : α) : upd a i v i = v := by simp [upd]
-@[simp] theorem upd_other {{α : Type}} (a : Int → α) (i j : Int) (v : α) (h : j ≠ i) : upd a i v j = a j := by simp [upd, h]
-theorem upd_apply {{α : Type}} (a : Int → α) (i j : Int) (v : α) : upd a i v j = if j = i then v else a j := rfl
+def upd {{ι α : Type}} [DecidableEq ι] (a : ι → α) (i : ι) (v : α) : ι → α := fun j => if j = i then v else a j
+@[simp] theorem upd_same {{ι α : Type}} [DecidableEq ι] (a : ι → α) (i : ι) (v : α) : upd a i v i = v := by simp [upd]
+@[simp] theorem upd_other {{ι α : Type}} [DecidableEq ι] (a : ι → α) (i j : ι) (v : α) (h : j ≠ i) : upd a i v j = a j := by simp [upd, h]
+theorem upd_apply {{ι α : Type}} [DecidableEq ι] (a : ι → α) (i j : ι) (v : α) : upd a i v j = if j = i then v else a j := rfl
 end Telic
 """
 

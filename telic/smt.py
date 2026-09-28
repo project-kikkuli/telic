@@ -82,7 +82,7 @@ class Z3Encoder:
             return z3.StringSort(c)
         if s.name == "Array":
             assert s.elem is not None
-            return z3.ArraySort(z3.IntSort(c), self.sort(s.elem))
+            return z3.ArraySort(self.sort(L.index_sort(s)), self.sort(s.elem))
         if s.name == "Rec":
             return self.record(s)[0]
         if s.name == "None":
@@ -185,6 +185,8 @@ class Z3Encoder:
             return z3.Select(a[0], a[1])
         if op == "store":
             return z3.Store(a[0], a[1], a[2])
+        if op == "K":
+            return z3.K(self.sort(L.index_sort(t.sort)), a[0])
         if op.startswith("field:"):
             sort, s = self.record(t.args[0].sort)
             idx = [n for n, _ in s.fields].index(op[6:])

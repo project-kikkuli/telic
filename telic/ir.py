@@ -76,7 +76,39 @@ class TRecord:
         return self.name
 
 
-Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord]
+@dataclass(frozen=True)
+class TOption:
+    """``Optional[T]`` / ``T | None`` / ``T | undefined``."""
+
+    inner: "Type"
+
+    def __str__(self) -> str:
+        return f"{self.inner} | None"
+
+
+@dataclass(frozen=True)
+class TDict:
+    """``dict[K, V]`` / ``Map<K, V>`` / ``Record<K, V>``: a finite map."""
+
+    key: "Type"
+    val: "Type"
+
+    def __str__(self) -> str:
+        return f"dict[{self.key}, {self.val}]"
+
+
+@dataclass(frozen=True)
+class TClass:
+    """A reference to a mutable object of a user class (heap allocated;
+    two references may point to the same object)."""
+
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+
+Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass]
 
 INT, REAL, BOOL, STR, NONE = TInt(), TReal(), TBool(), TStr(), TNone()
 
@@ -185,6 +217,13 @@ class Call(Expr):
 #   slice(xs, lo, hi)   Python/JS slice semantics (negative wrap + clamp);
 #                       lo/hi may be ``Lit(None)`` for "omitted".
 #   count(xs, v)        number of occurrences
+#   some(x)             wrap a value as a present optional
+#   is_none(o)          optional is absent (``o is None``)
+#   unwrap(o)           the value of a present optional (obligation: not None)
+#   dict_has(d, k)      ``k in d`` / ``m.has(k)``
+#   dict_get_opt(d, k)  ``d.get(k)`` / ``m.get(k)``: an optional
+#   dict_get_or(d, k, v)  ``d.get(k, v)``
+#   dict_lit(k1, v1, ...) a fresh dict
 @dataclass(frozen=True)
 class Builtin(Expr):
     name: str
@@ -224,6 +263,15 @@ class Quant(Expr):
 
 
 @dataclass(frozen=True)
+class New(Expr):
+    """``C(args)`` / ``new C(args)``: allocate a fresh object and run
+    ``C.__init__`` on it."""
+
+    cls: str
+    args: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
 class ListLit(Expr):
     elems: tuple[Expr, ...]
 
@@ -260,6 +308,22 @@ class IndexAssign(Stmt):
 class Append(Stmt):
     name: str
     value: Expr
+
+
+@dataclass(frozen=True)
+class FieldAssign(Stmt):
+    """``obj.f = value`` on a class instance."""
+
+    obj: Expr
+    cls: str
+    field: str
+    value: Expr
+
+
+@dataclass(frozen=True)
+class DictDel(Stmt):
+    name: str
+    key: Expr
 
 
 @dataclass(frozen=True)
@@ -405,6 +469,24 @@ class IntentDecl:
 
 
 @dataclass
+class ClassDecl:
+    """A mutable class: typed fields, invariants over ``self``, methods
+    (lowered as functions named ``Class.method`` whose first parameter is
+    ``self``), and a constructor ``Class.__init__``."""
+
+    name: str
+    fields: list[tuple[str, Type]]
+    invariants: list[Clause] = field(default_factory=list)
+    loc: Loc = NOLOC
+
+    def field_type(self, name: str) -> Type | None:
+        for f, t in self.fields:
+            if f == name:
+                return t
+        return None
+
+
+@dataclass
 class Module:
     path: str  # as given on the command line / relative to project root
     language: str  # "python" | "typescript"
@@ -412,6 +494,7 @@ class Module:
     functions: dict[str, Function] = field(default_factory=dict)
     intents: list[IntentDecl] = field(default_factory=list)
     records: dict[str, TRecord] = field(default_factory=dict)
+    classes: dict[str, "ClassDecl"] = field(default_factory=dict)
     problems: list[tuple[str, Loc]] = field(default_factory=list)
     # Assumptions the language model makes, listed verbatim in reports.
     assumptions: list[str] = field(default_factory=list)
@@ -445,7 +528,7 @@ def walk_expr(e: Expr):
         yield from walk_expr(e.cond)
         yield from walk_expr(e.then)
         yield from walk_expr(e.orelse)
-    elif isinstance(e, (Call, Builtin)):
+    elif isinstance(e, (Call, Builtin, New)):
         for a in e.args:
             yield from walk_expr(a)
     elif isinstance(e, Index):
@@ -489,6 +572,11 @@ def stmt_exprs(s: Stmt):
         yield s.value
     elif isinstance(s, ExprStmt):
         yield s.expr
+    elif isinstance(s, FieldAssign):
+        yield s.obj
+        yield s.value
+    elif isinstance(s, DictDel):
+        yield s.key
     elif isinstance(s, AssertStmt) and s.native:
         yield s.clause.expr  # a native assert executes, effects included
 
@@ -497,7 +585,7 @@ def assigned_names(stmts: Any) -> set[str]:
     """Variables (re)bound or mutated anywhere in ``stmts``."""
     out: set[str] = set()
     for s in walk_stmts(stmts):
-        if isinstance(s, (Assign, IndexAssign, Append)):
+        if isinstance(s, (Assign, IndexAssign, Append, DictDel)):
             out.add(s.name)
         elif isinstance(s, ForRange):
             out.add(s.var)

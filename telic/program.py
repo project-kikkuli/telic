@@ -31,6 +31,13 @@ class Program:
     mutated: dict[str, set[str]] = field(default_factory=dict)
     appends: dict[str, set[str]] = field(default_factory=dict)
     logic_names: dict[str, str] = field(default_factory=dict)
+    classes: dict[str, ir.ClassDecl] = field(default_factory=dict)
+    class_module: dict[str, ir.Module] = field(default_factory=dict)
+    # 'Class.field' -> targets written: a parameter name, '*' (any object),
+    # or '@new' (only objects allocated during the call).
+    heap_writes: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    heap_reads: dict[str, set[str]] = field(default_factory=dict)
+    allocates: set[str] = field(default_factory=set)
 
     @classmethod
     def build(cls, modules: list[ir.Module]) -> "Program":
@@ -39,9 +46,14 @@ class Program:
             for f in m.functions.values():
                 ref = FuncRef(m, f)
                 p.funcs[ref.key] = ref
+        for m in modules:
+            for cname, decl in m.classes.items():
+                p.classes[cname] = decl
+                p.class_module[cname] = m
         p._call_graph()
         p._sccs()
         p._mutation()
+        p._heap()
         p._definitional()
         p._names()
         return p
@@ -151,6 +163,93 @@ class Program:
                                         self.appends[key].add(a.name)
                                         changed = True
 
+    def _heap(self) -> None:
+        """Which fields each function may write (and of which objects), which
+        it reads, and whether it allocates; transitively through calls."""
+        params = {k: {p.name for p in r.fn.params} for k, r in self.funcs.items()}
+        direct_w: dict[str, dict[str, set[str]]] = {}
+        direct_r: dict[str, set[str]] = {}
+        calls: dict[str, list[tuple[str, tuple[ir.Expr, ...], bool]]] = {}
+        for key, ref in self.funcs.items():
+            w: dict[str, set[str]] = {}
+            r: set[str] = set()
+            cs: list[tuple[str, tuple[ir.Expr, ...], bool]] = []
+            exprs: list[ir.Expr] = []
+            for st in ir.walk_stmts(ref.fn.body):
+                if isinstance(st, ir.FieldAssign):
+                    tgt = st.obj.name if isinstance(st.obj, ir.Var) and st.obj.name in params[key] else "*"
+                    w.setdefault(f"{st.cls}.{st.field}", set()).add(tgt)
+                exprs.extend(ir.stmt_exprs(st))
+                if isinstance(st, (ir.While, ir.ForRange, ir.ForEach)):
+                    exprs.extend(c.expr for c in st.invariants)
+            for c in ref.fn.requires + ref.fn.ensures:
+                exprs.append(c.expr)
+            for e in exprs:
+                for sub in ir.walk_expr(e):
+                    if isinstance(sub, ir.Field) and isinstance(sub.obj.ty, ir.TClass):
+                        r.add(f"{sub.obj.ty.name}.{sub.name}")
+                    elif isinstance(sub, ir.Call):
+                        tgt = self.resolve(ref.module, sub.func)
+                        if tgt is not None:
+                            cs.append((tgt.key, sub.args, False))
+                    elif isinstance(sub, ir.New):
+                        self.allocates.add(key)
+                        init = self.resolve(self.class_module.get(sub.cls, ref.module), f"{sub.cls}.__init__")
+                        if init is not None:
+                            cs.append((init.key, sub.args, True))
+                        else:
+                            decl = self.classes.get(sub.cls)
+                            for fname, _ in decl.fields if decl else []:
+                                w.setdefault(f"{sub.cls}.{fname}", set()).add("@new")
+            direct_w[key], direct_r[key], calls[key] = w, r, cs
+        self.heap_writes = {k: {f: set(t) for f, t in v.items()} for k, v in direct_w.items()}
+        self.heap_reads = {k: set(v) for k, v in direct_r.items()}
+        changed = True
+        while changed:
+            changed = False
+            for key, cs in calls.items():
+                mine = self.heap_writes[key]
+                for callee, args, is_new in cs:
+                    if callee in self.allocates and key not in self.allocates:
+                        self.allocates.add(key)
+                        changed = True
+                    for rf in self.heap_reads.get(callee, set()) - self.heap_reads[key]:
+                        self.heap_reads[key].add(rf)
+                        changed = True
+                    cparams = [p.name for p in self.funcs[callee].fn.params]
+                    if is_new:
+                        cparams = cparams[1:]  # 'self' is the fresh object
+                    for f, tgts in self.heap_writes.get(callee, {}).items():
+                        for t in tgts:
+                            if t in ("*", "@new"):
+                                mapped = t
+                            elif is_new and t == "self":
+                                mapped = "@new"
+                            elif t in cparams:
+                                a = args[cparams.index(t)]
+                                mapped = a.name if isinstance(a, ir.Var) and a.name in params[key] else "*"
+                            else:
+                                mapped = "*"
+                            if mapped not in mine.setdefault(f, set()):
+                                mine[f].add(mapped)
+                                changed = True
+
+    def def_heap_keys(self, key: str) -> list[str]:
+        """Heap components a definitional function's body reads, in a fixed
+        order; they become extra parameters of its logical definition."""
+        from .vcgen import components
+
+        out = []
+        for cf in sorted(self.heap_reads.get(key, ())):
+            c, f = cf.split(".", 1)
+            decl = self.classes.get(c)
+            fty = decl.field_type(f) if decl else None
+            if fty is None:
+                continue
+            for suffix, _ in components(fty):
+                out.append(f"@{c}.{f}" + (f".{suffix}" if suffix else ""))
+        return out
+
     def _definitional(self) -> None:
         """A function is definitional if its body is loop-free, mutation-free,
         free of raises, and only calls other definitional functions. Its body
@@ -158,11 +257,13 @@ class Program:
         cand: set[str] = set()
         for key, ref in self.funcs.items():
             fn = ref.fn
-            if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, ir.TList):
+            if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, (ir.TList, ir.TOption, ir.TDict)):
+                continue
+            if key in self.allocates or fn.name.endswith(".__init__"):
                 continue
             ok = True
             for s in ir.walk_stmts(fn.body):
-                if isinstance(s, (ir.While, ir.ForRange, ir.ForEach, ir.IndexAssign, ir.Append, ir.Raise, ir.Break, ir.Continue, ir.ExprStmt, ir.Unsupported, ir.AssumeStmt)):
+                if isinstance(s, (ir.While, ir.ForRange, ir.ForEach, ir.IndexAssign, ir.Append, ir.Raise, ir.Break, ir.Continue, ir.ExprStmt, ir.Unsupported, ir.AssumeStmt, ir.FieldAssign, ir.DictDel)):
                     ok = False
                     break
             if ok:
@@ -184,7 +285,7 @@ class Program:
         for name, keys in by_name.items():
             for key in keys:
                 if len(keys) == 1 and not name.startswith(("seqsum", "seqcount", "Telic")):
-                    cand = name
+                    cand = re.sub(r"\W", "_", name)
                 else:
                     stem = re.sub(r"\W", "_", self.funcs[key].module.path.rsplit("/", 1)[-1])
                     cand = f"{stem}_{name}"

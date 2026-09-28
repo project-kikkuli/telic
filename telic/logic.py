@@ -25,12 +25,13 @@ from typing import Iterable
 class Sort:
     name: str  # Int | Real | Bool | Str | Array | Rec
     elem: "Sort | None" = None  # Array element sort
+    index: "Sort | None" = None  # Array index sort (None = Int)
     rec: str | None = None  # record name
     fields: tuple[tuple[str, "Sort"], ...] = ()
 
     def __str__(self) -> str:
         if self.name == "Array":
-            return f"Array[{self.elem}]"
+            return f"Array[{self.elem}]" if self.index is None else f"Array[{self.index}->{self.elem}]"
         if self.name == "Rec":
             return self.rec or "Rec"
         return self.name
@@ -42,8 +43,17 @@ BOOL = Sort("Bool")
 STR = Sort("Str")
 
 
-def ARRAY(elem: Sort) -> Sort:
-    return Sort("Array", elem=elem)
+def ARRAY(elem: Sort, index: Sort | None = None) -> Sort:
+    return Sort("Array", elem=elem, index=None if index == INT else index)
+
+
+def index_sort(s: Sort) -> Sort:
+    return s.index or INT
+
+
+def const_array(sort: Sort, v: Term) -> Term:
+    """The array mapping every index to ``v``."""
+    return App("K", (v,), sort)
 
 
 def REC(name: str, fields: tuple[tuple[str, Sort], ...]) -> Sort:
@@ -378,6 +388,8 @@ def ite(c: Term, a: Term, b: Term) -> Term:
 
 
 def select(arr: Term, idx: Term) -> Term:
+    if isinstance(arr, App) and arr.op == "K":
+        return arr.args[0]
     if isinstance(arr, App) and arr.op == "store":
         base, k, v = arr.args
         if k == idx:
