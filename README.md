@@ -194,6 +194,7 @@ telic explain NAME       every obligation of a function, with its formula and in
 telic gaps [PATHS]       mutants the contracts fail to reject
 telic lean ID            the Lean theorem for one obligation
 telic prove --agent CMD  close open obligations in Lean with an agent in the loop
+telic report -o out.html the proof ledger as a page: intents, mirrors, source with a proof gutter
 telic run script.py      run with every contract enforced (C0's -d)
 pytest -p telic.pytest_plugin   enforce contracts during your test suite
 telic demo               the walkthrough

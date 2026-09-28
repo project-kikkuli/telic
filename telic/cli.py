@@ -178,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     from .gaps import add_commands as add_gaps
 
     add_gaps(sub, _common, _options)
+    from .html import add_commands as add_report
+
+    add_report(sub, _common, _options)
     from .demo import add_commands as add_demo
 
     add_demo(sub)
