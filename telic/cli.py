@@ -123,7 +123,9 @@ def cmd_explain(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root or os.getcwd())
     name = args.name.split("/")[0]
     args.only = [name]
-    rep = check(args.paths, _options(args, root), root=root)
+    opts = _options(args, root)
+    opts.receipts = False  # explain needs the formulas, not just the verdicts
+    rep = check(args.paths, opts, root=root)
     print(explain(rep, args.name, Paint()))
     return 0
 
@@ -181,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     from .html import add_commands as add_report
 
     add_report(sub, _common, _options)
+    from .ledger import add_commands as add_ledger
+
+    add_ledger(sub, _common, _options)
     from .demo import add_commands as add_demo
 
     add_demo(sub)

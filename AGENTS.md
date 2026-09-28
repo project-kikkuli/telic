@@ -18,7 +18,8 @@ Read [docs/design.md](docs/design.md) first.
 | `telic/smt.py`, `telic/lean.py` | backends; Lean sidecars, agent loop, axiom audit |
 | `telic/replay.py`, `telic/replay_harness.py`, `telic/frontend/ts/harness.mjs` | executing counterexamples, fuzzing, shrinking |
 | `telic/equiv.py`, `telic/gaps.py` | `@mirrors` and spec-gap mutation |
-| `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, cache, intent ledger, output |
+| `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
+| `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
 
 ## Rules

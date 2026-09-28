@@ -188,6 +188,8 @@ More in [docs/contracts.md](docs/contracts.md).
 ## Commands
 
 ```
+telic init               ledger + CI workflow + pre-push hook for this repository
+telic ci --since REF     check what a change can affect; fail on regressions vs telic.ledger.json
 telic check [PATHS]      verify; exit 1 on a refutation (--strict: also on anything open)
 telic check --json       machine-readable results for agents and CI
 telic explain NAME       every obligation of a function, with its formula and inferred invariants
@@ -204,6 +206,37 @@ Results are cached by the exact formula of each obligation (`.telic/cache.json`)
 Because calls are verified modularly (against callee *contracts*, not bodies),
 editing a function body re-verifies only that function. Editing a contract
 re-verifies that function and its callers.
+
+## Continuous: a ledger that ratchets
+
+`telic init` sets up a repository for good:
+- it commits `telic.ledger.json`, the status of every intent, function and mirror
+  plus the clauses each intent rests on;
+- it adds a GitHub workflow;
+- it adds a pre-push hook.
+
+On every change, `telic ci --since origin/main` re-checks exactly what the change
+can affect. Calls resolve within a module and cross-file edges are only explicit
+`@mirrors` or shared intents, so the affected set is computed rather than
+guessed. Anything that got worse fails the build:
+- an intent going proved → open;
+- a mirror diverging;
+- a clause dropped from an intent.
+
+A `Telic-accept: <id> <reason>` line in a commit message accepts one regression
+on the record. Improvements are written back. Evidence is reused through
+receipts keyed by exact inputs: each obligation's formula, each function's call
+closure, and the verifier's own identity. Reuse therefore survives rebases and
+file moves, and stale proofs never outlive a telic or Z3 upgrade.
+
+Measured on a 320-function, 60-file repository ([details](docs/ci.md)):
+
+| | seconds |
+|---|---|
+| cold, empty cache | 12.0 |
+| warm full check | 0.78 |
+| PR editing one function | 0.45 |
+| PR touching six files | 1.35 |
 
 ## With a coding agent
 

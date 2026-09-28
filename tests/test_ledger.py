@@ -1,0 +1,110 @@
+"""The CI ratchet: regressions fail, acceptances and improvements pass."""
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = """#@ intent CAP: A result never exceeds the cap.
+
+def capped(x: int, cap: int) -> int:
+    #@ requires cap >= 0
+    #@ intent CAP
+    #@ ensures result <= cap
+    return min(x, cap)
+
+
+def other(x: int) -> int:
+    #@ ensures result >= x
+    return x + 1
+"""
+
+
+def sh(cwd, *cmd):
+    return subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True)
+
+
+def telic(cwd, *args):
+    return sh(cwd, sys.executable, "-m", "telic", *args)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "cap.py").write_text(SRC)
+    (tmp_path / "lib" / "unrelated.py").write_text("def f(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
+    sh(tmp_path, "git", "init", "-q", "-b", "main")
+    sh(tmp_path, "git", "config", "user.email", "t@example.com")
+    sh(tmp_path, "git", "config", "user.name", "t")
+    assert telic(tmp_path, "init", "--no-hook").returncode == 0
+    sh(tmp_path, "git", "add", "-A")
+    sh(tmp_path, "git", "commit", "-qm", "init")
+    sh(tmp_path, "git", "checkout", "-qb", "feature")
+    return tmp_path
+
+
+def commit(repo, msg):
+    sh(repo, "git", "commit", "-qam", msg)
+
+
+def test_ledger_records_intents_and_clauses(repo):
+    data = json.loads((repo / "telic.ledger.json").read_text())
+    assert data["intents"]["CAP"]["status"] == "proved"
+    assert data["intents"]["CAP"]["clauses"] == ["capped: ensures result <= cap"]
+    assert data["functions"]["lib/cap.py::capped"]["status"] == "proved"
+
+
+def test_no_change_is_free(repo):
+    out = telic(repo, "ci", "--since", "main")
+    assert out.returncode == 0 and "no checkable files changed" in out.stdout
+
+
+def test_regression_fails_and_scope_is_exact(repo):
+    p = repo / "lib" / "cap.py"
+    p.write_text(SRC.replace("return min(x, cap)", "return x"))
+    commit(repo, "oops")
+    out = telic(repo, "ci", "--since", "main", "--color", "never")
+    assert out.returncode == 1
+    assert "intent CAP: proved → refuted" in out.stdout
+    assert "1 affected file" in out.stdout  # unrelated.py is not re-checked
+
+
+def test_dropping_a_clause_needs_acceptance(repo):
+    p = repo / "lib" / "cap.py"
+    p.write_text(SRC.replace("    #@ ensures result <= cap\n", ""))
+    commit(repo, "weaken")
+    out = telic(repo, "ci", "--since", "main", "--color", "never")
+    assert out.returncode == 1 and "lost a clause" in out.stdout
+    sh(repo, "git", "commit", "-q", "--allow-empty", "-m", "ack\n\nTelic-accept: CAP the cap moved to the caller")
+    out = telic(repo, "ci", "--since", "main", "--color", "never")
+    assert out.returncode == 0 and "accepted: the cap moved to the caller" in out.stdout
+
+
+def test_improvement_updates_ledger(repo):
+    p = repo / "lib" / "unrelated.py"
+    p.write_text("#@ intent SAME: f is the identity.\n\ndef f(x: int) -> int:\n    #@ intent SAME\n    #@ ensures result == x\n    return x\n")
+    commit(repo, "formalize")
+    out = telic(repo, "ci", "--since", "main", "--update", "--color", "never")
+    assert out.returncode == 0 and "intent SAME (proved)" in out.stdout
+    data = json.loads((repo / "telic.ledger.json").read_text())
+    assert data["intents"]["SAME"]["status"] == "proved" and "CAP" in data["intents"]
+
+
+def test_github_annotations(repo):
+    p = repo / "lib" / "cap.py"
+    p.write_text(SRC.replace("return min(x, cap)", "return x"))
+    commit(repo, "oops")
+    out = telic(repo, "ci", "--since", "main", "--format", "github", "--color", "never")
+    assert "::error file=lib/cap.py,line=" in out.stdout
+
+
+def test_receipts_are_bound_to_the_toolchain(repo, monkeypatch):
+    import telic.checker as C
+
+    first = C.toolchain_id()
+    monkeypatch.setattr(C, "_TOOLCHAIN", None)
+    assert C.toolchain_id() == first  # stable across processes for the same sources

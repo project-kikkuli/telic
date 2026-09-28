@@ -1,0 +1,22 @@
+{
+  "repository": {
+    "python_modules": 40,
+    "typescript_modules": 20,
+    "functions": 320,
+    "intents": 3
+  },
+  "seconds": {
+    "cold": 12.04,
+    "warm": 0.78,
+    "pr-none": 0.15,
+    "pr-body": 0.45,
+    "pr-spec": 0.47,
+    "pr-many": 1.35
+  },
+  "machine": {
+    "python": "3.11.15",
+    "cpus": 4,
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39"
+  },
+  "warm_header": "telic  60 files \u00b7 320 functions \u00b7 1780 obligations \u00b7 1780 cached \u00b7 0.6s"
+}

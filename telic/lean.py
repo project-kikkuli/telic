@@ -675,6 +675,7 @@ def cmd_lean(args) -> int:
     opts.only = {fname}
     opts.lean = False
     opts.replay = False
+    opts.receipts = False
     rep = check(args.paths, opts, root=root)
     f, v = _find(rep, args.id)
     if v is None:

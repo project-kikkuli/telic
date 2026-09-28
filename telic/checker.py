@@ -123,6 +123,7 @@ class FunctionReport:
     deps: set[str] = field(default_factory=set)
     open_deps: set[str] = field(default_factory=set)
     seconds: float = 0.0
+    from_receipt: bool = False
 
     @property
     def fn(self) -> ir.Function:
@@ -209,6 +210,50 @@ class ProofCache:
         Path(self.path).write_text(json.dumps({"version": self.VERSION, "proofs": keep}, indent=1, sort_keys=True))
 
 
+def make_receipt(rep: "FunctionReport") -> dict[str, Any]:
+    return {
+        "method": "function",
+        "status": rep.status,
+        "deps": sorted(rep.deps),
+        "assumptions": [[loc.line, text] for loc, text in rep.assumptions],
+        "obs": [
+            {
+                "id": v.ob.id,
+                "kind": v.ob.kind,
+                "loc": [v.ob.loc.line, v.ob.loc.col, v.ob.loc.end_col],
+                "site": [v.ob.site.line, v.ob.site.col, v.ob.site.end_col] if v.ob.site else None,
+                "message": v.ob.message,
+                "intents": list(v.ob.intents),
+                "method": v.reason if v.method == "cache" else v.method,
+                "inferred": v.ob.inferred,
+            }
+            for v in rep.verdicts
+        ],
+    }
+
+
+def restore_receipt(rep: "FunctionReport", r: dict[str, Any]) -> None:
+    """Rebuild a proved function's report from its receipt (no formulas are
+    kept; `telic explain` recomputes them)."""
+    rep.status = r["status"]
+    rep.deps = set(r.get("deps", []))
+    rep.assumptions = [(ir.Loc(line), text) for line, text in r.get("assumptions", [])]
+    for o in r["obs"]:
+        ob = Obligation(
+            id=o["id"],
+            func=rep.ref.key,
+            kind=o["kind"],
+            loc=ir.Loc(*o["loc"]),
+            site=ir.Loc(*o["site"]) if o.get("site") else None,
+            message=o["message"],
+            hyps=[],
+            goal=L.TRUE,
+            intents=tuple(o.get("intents", ())),
+            inferred=o.get("inferred", False),
+        )
+        rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=o.get("method", "")))
+
+
 _sidecars: dict[str, dict] = {}
 
 
@@ -236,16 +281,62 @@ def inference_key(program: Program, key: str) -> str:
             continue
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
-    h = hashlib.sha256(f"infer {__version__}".encode())
+    h = hashlib.sha256(f"infer {__version__} {toolchain_id()}".encode())
     for k in sorted(seen):
         ref = program.ref(k)
         h.update(f"{k}\n{ref.fn.source}\n{sorted(ref.module.records)}".encode())
     return "infer:" + h.hexdigest()[:24]
 
 
+_TOOLCHAIN: str | None = None
+
+
+def toolchain_id() -> str:
+    """Evidence is only as good as the verifier that produced it, so every
+    receipt is bound to the exact telic sources and Z3 version (a telic fix
+    or a solver upgrade invalidates old receipts instead of trusting them)."""
+    global _TOOLCHAIN
+    if _TOOLCHAIN is None:
+        import z3
+
+        h = hashlib.sha256(f"z3 {z3.get_version_string()}".encode())
+        pkg = Path(__file__).resolve().parent
+        for f in sorted(pkg.rglob("*")):
+            if f.suffix in (".py", ".mjs", ".lean") and "node_modules" not in f.parts and "demo" not in f.parts:
+                h.update(f.relative_to(pkg).as_posix().encode())
+                h.update(f.read_bytes())
+        _TOOLCHAIN = h.hexdigest()[:16]
+    return _TOOLCHAIN
+
+
+def function_key(program: Program, key: str, root: str | None) -> str:
+    """A function's verdict depends on its own source, everything it calls
+    (contracts, and bodies of pure callees used as definitions), the records
+    it uses, its Lean sidecar proofs, and the toolchain. Nothing else."""
+    seen: set[str] = set()
+    todo = [key]
+    while todo:
+        k = todo.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        todo.extend(program.callees.get(k, ()))
+    h = hashlib.sha256(f"fn {toolchain_id()}".encode())
+    for k in sorted(seen):
+        ref = program.ref(k)
+        h.update(f"{k}\n{ref.module.language}\n{ref.fn.source}\n{sorted((n, str(t)) for n, t in ref.module.records.items())}".encode())
+    ref = program.ref(key)
+    from .lean import sidecar_path
+
+    side = sidecar_path(os.path.join(root or os.getcwd(), ref.module.path))
+    if os.path.exists(side):
+        h.update(Path(side).read_bytes())
+    return "fn:" + h.hexdigest()[:24]
+
+
 def obligation_key(ob: Obligation, theory: Theory) -> str:
     defs, axioms = theory.closure(list(ob.hyps) + [ob.goal], ob.exclude_axioms)
-    h = hashlib.sha256()
+    h = hashlib.sha256(toolchain_id().encode())
     h.update(L.canonical(ob.formula()).encode())
     for d in defs:
         h.update(f"def {d.name}({' '.join(L.canonical(p) for p in d.params)})={L.canonical(d.body) if d.body else '?'}".encode())
@@ -266,6 +357,7 @@ class CheckOptions:
     cache_path: str | None = None
     only: set[str] | None = None  # function names to check
     progress: Callable[[str], None] | None = None
+    receipts: bool = True  # reuse whole-function verdicts for unchanged functions
 
 
 def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory, list[tuple[str, str]]]:
@@ -357,6 +449,14 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             continue
         inf = inferred.get(key) or Inferred()
         rep.inferred = inf
+        fkey = function_key(program, key, root) if opts.receipts else None
+        receipt = cache.get(fkey) if fkey else None
+        if receipt is not None and receipt.get("method") == "function":
+            restore_receipt(rep, receipt)
+            hits += len(rep.verdicts)
+            rep.from_receipt = True
+            reports.append(rep)
+            continue
         try:
             gen = VCGen(program, ref, inf.options)
             obs = gen.run()
@@ -413,6 +513,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         elif any(v.status != "proved" for v in rep.verdicts) or any("termination" in p for p, _ in rep.problems):
             rep.status = "open"
         rep.seconds = time.perf_counter() - ft
+        if fkey and rep.status == "proved" and not rep.problems:
+            cache.put(fkey, make_receipt(rep))
         reports.append(rep)
 
     # Transitive dependency status: a proof that assumes an unproved contract
