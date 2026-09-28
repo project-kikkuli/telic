@@ -447,48 +447,54 @@ class Renderer:
     # -- tables --------------------------------------------------------------
 
     def intent_table(self) -> list[str]:
+        """Requirements first: each intent, what backs it, and whether its
+        links and wording hold up. Lemmas are listed under it."""
         p = self.p
         if not self.r.intents:
             return []
         out = [self.rule("intents", f"{len(self.r.intents)}"), ""]
-        idw = max(len(i.id) for i in self.r.intents) + 2
+        label = {
+            "backed": p.green("backed"),
+            "broken": p.red("broken"),
+            "partial": p.yellow("partial"),
+            "unbacked": p.gray("unbacked"),
+            "undeclared": p.yellow("undeclared"),
+        }
+        glyph = {"backed": p.green("●"), "broken": p.red("✗"), "partial": p.yellow("◐"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
         for i in self.r.intents:
-            status = i.status
-            label = {
-                "proved": p.green("proved"),
-                "refuted": p.red("refuted"),
-                "open": p.yellow("open"),
-                "unformalized": p.gray("unformalized"),
-                "undeclared": p.yellow("undeclared"),
-            }[status]
-            text = i.text or p.dim("referenced but never declared with '@intent ID: sentence'")
-            maxw = self.width - idw - 22
-            if visible_len(text) > maxw:
-                text = text[: maxw - 1] + "…"
-            out.append(f"  {mark(p, status)} {pad(p.cyan(i.id), idw)}{pad(label, 14)}{text}")
-            detail = []
-            if i.functions:
-                names = [k.split("::")[-1] for k in i.functions]
-                detail.append(", ".join(names))
-            mirrors = [m for m in self.r.mirrors if i.id in m.intents]
-            if status == "unformalized":
-                detail.append("no @ensures carries this intent yet")
-            elif i.proved or i.refuted or i.open:
-                n = i.proved + i.refuted + i.open
-                bits = [f"{n} obligation{'s' * (n != 1)}"]
-                if i.refuted:
-                    bits.append(f"{i.refuted} refuted")
-                if i.open:
-                    bits.append(f"{i.open} open")
-                if not i.refuted and not i.open:
-                    bits.append("all proved")
-                detail.append(": ".join([bits[0], ", ".join(bits[1:])]))
-            for m in mirrors:
-                word = {"proved": "mirror proved equal", "refuted": p.red("mirror diverges"), "open": "mirror not proved"}[m.status]
-                detail.append(word)
-            if detail:
-                out.append(" " * (4 + idw + 14) + p.dim("  ·  ".join(detail)))
-        out.append("")
+            n = len(i.lemmas)
+            ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
+            summary = [label[i.status]]
+            if n:
+                summary.append(f"{ok}/{n} lemma{'s' * (n != 1)} proved")
+            cov = i.coverage
+            if cov is not None and cov.get("kind") == "reviewed":
+                summary.append(p.green(f"reviewed by {cov.get('by') or 'a person'}") if cov.get("fresh") else p.yellow("review stale (lemmas or wording changed)"))
+            elif cov is not None and cov.get("kind") == "judged":
+                v = cov.get("verdict")
+                summary.append(p.cyan("judged sufficient") if v == "sufficient" else p.yellow("judged insufficient"))
+            elif i.status == "backed":
+                summary.append(p.dim("coverage not reviewed"))
+            where = f"{i.loc[0]}:{i.loc[1]}" if i.loc else ""
+            out.append(f"  {glyph[i.status]} {p.bold(p.cyan(i.id))}  {'  ·  '.join(summary)}  {p.dim(where)}")
+            text = i.text or p.dim("cited, but never declared with '@intent ID: sentence'")
+            for line in _wrap(text, self.width - 6):
+                out.append(f"    {line}")
+            nw = max((len(x.name) for x in i.lemmas), default=0) + 2
+            for x in i.lemmas:
+                m = {"proved": p.green("✓"), "trusted": p.blue("◇"), "refuted": p.red("✗")}.get(x.status, p.yellow("?"))
+                body = x.text if x.kind == "mirror" else f"{x.kind} {x.text}"
+                room = self.width - nw - 12
+                if visible_len(body) > room:
+                    body = body[: max(10, room - 1)] + "…"
+                out.append(f"    {m} {pad(x.name, nw)}{p.dim(body)}")
+            if cov is not None and cov.get("kind") == "judged" and cov.get("verdict") != "sufficient" and cov.get("missing"):
+                out.append(f"    {p.yellow('judge')}  {p.dim('missing: ' + cov['missing'])}")
+            for msg in i.pointers:
+                out.append(f"    {p.yellow('link')}   {msg}")
+            for msg in i.ears:
+                out.append(f"    {p.dim('ears')}   {p.dim('the sentence ' + msg)}")
+            out.append("")
         return out
 
     def function_table(self) -> list[str]:
@@ -574,6 +580,12 @@ class Renderer:
                     out.append(f"  {p.dim('·')} {p.dim(lang + ': ' + a)}")
         out.append("")
         return out
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, max(30, width)) or [""]
 
 
 def _term_width() -> int:

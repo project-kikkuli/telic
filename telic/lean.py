@@ -582,6 +582,13 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
         h = statement_hash(stmt, defs_text)
         k = key_fn(v.ob, theory)
         sp = stored.get(v.ob.id)
+        if sp is None or sp.hash != h:
+            # The obligation id carries line numbers; a proof whose statement
+            # is unchanged still applies after the code above it moved.
+            fn_prefix = v.ob.id.split("/")[0] + "/"
+            moved = [x for x in stored.values() if x.hash == h and x.id.startswith(fn_prefix)]
+            if moved:
+                sp = moved[0]
         hit = cache.get(k)
         if hit is not None and hit.get("method", "").startswith("lean") and (sp is None or hit.get("proof_hash") == _phash(sp.proof)):
             v.status = "proved"

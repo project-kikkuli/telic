@@ -37,7 +37,7 @@ from typing import Any
 from .checker import CheckOptions, Report, check, language_of
 
 LEDGER = "telic.ledger.json"
-RANK = {"proved": 4, "trusted": 3, "open": 2, "unsupported": 2, "error": 1, "unformalized": 1, "undeclared": 1, "refuted": 0}
+RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
             for c in f.fn.ensures + f.fn.raises:
                 if i.id in c.intents:
                     clauses.append(f"{f.fn.name}: {c.kind} {c.text}")
-        intents[i.id] = {"status": i.status, "text": i.text, "functions": sorted(i.functions), "clauses": sorted(set(clauses))}
+        intents[i.id] = {"status": i.status, "text": i.text, "functions": sorted(i.functions), "clauses": sorted(set(clauses)), **({"links": sorted(i.pointers)} if i.pointers else {})}
     functions = {}
     for f in rep.functions:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))

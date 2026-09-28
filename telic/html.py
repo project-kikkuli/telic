@@ -26,8 +26,12 @@ STATUS_WORD = {
     "error": "error",
     "unformalized": "unformalized",
     "undeclared": "undeclared",
+    "backed": "backed",
+    "broken": "broken",
+    "partial": "partial",
+    "unbacked": "unbacked",
 }
-MARK = {"proved": "✓", "refuted": "✗", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!"}
+MARK = {"proved": "✓", "refuted": "✗", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "unbacked": "○"}
 
 CSS = """
 /* Layout: a ledger. Intents summary on top, then one panel per function:
@@ -83,6 +87,10 @@ header.top { display: grid; gap: 10px; }
 .pill.proved { color: var(--proved); background: var(--proved-bg); }
 .pill.refuted { color: var(--refuted); background: var(--refuted-bg); }
 .pill.open, .pill.unknown, .pill.unconfirmed, .pill.undeclared { color: var(--open); background: var(--open-bg); }
+.pill.backed { color: var(--proved); background: var(--proved-bg); }
+.pill.broken { color: var(--refuted); background: var(--refuted-bg); }
+.pill.partial, .pill.unbacked { color: var(--open); background: var(--open-bg); }
+.intent ul { margin: 6px 0 0; padding-left: 1.1rem; list-style: none; }
 .pill.unsupported, .pill.trusted, .pill.unformalized, .pill.error { color: var(--quiet); background: var(--quiet-bg); }
 section { display: grid; gap: 14px; }
 .intents { display: grid; gap: 0; border-top: 1px solid var(--rule); }
@@ -302,20 +310,20 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         tally.append(f"<span><b>{inferred}</b> inferred invariant{'s' * (inferred != 1)}</span>")
     intents = []
     for i in rep.intents:
-        ev = []
-        if i.functions:
-            ev.append(", ".join(k.split("::")[-1] for k in i.functions))
-        n = i.proved + i.refuted + i.open
-        if n:
-            ev.append(f"{n} obligations" + (f", {i.refuted} refuted" if i.refuted else "") + (f", {i.open} open" if i.open else ""))
-        for m in rep.mirrors:
-            if i.id in m.intents:
-                ev.append({"proved": "mirror proved equal", "refuted": "mirror diverges", "open": "mirror not proved"}[m.status])
-        if i.status == "unformalized":
-            ev.append("no @ensures carries this intent yet")
+        ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
+        ev = [f"{ok}/{len(i.lemmas)} lemmas proved"] if i.lemmas else ["no lemma cites this intent yet"]
+        cov = i.coverage or {}
+        if cov.get("kind") == "reviewed":
+            ev.append(f"reviewed by {cov.get('by') or 'a person'}" if cov.get("fresh") else "review stale")
+        elif cov.get("kind") == "judged":
+            ev.append("judged " + cov.get("verdict", "") + (f" (missing: {cov['missing']})" if cov.get("verdict") != "sufficient" and cov.get("missing") else ""))
+        lemmas = "".join(
+            f"<li>{MARK.get(x.status, '?')} <code>{e(x.name)}</code> {e(x.text if x.kind == 'mirror' else x.kind + ' ' + x.text)}</li>" for x in i.lemmas
+        )
+        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears)
         intents.append(
-            f'<div class="intent"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "referenced but never declared")}</span>'
-            f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}</span></div>"
+            f'<div class="intent"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
+            f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}<ul>{lemmas}{issues}</ul></span></div>"
         )
     trust = []
     for f in fs:

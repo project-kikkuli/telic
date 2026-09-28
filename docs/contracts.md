@@ -63,20 +63,51 @@ every report under *trusted base*.
 
 ## Intents
 
+An intent is a top-level requirement, written for a reviewer as one EARS
+sentence. It is not a formula, and telic never reports one as "proved".
+
 ```python
-#@ intent REFUND-CAP: A refund never exceeds what the customer paid, net of earlier refunds.
+#@ intent REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
+#@   what the customer paid, net of earlier refunds.
+#@   by: refund_amount, Ledger.apply, web/checkout.ts::refundButton
 ```
 
-declares an intent (IDs are `UPPER-KEBAB`). Inside a function, `#@ intent ID`
-links the function and tags every following clause, until the next `intent`
-line. `#@ [ID] ensures …` tags a single clause. An intent's status is derived
-from the evidence of every function linked to it, plus any `@mirrors` it covers:
+Declare an intent anywhere in the project; IDs are `UPPER-KEBAB` and unique
+project-wide. What telic proves are **lemmas** one layer below: contract clauses
+that cite the intent. `#@ intent ID` inside a function tags every following
+clause, and `#@ [ID] ensures …` tags one clause. An intent's lemmas can be spread
+over many functions, files and both languages, and an `@mirrors` equivalence
+counts as a lemma too.
 
-`proved` · `refuted` · `open` · `unformalized` (declared, no clause carries it) ·
-`undeclared` (referenced, never declared).
+**Two-sided links.** `by:` points down from the intent to the functions that
+back it, and citations point back up. telic checks both directions: a `by:` entry
+that does not cite the intent, or a function that cites it without being listed,
+is reported, and `telic intents` fails on it. `by:` accepts `name`,
+`Class.method` or `path::name`.
 
-The EARS patterns (`WHEN <trigger> the <system> shall <response>`, `IF …
-THEN …`, `WHILE …`) make good intent sentences: one sentence, one requirement.
+**EARS.** The sentence is linted against the EARS patterns:
+`The <system> shall …`, `WHEN <trigger>, the <system> shall …`, `WHILE …`,
+`IF … THEN …`, `WHERE …`, and combinations of them. One `shall`, one sentence.
+
+**Status** says what the lemmas establish:
+
+`backed` (every lemma proved) · `broken` (a lemma refuted) · `partial` (some
+open) · `unbacked` (declared, nothing cites it) · `undeclared` (cited, never
+declared).
+
+**Coverage** is a separate question: do the lemmas cover the requirement? A
+prover can't answer it, so telic records an answer instead:
+
+```
+telic intents --accept REFUND-CAP      # you reviewed it: pinned to a digest of
+                                       # the sentence and the lemma set
+telic intents --judge                  # a cheap model's opinion, cached by the same
+                                       # digest, always labelled "judged"
+```
+
+A review goes stale when either the sentence or the lemma set changes. The
+judge reads `ANTHROPIC_API_KEY` (model: `TELIC_JUDGE_MODEL`, default a Haiku
+model), or `TELIC_JUDGE_CMD`, any command that reads the prompt on stdin.
 
 ## Mirrors
 

@@ -50,7 +50,7 @@ def tagged(x: int) -> int:
 """
     rep = run_check(tmp_path, {"i.py": src})
     st = {i.id: i.status for i in rep.intents}
-    assert st == {"CAP": "proved", "LATER": "unformalized", "GHOST": "undeclared"}
+    assert st == {"CAP": "backed", "LATER": "unbacked", "GHOST": "undeclared"}
 
 
 def test_function_without_contract_still_gets_safety_checks(tmp_path):

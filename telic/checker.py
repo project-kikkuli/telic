@@ -133,17 +133,7 @@ class FunctionReport:
         return sum(1 for v in self.verdicts if v.status == status)
 
 
-@dataclass
-class IntentReport:
-    id: str
-    text: str | None
-    loc: tuple[str, int] | None
-    functions: list[str]
-    status: str  # proved | refuted | open | unformalized | undeclared
-    clauses: int = 0
-    proved: int = 0
-    refuted: int = 0
-    open: int = 0
+from .intent import IntentReport  # noqa: E402  (re-exported)
 
 
 @dataclass
@@ -543,6 +533,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     cache.save()
     rep = Report(modules, program, reports, [], mirrors, time.perf_counter() - t0, hits, solved)
+    rep.root = program.root  # type: ignore[attr-defined]
     rep.intents = intent_reports(rep)
     return rep
 
@@ -551,44 +542,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
 
 def intent_reports(rep: Report) -> list[IntentReport]:
-    decls: dict[str, tuple[str, tuple[str, int]]] = {}
-    for m in rep.modules:
-        for d in m.intents:
-            decls.setdefault(d.id, (d.text, (m.path, d.loc.line)))
-    linked: dict[str, list[FunctionReport]] = {}
-    for f in rep.functions:
-        for i in f.fn.intents:
-            linked.setdefault(i, []).append(f)
-    mirror_by_intent: dict[str, list[Any]] = {}
-    for mr in rep.mirrors:
-        for i in mr.intents:
-            mirror_by_intent.setdefault(i, []).append(mr)
-    out: list[IntentReport] = []
-    for iid in sorted(set(decls) | set(linked)):
-        text, loc = decls.get(iid, (None, None))
-        fns = linked.get(iid, [])
-        clauses = sum(
-            1
-            for f in fns
-            for c in f.fn.requires + f.fn.ensures + f.fn.raises
-            if iid in c.intents and c.kind != "requires"
-        )
-        verdicts = [v for f in fns for v in f.verdicts]
-        ir_ = IntentReport(iid, text, loc, [f.ref.key for f in fns], "open", clauses)
-        ir_.proved = sum(1 for v in verdicts if v.status == "proved")
-        ir_.refuted = sum(1 for v in verdicts if v.status == "refuted")
-        ir_.open = sum(1 for v in verdicts if v.status not in ("proved", "refuted"))
-        mirrors = mirror_by_intent.get(iid, [])
-        statuses = [f.status for f in fns] + [m.status for m in mirrors]
-        if text is None:
-            ir_.status = "undeclared"
-        elif not fns or (clauses == 0 and not mirrors):
-            ir_.status = "unformalized"
-        elif "refuted" in statuses:
-            ir_.status = "refuted"
-        elif all(s in ("proved", "trusted") for s in statuses) and not any(f.open_deps for f in fns):
-            ir_.status = "proved"
-        else:
-            ir_.status = "open"
-        out.append(ir_)
+    from . import intent
+
+    out = intent.build(rep)
+    intent.attach_cached_judgments(getattr(rep, "root", None) or ".", out)
     return out

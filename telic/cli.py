@@ -183,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     from .html import add_commands as add_report
 
     add_report(sub, _common, _options)
+    from .intent import add_commands as add_intents
+
+    add_intents(sub, _common, _options)
     from .ledger import add_commands as add_ledger
 
     add_ledger(sub, _common, _options)

@@ -53,7 +53,7 @@ def commit(repo, msg):
 
 def test_ledger_records_intents_and_clauses(repo):
     data = json.loads((repo / "telic.ledger.json").read_text())
-    assert data["intents"]["CAP"]["status"] == "proved"
+    assert data["intents"]["CAP"]["status"] == "backed"
     assert data["intents"]["CAP"]["clauses"] == ["capped: ensures result <= cap"]
     assert data["functions"]["lib/cap.py::capped"]["status"] == "proved"
 
@@ -69,7 +69,7 @@ def test_regression_fails_and_scope_is_exact(repo):
     commit(repo, "oops")
     out = telic(repo, "ci", "--since", "main", "--color", "never")
     assert out.returncode == 1
-    assert "intent CAP: proved → refuted" in out.stdout
+    assert "intent CAP: backed → broken" in out.stdout
     assert "1 affected file" in out.stdout  # unrelated.py is not re-checked
 
 
@@ -89,9 +89,9 @@ def test_improvement_updates_ledger(repo):
     p.write_text("#@ intent SAME: f is the identity.\n\ndef f(x: int) -> int:\n    #@ intent SAME\n    #@ ensures result == x\n    return x\n")
     commit(repo, "formalize")
     out = telic(repo, "ci", "--since", "main", "--update", "--color", "never")
-    assert out.returncode == 0 and "intent SAME (proved)" in out.stdout
+    assert out.returncode == 0 and "intent SAME (backed)" in out.stdout
     data = json.loads((repo / "telic.ledger.json").read_text())
-    assert data["intents"]["SAME"]["status"] == "proved" and "CAP" in data["intents"]
+    assert data["intents"]["SAME"]["status"] == "backed" and "CAP" in data["intents"]
 
 
 def test_github_annotations(repo):

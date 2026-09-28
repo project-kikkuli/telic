@@ -3,8 +3,8 @@
 -- code on every run; edit only the tactic proofs. A block whose statement no
 -- longer matches the code is reported as stale and ignored.
 
--- telic: chained_bonus_is_product/ensures@18>19 statement=2f5ca002b5bd
-theorem vc_chained_bonus_is_product_ensures_18_19
+-- telic: chained_bonus_is_product/ensures@20>21 statement=2f5ca002b5bd
+theorem vc_chained_bonus_is_product_ensures_20_21
     (a : Int)
     (b : Int)
     (level_bonus_spec : ∀ (depth : Int), 0 ≤ depth → 1 ≤ level_bonus depth)

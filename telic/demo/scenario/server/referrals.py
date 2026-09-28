@@ -1,6 +1,8 @@
 """Referral bonuses double at every level of the referral tree."""
 
-#@ intent BONUS-COMPOSE: Chaining two referral paths pays the product of their bonuses.
+#@ intent BONUS-COMPOSE: WHEN two referral paths are chained, the shop shall pay
+#@   the product of their bonuses.
+#@   by: chained_bonus_is_product
 
 
 def level_bonus(depth: int) -> int:
