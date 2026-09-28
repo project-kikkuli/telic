@@ -162,8 +162,12 @@ def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth
     return {"k": str(ty)}
 
 
+REPLAY_ROOT: list[str] = []  # the project root, so package-relative imports resolve
+
+
 def run_python(path: str, func: str, args: list[Any], timeout: float = TIMEOUT_S, extra: dict | None = None) -> dict[str, Any]:
-    req = json.dumps({"path": os.path.abspath(path), "func": func, "args": args, **(extra or {})})
+    root = _package_root(os.path.abspath(path))
+    req = json.dumps({"path": os.path.abspath(path), "func": func, "args": args, **({"root": root} if root else {}), **(extra or {})})
     env = dict(os.environ)
     env["PYTHONPATH"] = PKG_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     try:
@@ -182,6 +186,16 @@ def run_python(path: str, func: str, args: list[Any], timeout: float = TIMEOUT_S
     if not lines:
         return {"harness_error": (p.stderr or p.stdout).strip()[-500:]}
     return json.loads(lines[-1])
+
+
+def _package_root(path: str) -> str | None:
+    """The directory above the outermost package containing ``path``."""
+    d = os.path.dirname(path)
+    if not os.path.exists(os.path.join(d, "__init__.py")):
+        return None
+    while os.path.exists(os.path.join(d, "__init__.py")):
+        d = os.path.dirname(d)
+    return d
 
 
 def run_typescript(path: str, func: str, args: list[Any], timeout: float = TIMEOUT_S, extra: dict | None = None) -> dict[str, Any]:
@@ -305,6 +319,12 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
         return True, summary, str(what)
     if "violation" in out or "crash" in out:
         return False, f"{summary} -- a real failure, but a different one from this obligation", None
+    from . import ir as _ir
+
+    has_loop = any(isinstance(st, (_ir.While, _ir.ForRange, _ir.ForEach)) for st in _ir.walk_stmts(fn.body))
+    if not has_loop and ob.deps and ob.kind not in ("inv.step", "variant"):
+        callees = ", ".join(sorted(d.split("::")[-1] for d in ob.deps))
+        return False, f"{summary} without violating anything -- the contracts of {callees} are too weak to rule this out (telic checks each function against the others' contracts, not their code)", None
     loop_state = any("@" in c.name for h in ob.hyps for c in _consts(h))
     if ob.kind in ("inv.step", "variant") or loop_state:
         return False, f"{summary} without violating anything -- the state behind this counterexample is unreachable; a loop invariant is too weak to rule it out", None

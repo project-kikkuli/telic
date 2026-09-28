@@ -70,11 +70,32 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
         from .frontend.typescript import lower_typescript_files
 
         ts_mods = lower_typescript_files(ts_files, root)
+    from .frontend.python import lower_python_project, project_imports
+
+    py_files = [f for f in files if language_of(f) == "python"]
+    # Checked modules they import come along as context (declarations and
+    # contracts only): a call into them uses their contracts.
+    context: set[str] = set()
+    todo = list(py_files)
+    known = {os.path.normpath(os.path.abspath(f)) for f in py_files}
+    while todo:
+        f = todo.pop()
+        for dep in project_imports(f, root):
+            d = os.path.normpath(os.path.abspath(dep))
+            if d not in known:
+                known.add(d)
+                context.add(d)
+                py_files.append(dep)
+                todo.append(dep)
+    py_mods = dict(zip(py_files, lower_python_project([(os.path.relpath(f, root), Path(f).read_text()) for f in py_files]))) if py_files else {}
+    for f in py_files:
+        if os.path.normpath(os.path.abspath(f)) in context:
+            py_mods[f].context = True
+            mods.append(py_mods[f])
     for f in files:
-        rel = os.path.relpath(f, root)
         lang = language_of(f)
         if lang == "python":
-            mods.append(lower_python(rel, Path(f).read_text()))
+            mods.append(py_mods[f])
         elif lang == "typescript":
             mods.append(ts_mods[f])
     return mods
@@ -122,6 +143,7 @@ class FunctionReport:
     assumptions: list[tuple[ir.Loc, str]] = field(default_factory=list)
     deps: set[str] = field(default_factory=set)
     open_deps: set[str] = field(default_factory=set)
+    context_deps: set[str] = field(default_factory=set)
     seconds: float = 0.0
     from_receipt: bool = False
 
@@ -403,7 +425,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     for key, ref in program.funcs.items():
         if opts.only and ref.fn.name not in opts.only:
             continue
-        if ref.fn.unsupported or ref.fn.trusted:
+        if ref.fn.unsupported or ref.fn.trusted or ref.module.context:
             continue
         if opts.infer:
             ikey = inference_key(program, key)
@@ -420,6 +442,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     for key, ref in program.funcs.items():
         fn = ref.fn
         if opts.only and fn.name not in opts.only:
+            continue
+        if ref.module.context:
             continue
         if opts.progress:
             opts.progress(f"{ref.module.path}::{fn.name}")
@@ -519,6 +543,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 continue
             seen.add(d)
             dr = by_key.get(d)
+            if dr is None and d in program.funcs and program.funcs[d].module.context:
+                r.context_deps.add(d)  # checked on its own; its contract is what this proof uses
+                continue
             if dr is None or dr.status not in ("proved",):
                 if dr is None or dr.status != "trusted":
                     r.open_deps.add(d)

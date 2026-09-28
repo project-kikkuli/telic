@@ -551,6 +551,10 @@ class Module:
     intents: list[IntentDecl] = field(default_factory=list)
     records: dict[str, TRecord] = field(default_factory=dict)
     classes: dict[str, "ClassDecl"] = field(default_factory=dict)
+    # local name -> (module path, name there): calls into other checked modules
+    imports: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # loaded only for what other modules import from it (not checked this run)
+    context: bool = False
     problems: list[tuple[str, Loc]] = field(default_factory=list)
     # Assumptions the language model makes, listed verbatim in reports.
     assumptions: list[str] = field(default_factory=list)

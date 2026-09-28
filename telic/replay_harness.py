@@ -232,7 +232,7 @@ def main() -> None:
     path = req["path"]
     sys.path.insert(0, __import__("os").path.dirname(path))
     try:
-        mod = load_instrumented(path, "__telic_target__")
+        mod = load_instrumented(path, "__telic_target__", root=req.get("root"))
         fn = mod
         for part in req["func"].split("."):
             fn = getattr(fn, part)

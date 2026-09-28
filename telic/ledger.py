@@ -189,10 +189,23 @@ def acceptances(root: str, base: str | None) -> dict[str, str]:
 
 
 def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) -> set[str]:
-    """Changed checkable files, their @mirrors partners, and files that share
-    an intent with them. Exact, because telic has no other cross-file edges."""
+    """Changed checkable files, the files that import them (their proofs use
+    the changed contracts), their @mirrors partners, and files that share an
+    intent with them. Importers of importers are unaffected: a proof depends
+    on its callees' contracts, not on what those rest on."""
     files = {f for f in changed if language_of(f) and os.path.exists(os.path.join(root, f))}
     deleted = {f for f in changed if language_of(f) and not os.path.exists(os.path.join(root, f))}
+    if any(f.endswith(".py") for f in files | deleted):
+        from .frontend.python import project_imports
+
+        touched = {os.path.normpath(os.path.join(root, f)) for f in files | deleted if f.endswith(".py")}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build")]
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    full = os.path.join(dirpath, fn)
+                    if touched & {os.path.normpath(x) for x in project_imports(full, root)}:
+                        files.add(os.path.relpath(full, root))
     grow = True
     while grow:
         grow = False

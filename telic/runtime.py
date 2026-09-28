@@ -15,6 +15,7 @@ import ast
 import copy
 import importlib.abc
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -378,15 +379,28 @@ def instrument_source(source: str, module: ir.Module, filename: str = "<telic>")
     return tree
 
 
-def load_instrumented(path: str, name: str | None = None) -> types.ModuleType:
-    from .frontend.python import lower_python
+def load_instrumented(path: str, name: str | None = None, root: str | None = None) -> types.ModuleType:
+    """Load a module with its contracts enforced. With ``root``, it is loaded
+    under its package name so relative imports work."""
+    from .frontend.python import _dotted, lower_python
 
     src = Path(path).read_text()
     mod_ir = lower_python(path, src)
     tree = instrument_source(src, mod_ir, path)
+    package = None
+    if root is not None:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+        if not rel.startswith(".."):
+            dotted = _dotted(rel)
+            name = dotted
+            package = dotted if rel.endswith("__init__.py") else dotted.rpartition(".")[0]
+            if root not in sys.path:
+                sys.path.insert(0, root)
     name = name or Path(path).stem
     module = types.ModuleType(name)
     module.__file__ = path
+    if package is not None:
+        module.__package__ = package
     sys.modules[name] = module
     exec(compile(tree, path, "exec"), module.__dict__)
     return module

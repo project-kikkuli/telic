@@ -396,6 +396,8 @@ class Renderer:
         if v.status == "unconfirmed":
             if ob.kind == "variant":
                 return "add or fix '@decreases' on this loop"
+            if v.replay is not None and "too weak to rule this out" in v.replay.summary:
+                return "add the missing fact to the callee's '@ensures'"
             return "strengthen the loop invariant(s) so the solver cannot pick an unreachable state"
         if v.status == "unknown":
             return "prove it in Lean: telic lean " + ob.id
@@ -532,6 +534,9 @@ class Renderer:
             lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
             if lean:
                 extras.append(f"{lean} by Lean")
+            if f.context_deps and f.status == "proved" and not f.open_deps:
+                deps = ", ".join(sorted(d.split("::")[-1] for d in f.context_deps))
+                extras.append(f"uses the contracts of {deps}")
             if f.open_deps and f.status == "proved":
                 deps = ", ".join(sorted(d.split("::")[-1] for d in f.open_deps))
                 extras.append(p.yellow(f"assumes unproved {deps}"))

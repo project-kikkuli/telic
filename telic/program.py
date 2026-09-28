@@ -48,6 +48,9 @@ class Program:
                 p.funcs[ref.key] = ref
         for m in modules:
             for cname, decl in m.classes.items():
+                if cname in p.classes and p.class_module[cname] is not m:
+                    m.problems.append((f"class {cname} is also defined in {p.class_module[cname].path}; telic needs class names to be unique across checked files", decl.loc))
+                    continue
                 p.classes[cname] = decl
                 p.class_module[cname] = m
         p._call_graph()
@@ -59,7 +62,18 @@ class Program:
         return p
 
     def resolve(self, module: ir.Module, name: str) -> FuncRef | None:
-        return self.funcs.get(f"{module.path}::{name}")
+        hit = self.funcs.get(f"{module.path}::{name}")
+        if hit is not None:
+            return hit
+        if name in module.imports:
+            path, remote = module.imports[name]
+            return self.funcs.get(f"{path}::{remote}")
+        if "." in name:
+            cls = name.split(".", 1)[0]
+            home = self.class_module.get(cls)
+            if home is not None and home is not module:
+                return self.funcs.get(f"{home.path}::{name}")
+        return None
 
     def ref(self, key: str) -> FuncRef:
         return self.funcs[key]

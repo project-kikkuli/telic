@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ast
 import io
+import os
 import tokenize
 from fractions import Fraction
+from pathlib import Path
 
 from .. import ir
 from ..contracts import (
@@ -90,20 +92,71 @@ class PythonFrontend:
         self.setters: set[str] = set()
         self.classmethods: set[str] = set()
         self.varargs: dict[str, tuple[str | None, str | None]] = {}
+        self.foreign_classes: dict[str, ir.ClassDecl] = {}
+        self.linked_classes: dict[str, "PythonFrontend"] = {}
+        self.linked_functions: dict[str, tuple["PythonFrontend", str]] = {}
+        self.module_aliases: dict[str, "PythonFrontend"] = {}
+        self.imports: list[tuple[str, int, str, str | None]] = []  # (module, level, name, asname)
+
+    def import_class_info(self, other: "PythonFrontend", cname: str) -> None:
+        """Make a class from another checked module usable here: its
+        constructor, methods and what calling them means."""
+        for key, sig in other.signatures.items():
+            if key.startswith(cname + "."):
+                self.signatures[key] = sig
+                for attr in ("defaults", "kwonly", "varargs", "wrapped"):
+                    src = getattr(other, attr)
+                    if key in src:
+                        getattr(self, attr)[key] = src[key]
+        prefix = cname + "."
+        for attr in ("properties", "setters", "classmethods"):
+            getattr(self, attr).update(k for k in getattr(other, attr) if k.startswith(prefix))
+        for attr in ("custom_eq", "custom_bool"):
+            if cname in getattr(other, attr):
+                getattr(self, attr)[cname] = getattr(other, attr)[cname]
+        if cname in other.dataclasses:
+            self.dataclasses.add(cname)
+        if cname in other.dataclass_defaults:
+            self.dataclass_defaults[cname] = other.dataclass_defaults[cname]
+
+    def import_function(self, other: "PythonFrontend", name: str) -> None:
+        self.signatures[name] = other.signatures[name]
+        for attr in ("defaults", "kwonly", "varargs", "wrapped"):
+            src = getattr(other, attr)
+            if name in src:
+                getattr(self, attr)[name] = src[name]
+        self.module.imports[name] = (other.path, name)
+
+    @property
+    def classes(self) -> dict[str, ir.ClassDecl]:
+        """Classes usable here: this module's and those imported from other
+        checked modules."""
+        if not self.foreign_classes:
+            return self.module.classes
+        return {**self.foreign_classes, **self.module.classes}
 
     # -- entry --------------------------------------------------------------
 
     def run(self) -> ir.Module:
+        for _ in self.stages():
+            pass
+        return self.module
+
+    def stages(self):
+        """Lowering in three steps, so a project can link imports between
+        them: yields "names" once classes, enums and records are known, and
+        "signatures" once fields and signatures are."""
         try:
             tree = ast.parse(self.source, filename=self.path)
         except SyntaxError as e:
             self.module.problems.append((f"syntax error: {e.msg}", ir.Loc(e.lineno or 0)))
-            return self.module
+            return
         try:
             self.contract_lines = parse_comment_lines(self._comments(), "#")
         except ContractSyntaxError as e:
             self.module.problems.append((str(e), ir.Loc(e.line, e.col)))
-            return self.module
+            return
+        self.tree = tree
 
         # Names bound at module level shadow builtins of the same name.
         assigned: dict[str, int] = {}
@@ -113,6 +166,9 @@ class PythonFrontend:
                     self.bound.add((a.asname or a.name).split(".")[0])
                     if isinstance(node, ast.Import):
                         self.modules.add((a.asname or a.name).split(".")[0])
+                        self.imports.append((a.name, 0, "", a.asname))
+                    else:
+                        self.imports.append((node.module or "", node.level, a.name, a.asname))
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
@@ -158,6 +214,7 @@ class PythonFrontend:
                 if node.name not in self.module.records:
                     self.class_names.add(node.name)
                     classes.append(node)
+        yield "names"
         for node in classes:
             try:
                 self._class_fields(node)
@@ -198,6 +255,7 @@ class PythonFrontend:
                     methods.append((sub, c.name, key))
                 except LowerError as e:
                     self.module.problems.append((f"{key}: {e}", ir.Loc(e.line or sub.lineno)))
+        yield "signatures"
         for c in classes:
             self._class_invariants(c)
         for node in tree.body:
@@ -246,7 +304,6 @@ class PythonFrontend:
                 self.module.problems.append(
                     (f"stray '@{cl.keyword}' is not attached to any function, loop, or statement", ir.Loc(cl.line, cl.col))
                 )
-        return self.module
 
     def _comments(self) -> list[tuple[int, int, str]]:
         out = []
@@ -1035,7 +1092,7 @@ class FunctionLowerer:
             if prop in self.fe.properties:
                 yield ir.Raise(loc, f"AttributeError: property '{target.attr}' of {obj.ty.name} has no setter", caught=self.try_depth > 0)
                 return
-            decl = self.fe.module.classes[obj.ty.name]
+            decl = self.fe.classes[obj.ty.name]
             ft = decl.field_type(target.attr)
             if ft is None:
                 raise LowerError(f"{obj.ty.name} has no field '{target.attr}' (declare it in the class or __init__)", s)
@@ -1619,7 +1676,7 @@ class ExprLowerer:
                 key = f"{obj.ty.name}.{n.attr}"
                 if key in self.fl.fe.properties:
                     return self.method_call(key, obj, [], [], n, loc)
-                ft = self.fl.fe.module.classes[obj.ty.name].field_type(n.attr)
+                ft = self.fl.fe.classes[obj.ty.name].field_type(n.attr)
                 if ft is None:
                     raise self.err(f"{obj.ty.name} has no field '{n.attr}'", n)
                 return ir.Field(ft, loc, obj, n.attr)
@@ -1827,7 +1884,7 @@ class ExprLowerer:
         if cls not in fe.dataclasses:
             return ir.Binary(ir.BOOL, loc, "eq", a, b)
         out: ir.Expr = ir.Lit(ir.BOOL, loc, True)
-        for fname, fty in fe.module.classes[cls].fields:
+        for fname, fty in fe.classes[cls].fields:
             if isinstance(fty, (ir.TClass, ir.TDict)):
                 raise self.err(f"== on {cls} compares field '{fname}' structurally, which is not modelled; compare fields explicitly", n)
             eq = ir.Binary(ir.BOOL, loc, "eq", ir.Field(fty, loc, a, fname), ir.Field(fty, loc, b, fname))
@@ -1839,6 +1896,18 @@ class ExprLowerer:
     def call(self, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
         f = n.func
         fe = self.fl.fe
+        # Functions of another checked module imported as a whole.
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.module_aliases and f.value.id not in self.fl.env:
+            other = fe.module_aliases[f.value.id]
+            key = f"{f.value.id}.{f.attr}"
+            if f.attr in other.signatures and "." not in f.attr:
+                if key not in fe.signatures:
+                    fe.signatures[key] = other.signatures[f.attr]
+                    for attr in ("defaults", "kwonly", "varargs", "wrapped"):
+                        if f.attr in getattr(other, attr):
+                            getattr(fe, attr)[key] = getattr(other, attr)[f.attr]
+                    fe.module.imports[key] = (other.path, f.attr)
+                return self.user_call(n, loc, key)
         # Module functions (math.sqrt, json.dumps, requests.get): unchecked.
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id not in self.fl.env and f.value.id not in self.bound and (f.value.id in fe.modules or (f.value.id in fe.bound and f.value.id not in fe.class_names) or f.value.id in PY_GLOBALS) and f.value.id != "math":
             return self.extern(f"{f.value.id}.{f.attr}", [], n, loc, expect)
@@ -2108,7 +2177,7 @@ class ExprLowerer:
             params, _ = fe.signatures[init]
             args = self.bind_args(init, params[1:], n.args, n.keywords, n)
         elif cls in fe.dataclass_defaults:
-            decl = fe.module.classes[cls]
+            decl = fe.classes[cls]
             params = [ir.Param(f, t) for f, t in decl.fields]
             fe.defaults.setdefault(f"{cls}()", fe.dataclass_defaults[cls])
             args = self.bind_args(f"{cls}()", params, n.args, n.keywords, n)
@@ -2119,7 +2188,7 @@ class ExprLowerer:
             if n.args or n.keywords:
                 raise self.err(f"{cls} has no __init__ taking arguments", n)
             args = []
-            if fe.module.classes[cls].fields:
+            if fe.classes[cls].fields:
                 raise self.err(f"{cls} has fields but no __init__ to set them; add one (or make it a @dataclass)", n)
         return ir.New(ir.TClass(cls), loc, cls, tuple(args))
 
@@ -2287,3 +2356,131 @@ class ExprLowerer:
 
 def lower_python(path: str, source: str) -> ir.Module:
     return PythonFrontend(path, source).run()
+
+
+# ---------------------------------------------------------------------------
+# Projects: imports between checked modules
+
+
+def _dotted(rel: str) -> str:
+    p = rel[:-3] if rel.endswith(".py") else rel
+    p = p.replace("\\", "/")
+    if p.endswith("/__init__"):
+        p = p[: -len("/__init__")]
+    return p.replace("/", ".")
+
+
+def project_imports(path: str, root: str) -> list[str]:
+    """Python files under ``root`` that ``path`` imports (best effort)."""
+    try:
+        tree = ast.parse(Path(path).read_text())
+    except (OSError, SyntaxError, ValueError):
+        return []
+    here = os.path.dirname(os.path.abspath(path))
+    out: list[str] = []
+
+    def cands(dotted: str, base: str) -> list[str]:
+        p = os.path.join(base, *dotted.split(".")) if dotted else base
+        return [p + ".py", os.path.join(p, "__init__.py")]
+
+    for node in ast.walk(tree):
+        names: list[tuple[str, int]] = []
+        if isinstance(node, ast.ImportFrom):
+            names.append((node.module or "", node.level))
+            names += [((node.module + "." if node.module else "") + a.name, node.level) for a in node.names]
+        elif isinstance(node, ast.Import):
+            names += [(a.name, 0) for a in node.names]
+        for dotted, level in names:
+            if level:
+                base = here
+                for _ in range(level - 1):
+                    base = os.path.dirname(base)
+                bases = [base]
+            else:
+                bases = [os.path.abspath(root), here]
+            for b in bases:
+                for c in cands(dotted, b):
+                    if os.path.isfile(c) and os.path.abspath(c).startswith(os.path.abspath(root)) and os.path.abspath(c) != os.path.abspath(path):
+                        out.append(c)
+    return sorted(set(out))
+
+
+def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
+    """Lower several modules so that ``from .models import Order`` or
+    ``import billing`` between them resolve to the checked definitions:
+    classes, enums, records, functions and module constants."""
+    fes = [PythonFrontend(rel, src) for rel, src in files]
+    by_dotted: dict[str, PythonFrontend] = {}
+    for fe in fes:
+        by_dotted[_dotted(fe.path)] = fe
+
+    def find(importer: PythonFrontend, module: str, level: int) -> PythonFrontend | None:
+        if level:
+            pkg = _dotted(importer.path).split(".")
+            if not importer.path.endswith("__init__.py"):
+                pkg = pkg[:-1]
+            base = pkg[: len(pkg) - (level - 1)] if level > 1 else pkg
+            name = ".".join(base + ([module] if module else []))
+            return by_dotted.get(name)
+        if module in by_dotted:
+            return by_dotted[module]
+        hits = [fe for d, fe in by_dotted.items() if d.endswith("." + module)]
+        return hits[0] if len(hits) == 1 else None
+
+    gens = [fe.stages() for fe in fes]
+
+    def advance(to: str) -> None:
+        for fe, g in zip(fes, gens):
+            if getattr(fe, "_stage", None) == "done":
+                continue
+            for got in g:
+                if got == to:
+                    fe._stage = to  # type: ignore[attr-defined]
+                    break
+            else:
+                fe._stage = "done"  # type: ignore[attr-defined]
+
+    advance("names")
+    for fe in fes:
+        for module, level, name, asname in fe.imports:
+            if not name:  # 'import pkg.mod [as m]'
+                other = find(fe, module, 0)
+                if other is not None and other is not fe:
+                    fe.module_aliases[asname or module] = other
+                continue
+            sub = find(fe, f"{module}.{name}" if module else name, level)
+            if sub is not None and sub is not fe:  # 'from . import models'
+                fe.module_aliases[asname or name] = sub
+                continue
+            other = find(fe, module, level)
+            if other is None or other is fe:
+                continue
+            local = asname or name
+            if name in other.enum_types:
+                fe.enum_types[local] = other.enum_types[name]
+                fe.enums[local] = other.enums[name]
+            elif name in other.module.records:
+                fe.module.records[local] = other.module.records[name]
+            elif name in other.class_names and local == name:
+                fe.class_names.add(name)
+                fe.linked_classes[name] = other
+            elif name in other.constants:
+                fe.constants[local] = other.constants[name]
+            elif name in other.ignored_classes:
+                fe.ignored_classes.add(local)
+            else:
+                fe.linked_functions[local] = (other, name)
+    advance("signatures")
+    for fe in fes:
+        for cname, other in fe.linked_classes.items():
+            decl = other.module.classes.get(cname)
+            if decl is None:
+                fe.class_names.discard(cname)
+                continue
+            fe.foreign_classes[cname] = decl
+            fe.import_class_info(other, cname)
+        for local, (other, name) in fe.linked_functions.items():
+            if name in other.signatures and local == name:
+                fe.import_function(other, name)
+    advance("done")
+    return [fe.module for fe in fes]
