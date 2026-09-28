@@ -86,6 +86,10 @@ class PythonFrontend:
         self.constants: dict[str, ast.expr] = {}  # module-level literals never rebound
         self.modules: set[str] = set()  # names bound by 'import'
         self.ignored_classes: set[str] = set()
+        self.wrapped: dict[str, str] = {}  # key -> an unknown decorator: calls go through a wrapper
+        self.setters: set[str] = set()
+        self.classmethods: set[str] = set()
+        self.varargs: dict[str, tuple[str | None, str | None]] = {}
 
     # -- entry --------------------------------------------------------------
 
@@ -122,6 +126,7 @@ class PythonFrontend:
                 del self.constants[name]
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
+                self.bound.add(node.name)
                 bases = {_decorator_name(b) for b in node.bases}
                 if bases & {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}:
                     members, values = [], []
@@ -130,7 +135,7 @@ class PythonFrontend:
                             members.append(st.targets[0].id)
                             values.append(st.value.value if isinstance(st.value, ast.Constant) else None)
                     mixed = bases & {"IntEnum", "StrEnum", "str", "int", "Flag", "IntFlag"}
-                    if members and not mixed and not any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) for st in node.body):
+                    if members and not mixed:
                         self.enums[node.name] = list(members)
                         self.enum_types[node.name] = ir.TEnum(node.name, tuple(members), tuple(values))
                     else:
@@ -167,19 +172,30 @@ class PythonFrontend:
                     self.signatures[node.name] = self._signature(node)
                 except LowerError as e:
                     self.module.problems.append((f"{node.name}: {e}", ir.Loc(e.line)))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures:
+                unknown = {_decorator_name(d) for d in node.decorator_list} - TRANSPARENT_DECORATORS
+                if unknown and not all(_route_decorator(d) for d in node.decorator_list if _decorator_name(d) in unknown):
+                    self.wrapped[node.name] = sorted(unknown)[0]
         for c in classes:
             for sub in c.body:
                 if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 decos = {_decorator_name(d) for d in sub.decorator_list}
                 key = f"{c.name}.{sub.name}"
+                if "setter" in decos:
+                    key += ".setter"
+                    self.setters.add(f"{c.name}.{sub.name}")
                 try:
-                    if decos - {"property", "staticmethod"}:
-                        raise LowerError(f"decorator @{sorted(decos - {'property', 'staticmethod'})[0]} is not modelled", sub)
-                    self.signatures[key] = self._signature(sub, c.name, static="staticmethod" in decos)
-                    if "property" in decos:
+                    self.signatures[key] = self._signature(sub, c.name, static="staticmethod" in decos, clsmethod="classmethod" in decos)
+                    if decos & {"property", "cached_property"}:
                         self.properties.add(key)
-                    methods.append((sub, c.name))
+                    if "classmethod" in decos:
+                        self.classmethods.add(key)
+                    unknown = decos - TRANSPARENT_DECORATORS
+                    if unknown:
+                        self.wrapped[key] = sorted(unknown)[0]
+                    methods.append((sub, c.name, key))
                 except LowerError as e:
                     self.module.problems.append((f"{key}: {e}", ir.Loc(e.line or sub.lineno)))
         for c in classes:
@@ -188,8 +204,8 @@ class PythonFrontend:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures:
                 fn = FunctionLowerer(self, node).lower()
                 self.module.functions[fn.name] = fn
-        for node, cname in methods:
-            fn = FunctionLowerer(self, node, cname).lower()
+        for node, cname, key in methods:
+            fn = FunctionLowerer(self, node, cname, key).lower()
             self.module.functions[fn.name] = fn
 
         # Module-level intent declarations (anything not consumed by a function).
@@ -216,7 +232,7 @@ class PythonFrontend:
                 for sub in node.body:
                     if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}.{sub.name}" not in self.signatures:
                         spans.append((min([sub.lineno] + [d.lineno for d in sub.decorator_list]) - 3, sub.end_lineno or sub.lineno, f"'{node.name}.{sub.name}' is not checked (see the problem reported for it or its class)"))
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node not in tree.body and not any(node is m for m, _ in methods):
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node not in tree.body and not any(node is m for m, _, _ in methods):
                 spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"nested functions are not checked yet ('{node.name}')"))
         reported: set[str] = set()
         for cl in self.contract_lines:
@@ -416,13 +432,14 @@ class PythonFrontend:
             return ir.TOpaque(ast.unparse(node))
         return ir.TOption(inner)
 
-    def _signature(self, node: ast.FunctionDef, cls: str | None = None, static: bool = False) -> tuple[list[ir.Param], ir.Type]:
+    def _signature(self, node: ast.FunctionDef, cls: str | None = None, static: bool = False, clsmethod: bool = False) -> tuple[list[ir.Param], ir.Type]:
         a = node.args
-        if a.vararg or a.kwarg or a.posonlyargs:
-            raise LowerError("*args, **kwargs and positional-only parameters are not supported", node)
         params = []
-        args = list(a.args) + list(a.kwonlyargs)
+        args = list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs)
         for i, arg in enumerate(args):
+            if i == 0 and clsmethod:
+                params.append(ir.Param(arg.arg, ir.TOpaque("cls")))
+                continue
             if i == 0 and cls is not None and not static:
                 if arg.annotation is not None and not (isinstance(arg.annotation, ast.Name) and arg.annotation.id in (cls, "Self")):
                     raise LowerError(f"'{arg.arg}' of a method of {cls} must be the instance", arg)
@@ -432,10 +449,19 @@ class PythonFrontend:
                 params.append(ir.Param(arg.arg, ir.TOpaque("unannotated")))
                 continue
             params.append(ir.Param(arg.arg, self.type_of_annotation(arg.annotation)))
-        # Default values, by parameter name: substituted at call sites.
+        # *args / **kwargs: unchecked collections of whatever is passed.
         key = f"{cls}.{node.name}" if cls else node.name
+        if any(_decorator_name(d) == "setter" for d in node.decorator_list):
+            key += ".setter"
+        if a.vararg is not None:
+            params.append(ir.Param(a.vararg.arg, ir.TOpaque("*args")))
+        if a.kwarg is not None:
+            params.append(ir.Param(a.kwarg.arg, ir.TOpaque("**kwargs")))
+        self.varargs[key] = (a.vararg.arg if a.vararg else None, a.kwarg.arg if a.kwarg else None)
+        # Default values, by parameter name: substituted at call sites.
         defaults: dict[str, ast.expr] = {}
-        for arg, d in zip(a.args[len(a.args) - len(a.defaults):], a.defaults):
+        pos = list(a.posonlyargs) + list(a.args)
+        for arg, d in zip(pos[len(pos) - len(a.defaults):], a.defaults):
             defaults[arg.arg] = d
         for arg, d in zip(a.kwonlyargs, a.kw_defaults):
             if d is not None:
@@ -460,11 +486,11 @@ class PythonFrontend:
 
 
 class FunctionLowerer:
-    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef, cls: str | None = None):
+    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef, cls: str | None = None, key: str | None = None):
         self.fe = fe
         self.node = node
         self.cls = cls
-        self.key = f"{cls}.{node.name}" if cls else node.name
+        self.key = key or (f"{cls}.{node.name}" if cls else node.name)
         self.env: dict[str, ir.Type] = {}
         self.fn: ir.Function
         self.tmp = 0
@@ -535,9 +561,32 @@ class FunctionLowerer:
         body = node.body
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
             body = body[1:]
+        self._scan_closures(node)
         self.fn.body = list(self.block(body, node))
         self.fn.locals = dict(self.env)
+        self.fn.escaped = {n for n in self.escaped if isinstance(self.env.get(n), (ir.TList, ir.TDict, ir.TClass, ir.TOpaque))}
         return self.fn
+
+    def _scan_closures(self, node: ast.AST) -> None:
+        """Nested functions and lambdas capture the enclosing locals. If one
+        escapes (is used other than by calling it), code telic cannot see may
+        run it later, so what it captures may change at any unchecked call."""
+        self.closures: dict[str, list[str]] = {}
+        self.escaped: set[str] = set()
+        called: set[int] = set()
+        for n in _own_nodes(node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                called.add(id(n.func))
+        nested = {n.name: n for n in _own_nodes(node) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for name, fnode in nested.items():
+            if any(isinstance(x, (ast.Nonlocal, ast.Global)) for x in ast.walk(fnode)):
+                self.fn.unsupported.append((f"nested function '{name}' rebinds outer variables (nonlocal/global); not modelled", ir.Loc(fnode.lineno)))
+            self.closures[name] = sorted({x.id for x in ast.walk(fnode) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)} & self.stored_names)
+        for n in _own_nodes(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.closures and id(n) not in called:
+                self.escaped.update(self.closures[n.id])
+            if isinstance(n, ast.Lambda) and any(isinstance(x, ast.Call) for x in ast.walk(n.body)):
+                self.escaped.update({x.id for x in ast.walk(n.body) if isinstance(x, ast.Name)} & self.stored_names)
 
     def _function_contract(self, cl: ContractLine) -> None:
         kw = cl.keyword
@@ -920,6 +969,12 @@ class FunctionLowerer:
             return
         if isinstance(s, (ast.Global, ast.Nonlocal)):
             raise LowerError("'global'/'nonlocal' state is not modelled", s)
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # A local function or class: an opaque value; calls to it are
+            # unchecked and may change what it captures.
+            self.declare(s.name, ir.TOpaque("closure"), s)
+            yield ir.Assign(loc, s.name, ir.Builtin(ir.TOpaque("closure"), loc, "opaque_op", (ir.Lit(ir.STR, loc, "closure"), ir.Lit(ir.STR, loc, s.name))))
+            return
         raise LowerError(f"unsupported statement: {type(s).__name__}", s)
 
     def _effects_of(self, args: list[ast.expr], loc: ir.Loc):
@@ -969,6 +1024,17 @@ class FunctionLowerer:
                 raise LowerError(f"{obj.ty.name} is frozen; build a new one with dataclasses.replace or the constructor", s)
             if not isinstance(obj.ty, ir.TClass):
                 raise LowerError(f"cannot assign an attribute of {obj.ty}", s)
+            prop = f"{obj.ty.name}.{target.attr}"
+            if prop in self.fe.setters:
+                sk = prop + ".setter"
+                params, _ = self.fe.signatures[sk]
+                val = self.coerce(self.expr(value, params[1].ty), params[1].ty) if len(params) > 1 else self.expr(value)
+                call = ir.Extern(ir.NONE, loc, f"@{self.fe.wrapped[sk]} {sk}", (obj, val)) if sk in self.fe.wrapped else ir.Call(ir.NONE, loc, sk, (obj, val))
+                yield ir.ExprStmt(loc, call)
+                return
+            if prop in self.fe.properties:
+                yield ir.Raise(loc, f"AttributeError: property '{target.attr}' of {obj.ty.name} has no setter", caught=self.try_depth > 0)
+                return
             decl = self.fe.module.classes[obj.ty.name]
             ft = decl.field_type(target.attr)
             if ft is None:
@@ -1023,6 +1089,25 @@ class FunctionLowerer:
             if val.ty != t.elem:
                 raise LowerError(f"cannot store {val.ty} into {t}", s)
             yield ir.IndexAssign(loc, name, idx, val, wrap=True)
+            return
+        if isinstance(target, ast.Tuple) and not isinstance(value, ast.Tuple) and isinstance(self.expr(value).ty, ir.TList):
+            v = self.expr(value)
+            assert isinstance(v.ty, ir.TList)
+            k = len(target.elts)
+            if isinstance(v, ir.Var):
+                src = v
+            else:
+                t = self.fresh("unpack")
+                self.env[t] = v.ty
+                yield ir.Assign(loc, t, v)
+                src = ir.Var(v.ty, loc, t)
+            ln = ir.Binary(ir.BOOL, loc, "eq", ir.Builtin(ir.INT, loc, "len", (src,)), ir.Lit(ir.INT, loc, k))
+            yield ir.AssertStmt(loc, ir.Clause("assert", ln, loc, f"unpacking needs exactly {k} elements"), native=True)
+            for i, tgt in enumerate(target.elts):
+                if not isinstance(tgt, ast.Name):
+                    raise LowerError("unpacking targets must be names", s)
+                self.declare(tgt.id, v.ty.elem, s)
+                yield ir.Assign(loc, tgt.id, self.coerce(ir.Index(v.ty.elem, loc, src, ir.Lit(ir.INT, loc, i), wrap=False), self.env[tgt.id]))
             return
         if isinstance(target, ast.Tuple) and not isinstance(value, ast.Tuple):
             v = self.expr(value)
@@ -1184,6 +1269,8 @@ class _ClassScope(FunctionLowerer):
         self.local_contracts = []
         self.stored_names = set()
         self.try_depth = 0
+        self.closures = {}
+        self.escaped = set()
 
 
 def fresh_list(e: ir.Expr) -> bool:
@@ -1211,7 +1298,7 @@ def _own_fields_only(e: ir.Expr, cls: str, line: int) -> None:
             raise LowerError("a class invariant may not call methods (they could read other objects); write the condition on self's fields", line=line)
 
 
-PY_GLOBALS = {"datetime", "time", "uuid", "os", "json", "re", "random", "logging", "Decimal", "sorted", "reversed", "zip", "map", "filter", "open", "input", "id", "hash", "repr", "type", "set", "tuple", "list", "frozenset", "getattr", "setattr", "hasattr", "iter", "next", "divmod", "pow", "chr", "ord", "hex", "bin", "format", "vars", "dir", "callable", "super"}
+PY_GLOBALS = set(dir(__import__("builtins"))) | {"__name__", "__file__", "__spec__", "__package__", "__doc__"} | {"datetime", "time", "uuid", "os", "json", "re", "random", "logging", "Decimal", "sorted", "reversed", "zip", "map", "filter", "open", "input", "id", "hash", "repr", "type", "set", "tuple", "list", "frozenset", "getattr", "setattr", "hasattr", "iter", "next", "divmod", "pow", "chr", "ord", "hex", "bin", "format", "vars", "dir", "callable", "super"}
 
 
 def _has_opaque(t: ir.Type) -> bool:
@@ -1265,6 +1352,17 @@ def _simple_default(d: ast.expr) -> bool:
     if isinstance(d, ast.UnaryOp) and isinstance(d.op, (ast.USub, ast.UAdd)) and isinstance(d.operand, ast.Constant):
         return True
     return False
+
+
+TRANSPARENT_DECORATORS = {"property", "staticmethod", "classmethod", "setter", "cached_property", "abstractmethod", "override", "final", "lru_cache", "cache", "wraps", "total_ordering", "overload", "no_type_check"}
+ROUTE_VERBS = {"get", "post", "put", "patch", "delete", "route", "websocket", "head", "options", "api_route", "on_event", "command", "task", "shared_task", "fixture", "listens_for", "register"}
+
+
+def _route_decorator(d: ast.expr) -> bool:
+    """``@app.get(...)``, ``@router.post(...)``, ``@celery.task``: registration
+    decorators that return the function itself."""
+    f = d.func if isinstance(d, ast.Call) else d
+    return isinstance(f, ast.Attribute) and f.attr in ROUTE_VERBS
 
 
 def _decorator_name(d: ast.expr) -> str:
@@ -1447,7 +1545,9 @@ class ExprLowerer:
             b = self.expr(n.orelse, expect)
             if a.ty != b.ty:
                 opt = _join_optional(a.ty, b.ty)
-                if opt is not None:
+                if isinstance(a.ty, ir.TOpaque) or isinstance(b.ty, ir.TOpaque):
+                    a, b = self.fl.coerce(a, ir.TOpaque("")), self.fl.coerce(b, ir.TOpaque(""))
+                elif opt is not None:
                     a, b = self.fl.coerce(a, opt), self.fl.coerce(b, opt)
                 elif ir.is_numeric(a.ty) and ir.is_numeric(b.ty):
                     a, b, _ = self.numeric_pair(a, b, n)
@@ -1589,7 +1689,7 @@ class ExprLowerer:
                 for _ in range(k - 1):
                     out = ir.Binary(a.ty, loc, "mul", out, a)
                 return out
-            raise self.err("'**' is supported only with a literal exponent 0..4", n)
+            return self.opaque("pow", [a, b], ir.TOpaque("") if not (isinstance(a.ty, ir.TReal) or isinstance(b.ty, ir.TReal)) else ir.REAL, loc)
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TList):
             raise self.err("list concatenation is not supported", n)
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TStr):
@@ -1626,6 +1726,10 @@ class ExprLowerer:
                     raise self.err(f"'in' on a string needs a string on the left, got {left.ty}", n)
                 c = ir.Builtin(ir.BOOL, loc, "str_contains", (right, left))
                 parts.append(ir.Unary(ir.BOOL, loc, "not", c) if isinstance(op, ast.NotIn) else c)
+                left = right
+                continue
+            if isinstance(left.ty, ir.TEnum) and isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                parts.append(self.opaque(f"cmp.{type(op).__name__.lower()}", [left, right], ir.BOOL, loc))
                 left = right
                 continue
             if left.ty == right.ty == ir.STR and isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
@@ -1747,8 +1851,10 @@ class ExprLowerer:
             return self.method_call(key, None, n.args, n.keywords, n, loc)
         if isinstance(f, ast.Attribute) and not (isinstance(f.value, ast.Name) and f.value.id == "math"):
             obj = self.expr(f.value)
-            if isinstance(obj.ty, ir.TOption) and isinstance(obj.ty.inner, (ir.TClass, ir.TDict)):
+            if isinstance(obj.ty, ir.TOption):
                 obj = self.need(obj)
+            if isinstance(obj.ty, ir.TEnum):
+                return self.extern(f"{obj.ty.name}.{f.attr}", [obj], n, loc, expect)
             if isinstance(obj.ty, ir.TClass):
                 key = f"{obj.ty.name}.{f.attr}"
                 if key not in fe.signatures or key in fe.properties:
@@ -1782,8 +1888,10 @@ class ExprLowerer:
                 if f.attr == "copy" and not n.args:
                     return ir.Builtin(obj.ty, loc, "dict_copy", (obj,))
                 raise self.err(f"dict method '.{f.attr}(...)' is not supported yet", n)
-        if n.keywords and not (isinstance(n.func, ast.Name) and (n.func.id in fe.module.records or n.func.id in fe.signatures or n.func.id in fe.class_names)):
-            raise self.err("keyword arguments are only supported for checked functions and constructors", n)
+        if n.keywords and isinstance(n.func, ast.Name) and n.func.id in ("min", "max", "sum", "sorted", "round") and n.func.id not in fe.bound:
+            return self.extern(n.func.id, [], n, loc, expect)
+        if n.keywords and isinstance(n.func, ast.Name) and n.func.id in BUILTINS and n.func.id not in fe.bound and n.func.id not in ("print",):
+            raise self.err(f"keyword arguments to {n.func.id}() are not modelled", n)
         if isinstance(f, ast.Attribute):
             if isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr in ("floor", "ceil", "trunc"):
                 (x,) = self._args(n, 1)
@@ -1800,7 +1908,9 @@ class ExprLowerer:
                 return ir.Builtin(ir.INT, loc, "count", (seq, self.fl.coerce(v, seq.ty.elem)))
             raise self.err(f"unsupported method call '.{f.attr}(...)'", n)
         if not isinstance(f, ast.Name):
-            raise self.err("unsupported call", n)
+            if self.spec:
+                raise self.err("unsupported call", n)
+            return self.extern(_desc(f), [self.fl.coerce(self.expr(f), ir.TOpaque(""))], n, loc, expect)
         name = f.id
         if name in fe.class_names and name not in self.fl.env:
             return self.new(name, n, loc)
@@ -1831,6 +1941,8 @@ class ExprLowerer:
             if not isinstance(x.ty, ir.TList):
                 raise self.err("len() is supported on lists", n)
             return ir.Builtin(ir.INT, loc, "len", (x,))
+        if name in ("abs", "round", "min", "max", "sum") and any(isinstance(self.expr(a).ty, ir.TOpaque) for a in n.args if not isinstance(a, (ast.GeneratorExp, ast.ListComp))):
+            return self.opaque(name, [self.expr(a) for a in n.args], ir.TOpaque(""), loc)
         if name == "abs":
             (x,) = self._args(n, 1)
             if not ir.is_numeric(x.ty):
@@ -1863,7 +1975,7 @@ class ExprLowerer:
             return self.extern("int", [x], None, loc, ir.INT)  # int(s): parsing, may raise
         if name == "round":
             if len(n.args) != 1:
-                raise self.err("round() with ndigits is not supported", n)
+                return self.extern("round", [], n, loc, ir.REAL)
             (x,) = self._args(n, 1)
             if isinstance(x.ty, ir.TInt):
                 return x
@@ -1904,8 +2016,11 @@ class ExprLowerer:
         if name == "isinstance" and name not in fe.bound:
             x = self.expr(n.args[0])
             return self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(n.args[1]))], ir.BOOL, loc)
-        if name in fe.signatures:
+        if name in fe.signatures and name not in self.fl.env:
             return self.user_call(n, loc, name)
+        if name in self.fl.closures and not self.spec:
+            captured = [ir.Var(self.fl.env[c], loc, c) for c in self.fl.closures[name] if isinstance(self.fl.env.get(c), (ir.TList, ir.TDict, ir.TClass, ir.TOpaque))]
+            return self.extern(f"local {name}", captured, n, loc, expect)
         if not self.spec:
             return self.extern(name, [], n, loc, expect)
         return self.user_call(n, loc, name)
@@ -1916,6 +2031,8 @@ class ExprLowerer:
             raise self.err(f"call to '{name}', which telic cannot see (define it in a checked file with a contract)", n)
         params, ret = sig
         args = self.bind_args(name, params, n.args, n.keywords, n)
+        if name in self.fl.fe.wrapped:
+            return ir.Extern(ret, loc, f"@{self.fl.fe.wrapped[name]} {name}", tuple(args))
         return ir.Call(ret, loc, name, tuple(args))
 
     def bind_args(self, key: str, params: list[ir.Param], pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST) -> list[ir.Expr]:
@@ -1924,23 +2041,38 @@ class ExprLowerer:
         fe = self.fl.fe
         defaults = fe.defaults.get(key, {})
         kwonly = fe.kwonly.get(key, set())
+        star, dstar = fe.varargs.get(key, (None, None))
         chosen: dict[str, ast.expr] = {}
-        positional = [p for p in params if p.name not in kwonly]
+        positional = [p for p in params if p.name not in kwonly and p.name not in (star, dstar)]
         if any(isinstance(a, ast.Starred) for a in pos) or any(k.arg is None for k in kws):
             raise self.err("*args / **kwargs at call sites are not supported", n)
-        if len(pos) > len(positional):
+        extra_pos = pos[len(positional):]
+        if extra_pos and star is None:
             raise self.err(f"'{key}' takes {len(positional)} positional arguments, got {len(pos)}", n)
         for p, a in zip(positional, pos):
             chosen[p.name] = a
-        names = {p.name for p in params}
+        names = {p.name for p in params} - {star, dstar}
+        extra_kw: list[ast.keyword] = []
         for k in kws:
             if k.arg not in names:
-                raise self.err(f"'{key}' has no parameter '{k.arg}'", n)
+                if dstar is None:
+                    raise self.err(f"'{key}' has no parameter '{k.arg}'", n)
+                extra_kw.append(k)
+                continue
             if k.arg in chosen:
                 raise self.err(f"'{key}' got two values for '{k.arg}'", n)
             chosen[k.arg] = k.value  # type: ignore[index]
+        loc = self.loc(n)
+        packed: dict[str, ir.Expr] = {}
+        if star is not None:
+            packed[star] = self.opaque("tuple", [self.expr(a) for a in extra_pos], ir.TOpaque("*args"), loc)
+        if dstar is not None:
+            packed[dstar] = self.opaque("dict", [self.expr(k.value) for k in extra_kw], ir.TOpaque("**kwargs"), loc)
         out = []
         for p in params:
+            if p.name in packed:
+                out.append(packed[p.name])
+                continue
             a = chosen.get(p.name, defaults.get(p.name))
             if a is None and p.name in defaults:
                 out.append(ir.Extern(p.ty, self.loc(n), f"default of '{p.name}'", ()))  # computed default
@@ -1954,11 +2086,18 @@ class ExprLowerer:
         return out
 
     def method_call(self, key: str, obj: ir.Expr | None, pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST, loc: ir.Loc) -> ir.Expr:
-        params, ret = self.fl.fe.signatures[key]
-        if obj is None:
-            return ir.Call(ret, loc, key, tuple(self.bind_args(key, params, pos, kws, n)))
-        rest = self.bind_args(key, params[1:], pos, kws, n)
-        return ir.Call(ret, loc, key, (obj, *rest))
+        fe = self.fl.fe
+        params, ret = fe.signatures[key]
+        if key in fe.classmethods:
+            cls_v = self.opaque("class", [ir.Lit(ir.STR, loc, key.split(".")[0])], ir.TOpaque("cls"), loc)
+            args = [cls_v] + self.bind_args(key, params[1:], pos, kws, n)
+        elif obj is None:
+            args = self.bind_args(key, params, pos, kws, n)
+        else:
+            args = [obj] + self.bind_args(key, params[1:], pos, kws, n)
+        if key in fe.wrapped:
+            return ir.Extern(ret, loc, f"@{fe.wrapped[key]} {key}", tuple(args))
+        return ir.Call(ret, loc, key, tuple(args))
 
     def new(self, cls: str, n: ast.Call, loc: ir.Loc) -> ir.Expr:
         fe = self.fl.fe

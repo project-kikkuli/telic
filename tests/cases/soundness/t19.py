@@ -81,3 +81,48 @@ async def racy(b: Box) -> int:
     #@ ensures result == 1
     await lib.sleep(0)
     return b.v
+
+
+def closure_mutates(xs: list[int]) -> int:
+    #@ requires len(xs) == 1 and xs[0] == 0
+    #@ ensures result == 0
+    def bump() -> None:
+        xs[0] = 5
+    bump()
+    return xs[0]
+
+
+def closure_escapes(xs: list[int], sink: Any) -> int:
+    #@ requires len(xs) == 1 and xs[0] == 0
+    #@ ensures result == 0
+    def bump() -> None:
+        xs[0] = 5
+    sink.register(bump)
+    lib.run_callbacks()
+    return xs[0]
+
+
+def lambda_escapes(xs: list[int]) -> int:
+    #@ requires len(xs) == 1 and xs[0] == 0
+    #@ ensures result == 0
+    lib.later(lambda: xs.append(1))
+    lib.tick()
+    return len(xs) - 1
+
+
+def wrapped_contract(x: int) -> int:
+    #@ ensures result == 1
+    return decorated(x)
+
+
+import functools
+
+
+def weird(f: Any) -> Any:
+    return f
+
+
+@weird
+def decorated(x: int) -> int:
+    #@ ensures result == 1
+    return 1

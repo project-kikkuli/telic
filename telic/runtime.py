@@ -349,7 +349,7 @@ def instrument_source(source: str, module: ir.Module, filename: str = "<telic>")
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             targets.append((node, node.name))
         elif isinstance(node, ast.ClassDef):
-            targets.extend((sub, f"{node.name}.{sub.name}") for sub in node.body if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            targets.extend((sub, f"{node.name}.{sub.name}" + (".setter" if any(isinstance(d, ast.Attribute) and d.attr == "setter" for d in sub.decorator_list) else "")) for sub in node.body if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)))
     for node, key in targets:
         if key in module.functions:
             fn = module.functions[key]

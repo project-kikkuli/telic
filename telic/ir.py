@@ -509,6 +509,8 @@ class Function:
     exported: bool = True
     source: str = ""  # exact source text of the function
     locals: dict[str, "Type"] = field(default_factory=dict)  # every variable's type
+    # locals captured by closures that escape: any unchecked call may change them
+    escaped: set[str] = field(default_factory=set)
 
     @property
     def has_contract(self) -> bool:

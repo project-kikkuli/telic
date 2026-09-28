@@ -1548,14 +1548,15 @@ class VCGen:
             env = ctx.state.env
             # It may change any list/dict variable passed to it, and, if it
             # is handed anything that can reach objects, any object.
-            for a_e in e.args:
+            touched = list(e.args) + [ir.Var(self.fn.locals[n], e.loc, n) for n in sorted(self.fn.escaped) if n in self.fn.locals]
+            for a_e in touched:
                 if isinstance(a_e, ir.Var) and isinstance(env.get(a_e.name), (ListVal, DictVal)):
                     ty = self.fn.locals.get(a_e.name) or a_e.ty
                     nv = self.fresh(a_e.name, ty)
                     if isinstance(nv, ListVal):
                         ctx.assume(L.le(L.ZERO, nv.len))
                     env[a_e.name] = nv
-            if self.program.extern_touches_heap(e):
+            if self.program.extern_touches_heap(e) or (self.program.classes and self.fn.escaped):
                 self.havoc_heap(ctx)
         r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
         if isinstance(r, ListVal):
