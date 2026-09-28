@@ -138,6 +138,13 @@ class Program:
                     muts.add(s.name)
                     if isinstance(s, ir.Append):
                         apps.add(s.name)
+                for e in ir.stmt_exprs(s):
+                    for sub in ir.walk_expr(e):
+                        if isinstance(sub, ir.Extern):
+                            for a in sub.args:
+                                if isinstance(a, ir.Var) and a.name in params:
+                                    muts.add(a.name)
+                                    apps.add(a.name)
             self.mutated[key] = muts
             self.appends[key] = apps
         # Propagate through calls that pass a list parameter to a mutating callee.
@@ -192,6 +199,11 @@ class Program:
                         tgt = self.resolve(ref.module, sub.func)
                         if tgt is not None:
                             cs.append((tgt.key, sub.args, False))
+                    elif isinstance(sub, ir.Extern) and self.extern_touches_heap(sub):
+                        self.allocates.add(key)
+                        for cname, decl in self.classes.items():
+                            for fname, _ in decl.fields:
+                                w.setdefault(f"{cname}.{fname}", set()).add("*")
                     elif isinstance(sub, ir.New):
                         self.allocates.add(key)
                         init = self.resolve(self.class_module.get(sub.cls, ref.module), f"{sub.cls}.__init__")
@@ -237,6 +249,26 @@ class Program:
                                 mine[f].add(mapped)
                                 changed = True
 
+    def extern_touches_heap(self, e: ir.Extern) -> bool:
+        """Can this unchecked call reach checked objects? Only through what
+        it is handed: objects, containers, or opaque values (which may hold
+        objects handed out earlier)."""
+        if not self.classes:
+            return False
+
+        def reach(t: ir.Type) -> bool:
+            if isinstance(t, (ir.TClass, ir.TOpaque)):
+                return True
+            if isinstance(t, ir.TList):
+                return reach(t.elem)
+            if isinstance(t, ir.TDict):
+                return reach(t.val)
+            if isinstance(t, ir.TOption):
+                return reach(t.inner)
+            return False
+
+        return any(reach(a.ty) for a in e.args)
+
     def def_heap_keys(self, key: str) -> list[str]:
         """Heap components a definitional function's body reads, in a fixed
         order; they become extra parameters of its logical definition."""
@@ -263,6 +295,8 @@ class Program:
             if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, (ir.TList, ir.TOption, ir.TDict)):
                 continue
             if key in self.allocates or fn.name.endswith(".__init__"):
+                continue
+            if any(isinstance(sub, ir.Extern) for st in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st) for sub in ir.walk_expr(e)):
                 continue
             ok = True
             for s in ir.walk_stmts(fn.body):

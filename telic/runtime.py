@@ -65,6 +65,16 @@ def show(v: Any, depth: int = 0) -> str:
     return repr(v)
 
 
+def settle(r: Any) -> Any:
+    """Run a coroutine to completion (replaying an async function)."""
+    import asyncio
+    import inspect
+
+    if inspect.iscoroutine(r):
+        return asyncio.run(r)
+    return r
+
+
 def check_written(objs: list, invs: dict, func: str) -> None:
     seen: set[int] = set()
     for o in objs:
@@ -336,10 +346,10 @@ def instrument_source(source: str, module: ir.Module, filename: str = "<telic>")
     tree = ast.parse(source, filename=filename)
     targets: list[tuple[ast.FunctionDef, str]] = []
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             targets.append((node, node.name))
         elif isinstance(node, ast.ClassDef):
-            targets.extend((sub, f"{node.name}.{sub.name}") for sub in node.body if isinstance(sub, ast.FunctionDef))
+            targets.extend((sub, f"{node.name}.{sub.name}") for sub in node.body if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)))
     for node, key in targets:
         if key in module.functions:
             fn = module.functions[key]

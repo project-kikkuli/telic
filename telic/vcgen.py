@@ -79,6 +79,15 @@ class ObjVal:
     fields: tuple[tuple[str, "Val"], ...] | None  # None: beyond the shown depth
 
 
+@dataclass(frozen=True)
+class TypedView:
+    """A counterexample input whose type decoding needs (enums, lists of
+    objects); only used for decoding models."""
+
+    val: "Val"
+    ty: ir.Type
+
+
 Val = Union[L.Term, ListVal, OptVal, DictVal]
 NONE_V = L.Const("None", L.Sort("None"))
 
@@ -128,6 +137,10 @@ def sort_of(ty: ir.Type) -> L.Sort:
         return L.ARRAY(sort_of(ty.elem))
     if isinstance(ty, ir.TClass):
         return L.INT  # an object reference
+    if isinstance(ty, ir.TOpaque):
+        return L.OPAQUE
+    if isinstance(ty, ir.TEnum):
+        return L.INT  # member index
     raise VCError(f"no single logical sort for {ty}")
 
 
@@ -162,6 +175,8 @@ def default_term(s: L.Sort) -> L.Term:
         return L.const_array(s, default_term(s.elem))
     if s.name == "Rec":
         return L.mkrec(s, tuple(default_term(fs) for _, fs in s.fields))
+    if s == L.OPAQUE:
+        return L.Const("opaque!default", L.OPAQUE)
     raise VCError(f"no default value for {s}")
 
 
@@ -482,8 +497,10 @@ class VCGen:
             decl = self.program.classes[ty.name]
             fs = tuple((f, self.input_view(self.heap_read(env, ty.name, f, v), fty, env, depth - 1)) for f, fty in decl.fields)  # type: ignore[arg-type]
             return ObjVal(v, ty.name, fs)  # type: ignore[arg-type]
-        if isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TClass) and isinstance(v, OptVal):
+        if isinstance(ty, ir.TOption) and isinstance(ty.inner, (ir.TClass, ir.TEnum)) and isinstance(v, OptVal):
             return OptVal(v.some, self.input_view(v.val, ty.inner, env, depth), ty)  # type: ignore[arg-type]
+        if isinstance(ty, ir.TEnum) or (isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum))):
+            return TypedView(v, ty)
         return v
 
     @property
@@ -492,6 +509,10 @@ class VCGen:
 
     def alloc_facts(self, v: Val, ty: ir.Type, env: dict[str, Val]) -> list[L.Term]:
         """Objects handed to a function already exist."""
+        if isinstance(ty, ir.TEnum) and isinstance(v, L.Term):
+            return [L.le(L.ZERO, v), L.lt(v, L.IntV(len(ty.members)))]
+        if isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TEnum) and isinstance(v, OptVal):
+            return [L.implies(v.some, L.and_(L.le(L.ZERO, v.val), L.lt(v.val, L.IntV(len(ty.inner.members)))))]
         alloc = env["@alloc"]
         if isinstance(ty, ir.TClass) and not (self.is_init and v == self.entry.get("self", None)):
             return [L.select(alloc, v)]  # type: ignore[arg-type]
@@ -649,6 +670,31 @@ class VCGen:
             st.facts.append(g)
             self.assumptions.append((s.clause.loc, s.clause.text))
             return st
+        if isinstance(s, ir.Try):
+            entry = st.copy()
+            # Which way control goes is a free choice: merge needs each
+            # branch to carry its own path condition.
+            choice = L.Const(f"raised@{next(self.counter)}", L.INT)
+            k = len(s.handlers)
+            st.facts.append(L.eq(choice, L.ZERO))
+            normal = self.block(s.body, st)
+            if normal.alive:
+                normal = self.block(s.orelse, normal)
+            outs = [normal]
+            if s.handlers:
+                names, appends = self.modified(list(s.body))
+                for i, h in enumerate(s.handlers):
+                    hst = self.havoc(entry, names, appends)
+                    hst.facts.append(L.eq(choice, L.IntV(i + 1)))
+                    outs.append(self.block(h, hst))
+            del k
+            out = self.merge(outs)
+            if out.alive and s.finalbody:
+                out = self.block(s.finalbody, out)
+            return out
+        if isinstance(s, ir.Raise) and s.caught:
+            st.alive = False  # control goes to a handler (modelled from a havocked state)
+            return st
         if isinstance(s, ir.Raise):
             self.raise_paths.append(list(st.facts))
             ctx = self.ctx(st)
@@ -727,6 +773,14 @@ class VCGen:
                             for cls_field in self.program.heap_writes.get(post.key if post else "", {}):
                                 c, f = cls_field.split(".", 1)
                                 names.update(k for k, _ in self.heap_keys(c, f))
+                    if isinstance(sub, ir.Extern):
+                        for a in sub.args:
+                            if isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
+                                names.add(a.name)
+                                appends.add(a.name)
+                        if self.program.extern_touches_heap(sub):
+                            names.add("@alloc")
+                            names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Call):
                         tgt = self.program.resolve(self.module, sub.func)
                         if tgt is None:
@@ -1158,6 +1212,8 @@ class VCGen:
 
     def ev_Builtin(self, e: ir.Builtin, ctx: Ctx) -> Val:
         name = e.name
+        if name == "comp":
+            return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
         if name == "dict_lit":
             assert isinstance(e.ty, ir.TDict)
             ks = sort_of(e.ty.key)
@@ -1189,6 +1245,75 @@ class VCGen:
                 return o
             self.oblige("none", ctx, o.some, e.loc, f"'{_expr_name(e.args[0])}' is not None here")
             return o.val
+        if name == "from_opaque":
+            # A value from unchecked code, used at a checked type.
+            (x,) = args
+            ty = e.ty
+            tag = str(ty).replace(" ", "")
+            comps = [L.Fn(f"unbox.{tag}.{suffix}", tuple(flatten(x)), srt) for suffix, srt in components(ty)]
+            v = pack(ty, comps)
+            if isinstance(v, ListVal):
+                ctx.assume(L.le(L.ZERO, v.len))
+            if ctx.state is not None:
+                for fact in self.alloc_facts(v, ty, ctx.state.env):
+                    ctx.assume(fact)
+                if isinstance(ty, ir.TClass):
+                    for _, t in self.class_invariants(ty.name, v, ctx.state.env, ctx.base):  # type: ignore[arg-type]
+                        ctx.assume(t)
+            self.note(e.loc, "values from unchecked code have the types they are used at")
+            return v
+        if name == "to_opaque":
+            (x,) = args
+            tag = str(e.args[0].ty).replace(" ", "")
+            return L.Fn(f"box.{tag}", tuple(flatten(x)), L.OPAQUE)
+        if name == "opaque_op":
+            # An operation involving an opaque value: some deterministic,
+            # otherwise unknown result.
+            op = e.args[0]
+            assert isinstance(op, ir.Lit)
+            flat: list[L.Term] = []
+            for a in args[1:]:
+                flat.extend(flatten(a))
+            srt = sort_of(e.ty)
+            r = L.Fn(f"opaque.{op.value}.{srt.name}", tuple(flat), srt)
+            if not ctx.spec and not ctx.quiet:
+                self.note(e.loc, "operations on values from unchecked code do not raise")
+            if isinstance(e.ty, ir.TInt) and op.value == "len":
+                ctx.assume(L.le(L.ZERO, r))
+            return r
+        if name.startswith("str_"):
+            return self.string_op(name, args, e, ctx)
+        if name == "await":
+            if ctx.state is not None and not ctx.spec:
+                self.await_havoc(ctx, e.loc)
+            return args[0]
+        if name == "enum_name" or name == "enum_value":
+            (x,) = args
+            et = e.args[0].ty
+            assert isinstance(et, ir.TEnum)
+            items = et.members if name == "enum_name" else et.values
+            out: L.Term = L.StrV(items[-1]) if isinstance(items[-1], str) else L.IntV(items[-1])  # type: ignore[arg-type]
+            for i in range(len(items) - 2, -1, -1):
+                lit = L.StrV(items[i]) if isinstance(items[i], str) else L.IntV(items[i])  # type: ignore[arg-type]
+                out = L.ite(L.eq(x, L.IntV(i)), lit, out)  # type: ignore[arg-type]
+            return out
+        if name in ("dict_keys", "dict_values"):
+            (d,) = args
+            assert isinstance(d, DictVal)
+            n = next(self.counter)
+            keys = L.Const(f"keys@{n}", L.ARRAY(sort_of(d.ty.key)))
+            ln = L.Const(f"keys@{n}.len", L.INT)
+            i = L.Const(f"i!{n}", L.INT)
+            rng = L.and_(L.le(L.ZERO, i), L.lt(i, ln))
+            ctx.assume(L.le(L.ZERO, ln))
+            ctx.assume(L.Quant("forall", (i,), L.implies(rng, L.select(d.has, L.select(keys, i))), patterns=((L.select(keys, i),),)))
+            if name == "dict_keys":
+                return ListVal(keys, L.ZERO, ln, ir.TList(d.ty.key))
+            vals = L.Const(f"values@{n}", L.ARRAY(sort_of(d.ty.val)))
+            j = L.Const(f"j!{n}", L.INT)
+            ctx.assume(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, ln)), L.eq(L.select(vals, j), L.select(d.vals, L.select(keys, j)))), patterns=((L.select(vals, j),),)))
+            return ListVal(vals, L.ZERO, ln, ir.TList(d.ty.val))
+
         if name == "dict_copy":
             return args[0]  # dicts are values in the model; aliasing is excluded
         if name == "list_append":
@@ -1281,6 +1406,180 @@ class VCGen:
         if name == "is_int":
             return L.is_int(x)
         raise VCError(f"unknown builtin {name}", e.loc)
+
+    def string_op(self, name: str, args: list, e: ir.Builtin, ctx: Ctx) -> Val:
+        if name == "str_concat":
+            return L.App("str.++", tuple(args), L.STR)
+        if name == "str_len":
+            return L.App("str.len", (args[0],), L.INT)
+        if name == "str_contains":  # sub in s
+            return L.App("str.contains", (args[0], args[1]), L.BOOL)
+        if name == "str_startswith":
+            return L.App("str.prefixof", (args[1], args[0]), L.BOOL)
+        if name == "str_endswith":
+            return L.App("str.suffixof", (args[1], args[0]), L.BOOL)
+        if name == "str_of_int":
+            return L.App("str.from_int", (args[0],), L.STR)
+        if name == "str_lt":
+            return L.App("str.lt", (args[0], args[1]), L.BOOL)
+        if name == "str_le":
+            return L.App("str.le", (args[0], args[1]), L.BOOL)
+        if name == "str_find":
+            return L.App("str.indexof", (args[0], args[1], L.ZERO), L.INT)
+        if name == "str_index":
+            s_, i = args
+            n = L.App("str.len", (s_,), L.INT)
+            self.oblige("index", ctx, L.and_(L.le(L.neg(n), i), L.lt(i, n)), e.loc, f"index into '{_expr_name(e.args[0])}' is within -len..len-1")
+            j = L.ite(L.lt(i, L.ZERO), L.add(i, n), i)
+            return L.App("str.at", (s_, j), L.STR)
+        if name == "str_slice":
+            s_, lo, hi = args
+            n = L.App("str.len", (s_,), L.INT)
+
+            def norm(b, default):
+                if b is NONE_V:
+                    return default
+                return L.ite(L.lt(b, L.ZERO), L.max_(L.add(b, n), L.ZERO), L.min_(b, n))
+
+            lo2, hi2 = norm(lo, L.ZERO), norm(hi, n)
+            return L.App("str.substr", (s_, lo2, L.max_(L.sub(hi2, lo2), L.ZERO)), L.STR)
+        if name == "str_fn":
+            # lower(), strip(), replace(), ...: deterministic, not interpreted
+            op = e.args[0]
+            assert isinstance(op, ir.Lit)
+            flat: list[L.Term] = []
+            for a in args[1:]:
+                flat.extend(flatten(a))
+            return L.Fn(f"str.{op.value}", tuple(flat), sort_of(e.ty))
+        raise VCError(f"unknown string operation {name}", e.loc)
+
+    def comprehension(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> Val:
+        assert isinstance(seq, ListVal) and isinstance(e.ty, ir.TList)
+        elem_lit = e.args[1]
+        assert isinstance(elem_lit, ir.Lit)
+        elem = str(elem_lit.value)
+        body, cond = e.args[2], (e.args[3] if len(e.args) > 3 else None)
+        n = next(self.counter)
+        arr = L.Const(f"comp@{n}.arr", sort_of(e.ty))
+        pure = all(self._pure(x) for x in (body, cond) if x is not None)
+        if cond is None:
+            ln: L.Term = seq.len
+        else:
+            ln = L.Const(f"comp@{n}.len", L.INT)
+            ctx.assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
+        i = L.Const(f"{elem}!{n}", L.INT)
+        rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
+        sub = ctx.sub(rng, spec=True) if pure else ctx.sub(rng, spec=True, quiet=True)
+        sub.bound[elem] = seq.at(i)
+        if not pure:
+            # Effects of the body: whatever its calls may write is unknown now.
+            if ctx.state is not None:
+                self.havoc_heap(ctx)
+            return ListVal(arr, L.ZERO, ln, e.ty)
+        b = self.ev(body, sub)
+        if cond is None:
+            ctx.assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
+        else:
+            c = self.ev(cond, sub)
+            k = L.Const(f"k!{n}", L.INT)
+            j = L.Const(f"j!{n}", L.INT)
+            sub_j = ctx.sub(None, spec=True, quiet=True)
+            sub_j.bound[elem] = seq.at(j)
+            bj = self.ev(body, sub_j)
+            cj = self.ev(cond, sub_j)
+            # every element comes from some accepted source element
+            ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
+            del c
+        return ListVal(arr, L.ZERO, ln, e.ty)
+
+    def _pure(self, e: ir.Expr) -> bool:
+        for sub in ir.walk_expr(e):
+            if isinstance(sub, (ir.Extern, ir.New)):
+                return False
+            if isinstance(sub, ir.Builtin) and sub.name in ("await", "from_opaque", "comp", "dict_keys", "dict_values"):
+                return False
+            if isinstance(sub, ir.Call):
+                tgt = self.program.resolve(self.module, sub.func)
+                if tgt is None or tgt.key not in self.program.definitional:
+                    return False
+        return True
+
+    def await_havoc(self, ctx: Ctx, loc: ir.Loc) -> None:
+        """Other tasks run while this one awaits: objects that existed when
+        this call started may change; objects it created itself do not."""
+        assert ctx.state is not None
+        env = ctx.state.env
+        if not self.program.classes:
+            return
+        self.note(loc, "objects created during this call are not shared with concurrent tasks")
+        alloc0 = self.entry["@alloc"]
+        for key in [k for k in env if k.startswith("@") and k != "@alloc"]:
+            old = env[key]
+            assert isinstance(old, L.Term)
+            new = L.Const(f"{key[1:]}@await{loc.line}.{next(self.counter)}", old.sort)
+            r = L.Const(f"r!{next(self.counter)}", L.INT)
+            ctx.assume(L.Quant("forall", (r,), L.implies(L.not_(L.select(alloc0, r)), L.eq(L.select(new, r), L.select(old, r))), patterns=((L.select(new, r),),)))  # type: ignore[arg-type]
+            env[key] = new
+        # Other tasks are checked code too: they leave objects satisfying
+        # their class invariants whenever they yield.
+        for cname, decl in self.program.classes.items():
+            if not decl.invariants:
+                continue
+            r = L.Const(f"r!{next(self.counter)}", L.INT)
+            for inv, t in self.class_invariants(cname, r, env, ctx.base):
+                sels = [x for x in L.iter_terms(t) if isinstance(x, L.App) and x.op == "select" and x.args[1] == r]
+                if not sels:
+                    continue
+                self.note(loc, "other tasks do not await while an object's invariant is broken")
+                ctx.assume(L.Quant("forall", (r,), L.implies(L.select(alloc0, r), t), patterns=((sels[0],),)))  # type: ignore[arg-type]
+
+    def note(self, loc: ir.Loc, text: str) -> None:
+        """Record an assumption the proof rests on (shown as trusted base)."""
+        text = "assumed: " + text
+        if (loc, text) not in self.assumptions:
+            self.assumptions.append((loc, text))
+
+    def ev_Extern(self, e: ir.Extern, ctx: Ctx) -> Val:
+        args = [self.ev(a, ctx) for a in e.args]
+        if ctx.spec:
+            raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
+        self.note(e.loc, f"call:{e.name}")
+        if ctx.state is not None:
+            env = ctx.state.env
+            # It may change any list/dict variable passed to it, and, if it
+            # is handed anything that can reach objects, any object.
+            for a_e in e.args:
+                if isinstance(a_e, ir.Var) and isinstance(env.get(a_e.name), (ListVal, DictVal)):
+                    ty = self.fn.locals.get(a_e.name) or a_e.ty
+                    nv = self.fresh(a_e.name, ty)
+                    if isinstance(nv, ListVal):
+                        ctx.assume(L.le(L.ZERO, nv.len))
+                    env[a_e.name] = nv
+            if self.program.extern_touches_heap(e):
+                self.havoc_heap(ctx)
+        r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
+        if isinstance(r, ListVal):
+            ctx.assume(L.le(L.ZERO, r.len))
+        if ctx.state is not None and r is not NONE_V:
+            for fact in self.alloc_facts(r, e.ty, ctx.state.env):
+                ctx.assume(fact)
+            if isinstance(e.ty, ir.TClass):
+                for _, t in self.class_invariants(e.ty.name, r, ctx.state.env, ctx.base):  # type: ignore[arg-type]
+                    ctx.assume(t)
+        return r
+
+    def havoc_heap(self, ctx: Ctx) -> None:
+        assert ctx.state is not None
+        env = ctx.state.env
+        for key in [k for k in env if k.startswith("@") and k != "@alloc"]:
+            old = env[key]
+            assert isinstance(old, L.Term)
+            env[key] = L.Const(f"{key[1:]}@{next(self.counter)}", old.sort)
+        alloc_pre = env["@alloc"]
+        new_alloc = L.Const(f"alloc@{next(self.counter)}", L.ARRAY(L.BOOL))
+        r = L.Const(f"r!{next(self.counter)}", L.INT)
+        ctx.assume(L.Quant("forall", (r,), L.implies(L.select(alloc_pre, r), L.select(new_alloc, r)), patterns=((L.select(new_alloc, r),),)))  # type: ignore[arg-type]
+        env["@alloc"] = new_alloc
 
     def ev_Call(self, e: ir.Call, ctx: Ctx) -> Val:
         callee = self.program.resolve(ctx.module, e.func)

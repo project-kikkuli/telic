@@ -11,7 +11,7 @@ import traceback
 from fractions import Fraction
 from typing import Any
 
-from telic.runtime import show
+from telic.runtime import settle, show
 
 
 def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
@@ -32,6 +32,10 @@ def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
         return obj
     if isinstance(v, dict) and "__dict__" in v:
         return {decode(k, module, memo): decode(x, module, memo) for k, x in v["__dict__"]}
+    if isinstance(v, dict) and "__enum__" in v:
+        return getattr(getattr(module, v["__enum__"]), v["member"])
+    if isinstance(v, dict) and "__opaque__" in v:
+        return _Stub()
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return float(Fraction(n, d))
@@ -97,7 +101,7 @@ def _outcome(fn: Any, args: list, module: Any, ContractViolation: Any, fname: st
     import copy
 
     try:
-        fn(*copy.deepcopy(args))
+        settle(fn(*copy.deepcopy(args)))
         return None
     except ContractViolation as e:
         if e.kind == "requires" and e.func == fname:
@@ -176,8 +180,53 @@ def fuzz(fn: Any, types: list, n: int, module: Any, ContractViolation: Any, fnam
     return {"found": False, "tried": accepted}
 
 
+STUBBED: list[str] = []
+
+
+class _Stub:
+    """Stands in for anything from a module that is not installed."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        for k, v in kwargs.items():
+            object.__setattr__(self, k, v)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        pass
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return _Stub()
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _Stub()
+
+
+class _StubFinder:
+    """Last on sys.meta_path: an import that would fail yields a stub module,
+    so counterexamples can run without the app's dependencies installed."""
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
+        import importlib.machinery
+
+        return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+
+    def create_module(self, spec: Any) -> Any:
+        import types
+
+        mod = types.ModuleType(spec.name)
+        mod.__path__ = []  # type: ignore[attr-defined]
+        mod.__getattr__ = lambda name: type(name, (_Stub,), {})  # type: ignore[attr-defined]
+        STUBBED.append(spec.name)
+        return mod
+
+    def exec_module(self, module: Any) -> None:
+        pass
+
+
 def main() -> None:
     req = json.loads(sys.stdin.read())
+    sys.meta_path.append(_StubFinder())
     from telic.runtime import ContractViolation, load_instrumented
 
     path = req["path"]
@@ -198,7 +247,7 @@ def main() -> None:
             memo = {}
             args = [decode(a, mod, memo) for a in raw]
             try:
-                r = fn(*args)
+                r = settle(fn(*args))
                 results.append({"ok": True, "value": to_json(r), "repr": show(r)})
             except ContractViolation as e:
                 if e.kind == "requires" and e.func == req["func"]:
@@ -213,8 +262,8 @@ def main() -> None:
         print(json.dumps(fuzz(fn, req["types"], req["fuzz"], mod, ContractViolation, req["func"])))
         return
     try:
-        r = fn(*args)
-        print(json.dumps({"returned_repr": show(r), "returned_is_none": r is None}))
+        r = settle(fn(*args))
+        print(json.dumps({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED}))
     except ContractViolation as e:
         print(json.dumps({"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}))
     except RecursionError:

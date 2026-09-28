@@ -41,6 +41,7 @@ INT = Sort("Int")
 REAL = Sort("Real")
 BOOL = Sort("Bool")
 STR = Sort("Str")
+OPAQUE = Sort("Opaque")  # values of unchecked code: an uninterpreted sort
 
 
 def ARRAY(elem: Sort, index: Sort | None = None) -> Sort:

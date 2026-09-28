@@ -27,15 +27,24 @@ def main(paths: list[str]) -> None:
     for m in mods:
         for msg, _ in m.problems:
             reasons["[module] " + normalize(msg)] += 1
+        seen: set[str] = set()
         if m.language == "python":
             tree = ast.parse(m.source)
-            defs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-            top = set(m.functions)
-            for d in defs:
-                if d.name not in top or d not in tree.body:
-                    total += 1
-                    kind = "method" if any(isinstance(p, ast.ClassDef) and d in p.body for p in ast.walk(tree)) else "async" if isinstance(d, ast.AsyncFunctionDef) else "nested"
-                    reasons[f"[not a top-level function] {kind}"] += 1
+            owner = {}
+            for c in ast.walk(tree):
+                if isinstance(c, ast.ClassDef):
+                    for d in c.body:
+                        if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            owner[d] = c.name
+            for d in ast.walk(tree):
+                if not isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                key = f"{owner[d]}.{d.name}" if d in owner else d.name if d in tree.body else None
+                if key is not None and key in m.functions:
+                    continue
+                total += 1
+                kind = "async" if isinstance(d, ast.AsyncFunctionDef) else "method of an unmodelled class" if d in owner else "nested function" if key is None else "signature"
+                reasons[f"[not lowered] {kind}"] += 1
         for f in m.functions.values():
             total += 1
             if f.unsupported:

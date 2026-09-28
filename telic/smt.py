@@ -61,6 +61,7 @@ class Z3Encoder:
         self.consts: dict[L.Const, z3.ExprRef] = {}
         self.funcs: dict[str, z3.FuncDeclRef] = {}
         self.datatypes: dict[str, Any] = {}
+        self.key_candidates: dict[str, list[Any]] = {}
         self.defs = {d.name: d for d in theory_defs}
         for d in theory_defs:
             self.declare(d)
@@ -87,6 +88,10 @@ class Z3Encoder:
             return self.record(s)[0]
         if s.name == "None":
             return z3.IntSort(c)
+        if s == L.OPAQUE:
+            if "Opaque" not in self.datatypes:
+                self.datatypes["Opaque"] = z3.DeclareSort("Opaque", c)
+            return self.datatypes["Opaque"]
         raise TypeError(s)
 
     def record(self, s: L.Sort):
@@ -185,6 +190,29 @@ class Z3Encoder:
             return z3.Select(a[0], a[1])
         if op == "store":
             return z3.Store(a[0], a[1], a[2])
+        if op == "str.++":
+            return z3.Concat(*a)
+        if op == "str.len":
+            return z3.Length(a[0])
+        if op == "str.contains":
+            return z3.Contains(a[0], a[1])
+        if op == "str.prefixof":
+            return z3.PrefixOf(a[0], a[1])
+        if op == "str.suffixof":
+            return z3.SuffixOf(a[0], a[1])
+        if op == "str.from_int":
+            # Python str(n): a leading '-' for negatives
+            return z3.If(a[0] >= 0, z3.IntToStr(a[0]), z3.Concat(z3.StringVal("-", c), z3.IntToStr(-a[0])))
+        if op == "str.at":
+            return z3.SubString(a[0], a[1], z3.IntVal(1, c))
+        if op == "str.substr":
+            return z3.SubString(a[0], a[1], a[2])
+        if op == "str.indexof":
+            return z3.IndexOf(a[0], a[1], a[2])
+        if op == "str.lt":
+            return a[0] < a[1]
+        if op == "str.le":
+            return a[0] <= a[1]
         if op == "K":
             return z3.K(self.sort(L.index_sort(t.sort)), a[0])
         if op.startswith("field:"):
@@ -260,10 +288,26 @@ def array_entries(v: z3.ExprRef) -> tuple[list[tuple[Any, Any]], Any]:
 
 
 def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any:
-    from .vcgen import DictVal, ObjVal, OptVal
+    from .vcgen import DictVal, ObjVal, OptVal, TypedView
+    from . import ir
+
+    if isinstance(val, TypedView):
+        ty = val.ty
+        if isinstance(ty, ir.TEnum):
+            i = enc.value(model, val.val)
+            return {"__enum__": ty.name, "member": ty.members[i] if isinstance(i, int) and 0 <= i < len(ty.members) else ty.members[0]}
+        if isinstance(ty, ir.TList) and isinstance(val.val, ListVal):
+            items = enc.list_value(model, val.val)
+            if isinstance(ty.elem, ir.TEnum):
+                return [{"__enum__": ty.elem.name, "member": ty.elem.members[i] if isinstance(i, int) and 0 <= i < len(ty.elem.members) else ty.elem.members[0]} for i in items]
+            if isinstance(ty.elem, ir.TClass):
+                return [{"__class__": ty.elem.name, "__ref__": r, "__stub__": True} for r in items]
+        return decode(enc, model, val.val)
 
     if isinstance(val, ListVal):
         return [x for x in enc.list_value(model, val)]
+    if isinstance(val, L.Term) and val.sort == L.OPAQUE:
+        return {"__opaque__": True}
     if isinstance(val, OptVal):
         if enc.value(model, val.some) is not True:
             return None
@@ -273,13 +317,21 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
         if val.fields is None:
             out["__stub__"] = True
             return out
-        for fname, fv in val.fields:
+        for fname, fv in val.fields:  # noqa
             out[fname] = decode(enc, model, fv)
         return out
     if isinstance(val, DictVal):
         has = model.eval(enc.term(val.has), model_completion=True)
         entries, default = array_entries(has)
         keys = [k for k, x in entries if x is True]
+        if default is not False:
+            # "every key" is not a real dict: show the keys that matter,
+            # i.e. the other inputs of the key's type the model mentions
+            ks = val.has.sort.index or L.INT
+            cands = list(enc.key_candidates.get(ks.name, ()))
+            for k in cands:
+                if k not in keys and enc.value(model, L.select(val.has, _lit(k, ks))) is True:
+                    keys.append(k)
         return {k: enc.value(model, L.select(val.vals, _lit(k, val.has.sort.index))) for k in keys}
     if not isinstance(val, L.Term):
         return str(val)
@@ -329,6 +381,13 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
         return SmtResult("proved", dt)
     if r == z3.sat:
         m = s.model()
+        enc.key_candidates = {}
+        for _, v in ob.inputs:
+            if isinstance(v, L.Term) and v.sort in (L.INT, L.STR, L.BOOL):
+                x = enc.value(m, v)
+                enc.key_candidates.setdefault(v.sort.name, []).append(x)
+        for sname, default in (("Str", ""), ("Int", 0)):
+            enc.key_candidates.setdefault(sname, []).append(default)
         model = {name: decode(enc, m, v) for name, v in ob.inputs}
         too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
         state: dict[str, Any] = {}

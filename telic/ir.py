@@ -108,7 +108,38 @@ class TClass:
         return self.name
 
 
-Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass]
+@dataclass(frozen=True)
+class TOpaque:
+    """A value telic knows nothing about (unannotated, ``Any``, a library
+    type). It can be stored, passed and compared; every operation on it
+    has an unconstrained result. Gradual verification: code around opaque
+    values is still checked, and nothing is assumed about them."""
+
+    why: str = ""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TOpaque)
+
+    def __hash__(self) -> int:
+        return hash("TOpaque")
+
+    def __str__(self) -> str:
+        return "opaque"
+
+
+@dataclass(frozen=True)
+class TEnum:
+    """An ``Enum``: one of finitely many members, modelled by index."""
+
+    name: str
+    members: tuple[str, ...]
+    values: tuple[object, ...] = ()  # literal member values, when known
+
+    def __str__(self) -> str:
+        return self.name
+
+
+Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass, TOpaque, TEnum]
 
 INT, REAL, BOOL, STR, NONE = TInt(), TReal(), TBool(), TStr(), TNone()
 
@@ -263,6 +294,16 @@ class Quant(Expr):
 
 
 @dataclass(frozen=True)
+class Extern(Expr):
+    """A call into code telic does not check (a library, an unannotated
+    module). Its result is unconstrained; mutable arguments may change;
+    that it does not raise is a listed assumption."""
+
+    name: str
+    args: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
 class New(Expr):
     """``C(args)`` / ``new C(args)``: allocate a fresh object and run
     ``C.__init__`` on it."""
@@ -414,6 +455,19 @@ class AssumeStmt(Stmt):
 @dataclass(frozen=True)
 class Raise(Stmt):
     what: str
+    caught: bool = False  # inside a try with handlers: jumps to a handler
+
+
+@dataclass(frozen=True)
+class Try(Stmt):
+    """``try``/``except``/``else``/``finally``. A handler may start from any
+    state the body could have reached (modelled by forgetting what the body
+    changes); ``finally`` runs on the normal paths."""
+
+    body: tuple[Stmt, ...]
+    handlers: tuple[tuple[Stmt, ...], ...]
+    orelse: tuple[Stmt, ...] = ()
+    finalbody: tuple[Stmt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -512,6 +566,12 @@ def walk_stmts(stmts: Any):
             yield from walk_stmts(s.step)
         elif isinstance(s, (ForRange, ForEach)):
             yield from walk_stmts(s.body)
+        elif isinstance(s, Try):
+            yield from walk_stmts(s.body)
+            for h in s.handlers:
+                yield from walk_stmts(h)
+            yield from walk_stmts(s.orelse)
+            yield from walk_stmts(s.finalbody)
 
 
 def walk_expr(e: Expr):
@@ -528,7 +588,7 @@ def walk_expr(e: Expr):
         yield from walk_expr(e.cond)
         yield from walk_expr(e.then)
         yield from walk_expr(e.orelse)
-    elif isinstance(e, (Call, Builtin, New)):
+    elif isinstance(e, (Call, Builtin, New, Extern)):
         for a in e.args:
             yield from walk_expr(a)
     elif isinstance(e, Index):

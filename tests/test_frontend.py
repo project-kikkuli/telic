@@ -14,14 +14,16 @@ def test_unknown_keyword_is_a_problem():
 
 
 def test_unsupported_constructs_are_reported_with_lines():
-    src = "def f(x: int) -> int:\n    try:\n        return x\n    except Exception:\n        return 0\n"
+    src = "def f(x: int) -> int:\n    global y\n    return x\n"
     f = lower_python("x.py", src).functions["f"]
     assert f.unsupported and f.unsupported[0][1].line == 2
 
 
 def test_missing_annotation_is_reported():
+    # Unannotated code is gradual: the parameter is opaque, not an error.
     m = lower_python("x.py", "def f(x):\n    return x\n")
-    assert any("type annotation" in msg for msg, _ in m.problems)
+    assert not m.problems
+    assert str(m.functions["f"].params[0].ty) == "opaque"
 
 
 def test_list_alias_is_rejected():

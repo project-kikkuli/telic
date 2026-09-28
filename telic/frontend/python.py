@@ -33,6 +33,7 @@ PY_ASSUMPTIONS = [
 ]
 
 IGNORED_CALLS = {"print"}
+EXCEPTION_BASES = {"Exception", "BaseException", "ValueError", "KeyError", "RuntimeError", "TypeError", "LookupError", "ArithmeticError", "PermissionError", "HTTPException"}
 IGNORED_ATTR_CALLS = {"debug", "info", "warning", "error", "exception", "critical"}
 
 
@@ -80,6 +81,11 @@ class PythonFrontend:
         self.dataclasses: set[str] = set()
         self.custom_eq: dict[str, bool] = {}
         self.custom_bool: dict[str, bool] = {}
+        self.enums: dict[str, list[str]] = {}
+        self.enum_types: dict[str, ir.TEnum] = {}
+        self.constants: dict[str, ast.expr] = {}  # module-level literals never rebound
+        self.modules: set[str] = set()  # names bound by 'import'
+        self.ignored_classes: set[str] = set()
 
     # -- entry --------------------------------------------------------------
 
@@ -96,10 +102,41 @@ class PythonFrontend:
             return self.module
 
         # Names bound at module level shadow builtins of the same name.
+        assigned: dict[str, int] = {}
         for node in tree.body:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for a in node.names:
                     self.bound.add((a.asname or a.name).split(".")[0])
+                    if isinstance(node, ast.Import):
+                        self.modules.add((a.asname or a.name).split(".")[0])
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        assigned[t.id] = assigned.get(t.id, 0) + 1
+                        if node.value is not None and _simple_default(node.value):
+                            self.constants[t.id] = node.value
+        rebound = {n for f in ast.walk(tree) if isinstance(f, (ast.Global, ast.Nonlocal)) for n in f.names}
+        for name in list(self.constants):
+            if assigned.get(name, 0) != 1 or name in rebound:
+                del self.constants[name]
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                bases = {_decorator_name(b) for b in node.bases}
+                if bases & {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}:
+                    members, values = [], []
+                    for st in node.body:
+                        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and not st.targets[0].id.startswith("_"):
+                            members.append(st.targets[0].id)
+                            values.append(st.value.value if isinstance(st.value, ast.Constant) else None)
+                    mixed = bases & {"IntEnum", "StrEnum", "str", "int", "Flag", "IntFlag"}
+                    if members and not mixed and not any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) for st in node.body):
+                        self.enums[node.name] = list(members)
+                        self.enum_types[node.name] = ir.TEnum(node.name, tuple(members), tuple(values))
+                    else:
+                        self.ignored_classes.add(node.name)  # enum with behaviour: its values are opaque
+                elif bases & EXCEPTION_BASES or (node.name.endswith(("Error", "Exception")) and bases and not bases & {"BaseModel"}):
+                    self.ignored_classes.add(node.name)  # exceptions: only ever raised
             elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
@@ -111,7 +148,7 @@ class PythonFrontend:
         # Records and classes first, then signatures, then bodies: calls may be forward.
         classes: list[ast.ClassDef] = []
         for node in tree.body:
-            if isinstance(node, ast.ClassDef):
+            if isinstance(node, ast.ClassDef) and node.name not in self.enums and node.name not in self.ignored_classes:
                 self._record(node)
                 if node.name not in self.module.records:
                     self.class_names.add(node.name)
@@ -125,14 +162,14 @@ class PythonFrontend:
         classes = [c for c in classes if c.name in self.module.classes]
         methods: list[tuple[ast.FunctionDef, str]] = []
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 try:
                     self.signatures[node.name] = self._signature(node)
                 except LowerError as e:
                     self.module.problems.append((f"{node.name}: {e}", ir.Loc(e.line)))
         for c in classes:
             for sub in c.body:
-                if not isinstance(sub, ast.FunctionDef):
+                if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 decos = {_decorator_name(d) for d in sub.decorator_list}
                 key = f"{c.name}.{sub.name}"
@@ -148,7 +185,7 @@ class PythonFrontend:
         for c in classes:
             self._class_invariants(c)
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name in self.signatures:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures:
                 fn = FunctionLowerer(self, node).lower()
                 self.module.functions[fn.name] = fn
         for node, cname in methods:
@@ -179,9 +216,7 @@ class PythonFrontend:
                 for sub in node.body:
                     if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}.{sub.name}" not in self.signatures:
                         spans.append((min([sub.lineno] + [d.lineno for d in sub.decorator_list]) - 3, sub.end_lineno or sub.lineno, f"'{node.name}.{sub.name}' is not checked (see the problem reported for it or its class)"))
-            elif isinstance(node, ast.AsyncFunctionDef):
-                spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"async functions are not checked yet ('{node.name}')"))
-            elif isinstance(node, ast.FunctionDef) and node not in tree.body and not any(node is m for m, _ in methods):
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node not in tree.body and not any(node is m for m, _ in methods):
                 spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"nested functions are not checked yet ('{node.name}')"))
         reported: set[str] = set()
         for cl in self.contract_lines:
@@ -239,12 +274,14 @@ class PythonFrontend:
     def _class_fields(self, node: ast.ClassDef) -> None:
         """Fields of a mutable class: class-level annotations (dataclass
         style) plus 'self.x = ...' assignments in __init__."""
-        if any(not (isinstance(b, ast.Name) and b.id == "object") for b in node.bases) or node.keywords:
+        bases = [_decorator_name(b) for b in node.bases]
+        model_base = bool(set(bases) & {"BaseModel", "SQLModel"})  # pydantic: a validated dataclass
+        if any(b not in ("object", "BaseModel", "SQLModel") for b in bases) or (node.keywords and not model_base):
             raise LowerError("inheritance is not modelled yet", node)
         decos = {_decorator_name(d) for d in node.decorator_list}
         if decos - {"dataclass"}:
             raise LowerError(f"class decorator @{sorted(decos - {'dataclass'})[0]} is not modelled", node)
-        is_dc = "dataclass" in decos
+        is_dc = "dataclass" in decos or model_base
         magic = {st.name for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))} & {"__setattr__", "__getattr__", "__getattribute__", "__delattr__", "__new__", "__init_subclass__", "__class_getitem__"}
         if magic:
             raise LowerError(f"{sorted(magic)[0]} changes what attribute access means; not modelled", node)
@@ -258,19 +295,17 @@ class PythonFrontend:
                     continue
                 fields.append((st.target.id, self.type_of_annotation(st.annotation)))
                 if st.value is not None:
-                    if not _simple_default(st.value):
-                        if isinstance(st.value, ast.Call) and _decorator_name(st.value.func) == "field":
-                            raise LowerError("dataclasses.field(...) defaults are not modelled yet", st)
-                        raise LowerError(f"default of field '{st.target.id}' must be a literal", st)
-                    defaults[st.target.id] = st.value
-            elif isinstance(st, ast.Assign) and not (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "__slots__"):
+                    defaults[st.target.id] = st.value if _simple_default(st.value) else None  # type: ignore[assignment]
+            elif isinstance(st, ast.Assign) and not (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id in ("__slots__", "model_config", "Config")):
                 raise LowerError("class attributes other than annotated fields are not modelled", st)
         init = next((st for st in node.body if isinstance(st, ast.FunctionDef) and st.name == "__init__"), None)
-        if init is not None:
-            ann = {a.arg: a.annotation for a in init.args.args[1:]}
-            me = init.args.args[0].arg if init.args.args else "self"
-            known = {f for f, _ in fields}
-            for st in ast.walk(init):
+        methods = [init] if init is not None else []
+        methods += [st for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st is not init and st.args.args and not any(_decorator_name(d) == "staticmethod" for d in st.decorator_list)]
+        known = {f for f, _ in fields}
+        for meth in methods:
+            ann = {a.arg: a.annotation for a in meth.args.args[1:]}
+            me = meth.args.args[0].arg if meth.args.args else "self"
+            for st in ast.walk(meth):
                 tgt, tann, val = None, None, None
                 if isinstance(st, ast.AnnAssign):
                     tgt, tann, val = st.target, st.annotation, st.value
@@ -286,12 +321,12 @@ class PythonFrontend:
                     ty = self.type_of_annotation(ann[val.id])
                 elif isinstance(val, ast.Constant) and type(val.value) in (int, float, str, bool):
                     ty = {int: ir.INT, float: ir.REAL, str: ir.STR, bool: ir.BOOL}[type(val.value)]
+                elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id in self.enum_types:
+                    ty = self.enum_types[val.value.id]
                 else:
-                    raise LowerError(f"annotate the field: 'self.{tgt.attr}: <type> = ...'", st)
+                    ty = ir.TOpaque(f"field {tgt.attr}")  # annotate it to have it checked
                 fields.append((tgt.attr, ty))
                 known.add(tgt.attr)
-        elif not is_dc and fields:
-            pass  # annotated fields, no constructor: set after construction
         self.module.classes[node.name] = ir.ClassDecl(node.name, fields, [], ir.Loc(node.lineno, node.col_offset))
         if is_dc:
             self.dataclasses.add(node.name)
@@ -326,6 +361,8 @@ class PythonFrontend:
             return ir.NONE
         if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
             return self.type_of_annotation(ast.parse(ann.value, mode="eval").body)
+        if isinstance(ann, ast.Attribute):
+            return ir.TOpaque(ast.unparse(ann))  # e.g. datetime.date
         if isinstance(ann, ast.Name):
             simple = {"int": ir.INT, "float": ir.REAL, "bool": ir.BOOL, "str": ir.STR}
             if ann.id in simple:
@@ -334,7 +371,9 @@ class PythonFrontend:
                 return self.module.records[ann.id]
             if ann.id in self.class_names:
                 return ir.TClass(ann.id)
-            raise LowerError(f"unsupported type '{ann.id}'", ann)
+            if ann.id in self.enum_types:
+                return self.enum_types[ann.id]
+            return ir.TOpaque(ann.id)  # Any, object, library types: unchecked
         if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
             parts = _union_parts(ann)
             return self._union([self.type_of_annotation(x) for x in parts], ann)
@@ -343,8 +382,8 @@ class PythonFrontend:
             name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else None
             if name in {"list", "List", "Sequence"}:
                 elem = self.type_of_annotation(ann.slice)
-                if isinstance(elem, ir.TList):
-                    raise LowerError("nested lists are not supported yet", ann)
+                if isinstance(elem, (ir.TList, ir.TDict)):
+                    return ir.TOpaque(ast.unparse(ann))  # nested containers: unchecked
                 return ir.TList(elem)
             if name == "Optional":
                 return self._union([self.type_of_annotation(ann.slice), ir.NONE], ann)
@@ -356,22 +395,25 @@ class PythonFrontend:
                     raise LowerError("dict types need a key and a value type", ann)
                 k = self.type_of_annotation(ann.slice.elts[0])
                 v = self.type_of_annotation(ann.slice.elts[1])
-                if not isinstance(k, (ir.TInt, ir.TStr, ir.TBool)):
-                    raise LowerError(f"dict keys of type {k} are not supported (use int, str or bool)", ann)
-                if isinstance(v, (ir.TList, ir.TDict, ir.TOption)):
-                    raise LowerError(f"dict values of type {v} are not supported yet", ann)
+                if not isinstance(k, (ir.TInt, ir.TStr, ir.TBool)) or isinstance(v, (ir.TList, ir.TDict, ir.TOption)):
+                    return ir.TOpaque(ast.unparse(ann))
                 return ir.TDict(k, v)
-        raise LowerError(f"unsupported type annotation '{ast.unparse(ann)}'", ann)
+        return ir.TOpaque(ast.unparse(ann))
 
     def _union(self, ts: list[ir.Type], node: ast.AST) -> ir.Type:
         rest = [t for t in ts if t != ir.NONE]
         if len(rest) != 1:
-            raise LowerError("unions other than 'T | None' are not supported", node)
+            if all(ir.is_numeric(t) for t in rest):
+                rest = [ir.REAL]  # int | float: a number
+            else:
+                return ir.TOpaque(ast.unparse(node))  # a real union: unchecked
         if len(rest) == len(ts):
             return rest[0]
         inner = rest[0]
+        if isinstance(inner, ir.TOpaque):
+            return inner  # an unknown value may as well be None
         if isinstance(inner, (ir.TList, ir.TDict, ir.TOption)):
-            raise LowerError(f"'{inner} | None' is not supported yet", node)
+            return ir.TOpaque(ast.unparse(node))
         return ir.TOption(inner)
 
     def _signature(self, node: ast.FunctionDef, cls: str | None = None, static: bool = False) -> tuple[list[ir.Param], ir.Type]:
@@ -387,7 +429,8 @@ class PythonFrontend:
                 params.append(ir.Param(arg.arg, ir.TClass(cls)))
                 continue
             if arg.annotation is None:
-                raise LowerError(f"parameter '{arg.arg}' needs a type annotation", arg)
+                params.append(ir.Param(arg.arg, ir.TOpaque("unannotated")))
+                continue
             params.append(ir.Param(arg.arg, self.type_of_annotation(arg.annotation)))
         # Default values, by parameter name: substituted at call sites.
         key = f"{cls}.{node.name}" if cls else node.name
@@ -397,12 +440,19 @@ class PythonFrontend:
         for arg, d in zip(a.kwonlyargs, a.kw_defaults):
             if d is not None:
                 defaults[arg.arg] = d
-        for name, d in defaults.items():
+        for name, d in list(defaults.items()):
             if not _simple_default(d):
-                raise LowerError(f"default of '{name}' must be a literal (a mutable or computed default is evaluated once, at definition time)", d)
+                if isinstance(d, (ast.List, ast.Dict, ast.Set)):
+                    raise LowerError(f"default of '{name}' is a mutable {type(d).__name__.lower()} shared by every call; use None and create it inside", d)
+                defaults[name] = None  # type: ignore[assignment]  # computed default: unknown value
         self.defaults[key] = defaults
         self.kwonly[key] = {x.arg for x in a.kwonlyargs}
-        ret = self.type_of_annotation(node.returns) if node.returns is not None else ir.NONE
+        if node.returns is not None:
+            ret = self.type_of_annotation(node.returns)
+        elif any(isinstance(r, ast.Return) and r.value is not None for r in _own_nodes(node)):
+            ret = ir.TOpaque("unannotated return")
+        else:
+            ret = ir.NONE
         return params, ret
 
 
@@ -423,6 +473,7 @@ class FunctionLowerer:
             cl for cl in fe.contract_lines if node.lineno <= cl.line <= (node.end_lineno or node.lineno)
         ]
         self.current_intents: list[str] = []
+        self.try_depth = 0
         self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args + node.args.kwonlyargs}
 
     # -- contract comment association ------------------------------------
@@ -621,6 +672,8 @@ class FunctionLowerer:
         if old is None:
             self.env[name] = ty
         elif old != ty:
+            if isinstance(old, ir.TOpaque) or isinstance(ty, ir.TOpaque):
+                return  # mixing with unchecked values: converted on assignment
             if isinstance(old, ir.TOption) and ty in (old.inner, ir.NONE):
                 return
             if old == ir.NONE and not isinstance(ty, (ir.TList, ir.TDict, ir.TOption)):
@@ -633,6 +686,16 @@ class FunctionLowerer:
             raise LowerError(f"variable '{name}' changes type from {old} to {ty}; telic requires one type per variable", node)
 
     def coerce(self, e: ir.Expr, ty: ir.Type) -> ir.Expr:
+        if e.ty != ty and not isinstance(e.ty, ir.TOpaque) and not isinstance(ty, ir.TOpaque) and (_has_opaque(e.ty) or _has_opaque(ty)) and e.ty != ir.NONE:
+            return ir.Builtin(ty, e.loc, "from_opaque", (e,))  # e.g. list[opaque] used as list[str]
+        if isinstance(e.ty, ir.TOpaque) and not isinstance(ty, ir.TOpaque) and ty != ir.NONE:
+            if isinstance(e, ir.Extern):
+                return ir.Extern(ty, e.loc, e.name, e.args)  # its result is simply unknown at this type
+            return ir.Builtin(ty, e.loc, "from_opaque", (e,))
+        if isinstance(ty, ir.TOpaque) and not isinstance(e.ty, ir.TOpaque):
+            if e.ty == ir.NONE:
+                return ir.Builtin(ty, e.loc, "to_opaque", (ir.Lit(ir.INT, e.loc, 0),))
+            return ir.Builtin(ty, e.loc, "to_opaque", (e,))
         if isinstance(ty, ir.TOption):
             if e.ty == ir.NONE:
                 return ir.Lit(ty, e.loc, None)
@@ -716,6 +779,11 @@ class FunctionLowerer:
                     return
                 yield ir.ExprStmt(loc, self.expr(v))
                 return
+            if isinstance(v, ast.Await):
+                yield ir.ExprStmt(loc, self.expr(v))
+                return
+            if isinstance(v, (ast.Constant, ast.Name)):
+                return  # a bare name / Ellipsis: no effect
             raise LowerError("expression statement has no effect", s)
         if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Attribute):
             if s.value is None:
@@ -809,8 +877,49 @@ class FunctionLowerer:
             return
         if isinstance(s, ast.Raise):
             what = ast.unparse(s.exc) if s.exc is not None else "exception"
-            yield ir.Raise(loc, what)
+            yield ir.Raise(loc, what, caught=self.try_depth > 0)
             return
+        if isinstance(s, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            handlers = []
+            self.try_depth += 1 if s.handlers else 0
+            try:
+                body = tuple(self.block(s.body, s))
+            finally:
+                self.try_depth -= 1 if s.handlers else 0
+            for h in s.handlers:
+                pre: tuple[ir.Stmt, ...] = ()
+                if h.name:
+                    self.declare(h.name, ir.TOpaque("exception"), h)
+                    pre = (ir.Assign(loc, h.name, ir.Extern(ir.TOpaque("exception"), loc, "caught exception", ())),)
+                handlers.append(pre + tuple(self.block(h.body, h)))
+            orelse = tuple(self.block(s.orelse, s.orelse[0])) if s.orelse else ()
+            final = tuple(self.block(s.finalbody, s.finalbody[0])) if s.finalbody else ()
+            yield ir.Try(loc, body, tuple(handlers), orelse, final)
+            return
+        if isinstance(s, (ast.With, ast.AsyncWith)):
+            # The context manager is unchecked code; assume it does not
+            # swallow exceptions (listed as an assumption).
+            for item in s.items:
+                cm = self.expr(item.context_expr)
+                enter = ir.Extern(ir.TOpaque("context"), loc, f"{_desc(item.context_expr)}.__enter__", (cm,) if isinstance(cm.ty, (ir.TOpaque, ir.TClass)) else ())
+                if item.optional_vars is not None:
+                    if not isinstance(item.optional_vars, ast.Name):
+                        raise LowerError("'with ... as' target must be a name", s)
+                    self.declare(item.optional_vars.id, ir.TOpaque("context"), s)
+                    yield ir.Assign(loc, item.optional_vars.id, enter)
+                else:
+                    yield ir.ExprStmt(loc, enter)
+            yield from self.block(s.body, s)
+            return
+        if isinstance(s, (ast.Import, ast.ImportFrom)):
+            for a in s.names:
+                nm = (a.asname or a.name).split(".")[0]
+                self.fe.bound.add(nm)
+                if isinstance(s, ast.Import):
+                    self.fe.modules.add(nm)
+            return
+        if isinstance(s, (ast.Global, ast.Nonlocal)):
+            raise LowerError("'global'/'nonlocal' state is not modelled", s)
         raise LowerError(f"unsupported statement: {type(s).__name__}", s)
 
     def _effects_of(self, args: list[ast.expr], loc: ir.Loc):
@@ -852,6 +961,10 @@ class FunctionLowerer:
             obj = self.expr(target.value)
             if isinstance(obj.ty, ir.TOption):
                 obj = self.coerce(obj, obj.ty.inner)
+            if isinstance(obj.ty, ir.TOpaque):
+                val = self.expr(value)
+                yield ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, f"setattr .{target.attr}", (obj, val)))
+                return
             if isinstance(obj.ty, ir.TRecord):
                 raise LowerError(f"{obj.ty.name} is frozen; build a new one with dataclasses.replace or the constructor", s)
             if not isinstance(obj.ty, ir.TClass):
@@ -882,6 +995,11 @@ class FunctionLowerer:
                 yield ir.FieldAssign(loc, fld.obj, fld.obj.ty.name, fld.name, new_v)
                 return
             raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
+        if isinstance(target, ast.Subscript) and isinstance(self.expr(target.value).ty, ir.TOpaque):
+            obj = self.expr(target.value)
+            parts = [obj, self.expr(target.slice) if not isinstance(target.slice, ast.Slice) else ir.Lit(ir.STR, loc, "slice"), self.expr(value)]
+            yield ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, "setitem", tuple(parts)))
+            return
         if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and not isinstance(target.slice, ast.Slice) and isinstance(self.env.get(target.value.id), ir.TDict):
             name = target.value.id
             dt = self.env[name]
@@ -905,6 +1023,22 @@ class FunctionLowerer:
             if val.ty != t.elem:
                 raise LowerError(f"cannot store {val.ty} into {t}", s)
             yield ir.IndexAssign(loc, name, idx, val, wrap=True)
+            return
+        if isinstance(target, ast.Tuple) and not isinstance(value, ast.Tuple):
+            v = self.expr(value)
+            if not isinstance(v.ty, ir.TOpaque):
+                raise LowerError(f"unpacking a {v.ty} is not supported", s)
+            t = self.fresh("tuple")
+            self.env[t] = v.ty
+            yield ir.Assign(loc, t, v)
+            for k, tgt in enumerate(target.elts):
+                if not isinstance(tgt, ast.Name):
+                    raise LowerError("unpacking targets must be names", s)
+                item = ir.Builtin(ir.TOpaque(""), loc, "opaque_op", (ir.Lit(ir.STR, loc, f"item{k}"), ir.Var(v.ty, loc, t)))
+                known = self.env.get(tgt.id)
+                val = self.coerce(item, known) if known is not None else item
+                self.declare(tgt.id, val.ty, s)
+                yield ir.Assign(loc, tgt.id, val)
             return
         if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple) and len(target.elts) == len(value.elts):
             # a, b = e1, e2  ==>  t1 = e1; t2 = e2; a = t1; b = t2
@@ -1000,18 +1134,36 @@ class FunctionLowerer:
             seq_node = it.args[0]
             idx_visible = True
         else:
-            if not isinstance(s.target, ast.Name):
+            items_of = None
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items" and not it.args and isinstance(s.target, ast.Tuple) and len(s.target.elts) == 2 and all(isinstance(t, ast.Name) for t in s.target.elts):
+                d = self.expr(it.func.value)
+                if isinstance(d.ty, ir.TDict):
+                    items_of = d
+            if items_of is None and not isinstance(s.target, ast.Name):
                 raise LowerError("for-loop target must be a name", s)
-            elem = s.target.id
+            elem = s.target.elts[0].id if items_of is not None else s.target.id  # type: ignore[attr-defined]
             idx = index_name or self.fresh("i")
-            seq_node = it
+            seq_node = it.func.value if items_of is not None else it  # type: ignore[attr-defined]
         seq = self.expr(seq_node)
+        value_name = None
+        if isinstance(seq.ty, ir.TDict):
+            # for k in d / for k, v in d.items(): iterate over the keys
+            if isinstance(s.target, ast.Tuple):
+                value_name = s.target.elts[1].id  # type: ignore[attr-defined]
+            seq = ir.Builtin(ir.TList(seq.ty.key), seq.loc, "dict_keys", (seq,))
+        elif isinstance(seq.ty, ir.TOpaque):
+            seq = self.coerce(seq, ir.TList(ir.TOpaque("")))
         if not isinstance(seq.ty, ir.TList):
-            raise LowerError("can only iterate over range(...), a list, or enumerate(list)", s)
+            raise LowerError("can only iterate over range(...), a list, a dict, or enumerate(list)", s)
         self.declare(idx, ir.INT, s)
         self.declare(elem, seq.ty.elem, s)
-        body = tuple(self.block(s.body, s))
-        if isinstance(seq_node, ast.Name) and seq_node.id in ir.assigned_names(body):
+        prefix: tuple[ir.Stmt, ...] = ()
+        if value_name is not None:
+            d_expr = seq.args[0]  # type: ignore[attr-defined]
+            self.declare(value_name, d_expr.ty.val, s)
+            prefix = (ir.Assign(loc, value_name, ir.Index(d_expr.ty.val, loc, d_expr, ir.Var(seq.ty.elem, loc, elem), wrap=False)),)
+        body = prefix + tuple(self.block(s.body, s))
+        if isinstance(seq_node, ast.Name) and seq_node.id in ir.assigned_names(body[len(prefix):]):
             raise LowerError(f"loop body modifies '{seq_node.id}' while iterating over it", s)
         invs, dec = self._lower_loop_clauses(contracts)
         if dec is not None:
@@ -1031,6 +1183,7 @@ class _ClassScope(FunctionLowerer):
         self.current_intents = []
         self.local_contracts = []
         self.stored_names = set()
+        self.try_depth = 0
 
 
 def fresh_list(e: ir.Expr) -> bool:
@@ -1039,7 +1192,9 @@ def fresh_list(e: ir.Expr) -> bool:
     may not return their list parameters)."""
     if isinstance(e, (ir.ListLit, ir.Call)):
         return True
-    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy"):
+    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append"):
+        return True
+    if isinstance(e, ir.Extern):
         return True
     if isinstance(e, ir.Ite):
         return fresh_list(e.then) and fresh_list(e.orelse)
@@ -1054,6 +1209,38 @@ def _own_fields_only(e: ir.Expr, cls: str, line: int) -> None:
             raise LowerError(f"a class invariant may only read fields of 'self', not of other objects", line=line)
         if isinstance(sub, ir.Call) and any(isinstance(a.ty, ir.TClass) for a in sub.args):
             raise LowerError("a class invariant may not call methods (they could read other objects); write the condition on self's fields", line=line)
+
+
+PY_GLOBALS = {"datetime", "time", "uuid", "os", "json", "re", "random", "logging", "Decimal", "sorted", "reversed", "zip", "map", "filter", "open", "input", "id", "hash", "repr", "type", "set", "tuple", "list", "frozenset", "getattr", "setattr", "hasattr", "iter", "next", "divmod", "pow", "chr", "ord", "hex", "bin", "format", "vars", "dir", "callable", "super"}
+
+
+def _has_opaque(t: ir.Type) -> bool:
+    if isinstance(t, ir.TOpaque):
+        return True
+    if isinstance(t, ir.TList):
+        return _has_opaque(t.elem)
+    if isinstance(t, ir.TOption):
+        return _has_opaque(t.inner)
+    if isinstance(t, ir.TDict):
+        return _has_opaque(t.key) or _has_opaque(t.val)
+    return False
+
+
+def _desc(n: ast.expr) -> str:
+    try:
+        return ast.unparse(n)[:40]
+    except Exception:  # pragma: no cover
+        return "value"
+
+
+def _own_nodes(fn: ast.AST):
+    """Nodes of a function body, not descending into nested defs/classes."""
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        n = stack.pop()
+        yield n
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(n))
 
 
 def _join_optional(a: ir.Type, b: ir.Type) -> ir.Type | None:
@@ -1163,6 +1350,10 @@ class ExprLowerer:
             if isinstance(t.inner, ir.TRecord) or (isinstance(t.inner, ir.TClass) and not self.fl.fe.custom_bool.get(t.inner.name)):
                 return present
             return ir.Binary(ir.BOOL, e.loc, "and", present, self.truthy(ir.Builtin(t.inner, e.loc, "unwrap", (e,)), node))
+        if isinstance(t, ir.TOpaque):
+            return self.opaque("truthy", [e], ir.BOOL, e.loc)
+        if isinstance(t, ir.TEnum):
+            return ir.Lit(ir.BOOL, e.loc, True)
         if isinstance(t, ir.TClass) and self.fl.fe.custom_bool.get(t.name):
             raise self.err(f"{t.name} defines __bool__/__len__; its truth value is not modelled", node)
         if isinstance(t, (ir.TClass, ir.TRecord)):
@@ -1203,7 +1394,24 @@ class ExprLowerer:
                 if self.result_ty == ir.NONE:
                     raise self.err("'result' used but the function returns nothing", n)
                 return ir.Result(self.result_ty, loc)
+            fe = self.fl.fe
+            if n.id not in self.bound and n.id not in self.fl.env:
+                if n.id in fe.constants:
+                    return self.expr(fe.constants[n.id], expect)
+                if n.id in fe.bound or n.id in PY_GLOBALS:
+                    # a module global or import: read fresh each time (it may change)
+                    return ir.Extern(ir.TOpaque(n.id), loc, n.id, ())
             return ir.Var(self.lookup(n.id, n), loc, n.id)
+        if isinstance(n, ast.Await):
+            inner = self.expr(n.value, expect)
+            return ir.Builtin(inner.ty, loc, "await", (inner,))
+        if isinstance(n, ast.JoinedStr):
+            return self.fstring(n, loc)
+        if isinstance(n, (ast.Tuple, ast.Set)) and not self.spec:
+            parts = [self.expr(x) for x in n.elts]
+            return self.opaque("tuple" if isinstance(n, ast.Tuple) else "set", parts, ir.TOpaque("tuple"), loc)
+        if isinstance(n, ast.UnaryOp) and not isinstance(n.op, ast.Not) and isinstance(self.expr(n.operand).ty, ir.TOpaque):
+            return self.opaque(type(n.op).__name__.lower(), [self.expr(n.operand)], ir.TOpaque(""), loc)
         if isinstance(n, ast.UnaryOp):
             a = self.need(self.expr(n.operand)) if not isinstance(n.op, ast.Not) else ir.Lit(ir.BOOL, loc, True)
             if isinstance(n.op, ast.Not):
@@ -1223,6 +1431,8 @@ class ExprLowerer:
             # As a value, `a or b` is one of its operands, not a bool.
             op = "and" if isinstance(n.op, ast.And) else "or"
             vals = [self.expr(v) for v in n.values]
+            if any(isinstance(v.ty, ir.TOpaque) for v in vals):
+                return self.opaque(op, vals, ir.TOpaque(""), loc)
             if not all(isinstance(v.ty, ir.TBool) for v in vals):
                 raise self.err(f"'{op}' on non-bool values returns an operand, not a bool; compare explicitly", n)
             out = vals[0]
@@ -1248,6 +1458,20 @@ class ExprLowerer:
             return self.call(n, loc, expect)
         if isinstance(n, ast.Subscript):
             seq = self.need(self.expr(n.value))
+            if isinstance(seq.ty, ir.TOpaque):
+                parts = [seq] + ([self.expr(n.slice)] if not isinstance(n.slice, ast.Slice) else [self.expr(x) for x in (n.slice.lower, n.slice.upper) if x is not None])
+                return self.opaque("getitem", parts, ir.TOpaque(""), loc)
+            if isinstance(seq.ty, ir.TStr):
+                if isinstance(n.slice, ast.Slice):
+                    if n.slice.step is not None:
+                        return self.opaque("slice_step", [seq], ir.STR, loc)
+                    lo = self.expr(n.slice.lower) if n.slice.lower is not None else ir.Lit(ir.NONE, loc, None)
+                    hi = self.expr(n.slice.upper) if n.slice.upper is not None else ir.Lit(ir.NONE, loc, None)
+                    return ir.Builtin(ir.STR, loc, "str_slice", (seq, lo, hi))
+                i = self.expr(n.slice)
+                if not isinstance(i.ty, ir.TInt):
+                    raise self.err("string index must be an int", n)
+                return ir.Builtin(ir.STR, loc, "str_index", (seq, i))
             if isinstance(seq.ty, ir.TDict) and not isinstance(n.slice, ast.Slice):
                 k = self.fl.coerce(self.expr(n.slice), seq.ty.key)
                 if k.ty != seq.ty.key:
@@ -1269,7 +1493,28 @@ class ExprLowerer:
                 raise self.err("list index must be an int", n)
             return ir.Index(seq.ty.elem, loc, seq, idx, wrap=True)
         if isinstance(n, ast.Attribute):
+            fe = self.fl.fe
+            if isinstance(n.value, ast.Name) and n.value.id not in self.fl.env and n.value.id not in self.bound:
+                if n.value.id in fe.enum_types:
+                    et = fe.enum_types[n.value.id]
+                    if n.attr not in et.members:
+                        raise self.err(f"{et.name} has no member '{n.attr}'", n)
+                    return ir.Lit(et, loc, et.members.index(n.attr))
+                if n.value.id in fe.bound or n.value.id in PY_GLOBALS:
+                    return ir.Extern(ir.TOpaque(f"{n.value.id}.{n.attr}"), loc, f"{n.value.id}.{n.attr}", ())
             obj = self.need(self.expr(n.value))
+            if isinstance(obj.ty, ir.TOpaque):
+                return self.opaque(f"attr.{n.attr}", [obj], ir.TOpaque(""), loc)
+            if isinstance(obj.ty, ir.TEnum):
+                if n.attr == "name":
+                    return ir.Builtin(ir.STR, loc, "enum_name", (obj,))
+                if n.attr == "value":
+                    vals = obj.ty.values
+                    kinds = {type(v) for v in vals}
+                    if len(kinds) == 1 and kinds <= {int, str}:
+                        return ir.Builtin(ir.INT if kinds == {int} else ir.STR, loc, "enum_value", (obj,))
+                    return self.opaque("enum_value", [obj], ir.TOpaque(""), loc)
+                raise self.err(f"unsupported attribute '.{n.attr}' of an enum", n)
             if isinstance(obj.ty, ir.TClass):
                 key = f"{obj.ty.name}.{n.attr}"
                 if key in self.fl.fe.properties:
@@ -1316,13 +1561,25 @@ class ExprLowerer:
                 args += [k2, v2]
             return ir.Builtin(dt, loc, "dict_lit", tuple(args))
         if isinstance(n, (ast.GeneratorExp, ast.ListComp)):
-            raise self.err("comprehensions are only supported inside all(...) / any(...)", n)
+            return self.comprehension(n, loc)
+        if isinstance(n, (ast.DictComp, ast.SetComp, ast.Lambda)) and not self.spec:
+            return self.opaque(type(n).__name__.lower(), [], ir.TOpaque(""), loc)
         raise self.err(f"unsupported expression: {type(n).__name__}", n)
 
     def binop(self, n: ast.BinOp, loc: ir.Loc) -> ir.Expr:
         a = self.expr(n.left)
         b = self.expr(n.right)
         op = n.op
+        if isinstance(a.ty, ir.TOpaque) or isinstance(b.ty, ir.TOpaque):
+            return self.opaque(type(op).__name__.lower(), [a, b], ir.TOpaque(""), loc)
+        if isinstance(a.ty, ir.TStr) or isinstance(b.ty, ir.TStr):
+            if isinstance(op, ast.Add) and a.ty == b.ty == ir.STR:
+                return ir.Builtin(ir.STR, loc, "str_concat", (a, b))
+            if isinstance(op, ast.Mult) and {a.ty, b.ty} == {ir.STR, ir.INT}:
+                return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "repeat"), a, b))
+            if isinstance(op, ast.Mod) and a.ty == ir.STR:
+                return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "percent_format"), a, self.fl.coerce(b, ir.TOpaque("")) if not isinstance(b.ty, ir.TOpaque) else b))
+            raise self.err(f"unsupported operation on {a.ty} and {b.ty}", n)
         if isinstance(op, ast.Pow):
             if isinstance(n.right, ast.Constant) and isinstance(n.right.value, int) and 0 <= n.right.value <= 4 and ir.is_numeric(a.ty):
                 k = n.right.value
@@ -1360,12 +1617,32 @@ class ExprLowerer:
         left = self.expr(n.left)
         for op, rnode in zip(n.ops, n.comparators):
             right = self.expr(rnode)
+            if (isinstance(left.ty, ir.TOpaque) or isinstance(right.ty, ir.TOpaque)) and not (ir.NONE in (left.ty, right.ty) and isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq))):
+                parts.append(self.opaque(f"cmp.{type(op).__name__.lower()}", [left, right], ir.BOOL, loc))
+                left = right
+                continue
+            if isinstance(op, (ast.In, ast.NotIn)) and right.ty == ir.STR:
+                if left.ty != ir.STR:
+                    raise self.err(f"'in' on a string needs a string on the left, got {left.ty}", n)
+                c = ir.Builtin(ir.BOOL, loc, "str_contains", (right, left))
+                parts.append(ir.Unary(ir.BOOL, loc, "not", c) if isinstance(op, ast.NotIn) else c)
+                left = right
+                continue
+            if left.ty == right.ty == ir.STR and isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                a_, b_ = (left, right) if isinstance(op, (ast.Lt, ast.LtE)) else (right, left)
+                parts.append(ir.Builtin(ir.BOOL, loc, "str_lt" if isinstance(op, (ast.Lt, ast.Gt)) else "str_le", (a_, b_)))
+                left = right
+                continue
+            if (isinstance(op, (ast.Is, ast.IsNot)) and isinstance(left.ty, ir.TOpaque) and isinstance(right.ty, ir.TOpaque)):
+                pass
             if (isinstance(op, (ast.Is, ast.IsNot)) and ir.NONE in (left.ty, right.ty) or isinstance(op, (ast.Is, ast.IsNot)) and not (isinstance(left.ty, ir.TClass) and left.ty == right.ty)) or (isinstance(op, (ast.Eq, ast.NotEq)) and ir.NONE in (left.ty, right.ty)):
                 other = left if right.ty == ir.NONE else right if left.ty == ir.NONE else None
                 if other is None:
                     raise self.err("'is' is only supported against None", n)
                 if other.ty == ir.NONE:
                     c = ir.Lit(ir.BOOL, loc, True)
+                elif isinstance(other.ty, ir.TOpaque):
+                    c = self.opaque("is_none", [other], ir.BOOL, loc)
                 elif isinstance(other.ty, ir.TOption):
                     c = ir.Builtin(ir.BOOL, loc, "is_none", (other,))
                 else:
@@ -1458,6 +1735,11 @@ class ExprLowerer:
     def call(self, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
         f = n.func
         fe = self.fl.fe
+        # Module functions (math.sqrt, json.dumps, requests.get): unchecked.
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id not in self.fl.env and f.value.id not in self.bound and (f.value.id in fe.modules or (f.value.id in fe.bound and f.value.id not in fe.class_names) or f.value.id in PY_GLOBALS) and f.value.id != "math":
+            return self.extern(f"{f.value.id}.{f.attr}", [], n, loc, expect)
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr not in ("floor", "ceil", "trunc"):
+            return self.extern(f"math.{f.attr}", [], n, loc, expect or ir.REAL)
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.class_names and f.value.id not in self.fl.env:
             key = f"{f.value.id}.{f.attr}"  # a static method
             if key not in fe.signatures:
@@ -1472,6 +1754,14 @@ class ExprLowerer:
                 if key not in fe.signatures or key in fe.properties:
                     raise self.err(f"{obj.ty.name} has no checked method '{f.attr}'", n)
                 return self.method_call(key, obj, n.args, n.keywords, n, loc)
+            if isinstance(obj.ty, ir.TOpaque):
+                return self.extern(f"{_desc(f.value)}.{f.attr}", [obj], n, loc, expect)
+            if isinstance(obj.ty, ir.TStr):
+                return self.str_method(obj, f.attr, n, loc, expect)
+            if isinstance(obj.ty, ir.TList) and f.attr not in ("count", "append"):
+                return self.list_method(obj, f.attr, n, loc, expect)
+            if isinstance(obj.ty, ir.TDict) and f.attr in ("keys", "values", "items", "pop", "setdefault", "update", "clear") :
+                return self.dict_method(obj, f.attr, n, loc, expect)
             if isinstance(obj.ty, ir.TDict):
                 if n.keywords:
                     raise self.err("keyword arguments to dict methods are not supported", n)
@@ -1534,6 +1824,10 @@ class ExprLowerer:
             return self.quant(n, loc, "forall" if name == "all" else "exists")
         if name == "len":
             (x,) = self._args(n, 1)
+            if x.ty == ir.STR:
+                return ir.Builtin(ir.INT, loc, "str_len", (x,))
+            if isinstance(x.ty, (ir.TOpaque, ir.TDict)):
+                return self.opaque("len", [x], ir.INT, loc)
             if not isinstance(x.ty, ir.TList):
                 raise self.err("len() is supported on lists", n)
             return ir.Builtin(ir.INT, loc, "len", (x,))
@@ -1558,7 +1852,7 @@ class ExprLowerer:
         if name == "float":
             (x,) = self._args(n, 1)
             if not ir.is_numeric(x.ty):
-                raise self.err("float() needs a number", n)
+                return self.extern("float", [x], None, loc, ir.REAL)
             return self.fl.coerce(x, ir.REAL)
         if name == "int":
             (x,) = self._args(n, 1)
@@ -1566,7 +1860,7 @@ class ExprLowerer:
                 return x
             if isinstance(x.ty, ir.TReal):
                 return ir.Builtin(ir.INT, loc, "trunc", (x,))
-            raise self.err("int() needs a number", n)
+            return self.extern("int", [x], None, loc, ir.INT)  # int(s): parsing, may raise
         if name == "round":
             if len(n.args) != 1:
                 raise self.err("round() with ndigits is not supported", n)
@@ -1598,6 +1892,22 @@ class ExprLowerer:
                 if vals[fname].ty != fty:
                     raise self.err(f"field '{fname}' of {name} expects {fty}, got {vals[fname].ty}", n)
             return ir.RecordLit(rec, loc, tuple((f, vals[f]) for f, _ in rec.fields))
+        if name == "str" and name not in fe.bound:
+            (x,) = self._args(n, 1)
+            if x.ty == ir.STR:
+                return x
+            if x.ty == ir.INT:
+                return ir.Builtin(ir.STR, loc, "str_of_int", (x,))
+            if isinstance(x.ty, ir.TEnum):
+                return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "str"), ir.Builtin(ir.STR, loc, "enum_name", (x,))))
+            return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "str"), self.fl.coerce(x, ir.TOpaque("")) if isinstance(x.ty, (ir.TList, ir.TDict, ir.TOption)) else x))
+        if name == "isinstance" and name not in fe.bound:
+            x = self.expr(n.args[0])
+            return self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(n.args[1]))], ir.BOOL, loc)
+        if name in fe.signatures:
+            return self.user_call(n, loc, name)
+        if not self.spec:
+            return self.extern(name, [], n, loc, expect)
         return self.user_call(n, loc, name)
 
     def user_call(self, n: ast.Call, loc: ir.Loc, name: str) -> ir.Expr:
@@ -1632,6 +1942,9 @@ class ExprLowerer:
         out = []
         for p in params:
             a = chosen.get(p.name, defaults.get(p.name))
+            if a is None and p.name in defaults:
+                out.append(ir.Extern(p.ty, self.loc(n), f"default of '{p.name}'", ()))  # computed default
+                continue
             if a is None:
                 raise self.err(f"'{key}' is missing argument '{p.name}'", n)
             v = self.fl.coerce(self.expr(a, p.ty), p.ty)
@@ -1675,6 +1988,112 @@ class ExprLowerer:
         if len(n.args) != k:
             raise self.err(f"expected {k} argument(s)", n)
         return [self.expr(a) for a in n.args]
+
+    # -- gradual fallbacks ------------------------------------------------
+
+    def opaque(self, op: str, parts: list[ir.Expr], ty: ir.Type, loc: ir.Loc) -> ir.Expr:
+        """An operation telic does not interpret: deterministic, unknown result."""
+        return ir.Builtin(ty, loc, "opaque_op", (ir.Lit(ir.STR, loc, op), *parts))
+
+    def extern(self, name: str, pre: list[ir.Expr], n: ast.Call | None, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
+        """A call into unchecked code."""
+        if self.spec:
+            raise self.err(f"specifications cannot call unchecked code ('{name}')", n or ast.Constant(0))
+        args = list(pre)
+        if n is not None:
+            for a in n.args:
+                if isinstance(a, ast.Starred):
+                    a = a.value
+                args.append(self.expr(a))
+            for k in n.keywords:
+                args.append(self.expr(k.value))
+        ty = expect if expect is not None and not isinstance(expect, ir.TOpaque) else ir.TOpaque(f"result of {name}")
+        return ir.Extern(ty, loc, name, tuple(args))
+
+    def fstring(self, n: ast.JoinedStr, loc: ir.Loc) -> ir.Expr:
+        out: ir.Expr | None = None
+        for part in n.values:
+            if isinstance(part, ast.Constant):
+                piece: ir.Expr = ir.Lit(ir.STR, loc, str(part.value))
+            else:
+                assert isinstance(part, ast.FormattedValue)
+                v = self.expr(part.value)
+                if v.ty == ir.STR and part.conversion == -1 and part.format_spec is None:
+                    piece = v
+                elif v.ty == ir.INT and part.conversion == -1 and part.format_spec is None:
+                    piece = ir.Builtin(ir.STR, loc, "str_of_int", (v,))
+                else:
+                    spec = ast.unparse(part.format_spec) if part.format_spec is not None else ""
+                    if isinstance(v.ty, (ir.TList, ir.TDict, ir.TOption, ir.TClass, ir.TEnum)):
+                        v = self.opaque("repr", [v], ir.TOpaque(""), loc) if not isinstance(v.ty, ir.TEnum) else ir.Builtin(ir.STR, loc, "enum_name", (v,))
+                    piece = ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, f"format{part.conversion}{spec}"), v))
+            out = piece if out is None else ir.Builtin(ir.STR, loc, "str_concat", (out, piece))
+        return out if out is not None else ir.Lit(ir.STR, loc, "")
+
+    def str_method(self, obj: ir.Expr, attr: str, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
+        args = [self.expr(a) for a in n.args]
+        if n.keywords:
+            return self.extern(f"str.{attr}", [obj], n, loc, expect)
+        if attr in ("startswith", "endswith") and len(args) == 1 and args[0].ty == ir.STR:
+            return ir.Builtin(ir.BOOL, loc, f"str_{attr}", (obj, args[0]))
+        if attr == "find" and len(args) == 1 and args[0].ty == ir.STR:
+            return ir.Builtin(ir.INT, loc, "str_find", (obj, args[0]))
+        if attr in ("lower", "upper", "strip", "lstrip", "rstrip", "title", "capitalize", "casefold", "replace", "zfill", "ljust", "rjust", "center", "removeprefix", "removesuffix", "format", "join") and all(not isinstance(a.ty, (ir.TList, ir.TDict)) or attr == "join" for a in args):
+            parts = [self.fl.coerce(a, ir.TOpaque("")) if isinstance(a.ty, (ir.TList, ir.TDict, ir.TOption, ir.TClass)) else a for a in args]
+            return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, attr), obj, *parts))
+        if attr in ("isdigit", "isalpha", "isalnum", "isspace", "islower", "isupper", "isnumeric", "isdecimal", "isidentifier"):
+            return ir.Builtin(ir.BOOL, loc, "str_fn", (ir.Lit(ir.STR, loc, attr), obj))
+        if attr in ("split", "splitlines", "rsplit"):
+            return self.extern(f"str.{attr}", [obj], n, loc, ir.TList(ir.STR))
+        if attr in ("count", "index", "rfind"):
+            return self.extern(f"str.{attr}", [obj], n, loc, ir.INT)
+        return self.extern(f"str.{attr}", [obj], n, loc, expect)
+
+    def list_method(self, obj: ir.Expr, attr: str, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
+        assert isinstance(obj.ty, ir.TList)
+        res = {"pop": obj.ty.elem, "index": ir.INT, "copy": obj.ty}.get(attr, ir.NONE)
+        if attr == "copy" and not n.args:
+            return ir.Builtin(obj.ty, loc, "slice", (obj, ir.Lit(ir.NONE, loc, None), ir.Lit(ir.NONE, loc, None)))
+        if not isinstance(obj, ir.Var) and attr not in ("index",):
+            raise self.err(f"'.{attr}()' on a list that is not a variable is not tracked", n)
+        return self.extern(f"list.{attr}", [obj], n, loc, res if res != ir.NONE else ir.TOpaque(""))
+
+    def dict_method(self, obj: ir.Expr, attr: str, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
+        assert isinstance(obj.ty, ir.TDict)
+        if attr == "keys" and not n.args:
+            return ir.Builtin(ir.TList(obj.ty.key), loc, "dict_keys", (obj,))
+        if attr == "values" and not n.args:
+            return ir.Builtin(ir.TList(obj.ty.val), loc, "dict_values", (obj,))
+        if not isinstance(obj, ir.Var):
+            raise self.err(f"'.{attr}()' on a dict that is not a variable is not tracked", n)
+        res = {"pop": obj.ty.val, "setdefault": obj.ty.val}.get(attr)
+        return self.extern(f"dict.{attr}", [obj], n, loc, res or ir.TOpaque(""))
+
+    def comprehension(self, n: ast.GeneratorExp | ast.ListComp, loc: ir.Loc) -> ir.Expr:
+        """``[f(x) for x in xs if c(x)]``: a new list. Precise when the body
+        is pure (element i is f(xs[i]), same length without a filter)."""
+        if len(n.generators) != 1 or n.generators[0].is_async:
+            return self.opaque("comprehension", [], ir.TOpaque(""), loc)
+        gen = n.generators[0]
+        seq = self.expr(gen.iter)
+        if isinstance(seq.ty, ir.TOpaque):
+            seq = self.fl.coerce(seq, ir.TList(ir.TOpaque("")))
+        if not isinstance(seq.ty, ir.TList) or not isinstance(gen.target, ast.Name):
+            return self.opaque("comprehension", [seq] if not isinstance(seq.ty, ir.TList) else [], ir.TOpaque(""), loc)
+        saved = dict(self.bound)
+        try:
+            elem = gen.target.id
+            self.bound[elem] = seq.ty.elem
+            body = self.expr(n.elt)
+            conds = [self.cond(c) for c in gen.ifs]
+        finally:
+            self.bound = saved
+        cond: ir.Expr | None = None
+        for c in conds:
+            cond = c if cond is None else ir.Binary(ir.BOOL, loc, "and", cond, c)
+        if isinstance(body.ty, (ir.TList, ir.TDict)):
+            return self.opaque("comprehension", [], ir.TOpaque(""), loc)
+        return ir.Builtin(ir.TList(body.ty), loc, "comp", (seq, ir.Lit(ir.STR, loc, elem), body) + ((cond,) if cond is not None else ()))
 
     def quant(self, n: ast.Call, loc: ir.Loc, kind: str) -> ir.Expr:
         if len(n.args) != 1 or not isinstance(n.args[0], (ast.GeneratorExp, ast.ListComp)):

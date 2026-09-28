@@ -303,7 +303,10 @@ class Renderer:
         p = self.p
         ob = v.ob
         mod = f.ref.module
-        if v.status == "refuted":
+        race = v.replay is not None and v.replay.violation == "race"
+        if race:
+            tag = p.bred("⚡ RACE")
+        elif v.status == "refuted":
             tag = p.bred("✗ REFUTED")
         elif v.status == "unconfirmed":
             tag = p.byellow("? UNPROVEN")
@@ -358,7 +361,7 @@ class Renderer:
             if solver_cex and v.status in ("refuted", "unconfirmed"):
                 out.append(f"   {p.bold(pad('counterexample', 16))}{solver_cex}")
                 interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith("()") and "@new" not in k and not k.startswith(("alloc@",))}
-                if interesting and v.status == "unconfirmed":
+                if interesting and v.status == "unconfirmed" and not race:
                     st = ", ".join(f"{k.split('@')[0]}={fmt_state_value(val)}" for k, val in list(interesting.items())[:6])
                     out.append(f"   {p.dim(pad('loop state', 16))}{p.dim(st)}")
             if rp is not None:
@@ -366,7 +369,7 @@ class Renderer:
                     out.append(f"   {p.bold(pad('replayed', 16))}{p.green('✓')} {rp.summary}")
                 else:
                     out.append(f"   {p.bold(pad('replayed', 16))}{p.dim('·')} {rp.summary}")
-                if rp.fuzz_summary:
+                if rp.fuzz_summary and not race:
                     sym = p.red("✗") if rp.fuzz_witness else p.dim("·")
                     out.append(f"   {p.bold(pad('tested', 16))}{sym} {rp.fuzz_summary}")
         if v.status == "unknown":
@@ -388,6 +391,8 @@ class Renderer:
 
     def hint(self, f: FunctionReport, v: Verdict) -> str:
         ob = v.ob
+        if v.replay is not None and v.replay.violation == "race":
+            return "re-check the state after the await, or keep other tasks from changing it meanwhile (a lock, a version check)"
         if v.status == "unconfirmed":
             if ob.kind == "variant":
                 return "add or fix '@decreases' on this loop"
@@ -539,8 +544,29 @@ class Renderer:
         out = [self.rule("trusted base", ""), ""]
         for f in trusted:
             out.append(f"  {p.blue('◇')} {f.fn.name} {p.dim(fn_loc(f))} {p.dim('@trusted')}")
+        groups: dict[str, list[tuple[str, int]]] = {}
+        calls: dict[str, list[tuple[str, int]]] = {}
         for f, loc, text in assumes:
-            out.append(f"  {p.blue('◇')} {p.dim('@assume')} {text} {p.dim(f'{f.ref.module.path}:{loc.line}')}")
+            if text.startswith("assumed: call:"):
+                calls.setdefault(text[len("assumed: call:"):], []).append((f.ref.module.path, loc.line))
+            elif text.startswith("assumed: "):
+                groups.setdefault(text[len("assumed: "):], []).append((f.ref.module.path, loc.line))
+            else:
+                out.append(f"  {p.blue('◇')} {p.dim('@assume')} {text} {p.dim(f'{f.ref.module.path}:{loc.line}')}")
+
+        def where(locs: list[tuple[str, int]]) -> str:
+            by: dict[str, list[int]] = {}
+            for path, line in locs:
+                by.setdefault(path, [])
+                if line not in by[path]:
+                    by[path].append(line)
+            return "  ".join(f"{path}:{','.join(str(x) for x in sorted(ls))}" for path, ls in by.items())
+
+        if calls:
+            names = ", ".join(sorted(calls))
+            out.append(f"  {p.blue('◇')} unchecked calls do not raise: {names}  {p.dim(where([x for v in calls.values() for x in v]))}")
+        for text, locs in groups.items():
+            out.append(f"  {p.blue('◇')} {text}  {p.dim(where(locs))}")
         if self.verbose:
             for lang in langs:
                 mod = next(m for m in self.r.modules if m.language == lang)

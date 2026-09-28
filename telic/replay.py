@@ -29,6 +29,8 @@ PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 
 def _encode_any(v: Any) -> Any:
     """Encode a decoded model value whose static type is not at hand."""
+    if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
+        return v
     if isinstance(v, dict) and "__class__" in v:
         fields = None if v.get("__stub__") else {k: _encode_any(x) for k, x in v.items() if not k.startswith("__")}
         return {"__object__": v["__class__"], "ref": v.get("__ref__"), "fields": fields}
@@ -42,6 +44,12 @@ def _encode_any(v: Any) -> Any:
 
 
 def encode_value(v: Any, ty: ir.Type) -> Any:
+    if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
+        return v
+    if isinstance(ty, ir.TOpaque):
+        return {"__opaque__": True}
+    if isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum)):
+        return [_encode_any(x) for x in (v or [])]
     if isinstance(ty, ir.TOption):
         return None if v is None else encode_value(v, ty.inner)
     if isinstance(ty, ir.TClass):
@@ -83,6 +91,10 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         tag = v["__object__"] if label else f"{v['__object__']} #{v['ref']}"
         inner = " ".join(f"{k}={format_value(x, None, lang, names)}" for k, x in v["fields"].items())
         return f"<{tag} {inner}>" if inner else f"<{tag}>"
+    if isinstance(v, dict) and "__enum__" in v:
+        return f"{v['__enum__']}.{v['member']}"
+    if isinstance(v, dict) and "__opaque__" in v:
+        return "…"
     if isinstance(v, dict) and "__dict__" in v:
         inner = ", ".join(f"{format_value(k, None, lang)}: {format_value(x, None, lang)}" for k, x in v["__dict__"])
         return "{" + inner + "}"
@@ -104,7 +116,10 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         return "true" if v else "false"
     if isinstance(v, list):
         inner_ty = ty.elem if isinstance(ty, ir.TList) else None
-        return "[" + ", ".join(format_value(x, inner_ty, lang, names) for x in v) + "]"
+        shown = [format_value(x, inner_ty, lang, names) for x in v]
+        if len(shown) > 8 and len(set(shown)) == 1:
+            return f"[{shown[0]}] * {len(shown)}" if lang == "python" else f"Array({len(shown)}).fill({shown[0]})"
+        return "[" + ", ".join(shown) + "]"
     if isinstance(v, str):
         return json.dumps(v) if lang != "python" else repr(v)
     return str(v)
@@ -316,6 +331,10 @@ def replay_verdicts(program: Program, rep) -> None:
         if v.reason.startswith("the model's list input is too large"):
             v.replay = Replay(False, False, v.reason)
             v.status = "unconfirmed"
+            continue
+        race = sorted({c.name.split("@await")[1].split(".")[0] for t in list(v.ob.hyps) + [v.ob.goal] for c in _consts(t) if "@await" in c.name})
+        if race:
+            v.replay = Replay(False, False, f"another task may change these objects during the await at line {', '.join(race)}; a single run cannot reproduce a race", violation="race")
             continue
         args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
         try:

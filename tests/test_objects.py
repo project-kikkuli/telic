@@ -38,3 +38,15 @@ def test_heap_aliasing_and_frames():
     f = got["break_child"]
     v = next(v for v in f.verdicts if v.status == "refuted")
     assert "next=a" in call_text(f.fn, v.model, "python")
+
+
+def test_vibecoded_shop():
+    """Gradual verification on a realistic module: enums, pydantic models,
+    unchecked libraries, async, try/except, f-strings, comprehensions."""
+    got = run("shop.py")
+    for name in ("with_tax", "parse_qty", "summarize", "skus", "Order.__init__", "Order.pay", "Order.label"):
+        assert got[name].status == "proved", (name, got[name].status, got[name].problems)
+    assert refuted_confirmed(got["discount"])  # a negative discount code
+    assert got["Order.add"].status == "refuted"  # the raise needs '@raises'
+    race = [v for v in got["checkout"].verdicts if v.replay is not None and v.replay.violation == "race"]
+    assert race and all(v.ob.kind == "call" for v in race)  # status can change during the await
