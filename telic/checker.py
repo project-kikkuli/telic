@@ -188,6 +188,40 @@ class ProofCache:
         Path(self.path).write_text(json.dumps({"version": self.VERSION, "proofs": keep}, indent=1, sort_keys=True))
 
 
+_sidecars: dict[str, dict] = {}
+
+
+def sidecar_proof_hash(ref: FuncRef, oid: str, root: str | None) -> str | None:
+    from .lean import _phash, read_sidecar, sidecar_path
+
+    path = ref.module.path
+    full = os.path.join(root or os.getcwd(), path) if not os.path.isabs(path) else path
+    side = sidecar_path(full)
+    if side not in _sidecars:
+        _sidecars[side] = read_sidecar(side)
+    sp = _sidecars[side].get(oid)
+    return _phash(sp.proof) if sp is not None else None
+
+
+def inference_key(program: Program, key: str) -> str:
+    """Inference results depend on a function and everything it calls."""
+    from . import __version__
+
+    seen: set[str] = set()
+    todo = [key]
+    while todo:
+        k = todo.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        todo.extend(program.callees.get(k, ()))
+    h = hashlib.sha256(f"infer {__version__}".encode())
+    for k in sorted(seen):
+        ref = program.ref(k)
+        h.update(f"{k}\n{ref.fn.source}\n{sorted(ref.module.records)}".encode())
+    return "infer:" + h.hexdigest()[:24]
+
+
 def obligation_key(ob: Obligation, theory: Theory) -> str:
     defs, axioms = theory.closure(list(ob.hyps) + [ob.goal], ob.exclude_axioms)
     h = hashlib.sha256()
@@ -250,6 +284,7 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None) -> Report:
     t0 = t0 or time.perf_counter()
     program = Program.build(modules)
+    _sidecars.clear()
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)
     theory, theory_problems = build_theory(program, {})
@@ -266,8 +301,10 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if ref.fn.unsupported or ref.fn.trusted:
             continue
         if opts.infer:
+            ikey = inference_key(program, key)
             try:
-                inferred[key] = infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 3000))
+                inferred[key] = infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 3000), cached=cache.get(ikey))
+                cache.put(ikey, inferred[key].summary())
             except VCError:
                 inferred[key] = Inferred()
             if key in inferred[key].options.measures:
@@ -313,6 +350,17 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         for ob in obs:
             key_ = obligation_key(ob, theory)
             hit = cache.get(key_)
+            if hit is not None and hit.get("method") == "unknown":
+                if hit.get("timeout", 0) >= opts.timeout_ms:
+                    hits += 1
+                    rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'timeout')} (cached)"))
+                    continue
+                hit = None
+            if hit is not None and hit.get("method") == "lean:proof" and hit.get("proof_hash") != sidecar_proof_hash(ref, ob.id, root):
+                # The sidecar proof was edited or removed: Z3 already failed
+                # on this exact formula, so go straight back to Lean.
+                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason="needs Lean"))
+                continue
             if hit is not None:
                 hits += 1
                 rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=hit.get("method", "")))
@@ -322,6 +370,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             v = Verdict(ob, res.status, "z3", res.seconds, res.model, res.state, res.reason)
             if res.status == "proved":
                 cache.put(key_, {"method": "z3"})
+            elif res.status == "unknown":
+                cache.put(key_, {"method": "unknown", "timeout": opts.timeout_ms, "reason": res.reason})
             rep.verdicts.append(v)
         # Escalate: counterexamples get executed, unknowns go to Lean.
         if opts.replay:

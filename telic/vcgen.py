@@ -1088,6 +1088,14 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
     for ex in reversed(exits[:-1]):
         assert ex.value is not None and not isinstance(ex.value, ListVal)
         body = L.ite(L.and_(*ex.facts), ex.value, body)
+    # Outside its precondition a function has no meaning; giving it a fixed
+    # default there keeps the definition total and well-founded (a recursive
+    # equation that does not terminate could otherwise be inconsistent).
+    rctx = Ctx(base=[], env=env, module=ref.module, spec=True, quiet=True)
+    req = L.and_(*[g.ev(r.expr, rctx) for r in ref.fn.requires])
+    inner = body
+    if req != L.TRUE:
+        body = L.ite(req, body, default_value(sort_of(ref.fn.ret)))
     name = program.logic_names[ref.key]
     m = None
     if measure is not None:
@@ -1101,7 +1109,23 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
         recursive=ref.key in program.recursive,
         measure=m,  # type: ignore[arg-type]
         doc=f"{ref.module.path}:{ref.fn.loc.line}",
+        guard=req if req != L.TRUE else None,
+        inner=inner,
     )
+
+
+def default_value(s: L.Sort) -> L.Term:
+    if s == L.INT:
+        return L.ZERO
+    if s == L.REAL:
+        return L.RealV(Fraction(0))
+    if s == L.BOOL:
+        return L.FALSE
+    if s == L.STR:
+        return L.StrV("")
+    if s.name == "Rec":
+        return L.mkrec(s, tuple(default_value(fs) for _, fs in s.fields))
+    raise VCError(f"no default value for {s}")
 
 
 def build_axioms(program: Program, ref: FuncRef, fundef: L.FunDef) -> list[L.Axiom]:

@@ -310,6 +310,8 @@ class Renderer:
         else:
             tag = p.byellow("? UNKNOWN")
         head = KIND_HEADLINE.get(ob.kind, ob.kind)
+        if v.status == "unknown":
+            head = f"{KIND_NOUN.get(ob.kind, ob.kind)} not proved"
         where = f"{mod.path}:{(ob.site or ob.loc).line}"
         out = [self.rule(f"{tag} {p.bold(f.fn.name)} {p.dim('·')} {head}", where)]
         for iid in ob.intents:

@@ -285,6 +285,14 @@ class Inferred:
     measure: str | None = None
     solver_calls: int = 0
 
+    def summary(self) -> dict:
+        return {
+            "method": "inference",
+            "inv": {str(k): [c.text for c in v] for k, v in self.invariants.items()},
+            "var": {str(k): v for k, v in self.variants.items()},
+            "measure": self.measure,
+        }
+
 
 def _all_proved(obs, theory: Theory, timeout_ms: int, inf: Inferred) -> bool:
     for ob in obs:
@@ -294,10 +302,37 @@ def _all_proved(obs, theory: Theory, timeout_ms: int, inf: Inferred) -> bool:
     return True
 
 
-def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000) -> Inferred:
-    fn = ref.fn
+def from_cache(fn: ir.Function, ref: FuncRef, sites: list[LoopSite], cached: dict) -> Inferred:
     inf = Inferred()
+    for site in sites:
+        line = site.stmt.loc.line
+        keep = set(cached.get("inv", {}).get(str(line), []))
+        cs = [c for c in invariant_candidates(fn, site) if c.text in keep]
+        if cs:
+            inf.invariants[line] = cs
+        want = cached.get("var", {}).get(str(line))
+        if want and isinstance(site.stmt, ir.While):
+            for cand in variant_candidates(fn, site.stmt):
+                if render(cand) == want:
+                    inf.options.variants[line] = cand
+                    inf.variants[line] = want
+                    break
+    inf.options.extra_invariants = inf.invariants
+    if cached.get("measure"):
+        for cand in measure_candidates(fn):
+            if render(cand) == cached["measure"]:
+                inf.options.measures[ref.key] = cand
+                inf.measure = cached["measure"]
+                break
+    return inf
+
+
+def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000, cached: dict | None = None) -> Inferred:
+    fn = ref.fn
     sites = loop_sites(fn.body)
+    if cached is not None and cached.get("method") == "inference":
+        return from_cache(fn, ref, sites, cached)
+    inf = Inferred()
 
     # 1. Houdini over candidate loop invariants.
     cands: dict[int, list[ir.Clause]] = {}

@@ -553,6 +553,9 @@ class FunDef:
     # structural over a builtin (seqsum); user definitions carry a measure.
     measure: Term | None = None
     doc: str = ""
+    # For guarded definitions f(x) = if guard then inner else default:
+    guard: Term | None = None
+    inner: Term | None = None
 
 
 @dataclass
