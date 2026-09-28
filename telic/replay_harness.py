@@ -24,6 +24,18 @@ def decode(v: Any, module: Any) -> Any:
     return v
 
 
+def to_json(v: Any) -> Any:
+    if isinstance(v, (list, tuple)):
+        return [to_json(x) for x in v]
+    if hasattr(v, "__dataclass_fields__"):
+        return {k: to_json(getattr(v, k)) for k in v.__dataclass_fields__}
+    if hasattr(v, "_asdict"):
+        return {k: to_json(x) for k, x in v._asdict().items()}
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v
+
+
 def gen(ty: dict, rnd, module: Any, depth: int = 0) -> Any:
     k = ty["k"]
     if k == "int":
@@ -148,6 +160,22 @@ def main() -> None:
         args = [decode(a, mod) for a in req.get("args", [])]
     except Exception as e:
         print(json.dumps({"harness_error": f"{type(e).__name__}: {e}"}))
+        return
+    if "batch" in req:
+        results = []
+        for raw in req["batch"]:
+            args = [decode(a, mod) for a in raw]
+            try:
+                r = fn(*args)
+                results.append({"ok": True, "value": to_json(r), "repr": repr(r)})
+            except ContractViolation as e:
+                if e.kind == "requires" and e.func == req["func"]:
+                    results.append({"rejected": True})
+                else:
+                    results.append({"error": f"@{e.kind} {e.text} failed"})
+            except Exception as e:
+                results.append({"error": f"{type(e).__name__}: {e}"})
+        print(json.dumps({"results": results}))
         return
     if "fuzz" in req:
         print(json.dumps(fuzz(fn, req["types"], req["fuzz"], mod, ContractViolation, req["func"])))

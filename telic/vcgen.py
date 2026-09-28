@@ -209,7 +209,8 @@ class Options:
 
 
 class VCGen:
-    def __init__(self, program: Program, ref: FuncRef, opts: Options | None = None):
+    def __init__(self, program: Program, ref: FuncRef, opts: Options | None = None, inputs: dict[str, Val] | None = None):
+        self.input_override = inputs or {}
         self.program = program
         self.ref = ref
         self.fn = ref.fn
@@ -291,7 +292,7 @@ class VCGen:
         env: dict[str, Val] = {}
         facts: list[L.Term] = []
         for p in fn.params:
-            v = self.param_val(p.name, p.ty)
+            v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
             env[p.name] = v
             self.inputs.append((p.name, v))
             if isinstance(v, ListVal):

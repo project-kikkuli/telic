@@ -180,10 +180,17 @@ class Program:
         by_name: dict[str, list[str]] = {}
         for key, ref in self.funcs.items():
             by_name.setdefault(ref.fn.name, []).append(key)
+        used: set[str] = set()
         for name, keys in by_name.items():
             for key in keys:
                 if len(keys) == 1:
-                    self.logic_names[key] = name
+                    cand = name
                 else:
                     stem = re.sub(r"\W", "_", self.funcs[key].module.path.rsplit("/", 1)[-1])
-                    self.logic_names[key] = f"{stem}_{name}"
+                    cand = f"{stem}_{name}"
+                base, k = cand, 1
+                while cand in used:
+                    k += 1
+                    cand = f"{base}_{k}"
+                used.add(cand)
+                self.logic_names[key] = cand

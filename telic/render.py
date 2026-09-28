@@ -420,16 +420,21 @@ class Renderer:
             out.append("")
             w = mr.witness
             la, lb = a.module.language, b.module.language
-            out.append(f"   {p.bold(pad('input', 16))}{w['args_text']}")
-            out.append(f"   {p.bold(pad(a.module.path, 16))}{w['a_text']}   {p.dim('(' + la + ')')}")
-            out.append(f"   {p.bold(pad(b.module.path, 16))}{w['b_text']}   {p.dim('(' + lb + ')')}")
+            col = max(16, len(a.module.path) + 2, len(b.module.path) + 2)
+            out.append(f"   {p.bold(pad('input', col))}{w['args_text']}")
+            out.append(f"   {p.bold(pad(a.module.path, col))}{w['a_text']}")
+            out.append(f"   {p.bold(pad(b.module.path, col))}{w['b_text']}")
             if w.get("replay"):
                 ok = w["replay"].get("confirmed")
                 sym = p.green("✓") if ok else p.dim("·")
-                out.append(f"   {p.bold(pad('replayed', 16))}{sym} {w['replay']['summary']}")
+                out.append(f"   {p.bold(pad('replayed', col))}{sym} {w['replay']['summary']}")
             if mr.explanation:
-                out.append(f"   {p.magenta(pad('why', 16))}{mr.explanation}")
-        elif mr.status != "proved" and mr.reason:
+                out.append(f"   {p.magenta(pad('why', col))}{mr.explanation}")
+            how = "found by the solver" if mr.method == "smt" else "found by differential testing"
+            out.append(p.dim(f"   {pad('', col)}{how}; both functions satisfy their own contracts"))
+        elif mr.status == "proved":
+            out.append(p.dim("   proved: equal results for every input both accept"))
+        elif mr.reason:
             out.append(f"   {p.dim(mr.reason)}")
         out.append("")
         return out
@@ -460,6 +465,7 @@ class Renderer:
             if i.functions:
                 names = [k.split("::")[-1] for k in i.functions]
                 detail.append(", ".join(names))
+            mirrors = [m for m in self.r.mirrors if i.id in m.intents]
             if status == "unformalized":
                 detail.append("no @ensures carries this intent yet")
             elif i.proved or i.refuted or i.open:
@@ -472,6 +478,9 @@ class Renderer:
                 if not i.refuted and not i.open:
                     bits.append("all proved")
                 detail.append(": ".join([bits[0], ", ".join(bits[1:])]))
+            for m in mirrors:
+                word = {"proved": "mirror proved equal", "refuted": p.red("mirror diverges"), "open": "mirror not proved"}[m.status]
+                detail.append(word)
             if detail:
                 out.append(" " * (4 + idw + 14) + p.dim("  ·  ".join(detail)))
         out.append("")

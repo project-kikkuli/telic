@@ -156,7 +156,7 @@ function load(path, contracts) {
 function outcome(fn, args) {
   try {
     const r = fn(...args);
-    return { returned_repr: show(r), nonfinite: typeof r === "number" && !Number.isFinite(r), returned_is_none: r === undefined };
+    return { value: plain(r), returned_repr: show(r), nonfinite: typeof r === "number" && !Number.isFinite(r), returned_is_none: r === undefined };
   } catch (e) {
     if (e && e.telic) return { ...e.telic };
     if (e && e[OOB]) return { crash: "RangeError", msg: e.message, oob: true };
@@ -274,6 +274,16 @@ process.stdin.on("end", () => {
   const fn = fns[req.func];
   if (typeof fn !== "function") {
     console.log(JSON.stringify({ harness_error: `no function '${req.func}'` }));
+    return;
+  }
+  if (req.batch) {
+    const results = req.batch.map((raw) => {
+      const o = outcome(fn, raw.map(decode));
+      if (o.violation === "requires" && o.func === req.func) return { rejected: true };
+      if (o.violation || o.crash) return { error: o.violation ? `@${o.violation} ${o.text} failed` : `${o.crash}: ${o.msg}` };
+      return { ok: true, value: o.value, repr: o.returned_repr };
+    });
+    console.log(JSON.stringify({ results }));
     return;
   }
   if (req.fuzz) {

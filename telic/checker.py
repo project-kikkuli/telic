@@ -44,6 +44,28 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
         else:
             files.append(p)
     root = root or os.getcwd()
+    # Files named by '@mirrors' come along automatically.
+    from .equiv import mirror_targets
+
+    seen = {os.path.normpath(os.path.abspath(f)) for f in files}
+    pending = list(files)
+    while pending:
+        f = pending.pop()
+        try:
+            src = Path(f).read_text()
+        except OSError:
+            continue
+        for line in src.splitlines():
+            s = line.strip()
+            if s.startswith(("#@", "//@")) and " mirrors " in s + " ":
+                spec = s.split("mirrors", 1)[1].strip()
+                if "::" in spec:
+                    tgt = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(f)), spec.rsplit("::", 1)[0]))
+                    if tgt not in seen and os.path.exists(tgt):
+                        seen.add(tgt)
+                        files.append(tgt)
+                        pending.append(tgt)
+    del mirror_targets
     mods: list[ir.Module] = []
     ts_files = [f for f in files if language_of(f) == "typescript"]
     ts_mods: dict[str, ir.Module] = {}
