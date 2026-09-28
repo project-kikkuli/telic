@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telic"
+version = "0.1.0"
+description = "Contracts in comments, checked by proof: a static verifier for Python and TypeScript."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["z3-solver>=4.12"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+telic = "telic.cli:main"
+
+[project.entry-points.pytest11]
+
+[tool.setuptools.packages.find]
+include = ["telic*"]
+
+[tool.setuptools.package-data]
+telic = ["frontend/ts/*.mjs", "frontend/ts/package.json", "frontend/ts/package-lock.json", "lean/*.lean"]

@@ -1,0 +1,9 @@
+{
+  "name": "telic-ts-frontend",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript -> telic IR lowering (uses the official TypeScript compiler API)",
+  "dependencies": {
+    "typescript": "5.9.3"
+  }
+}
