@@ -50,20 +50,25 @@ const TAG_RE = new RegExp(`^\\[\\s*(${INTENT_ID}(?:\\s*,\\s*${INTENT_ID})*)\\s*\
 const INTENT_DECL_RE = new RegExp(`^(${INTENT_ID})\\s*(?::\\s*(.*))?$`);
 const INTENT_LIST_RE = new RegExp(`^${INTENT_ID}(?:\\s*,\\s*${INTENT_ID})*$`);
 
+// Every comment in the file, via the compiler's own trivia ranges (a raw
+// scanner can mistake `//` inside a template literal or regex for a comment).
 function collectComments(sf) {
-  const out = [];
-  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, sf.text);
-  let tok;
-  while ((tok = scanner.scan()) !== ts.SyntaxKind.EndOfFileToken) {
-    if (tok === ts.SyntaxKind.SingleLineCommentTrivia) {
-      const pos = scanner.getTokenStart ? scanner.getTokenStart() : scanner.getTokenPos();
-      const lc = sf.getLineAndCharacterOfPosition(pos);
-      out.push({ line: lc.line + 1, col: lc.character, text: scanner.getTokenText(), pos });
+  const seen = new Map();
+  const text = sf.text;
+  const grab = (ranges) => {
+    for (const r of ranges || []) {
+      if (r.kind !== ts.SyntaxKind.SingleLineCommentTrivia || seen.has(r.pos)) continue;
+      const lc = sf.getLineAndCharacterOfPosition(r.pos);
+      seen.set(r.pos, { line: lc.line + 1, col: lc.character, text: text.slice(r.pos, r.end), pos: r.pos });
     }
-    // Template literals / regexes can confuse a raw scanner; re-scan them.
-    if (tok === ts.SyntaxKind.CloseBraceToken) scanner.reScanTemplateToken && void 0;
-  }
-  return out;
+  };
+  const walk = (node) => {
+    grab(ts.getLeadingCommentRanges(text, node.getFullStart()));
+    grab(ts.getTrailingCommentRanges(text, node.getEnd()));
+    for (const child of node.getChildren(sf)) walk(child);
+  };
+  walk(sf);
+  return [...seen.values()].sort((a, b) => a.pos - b.pos);
 }
 
 function parseContractLines(comments) {
@@ -154,7 +159,9 @@ class ModuleLowerer {
     }
     // Function declarations (and `const f = (...) => ...`).
     const fns = [];
+    const isAsync = (n) => !!(n.modifiers && n.modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) || !!n.asteriskToken;
     for (const st of this.sf.statements) {
+      if ((ts.isFunctionDeclaration(st) && isAsync(st)) || (ts.isVariableStatement(st) && st.declarationList.declarations.some((d) => d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)) && isAsync(d.initializer)))) continue;
       if (ts.isFunctionDeclaration(st) && st.name && st.body) fns.push({ name: st.name.text, node: st, exported: !!(ts.getCombinedModifierFlags(st) & ts.ModifierFlags.Export) });
       else if (ts.isVariableStatement(st) && st.declarationList.declarations.length === 1) {
         const d = st.declarationList.declarations[0];
@@ -190,8 +197,27 @@ class ModuleLowerer {
         }
       }
     }
+    const spans = [];
+    const visit = (n) => {
+      if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+        const name = n.name ? n.name.text : "class";
+        spans.push([n.getStart(this.sf), n.getEnd(), `methods are not checked yet (in '${name}'); telic checks top-level functions`]);
+      } else if ((ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n)) && n.modifiers && n.modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) {
+        spans.push([n.getFullStart(), n.getEnd(), "async functions are not checked yet"]);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(this.sf);
+    const reported = new Set();
     for (const cl of this.contracts) {
-      if (!cl.consumed) this.module.problems.push([`stray '@${cl.keyword}' is not attached to any function, loop, or statement`, cl.line]);
+      if (cl.consumed) continue;
+      const span = spans.find(([a, b]) => cl.pos >= a && cl.pos <= b);
+      if (span) {
+        if (!reported.has(span[2])) this.module.problems.push([span[2], cl.line]);
+        reported.add(span[2]);
+        continue;
+      }
+      this.module.problems.push([`stray '@${cl.keyword}' is not attached to any function, loop, or statement`, cl.line]);
     }
     return this.module;
   }
@@ -434,9 +460,6 @@ class FunctionLowerer {
       locals: {},
     };
     this.fn = fn;
-    if (sig.ret.k === "real" && sig.retInferred) {
-      // number-returning without annotation and not provably int
-    }
     for (const cl of sig.contracts) {
       cl.consumed = true;
       try {
@@ -446,7 +469,6 @@ class FunctionLowerer {
         this.unsupported.push([`contract: ${e.message}`, e.line || cl.line]);
       }
     }
-    for (const n of this.intsFromContractMismatch()) this.unsupported.push([n, fn.loc[0]]);
     const body = node.body;
     if (ts.isBlock(body)) fn.body = this.block(body.statements, body);
     else {
@@ -462,10 +484,6 @@ class FunctionLowerer {
     fn.locals = { ...this.env };
     fn.intents = this.intents;
     return fn;
-  }
-
-  intsFromContractMismatch() {
-    return [];
   }
 
   functionContract(cl) {

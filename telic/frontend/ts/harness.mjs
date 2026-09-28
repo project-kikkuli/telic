@@ -114,11 +114,10 @@ function wrap(name, fn, c) {
   const H = Object.values(helpers);
   return function (...args) {
     for (const [t, f] of reqs) if (!f(...args, undefined, [], ...H)) throw new Violation("requires", t, name);
-    const entry = args.map((a, i) => (c.lists.includes(i) ? a : a));
     const olds = ens.map(([, , os]) => os.map((o) => structuredCloneSafe(o(...args, undefined, [], ...H))));
     const r = fn.apply(this, args);
     ens.forEach(([t, f], k) => {
-      if (!f(...entry, r, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(r)}`);
+      if (!f(...args, r, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(r)}`);
     });
     return r;
   };

@@ -525,8 +525,6 @@ class Renderer:
                 deps = ", ".join(sorted(d.split("::")[-1] for d in f.open_deps))
                 extras.append(p.yellow(f"assumes unproved {deps}"))
             ex = p.dim("  ·  " + "  ·  ".join(extras)) if extras else ""
-            if f.fn.name.startswith("_") and f.status == "proved" and not self.verbose:
-                pass
             out.append(f"  {mark(p, f.status)} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{desc}{ex}")
         out.append("")
         return out

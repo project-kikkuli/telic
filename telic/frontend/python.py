@@ -119,8 +119,25 @@ class PythonFrontend:
                 else:
                     self.module.intents.append(ir.IntentDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
                 cl.consumed = True
+        spans: list[tuple[int, int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        spans.append((min([sub.lineno] + [d.lineno for d in sub.decorator_list]) - 3, sub.end_lineno or sub.lineno, f"methods are not checked yet ('{node.name}.{sub.name}'); telic checks top-level functions"))
+            elif isinstance(node, ast.AsyncFunctionDef):
+                spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"async functions are not checked yet ('{node.name}')"))
+            elif isinstance(node, ast.FunctionDef) and node not in tree.body:
+                spans.append((node.lineno - 3, node.end_lineno or node.lineno, f"nested functions are not checked yet ('{node.name}')"))
+        reported: set[str] = set()
         for cl in self.contract_lines:
             if not cl.consumed:
+                why = next((msg for lo, hi, msg in spans if lo <= cl.line <= hi), None)
+                if why is not None:
+                    if why not in reported:
+                        self.module.problems.append((why, ir.Loc(cl.line, cl.col)))
+                        reported.add(why)
+                    continue
                 self.module.problems.append(
                     (f"stray '@{cl.keyword}' is not attached to any function, loop, or statement", ir.Loc(cl.line, cl.col))
                 )

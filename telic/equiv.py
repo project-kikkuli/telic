@@ -286,10 +286,8 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
         if not oa.get("ok") and not ob_.get("ok"):
             continue
         return _witness(rep, a, b, root, xa, xb, from_solver=False)
-    rep.status = "open" if rep.reason else "open"
+    rep.status = "open"
     rep.reason = (rep.reason + "; " if rep.reason else "") + f"agreed on {compared} random inputs (testing, not proof)"
-    if compared and not rep.reason.startswith("solver"):
-        rep.status = "open"
     return rep
 
 

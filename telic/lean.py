@@ -235,14 +235,6 @@ end Telic
 """
 
 
-@dataclass
-class LeanDoc:
-    """A self-contained Lean file proving one or more obligations."""
-
-    header: str
-    theorems: list[tuple[str, str]]  # (name, statement)
-
-
 def collect_records(terms: list[L.Term]) -> list[L.Sort]:
     out: dict[str, L.Sort] = {}
 
@@ -266,9 +258,7 @@ def collect_records(terms: list[L.Term]) -> list[L.Sort]:
 def render_defs(defs: list[L.FunDef], records: list[L.Sort], fn_names: dict[str, str]) -> str:
     lines: list[str] = []
     for r in records:
-        fields = " ".join(f"({n} : {lean_sort(s)})" for n, s in r.fields)
         lines.append(f"structure {r.rec} where\n  mk ::\n" + "".join(f"  {n} : {lean_sort(s)}\n" for n, s in r.fields))
-        del fields
     # Definitions in dependency order (callees first).
     order: list[L.FunDef] = []
     by = {d.name: d for d in defs}
@@ -368,7 +358,9 @@ def theorem_name(ob: Obligation) -> str:
 
 
 def statement_hash(statement: str, defs_text: str) -> str:
-    return hashlib.sha256((defs_text + "\n" + statement).encode()).hexdigest()[:12]
+    # Doc comments carry file paths; moving a file must not invalidate proofs.
+    defs = re.sub(r"/--.*?-/\n?", "", defs_text, flags=re.S)
+    return hashlib.sha256((defs + "\n" + statement).encode()).hexdigest()[:12]
 
 
 def build_context(ob: Obligation, theory: Theory, fn_names: dict[str, str]) -> tuple[str, str]:
@@ -541,10 +533,6 @@ class LeanOutcome:
     summary: str
     method: str = ""
     errors: list[str] = field(default_factory=list)
-
-
-def _fn_names(program) -> dict[str, str]:
-    return {}
 
 
 def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = None) -> None:
@@ -734,7 +722,7 @@ def run_agent(cmd: str, prompt: str, timeout: float = 600) -> str:
 
 
 def cmd_prove(args) -> int:
-    from .checker import build_theory, check, obligation_key
+    from .checker import build_theory, check
     from .render import Paint
 
     paint = Paint()
@@ -818,9 +806,7 @@ def cmd_prove(args) -> int:
                 entries[sid] = (sp.hash, m.group(1), m.group(2), sp.proof)
         entries[ob.id] = (h, theorem_name(ob), stmt, ok_proof)
         write_sidecar(side, src, entries)
-        opts.cache_path and None
         print(f"  {paint.dim('saved to ' + os.path.relpath(side, root))}")
-    del obligation_key
     print()
     print(f"{proved} of {len(todo)} proved")
     return 0 if proved == len(todo) else 1

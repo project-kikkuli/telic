@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Lean 4
+        run: |
+          curl -sSL -o lean.zip https://releases.lean-lang.org/lean4/v4.34.1/lean-4.34.1-linux.zip
+          unzip -q lean.zip -d "$HOME/lean"
+          echo "$HOME/lean/lean-4.34.1-linux/bin" >> "$GITHUB_PATH"
+      - name: Install
+        run: |
+          pip install -e '.[test]'
+          (cd telic/frontend/ts && npm ci)
+      - name: Test
+        run: pytest -q
+      - name: Demo
+        run: telic demo --no-pause --color never

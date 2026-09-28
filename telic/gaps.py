@@ -244,7 +244,7 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None) ->
 
 
 def render_gaps(results: list[FunctionGaps], seconds: float) -> str:
-    from .render import Paint, Renderer, pad, snippet
+    from .render import Paint, pad
 
     p = Paint()
     out: list[str] = []
@@ -264,7 +264,7 @@ def render_gaps(results: list[FunctionGaps], seconds: float) -> str:
             continue
         out.append("")
         head = f"{p.byellow('◌ GAP')} {p.bold(fn.name)} {p.dim('·')} the contract accepts {len(r.gaps)} wrong version{'s' * (len(r.gaps) != 1)}"
-        out.append(Renderer.__new__(Renderer).rule(head, loc) if False else f"{head}  {p.dim(loc)}")
+        out.append(f"{head}  {p.dim(loc)}")
         for g in r.gaps:
             mu = g.mutant
             w = len(str(mu.line))
@@ -287,7 +287,6 @@ def render_gaps(results: list[FunctionGaps], seconds: float) -> str:
         tail.append(p.dim(f"{eq} equivalent"))
     out.append("")
     out.append("  ".join(tail) + p.dim(f"   (mutation score {score}; equivalent mutants excluded)"))
-    del snippet
     return "\n".join(out)
 
 

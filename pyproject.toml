@@ -23,4 +23,4 @@ telic = "telic.cli:main"
 include = ["telic*"]
 
 [tool.setuptools.package-data]
-telic = ["frontend/ts/*.mjs", "frontend/ts/package.json", "frontend/ts/package-lock.json", "lean/*.lean"]
+telic = ["frontend/ts/*.mjs", "frontend/ts/package.json", "frontend/ts/package-lock.json", "lean/*.lean", "demo/scenario/**/*"]

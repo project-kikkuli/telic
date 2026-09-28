@@ -129,9 +129,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    import runpy
-
-    from .runtime import ContractViolation, install
+    from .frontend.python import lower_python
+    from .runtime import ContractViolation, install, instrument_source
 
     script = os.path.abspath(args.script)
     root = os.path.dirname(script)
@@ -139,9 +138,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     sys.argv = [script] + args.args
     sys.path.insert(0, root)
     try:
-        from .runtime import instrument_source
-        from .frontend.python import lower_python
-
         src = open(script).read()
         tree = instrument_source(src, lower_python(script, src), script)
         code = compile(tree, script, "exec")
@@ -150,7 +146,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ContractViolation as e:
         print(f"telic: contract violated: {e}", file=sys.stderr)
         return 1
-    del runpy
     return 0
 
 
@@ -183,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     from .gaps import add_commands as add_gaps
 
     add_gaps(sub, _common, _options)
+    from .demo import add_commands as add_demo
+
+    add_demo(sub)
 
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or (argv[0] not in sub.choices and argv[0] not in ("-h", "--help", "--version")):

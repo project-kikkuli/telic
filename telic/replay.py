@@ -152,7 +152,7 @@ EXPECTED = {
 }
 
 
-def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str, callee: str | None) -> tuple[bool, str, str | None]:
+def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool, str, str | None]:
     """(confirmed, summary, violation)."""
     runtime = "node" if lang == "typescript" else "python"
     if out.get("timeout"):
@@ -226,8 +226,7 @@ def replay_verdicts(program: Program, rep) -> None:
         except Exception as e:  # pragma: no cover - defensive
             v.replay = Replay(False, False, f"could not replay: {e}")
             continue
-        callee = None
-        confirmed, summary, violation = classify(v.ob, out, fn, lang, callee)
+        confirmed, summary, violation = classify(v.ob, out, fn, lang)
         v.replay = Replay(
             ran="harness_error" not in out,
             confirmed=confirmed,

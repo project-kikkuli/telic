@@ -606,7 +606,7 @@ class VCGen:
         out.facts.append(L.not_(c))
         return self.merge([out] + frame.breaks)
 
-    def _counted_loop(self, s, st: State, lo_v: L.Term, hi_v: L.Term, var: str | None, idx: str, bind) -> State:
+    def _counted_loop(self, s, st: State, lo_v: L.Term, hi_v: L.Term, idx: str, bind) -> State:
         """Shared shape of ``for i in range`` and ``for x in xs``.
 
         The hidden counter ``k`` runs over ``[lo, hi)``; invariants see the
@@ -643,10 +643,7 @@ class VCGen:
             self.check_invs(invs, it_end, "inv.step", s.loc, {idx: k1})
         out = head.copy()
         out.facts.append(L.not_(c))
-        # Python leaves the loop variable at its last value; we only need
-        # something sound: the last element when the loop ran at all.
-        after = self.merge([out] + frame.breaks)
-        return after
+        return self.merge([out] + frame.breaks)
 
     def loop_range(self, s: ir.ForRange, st: State) -> State:
         ctx = self.ctx(st)
@@ -657,7 +654,7 @@ class VCGen:
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.var] = k
 
-        out = self._counted_loop(s, st, lo_v, hi_v, s.var, s.var, bind)
+        out = self._counted_loop(s, st, lo_v, hi_v, s.var, bind)
         last = L.sub(hi_v, L.ONE)
         if prior is None:
             prior = self.fresh(s.var, ir.INT)
@@ -675,7 +672,7 @@ class VCGen:
             body_st.env[s.elem] = seq.at(k)
             body_st.env[s.idx] = k
 
-        out = self._counted_loop(s, st, L.ZERO, seq.len, s.elem, s.idx, bind)
+        out = self._counted_loop(s, st, L.ZERO, seq.len, s.idx, bind)
         out.env.pop(f"{s.idx}$k", None)
         for name in (s.elem, s.idx):
             if name in self.fn.locals:

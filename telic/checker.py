@@ -45,8 +45,6 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
             files.append(p)
     root = root or os.getcwd()
     # Files named by '@mirrors' come along automatically.
-    from .equiv import mirror_targets
-
     seen = {os.path.normpath(os.path.abspath(f)) for f in files}
     pending = list(files)
     while pending:
@@ -65,7 +63,6 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
                         seen.add(tgt)
                         files.append(tgt)
                         pending.append(tgt)
-    del mirror_targets
     mods: list[ir.Module] = []
     ts_files = [f for f in files if language_of(f) == "typescript"]
     ts_mods: dict[str, ir.Module] = {}
@@ -77,10 +74,7 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
         rel = os.path.relpath(f, root)
         lang = language_of(f)
         if lang == "python":
-            src = Path(f).read_text()
-            if "@" not in src:  # fast path: nothing to check unless contracts exist?
-                pass
-            mods.append(lower_python(rel, src))
+            mods.append(lower_python(rel, Path(f).read_text()))
         elif lang == "typescript":
             mods.append(ts_mods[f])
     return mods
@@ -191,12 +185,17 @@ class ProofCache:
             except (OSError, ValueError):
                 self.data = {}
         self.used: set[str] = set()
+        self.initial = set(self.data)
 
     def get(self, key: str) -> dict[str, Any] | None:
         hit = self.data.get(key)
         if hit is not None:
             self.used.add(key)
         return hit
+
+    def fresh(self, key: str) -> bool:
+        """True if the entry was produced during this run."""
+        return key not in self.initial
 
     def put(self, key: str, value: dict[str, Any]) -> None:
         self.data[key] = value
@@ -386,7 +385,10 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason="needs Lean"))
                 continue
             if hit is not None:
-                hits += 1
+                if cache.fresh(key_):
+                    solved += 1  # a duplicate obligation proved earlier in this run
+                else:
+                    hits += 1
                 rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=hit.get("method", "")))
                 continue
             solved += 1
