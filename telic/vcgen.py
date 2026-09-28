@@ -777,6 +777,13 @@ class VCGen:
             self.oblige("div", ctx, L.ne(b, zero), e.loc, f"divisor of '{sym}' is non-zero")
             if op == "rdiv":
                 return L.rdiv(a, b)
+            if a.sort == L.REAL:
+                # % on reals: fmod floors the quotient, tmod truncates it
+                q = L.rdiv(a, b)
+                qi = L.floor(q) if op in ("fmod", "floordiv") else L.ite(L.le(L.RealV(Fraction(0)), q), L.floor(q), L.neg(L.floor(L.neg(q))))
+                if op == "floordiv":
+                    return L.to_real(qi)
+                return L.sub(a, L.mul(b, L.to_real(qi)))
             if op == "floordiv":
                 return floordiv(a, b)
             if op == "fmod":

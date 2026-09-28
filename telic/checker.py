@@ -274,6 +274,8 @@ def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory
     problems: list[tuple[str, str]] = []
     for d in (L.seqsum_def(L.INT), L.seqsum_def(L.REAL), L.seqcount_def(L.INT), L.seqcount_def(L.REAL), L.seqcount_def(L.BOOL), L.seqcount_def(L.STR)):
         theory.fundefs[d.name] = d
+    for elem in (L.INT, L.REAL):
+        theory.axioms.extend(L.theory_lemmas(elem))
     for key in sorted(program.definitional):
         ref = program.ref(key)
         m = measures.get(key) or (ref.fn.decreases.expr if ref.fn.decreases else None)
@@ -325,7 +327,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if opts.infer:
             ikey = inference_key(program, key)
             try:
-                inferred[key] = infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 3000), cached=cache.get(ikey))
+                inferred[key] = infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 1000), cached=cache.get(ikey))
                 cache.put(ikey, inferred[key].summary())
             except VCError:
                 inferred[key] = Inferred()

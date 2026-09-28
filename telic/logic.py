@@ -121,6 +121,8 @@ class Quant(Term):
     vars: tuple[Const, ...]
     body: Term
     sort: Sort = BOOL
+    # SMT trigger patterns: each inner tuple is one multi-pattern.
+    patterns: tuple[tuple[Term, ...], ...] = ()
 
 
 TRUE = BoolV(True)
@@ -562,8 +564,9 @@ class FunDef:
 class Axiom:
     name: str
     formula: Term
-    about: str  # function name the axiom (lemma) is about
+    about: str  # FuncRef key of the function whose contract this is ("" for theory lemmas)
     doc: str = ""
+    symbol: str = ""  # logical function whose presence brings the axiom in
 
 
 def seqsum_def(elem: Sort) -> FunDef:
@@ -575,6 +578,48 @@ def seqsum_def(elem: Sort) -> FunDef:
     rec = Fn(name, (a, lo, sub(hi, ONE)), elem)
     body = ite(le(hi, lo), lit(0, elem), add(rec, select(a, sub(hi, ONE))))
     return FunDef(name, (a, lo, hi), elem, body, recursive=True, measure=sub(hi, lo), doc="sum of a[lo:hi]")
+
+
+def theory_lemmas(elem: Sort) -> list[Axiom]:
+    """Facts about ``seqsum``/``seqcount`` that need induction to prove.
+
+    Every one of these is proved in Lean in ``telic/lean/Theory.lean`` (and
+    checked by the test suite), so Z3 may use them without trusting them.
+    """
+    ss = "seqsum" if elem == INT else "seqsum_r"
+    sc = f"seqcount_{elem.name.lower()}"
+    arr = ARRAY(elem)
+    a, b = Const("a", arr), Const("b", arr)
+    lo, mid, hi, k, i = (Const(n, INT) for n in ("lo", "mid", "hi", "k", "i"))
+    v = Const("v", elem)
+    zero = lit(0, elem)
+
+    def S(x: Term, l: Term, h: Term) -> Term:
+        return Fn(ss, (x, l, h), elem)
+
+    def C(x: Term, l: Term, h: Term, y: Term) -> Term:
+        return Fn(sc, (x, l, h, y), INT)
+
+    out: list[Axiom] = []
+    q = lambda vs, body, pats: Quant("forall", tuple(vs), body, patterns=pats)  # noqa: E731
+    out.append(Axiom(f"{ss}_front", q((a, lo, hi), implies(lt(lo, hi), eq(S(a, lo, hi), add(select(a, lo), S(a, add(lo, ONE), hi)))), ((S(a, lo, hi), select(a, lo)),)), "", "sum peels off its first element", ss))
+    inner = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(zero, select(a, i))))
+    out.append(Axiom(f"{ss}_nonneg", q((a, lo, hi), implies(inner, le(zero, S(a, lo, hi))), ((S(a, lo, hi),),)), "", "sum of non-negatives is non-negative", ss))
+    upd = store(a, k, v)
+    out.append(
+        Axiom(
+            f"{ss}_store",
+            q((a, lo, hi, k, v), eq(S(upd, lo, hi), add(S(a, lo, hi), ite(and_(le(lo, k), lt(k, hi)), sub(v, select(a, k)), zero))), ((S(upd, lo, hi),),)),
+            "",
+            "updating one element changes the sum by the difference",
+            ss,
+        )
+    )
+    out.append(Axiom(f"{ss}_split", q((a, lo, mid, hi), implies(and_(le(lo, mid), le(mid, hi)), eq(S(a, lo, hi), add(S(a, lo, mid), S(a, mid, hi)))), ((S(a, lo, mid), S(a, mid, hi)),)), "", "sum splits at any midpoint", ss))
+    out.append(Axiom(f"{sc}_bounds", q((a, lo, hi, v), and_(le(ZERO, C(a, lo, hi, v)), le(C(a, lo, hi, v), max_(sub(hi, lo), ZERO))), ((C(a, lo, hi, v),),)), "", "a count lies between 0 and the length", sc))
+    out.append(Axiom(f"{sc}_front", q((a, lo, hi, v), implies(lt(lo, hi), eq(C(a, lo, hi, v), add(ite(eq(select(a, lo), v), ONE, ZERO), C(a, add(lo, ONE), hi, v)))), ((C(a, lo, hi, v), select(a, lo)),)), "", "count peels off its first element", sc))
+    del b, mid
+    return out
 
 
 def seqcount_def(elem: Sort) -> FunDef:

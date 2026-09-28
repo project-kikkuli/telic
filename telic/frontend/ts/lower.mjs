@@ -861,7 +861,6 @@ class FunctionLowerer {
     }
     if (op === "add" && (a.ty.k === "str" || b.ty.k === "str")) throw this.err("string concatenation is not supported", this.nline(node));
     const [x, y, t] = this.numPair(a, b, node);
-    if (op === "tmod" && t.k !== "int") throw this.err("'%' on non-integer numbers is not supported", this.nline(node));
     return { e: "Binary", ty: t, loc, op, left: x, right: y };
   }
 

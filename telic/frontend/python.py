@@ -870,9 +870,7 @@ class ExprLowerer:
             return ir.Builtin(ir.REAL, loc, "to_real", (ir.Builtin(ir.INT, loc, "floor", (q,)),))
         if isinstance(op, ast.Mod):
             a, b, t = self.numeric_pair(a, b, n)
-            if t != ir.INT:
-                raise self.err("'%' on floats is not supported", n)
-            return ir.Binary(ir.INT, loc, "fmod", a, b)
+            return ir.Binary(t, loc, "fmod", a, b)
         raise self.err(f"unsupported operator {type(op).__name__}", n)
 
     def compare(self, n: ast.Compare, loc: ir.Loc) -> ir.Expr:

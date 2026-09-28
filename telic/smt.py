@@ -20,7 +20,7 @@ class Theory:
     fundefs: dict[str, L.FunDef] = field(default_factory=dict)
     axioms: list[L.Axiom] = field(default_factory=list)
 
-    def closure(self, terms: list[L.Term], exclude: set[str]) -> tuple[list[L.FunDef], list[L.Axiom]]:
+    def closure(self, terms: list[L.Term], exclude: set[str], lemmas: bool = True) -> tuple[list[L.FunDef], list[L.Axiom]]:
         """Definitions and axioms reachable from ``terms``."""
         need: set[str] = set()
         todo: list[L.Term] = list(terms)
@@ -36,9 +36,9 @@ class Theory:
                 if fd is not None and fd.body is not None:
                     todo.append(fd.body)
                 for ax in self.axioms:
-                    if ax.about in exclude or ax.name in seen_ax:
+                    if (ax.about and ax.about in exclude) or ax.name in seen_ax:
                         continue
-                    if ax.name == f"{name}_spec":
+                    if ax.name == f"{name}_spec" or (lemmas and ax.symbol == name):
                         seen_ax.add(ax.name)
                         axioms.append(ax)
                         todo.append(ax.formula)
@@ -132,6 +132,9 @@ class Z3Encoder:
         if isinstance(t, L.Quant):
             vs = [self.term(v) for v in t.vars]
             body = self.term(t.body)
+            if t.patterns and t.kind == "forall":
+                pats = [z3.MultiPattern(*[self.term(x) for x in p]) if len(p) > 1 else self.term(p[0]) for p in t.patterns]
+                return z3.ForAll(vs, body, patterns=pats)
             return z3.ForAll(vs, body) if t.kind == "forall" else z3.Exists(vs, body)
         if isinstance(t, L.Fn):
             f = self.funcs.get(t.name)
@@ -237,9 +240,26 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
 
 
 def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
+    """Two phases. Theory lemmas are consequences of the definitions, so a
+    model found without them is a genuine model; but their quantifiers can
+    stop Z3 from finding models at all. So: first without them (fast, good
+    counterexamples), then with them only if the first phase is undecided."""
     t0 = time.perf_counter()
     terms = list(ob.hyps) + [ob.goal]
-    defs, axioms = theory.closure(terms, ob.exclude_axioms)
+    with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
+    without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
+    if len(with_lemmas[1]) == len(without[1]):
+        return _solve(ob, with_lemmas, timeout_ms, t0)
+    first = _solve(ob, without, max(500, timeout_ms // 3), t0)
+    if first.status != "unknown":
+        return first
+    second = _solve(ob, with_lemmas, timeout_ms, t0)
+    return second
+
+
+def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
+    terms = list(ob.hyps) + [ob.goal]
+    defs, axioms = closure
     enc = Z3Encoder(defs)
     s = z3.Solver(ctx=enc.ctx)
     s.set("timeout", timeout_ms)
