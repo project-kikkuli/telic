@@ -32,7 +32,7 @@ def language_of(path: str) -> str | None:
 
 
 def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
-    from .frontend.python import lower_python
+    from .frontend.intents_md import is_intents_file
 
     files: list[str] = []
     for p in paths:
@@ -41,11 +41,13 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build", "target")]
                 for f in sorted(filenames):
                     full = os.path.join(dirpath, f)
-                    if language_of(full):
+                    if language_of(full) or is_intents_file(full):
                         files.append(full)
         else:
             files.append(p)
     root = root or os.getcwd()
+    intents_files = [f for f in files if is_intents_file(f)]
+    files = [f for f in files if not is_intents_file(f)]
     # Files named by '@mirrors' come along automatically.
     seen = {os.path.normpath(os.path.abspath(f)) for f in files}
     pending = list(files)
@@ -104,7 +106,32 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
             from .frontend.rust import lower_rust
 
             mods.append(lower_rust(os.path.relpath(f, root), Path(f).read_text()))
-    return mods
+    return mods + intents_modules(paths, intents_files, root)
+
+
+def intents_modules(paths: list[str], named: list[str], root: str) -> list[ir.Module]:
+    """The intents.md files named or walked, plus those in ancestor
+    directories up to the root. Ancestors come as context: their intents are
+    reported only where the checked code cites them."""
+    from .frontend.intents_md import NAME, lower_intents_md
+
+    own = {os.path.normpath(os.path.abspath(f)) for f in named}
+    top = os.path.normpath(os.path.abspath(root))
+    ancestors: set[str] = set()
+    for p in paths:
+        full = os.path.normpath(os.path.abspath(p))
+        d = os.path.dirname(full)  # a walked directory's own intents.md is already named
+        while d == top or d.startswith(top + os.sep):
+            ancestors.add(os.path.join(d, NAME))
+            if d == top:
+                break
+            d = os.path.dirname(d)
+    out = []
+    for f in sorted(own | {a for a in ancestors if os.path.exists(a)}):
+        m = lower_intents_md(os.path.relpath(f, root), Path(f).read_text())
+        m.context = f not in own
+        out.append(m)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +569,7 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
 
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None) -> Report:
     t0 = t0 or time.perf_counter()
-    program = Program.build(modules)
+    program = Program.build([m for m in modules if m.language != "intents"])
     _sidecars.clear()
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)

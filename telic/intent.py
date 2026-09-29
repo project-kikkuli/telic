@@ -104,6 +104,8 @@ class IntentReport:
     ears: list[str] = field(default_factory=list)
     coverage: dict[str, Any] | None = None  # review / judgment
     digest: str = ""  # hash of the text and the lemma set
+    scope: str | None = None  # declared in <scope>/intents.md ('' = the root); None = a comment
+    advice: list[str] = field(default_factory=list)  # findings that do not fail
 
     # counts kept for the ledger and older callers
     @property
@@ -133,15 +135,18 @@ def _match(item: str, key: str, name: str) -> bool:
 
 
 def build(rep: Any) -> list[IntentReport]:
-    decls: dict[str, tuple[str, tuple[str, int], list[str]]] = {}
+    from .frontend.intents_md import LANGUAGE, scope_of
+
+    decls: dict[str, tuple[str, tuple[str, int], list[str], str | None, bool]] = {}
+    twice: dict[str, list[str]] = {}
     for m in rep.modules:
+        scope = scope_of(m.path) if m.language == LANGUAGE else None
         for d in m.intents:
             text, by = split_by(d.text)
             if d.id in decls:
-                old = decls[d.id]
-                decls[d.id] = (old[0], old[1], old[2] + [b for b in by if b not in old[2]])
+                twice.setdefault(d.id, []).append(f"{m.path}:{d.loc.line}")
             else:
-                decls[d.id] = (text, (m.path, d.loc.line), by)
+                decls[d.id] = (text, (m.path, d.loc.line), by, scope, m.context and scope is not None)
     citing: dict[str, list[Any]] = {}
     for f in rep.functions:
         for i in f.fn.intents:
@@ -152,10 +157,13 @@ def build(rep: Any) -> list[IntentReport]:
             mirrors.setdefault(i, []).append(mr)
     reviews = _load_reviews(getattr(rep, "root", None))
     out: list[IntentReport] = []
-    for iid in sorted(set(decls) | set(citing) | set(mirrors)):
-        text, loc, by = decls.get(iid, (None, None, []))
+    shown = {k for k, d in decls.items() if not d[4]} | set(citing) | set(mirrors)
+    for iid in sorted(shown):
+        text, loc, by, scope, context = decls.get(iid, (None, None, [], None, False))
         fns = citing.get(iid, [])
-        r = IntentReport(iid, text, loc, [f.ref.key for f in fns], "partial", by=by)
+        r = IntentReport(iid, text, loc, [f.ref.key for f in fns], "partial", by=by, scope=scope)
+        if iid in twice and loc is not None:
+            r.pointers.append(f"{iid} is declared more than once ({loc[0]}:{loc[1]}, {', '.join(twice[iid])}): keep one declaration")
         for f in fns:
             clauses = [c for c in f.fn.ensures + f.fn.raises if iid in c.intents]
             for s in _loop_invariants(f.fn):
@@ -173,12 +181,15 @@ def build(rep: Any) -> list[IntentReport]:
             for item in by:
                 hit = [f for f in rep.functions if _match(item, f.ref.key, f.fn.name)]
                 if not hit:
-                    r.pointers.append(f"'{item}' is listed in by: but no checked function has that name")
+                    if not context:  # an ancestor intents.md may list code outside this check
+                        r.pointers.append(f"'{item}' is listed in by: but no checked function has that name")
                 elif not any(iid in f.fn.intents for f in hit):
                     r.pointers.append(f"'{item}' is listed in by: but does not cite {iid}")
             for f in fns:
                 if not any(_match(item, f.ref.key, f.fn.name) for item in by):
                     r.pointers.append(f"{f.fn.name} cites {iid} but is not in its by: list")
+        if scope is not None:
+            _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context)
         if text is not None:
             r.ears = ears_problems(text)
         # Status: what the lemmas establish (never "proved").
@@ -201,6 +212,25 @@ def build(rep: Any) -> list[IntentReport]:
             r.coverage = {"kind": "reviewed", "by": rv.get("by", ""), "fresh": rv.get("digest") == r.digest}
         out.append(r)
     return out
+
+
+def _within(path: str, scope: str) -> bool:
+    return not scope or path.replace(os.sep, "/").startswith(scope + "/")
+
+
+def _check_scope(r: IntentReport, targets: list[str], partial: bool) -> None:
+    """A file-declared intent may only rest on code under its directory, and
+    one whose lemmas all sit in one file belongs in that file (judged only
+    when the check saw all of its code)."""
+    scope = r.scope or ""
+    home = f"{scope}/intents.md" if scope else "intents.md"
+    outside = sorted({x.path for x in r.lemmas if not _within(x.path, scope)} | {p for p in targets if not _within(p, scope)})
+    for path in outside:
+        r.pointers.append(f"{path} is outside {scope or '.'}/, the scope of {home}: declare {r.id} in the intents.md of a directory containing both")
+    files = {x.path for x in r.lemmas}
+    if len(files) == 1 and not partial and not outside and set(targets) <= files:
+        (only,) = files
+        r.advice.append(f"every lemma is in {only}: declare {r.id} there as an '@intent {r.id}: ...' comment")
 
 
 def _loop_invariants(fn: Any):
@@ -372,10 +402,74 @@ def attach_cached_judgments(root: str, reports: list[IntentReport]) -> None:
 # CLI: telic intents
 
 
+def intents_for(target: str, paths: list[str], root: str) -> list[dict[str, Any]]:
+    """What governs a file or directory: intents declared in the intents.md
+    files above or inside it, in its code, cited by its code, or naming its
+    functions in by:. Loads
+    and lowers only; nothing is proved."""
+    from .checker import load_modules
+    from .frontend.intents_md import LANGUAGE, scope_of
+
+    rel = os.path.relpath(os.path.abspath(target), root).replace(os.sep, "/")
+    rel = "" if rel == "." else rel
+    mods = load_modules(paths, root)
+    mine = [m for m in mods if m.language != LANGUAGE and (m.path == rel or _within(m.path, rel))]
+    if not mine:
+        more = load_modules([target], root)
+        mine = [m for m in more if m.language != LANGUAGE]
+        mods += more
+    decls: dict[str, tuple[str, list[str], str]] = {}
+    for m in mods:
+        for d in m.intents:
+            decls.setdefault(d.id, (*split_by(d.text), f"{m.path}:{d.loc.line}"))
+    why: dict[str, list[str]] = {}
+    for m in mods:
+        if m.language == LANGUAGE and (scope_of(m.path) == rel or _within(rel, scope_of(m.path)) or _within(scope_of(m.path), rel)):
+            for d in m.intents:
+                why.setdefault(d.id, []).append(f"declared in {m.path}")
+    for m in mine:
+        for d in m.intents:
+            why.setdefault(d.id, []).append(f"declared in {m.path}")
+        for fn in m.functions.values():
+            key = f"{m.path}::{fn.name}"
+            for i in fn.intents:
+                why.setdefault(i, []).append(f"cited by {fn.name}")
+            for iid, (_, by, _) in decls.items():
+                if any(_match(item, key, fn.name) for item in by):
+                    why.setdefault(iid, []).append(f"by: lists {fn.name}")
+    out = []
+    for iid in sorted(why):
+        text, by, at = decls.get(iid, (None, [], None))
+        out.append({"id": iid, "text": text, "at": at, "by": by, "why": list(dict.fromkeys(why[iid]))})
+    return out
+
+
+def cmd_intents_for(args: Any) -> int:
+    from .render import Paint
+
+    root = os.path.abspath(args.root or os.getcwd())
+    got = intents_for(args.for_path, args.paths, root)
+    if args.json:
+        print(json.dumps(got, indent=2))
+        return 0
+    p = Paint(None)
+    if not got:
+        print(p.dim(f"no intent governs {args.for_path}"))
+    for x in got:
+        print(f"{p.bold(p.cyan(x['id']))}  {p.dim(x['at'] or 'cited, never declared')}  {p.dim('(' + '; '.join(x['why']) + ')')}")
+        if x["text"]:
+            print(f"  {x['text']}")
+        if x["by"]:
+            print(p.dim(f"  by: {', '.join(x['by'])}"))
+    return 0
+
+
 def cmd_intents(args: Any, options: Any) -> int:
     from .checker import check
     from .render import Paint, Renderer
 
+    if args.for_path:
+        return cmd_intents_for(args)
     root = os.path.abspath(args.root or os.getcwd())
     rep = check(args.paths, options(args, root), root=root)
     notes: list[str] = []
@@ -399,10 +493,18 @@ def cmd_intents(args: Any, options: Any) -> int:
     else:
         paint = Paint(None)
         print("\n".join(Renderer(rep, paint).intent_table()))
+        for n in _file_problems(rep):
+            print(paint.yellow("  " + n))
         for n in notes:
             print(paint.dim("  " + n))
-    bad = [r for r in rep.intents if r.status in ("broken", "vacuous", "undeclared") or r.pointers]
-    return 1 if bad else 0
+    bad = [r for r in rep.intents if r.status in ("broken", "vacuous", "undeclared") or r.pointers or (r.status == "unbacked" and r.scope is not None)]
+    return 1 if bad or _file_problems(rep) else 0
+
+
+def _file_problems(rep: Any) -> list[str]:
+    from .frontend.intents_md import LANGUAGE
+
+    return [f"{m.path}:{loc.line}: {msg}" for m in rep.modules if m.language == LANGUAGE for msg, loc in m.problems]
 
 
 def _intent_json(r: IntentReport) -> dict[str, Any]:
@@ -415,6 +517,8 @@ def _intent_json(r: IntentReport) -> dict[str, Any]:
         "lemmas": [{"function": x.name, "at": f"{x.path}:{x.line}", "kind": x.kind, "text": x.text, "status": x.status} for x in r.lemmas],
         "links": r.pointers,
         "ears": r.ears,
+        "scope": r.scope,
+        "advice": r.advice,
         "coverage": r.coverage,
         "digest": r.digest,
     }
@@ -427,5 +531,6 @@ def add_commands(sub: Any, common: Any, options: Any) -> None:
     i.add_argument("--oracle", default=None, help="oracle spec (builtin, jev, anthropic, cmd:..., http:..., py:...; default TELIC_ORACLE)")
     i.add_argument("--accept", nargs="+", metavar="ID", help="record that you reviewed these intents' lemmas and they cover the requirement")
     i.add_argument("--as", dest="who", help="reviewer name for --accept")
+    i.add_argument("--for", dest="for_path", metavar="PATH", help="list the intents that govern PATH: declared in intents.md above it, cited in it, or naming its functions in by:")
     i.add_argument("--json", action="store_true")
     i.set_defaults(func=lambda a: cmd_intents(a, options))

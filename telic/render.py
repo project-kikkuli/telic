@@ -232,7 +232,7 @@ class Renderer:
         r = self.r
         nfun = len(r.functions)
         nob = sum(len(f.verdicts) for f in r.functions) + sum(len(m.verdicts) for m in r.mirrors)
-        files = len(r.modules)
+        files = sum(1 for m in r.modules if m.language != "intents")
         stats = f"{files} file{'s' * (files != 1)} · {nfun} function{'s' * (nfun != 1)} · {nob} obligation{'s' * (nob != 1)}"
         if r.cache_hits:
             stats += f" · {r.cache_hits} cached"
@@ -513,6 +513,10 @@ class Renderer:
                 out.append(f"    {p.yellow('link')}   {msg}")
             for msg in i.ears:
                 out.append(f"    {p.dim('ears')}   {p.dim('the sentence ' + msg)}")
+            for msg in i.advice:
+                out.append(f"    {p.dim('note')}   {p.dim(msg)}")
+            if i.status == "unbacked" and i.scope is not None:
+                out.append(f"    {p.yellow('orphan')} {p.dim('declared in an intents.md and nothing backs it: cite it from the code, or remove it')}")
             out.append("")
         return out
 

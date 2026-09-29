@@ -55,7 +55,14 @@ def snapshot(rep: Report) -> dict[str, Any]:
             for c in f.fn.ensures + f.fn.raises:
                 if i.id in c.intents:
                     clauses.append(f"{f.fn.name}: {c.kind} {c.text}")
-        intents[i.id] = {"status": i.status, "text": i.text, "functions": sorted(i.functions), "clauses": sorted(set(clauses)), **({"links": sorted(i.pointers)} if i.pointers else {})}
+        intents[i.id] = {
+            "status": i.status,
+            "text": i.text,
+            "functions": sorted(i.functions),
+            "clauses": sorted(set(clauses)),
+            **({"links": sorted(i.pointers)} if i.pointers else {}),
+            **({"declared": i.loc[0]} if i.scope is not None and i.loc else {}),
+        }
     functions = {}
     for f in rep.functions:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))
@@ -94,7 +101,7 @@ def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> d
             out["mirrors"][k] = v
     out["mirrors"].update(new["mirrors"])
     for k, v in old.get("intents", {}).items():
-        if not any(in_scope(f) for f in v.get("functions", [])) and k not in new["intents"]:
+        if not any(in_scope(f) for f in v.get("functions", []) + [v.get("declared", "")]) and k not in new["intents"]:
             out["intents"][k] = v
     out["intents"].update(new["intents"])
     return out
@@ -121,7 +128,7 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
     for iid, o in old.get("intents", {}).items():
         n = new["intents"].get(iid)
         if n is None:
-            if files is None or any(scoped(f) for f in o.get("functions", [])):
+            if files is None or any(scoped(f) for f in o.get("functions", []) + [o.get("declared", "")]):
                 out.append(Change(iid, "regression", f"intent {iid} was removed (it was {o['status']})"))
             continue
         if RANK.get(n["status"], 0) < RANK.get(o["status"], 0):
@@ -196,8 +203,19 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     ancestors and their importers: a call through a base may run any
     override. Importers of importers are unaffected: a proof depends on its
     callees' contracts, not on what those rest on."""
-    files = {f for f in changed if language_of(f) and os.path.exists(os.path.join(root, f))}
-    deleted = {f for f in changed if language_of(f) and not os.path.exists(os.path.join(root, f))}
+    from .frontend.intents_md import is_intents_file, lower_intents_md
+
+    files = {f for f in changed if (language_of(f) or is_intents_file(f)) and os.path.exists(os.path.join(root, f))}
+    deleted = {f for f in changed if (language_of(f) or is_intents_file(f)) and not os.path.exists(os.path.join(root, f))}
+    # an edited intents.md affects the code backing its intents, before and after
+    md = {f for f in files | deleted if is_intents_file(f)}
+    ids = {d.id for f in md & files for d in lower_intents_md(f, Path(root, f).read_text()).intents}
+    ids |= {k for k, v in (ledger or {}).get("intents", {}).items() if v.get("declared") in md}
+    for k in ids:
+        for key in (ledger or {}).get("intents", {}).get(k, {}).get("functions", []):
+            p = key.split("::")[0]
+            if os.path.exists(os.path.join(root, p)):
+                files.add(p)
     if any(f.endswith(".py") for f in files | deleted):
         from .frontend.python import ancestor_files, project_imports
 
@@ -218,6 +236,8 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
         grow = False
         # mirror partners, both directions (from source and from the ledger)
         for f in list(files):
+            if is_intents_file(f):
+                continue
             for line in Path(root, f).read_text().splitlines():
                 t = line.strip()
                 if t.startswith(("#@", "//@")) and " mirrors " in t + " " and "::" in t:

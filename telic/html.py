@@ -295,8 +295,9 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
     nob = sum(len(f.verdicts) for f in fs)
     lean = sum(1 for f in fs for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
     inferred = sum(sum(len(c) for c in f.inferred.invariants.values()) for f in fs if f.inferred)
+    nfiles = sum(1 for m in rep.modules if m.language != "intents")
     tally = [
-        f"<span><b>{len(rep.modules)}</b> file{'s' * (len(rep.modules) != 1)}</span>",
+        f"<span><b>{nfiles}</b> file{'s' * (nfiles != 1)}</span>",
         f"<span><b>{len(fs)}</b> function{'s' * (len(fs) != 1)}</span>",
         f"<span><b>{nob}</b> obligation{'s' * (nob != 1)}</span>",
         f"<span><b>{counts['proved']}</b> proved</span>",
@@ -323,7 +324,9 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         lemmas = "".join(
             f"<li>{MARK.get(x.status, '?')} <code>{e(x.name)}</code> {e(x.text if x.kind == 'mirror' else x.kind + ' ' + x.text)}</li>" for x in i.lemmas
         )
-        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears)
+        if i.loc:
+            ev.append(f"declared in {i.loc[0]}:{i.loc[1]}")
+        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
         intents.append(
             f'<div class="intent"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
             f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}<ul>{lemmas}{issues}</ul></span></div>"

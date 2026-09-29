@@ -101,7 +101,7 @@ def report_json(rep: Report) -> dict[str, Any]:
         "cache_hits": rep.cache_hits,
         "problems": [{"file": m.path, "line": loc.line, "message": msg} for m in rep.modules for msg, loc in m.problems],
         "intents": [
-            {"id": i.id, "status": i.status, "text": i.text, "functions": i.functions, "proved": i.proved, "refuted": i.refuted, "open": i.open}
+            {"id": i.id, "status": i.status, "text": i.text, "at": f"{i.loc[0]}:{i.loc[1]}" if i.loc else None, "scope": i.scope, "functions": i.functions, "proved": i.proved, "refuted": i.refuted, "open": i.open, "links": i.pointers, "advice": i.advice}
             for i in rep.intents
         ],
         "functions": fns,
