@@ -1,4 +1,4 @@
-"""intents.md: cross-file intents scoped to a directory, one ID space with
+"""intents/<ID>.md: cross-file intents scoped to a directory, one ID space with
 comments, found by `telic intents --for`, and carried into the ledger."""
 
 import json
@@ -8,7 +8,7 @@ import pytest
 
 from telic.checker import CheckOptions, check
 from telic.cli import main
-from telic.frontend.intents_md import lower_intents_md
+from telic.frontend.intent_file import lower_intent_file
 from telic.intent import intents_for
 from telic.ledger import affected_files
 
@@ -28,8 +28,8 @@ def tree(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
-def md(*intents: tuple[str, str, str]) -> str:
-    return "# Intents\n\nFree prose.\n\n" + "".join(f"## {i}\n{s}\n" + (f"by: {b}\n" if b else "") + "\n" for i, s, b in intents)
+def intents(where: str, *decls: tuple[str, str, str]) -> dict[str, str]:
+    return {f"{where}intents/{i}.md": f"{s}\n" + (f"by: {b}\n" if b else "") for i, s, b in decls}
 
 
 def report(root: Path, paths=(".",)):
@@ -43,35 +43,37 @@ def run(root: Path, *args: str, capsys=None) -> tuple[int, str]:
 
 
 @pytest.mark.parametrize(
-    "source, decls, problems",
+    "name, source, decls, problems",
     [
-        (md(("CAP", SAME, "a, b.c")), [("CAP", f"{SAME} by: a, b.c", 5)], []),
-        ("## CAP\nWHEN a charge is made,\nthe shop shall charge.\n", [("CAP", "WHEN a charge is made, the shop shall charge.", 1)], []),
-        ("## CAP\n\n## NEXT\nThe shop shall log.\n", [("NEXT", "The shop shall log.", 3)], ["no sentence"]),
-        ("## Overview\ntext\n", [], ["not an intent ID"]),
-        ("```\n## CAP\n```\n### CAP\nprose\n", [], []),
-        ("## CAP\nby: charge\n", [], ["no sentence"]),
+        ("CAP", f"{SAME}\nby: a, b.c\n", [("CAP", f"{SAME} by: a, b.c", 1)], []),
+        ("CAP", "\nWHEN a charge is made,\nthe shop shall charge.\n", [("CAP", "WHEN a charge is made, the shop shall charge.", 2)], []),
+        ("CAP", "by: charge\n", [], ["no sentence"]),
+        ("CAP", "", [], ["no sentence"]),
+        ("CAP", f"## CAP\n{SAME}\n", [], ["has a heading"]),
+        ("cap", f"{SAME}\n", [], ["not an intent ID"]),
+        ("CAP_2", f"{SAME}\n", [], ["not an intent ID"]),
+        ("README", f"{SAME}\n", [("README", SAME, 1)], []),
     ],
 )
-def test_parse(source, decls, problems):
-    m = lower_intents_md("intents.md", source)
+def test_parse(name, source, decls, problems):
+    m = lower_intent_file(f"x/intents/{name}.md", source)
     assert [(d.id, d.text, d.loc.line) for d in m.intents] == decls
     assert len(m.problems) == len(problems) and all(w in msg for w, (msg, _) in zip(problems, m.problems))
 
 
 def test_cross_file_intent_is_backed_from_its_scope(tmp_path):
-    tree(tmp_path, {"intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
+    tree(tmp_path, {**intents("", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
     _, got = report(tmp_path)
     pay = got["PAY"]
-    assert (pay.status, pay.pointers, pay.advice, pay.scope, pay.loc) == ("backed", [], [], "", ("intents.md", 5))
+    assert (pay.status, pay.pointers, pay.advice, pay.scope, pay.loc) == ("backed", [], [], "", ("intents/PAY.md", 1))
 
 
 @pytest.mark.parametrize(
     "files, pointer, advice",
     [
-        ({"a/intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")}, "b/y.py is outside a/", None),
-        ({"a/intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY") + fn("refund", "PAY")}, None, "every lemma is in a/x.py"),
-        ({"intents.md": md(("PAY", SAME, "")), "x.py": f"#@ intent PAY: {SAME}\n\n" + fn("charge", "PAY")}, "declared more than once", None),
+        ({**intents("a/", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")}, "b/y.py is outside a/", None),
+        ({**intents("a/", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY") + fn("refund", "PAY")}, None, "every lemma is in a/x.py"),
+        ({**intents("", ("PAY", SAME, "")), "x.py": f"#@ intent PAY: {SAME}\n\n" + fn("charge", "PAY")}, "declared more than once", None),
         ({"x.py": f"#@ intent PAY: {SAME}\n#@ intent PAY: {SAME}\n\n" + fn("charge", "PAY")}, "declared more than once", None),
     ],
 )
@@ -86,10 +88,10 @@ def test_scope_duplicates_and_sprawl(tmp_path, files, pointer, advice):
 @pytest.mark.parametrize(
     "files, code",
     [
-        ({"intents.md": md(("PAY", SAME, "")), "x.py": fn("charge", None)}, 1),  # orphan in intents.md
+        ({**intents("", ("PAY", SAME, "")), "x.py": fn("charge", None)}, 1),  # orphan intent file
         ({"x.py": f"#@ intent PAY: {SAME}\n\n" + fn("charge", None)}, 0),  # unbacked comment
-        ({"intents.md": "## pay\nThe shop shall pay.\n", "x.py": fn("charge", None)}, 1),  # malformed file
-        ({"intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")}, 0),
+        ({"intents/pay.md": "The shop shall pay.\n", "x.py": fn("charge", None)}, 1),  # bad filename
+        ({**intents("", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")}, 0),
     ],
 )
 def test_intents_exit_code(tmp_path, capsys, files, code):
@@ -98,7 +100,7 @@ def test_intents_exit_code(tmp_path, capsys, files, code):
 
 
 def test_symlinked_code_is_judged_where_it_lives(tmp_path):
-    tree(tmp_path, {"a/intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
+    tree(tmp_path, {**intents("a/", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
     (tmp_path / "a/ld").symlink_to("../b")
     _, got = report(tmp_path, ["a", "a/ld/y.py"])
     assert any("a/ld/y.py is outside a/" in p for p in got["PAY"].pointers)
@@ -106,34 +108,39 @@ def test_symlinked_code_is_judged_where_it_lives(tmp_path):
 
 @pytest.mark.parametrize("cited", [True, False])
 def test_partial_check_reports_its_own_intents_md_over_an_ancestor(tmp_path, cited):
-    tree(tmp_path, {"intents.md": md(("PAY", SAME, "")), "s/intents.md": md(("PAY", SAME, "")), "s/y.py": fn("refund", "PAY" if cited else None)})
+    tree(tmp_path, {**intents("", ("PAY", SAME, "")), **intents("s/", ("PAY", SAME, "")), "s/y.py": fn("refund", "PAY" if cited else None)})
     _, got = report(tmp_path, ["s"])
     pay = got["PAY"]
-    assert (pay.loc, pay.scope, pay.status) == (("s/intents.md", 5), "s", "backed" if cited else "unbacked")
+    assert (pay.loc, pay.scope, pay.status) == (("s/intents/PAY.md", 1), "s", "backed" if cited else "unbacked")
     assert any("declared more than once" in p for p in pay.pointers)
 
 
 def test_checking_one_file_reads_ancestor_intents(tmp_path):
-    tree(tmp_path, {"intents.md": md(("PAY", SAME, "charge, refund"), ("ELSE", "The shop shall log.", "")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
+    tree(tmp_path, {**intents("", ("PAY", SAME, "charge, refund"), ("ELSE", "The shop shall log.", "")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
     _, got = report(tmp_path, ["a/x.py"])
     assert set(got) == {"PAY"}  # uncited ancestor intents are not this check's business
     assert got["PAY"].status == "backed" and not got["PAY"].pointers and not got["PAY"].advice
 
 
+def test_a_deep_check_reads_every_intents_dir_above_it(tmp_path):
+    tree(tmp_path, {**intents("", ("TOP", SAME, "")), **intents("a/", ("MID", SAME, "")), **intents("a/b/c/", ("LOW", SAME, "")), "a/b/c/x.py": fn("f", "TOP") + fn("g", "MID") + fn("h", "LOW")})
+    _, got = report(tmp_path, ["a/b/c/x.py"])
+    assert {k: (i.status, i.loc[0]) for k, i in got.items()} == {"TOP": ("backed", "intents/TOP.md"), "MID": ("backed", "a/intents/MID.md"), "LOW": ("backed", "a/b/c/intents/LOW.md")}
+
 @pytest.mark.parametrize(
     "target, expected",
     [
-        ("a/x.py", {"PAY": "cited by charge", "AREA": "declared in a/intents.md", "LOCAL": "declared in a/x.py"}),
+        ("a/x.py", {"PAY": "cited by charge", "AREA": "declared in a/intents/AREA.md", "LOCAL": "declared in a/x.py"}),
         ("b/y.py", {"PAY": "by: lists refund"}),
-        ("a", {"PAY": "cited by charge", "AREA": "declared in a/intents.md", "LOCAL": "declared in a/x.py"}),
+        ("a", {"PAY": "cited by charge", "AREA": "declared in a/intents/AREA.md", "LOCAL": "declared in a/x.py"}),
     ],
 )
 def test_intents_for(tmp_path, target, expected):
     tree(
         tmp_path,
         {
-            "intents.md": md(("PAY", SAME, "charge, refund")),
-            "a/intents.md": md(("AREA", "The shop shall log.", "")),
+            **intents("", ("PAY", SAME, "charge, refund")),
+            **intents("a/", ("AREA", "The shop shall log.", "")),
             "a/x.py": "#@ intent LOCAL: The shop shall count.\n\n" + fn("charge", "PAY"),
             "b/y.py": fn("refund", None),
         },
@@ -143,16 +150,16 @@ def test_intents_for(tmp_path, target, expected):
 
 
 def test_json_and_ledger_carry_the_declaring_file(tmp_path, capsys):
-    tree(tmp_path, {"intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
+    tree(tmp_path, {**intents("", ("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
     _, out = run(tmp_path, "--json", capsys=capsys)
     (pay,) = json.loads(out)
-    assert (pay["at"], pay["scope"]) == ("intents.md:5", "")
+    assert (pay["at"], pay["scope"]) == ("intents/PAY.md:1", "")
     from telic.ledger import snapshot
 
     rep, _ = report(tmp_path)
     ledger = snapshot(rep)
-    assert ledger["intents"]["PAY"]["declared"] == "intents.md"
-    assert affected_files(str(tmp_path), {"intents.md"}, ledger) == {"intents.md", "a/x.py", "b/y.py"}
+    assert ledger["intents"]["PAY"]["declared"] == "intents/PAY.md"
+    assert affected_files(str(tmp_path), {"intents/PAY.md"}, ledger) == {"intents/PAY.md", "a/x.py", "b/y.py"}
 
 
 @pytest.mark.parametrize("args", [["check", "{root}/nope.py"], ["intents", "--for", "{root}/deep/nope.py"], ["{root}/nope"]])

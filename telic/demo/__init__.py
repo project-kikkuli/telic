@@ -90,9 +90,10 @@ ACTS: list[Step] = [
         say="""
         The checkout page re-implements the discount in TypeScript. That
         requirement spans the server and the page, so it is declared in the
-        intents.md at the top of the shop, whose scope is everything below it.
+        intents/ directory at the top of the shop, whose scope is everything
+        below it. The filename is the ID.
         """,
-        show=("intents.md", 6, 9),
+        show=("intents/PRICE-AGREE.md", 1, 3),
     ),
     Step(
         say="""

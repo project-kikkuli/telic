@@ -104,7 +104,7 @@ class IntentReport:
     ears: list[str] = field(default_factory=list)
     coverage: dict[str, Any] | None = None  # review / judgment
     digest: str = ""  # hash of the text and the lemma set
-    scope: str | None = None  # declared in <scope>/intents.md ('' = the root); None = a comment
+    scope: str | None = None  # declared in <scope>/intents/<ID>.md ('' = the root); None = a comment
     advice: list[str] = field(default_factory=list)  # findings that do not fail
 
     # counts kept for the ledger and older callers
@@ -135,7 +135,7 @@ def _match(item: str, key: str, name: str) -> bool:
 
 
 def build(rep: Any) -> list[IntentReport]:
-    from .frontend.intents_md import LANGUAGE, scope_of
+    from .frontend.intent_file import LANGUAGE, scope_of
 
     decls: dict[str, tuple[str, tuple[str, int], list[str], str | None, bool]] = {}
     twice: dict[str, list[str]] = {}
@@ -181,7 +181,7 @@ def build(rep: Any) -> list[IntentReport]:
             for item in by:
                 hit = [f for f in rep.functions if _match(item, f.ref.key, f.fn.name)]
                 if not hit:
-                    if not context:  # an ancestor intents.md may list code outside this check
+                    if not context:  # an ancestor's intent file may list code outside this check
                         r.pointers.append(f"'{item}' is listed in by: but no checked function has that name")
                 elif not any(iid in f.fn.intents for f in hit):
                     r.pointers.append(f"'{item}' is listed in by: but does not cite {iid}")
@@ -229,10 +229,9 @@ def _check_scope(r: IntentReport, targets: list[str], partial: bool, root: str) 
     one whose lemmas all sit in one file belongs in that file (judged only
     when the check saw all of its code)."""
     scope = r.scope or ""
-    home = f"{scope}/intents.md" if scope else "intents.md"
     outside = sorted({p for p in {x.path for x in r.lemmas} | set(targets) if not _inside(root, p, scope)})
     for path in outside:
-        r.pointers.append(f"{path} is outside {scope or '.'}/, the scope of {home}: declare {r.id} in the intents.md of a directory containing both")
+        r.pointers.append(f"{path} is outside {scope or '.'}/, the scope of {r.loc[0] if r.loc else r.id}: move {r.id}.md to the intents/ of a directory containing both")
     files = {x.path for x in r.lemmas}
     if len(files) == 1 and not partial and not outside and set(targets) <= files:
         (only,) = files
@@ -409,12 +408,12 @@ def attach_cached_judgments(root: str, reports: list[IntentReport]) -> None:
 
 
 def intents_for(target: str, paths: list[str], root: str) -> list[dict[str, Any]]:
-    """What governs a file or directory: intents declared in the intents.md
-    files above or inside it, in its code, cited by its code, or naming its
+    """What governs a file or directory: intents declared in the intents/
+    directories above or inside it, in its code, cited by its code, or naming its
     functions in by:. Loads
     and lowers only; nothing is proved."""
     from .checker import load_modules
-    from .frontend.intents_md import LANGUAGE, scope_of
+    from .frontend.intent_file import LANGUAGE, scope_of
 
     rel = os.path.relpath(os.path.abspath(target), root).replace(os.sep, "/")
     rel = "" if rel == "." else rel
@@ -509,8 +508,8 @@ def cmd_intents(args: Any, options: Any) -> int:
 
 def link_problems(rep: Any) -> list[tuple[str, str]]:
     """(message, file) for every broken link, scope breach, duplicate
-    declaration, intents.md orphan and malformed intents.md in the report."""
-    from .frontend.intents_md import LANGUAGE
+    declaration, orphaned intent file and malformed intent file in the report."""
+    from .frontend.intent_file import LANGUAGE
 
     out = []
     for r in rep.intents:
@@ -523,7 +522,7 @@ def link_problems(rep: Any) -> list[tuple[str, str]]:
 
 
 def _file_problems(rep: Any) -> list[str]:
-    from .frontend.intents_md import LANGUAGE
+    from .frontend.intent_file import LANGUAGE
 
     return [f"{m.path}:{loc.line}: {msg}" for m in rep.modules if m.language == LANGUAGE for msg, loc in m.problems]
 
@@ -552,6 +551,6 @@ def add_commands(sub: Any, common: Any, options: Any) -> None:
     i.add_argument("--oracle", default=None, help="oracle spec (builtin, jev, anthropic, cmd:..., http:..., py:...; default TELIC_ORACLE)")
     i.add_argument("--accept", nargs="+", metavar="ID", help="record that you reviewed these intents' lemmas and they cover the requirement")
     i.add_argument("--as", dest="who", help="reviewer name for --accept")
-    i.add_argument("--for", dest="for_path", metavar="PATH", help="list the intents that govern PATH: declared in intents.md above it, cited in it, or naming its functions in by:")
+    i.add_argument("--for", dest="for_path", metavar="PATH", help="list the intents that govern PATH: declared in intents/ above it, cited in it, or naming its functions in by:")
     i.add_argument("--json", action="store_true")
     i.set_defaults(func=lambda a: cmd_intents(a, options))

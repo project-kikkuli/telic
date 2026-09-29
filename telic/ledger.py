@@ -204,13 +204,13 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     ancestors and their importers: a call through a base may run any
     override. Importers of importers are unaffected: a proof depends on its
     callees' contracts, not on what those rest on."""
-    from .frontend.intents_md import is_intents_file, lower_intents_md
+    from .frontend.intent_file import is_intent_file, lower_intent_file
 
-    files = {f for f in changed if (language_of(f) or is_intents_file(f)) and os.path.exists(os.path.join(root, f))}
-    deleted = {f for f in changed if (language_of(f) or is_intents_file(f)) and not os.path.exists(os.path.join(root, f))}
-    # an edited intents.md affects the code backing its intents, before and after
-    md = {f for f in files | deleted if is_intents_file(f)}
-    ids = {d.id for f in md & files for d in lower_intents_md(f, Path(root, f).read_text()).intents}
+    files = {f for f in changed if (language_of(f) or is_intent_file(f)) and os.path.exists(os.path.join(root, f))}
+    deleted = {f for f in changed if (language_of(f) or is_intent_file(f)) and not os.path.exists(os.path.join(root, f))}
+    # an edited intent file affects the code backing its intents, before and after
+    md = {f for f in files | deleted if is_intent_file(f)}
+    ids = {d.id for f in md & files for d in lower_intent_file(f, Path(root, f).read_text()).intents}
     ids |= {k for k, v in (ledger or {}).get("intents", {}).items() if v.get("declared") in md}
     for k in ids:
         for key in (ledger or {}).get("intents", {}).get(k, {}).get("functions", []):
@@ -238,7 +238,7 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
         grow = False
         # mirror partners, both directions (from source and from the ledger)
         for f in list(files):
-            if is_intents_file(f):
+            if is_intent_file(f):
                 continue
             for line in Path(root, f).read_text().splitlines():
                 t = line.strip()

@@ -20,7 +20,7 @@ telic never ignores a contract silently.
 | `invariant`, `decreases`, `index` | a loop | directly above the loop header, or the first lines of its body |
 | `assert`, `assume` | a statement position | anywhere inside a block |
 | `intent ID: sentence` | the module | anywhere outside a function |
-| `## ID` + sentence | a directory | an `intents.md` file (see [Cross-file intents](#cross-file-intents)) |
+| sentence | a directory | an `intents/<ID>.md` file (see [Cross-file intents](#cross-file-intents)) |
 
 ## Clauses
 
@@ -92,34 +92,38 @@ is reported, and `telic intents` fails on it. `by:` accepts `name`,
 
 ### Cross-file intents
 
-An intent whose lemmas span files goes in an `intents.md`, placed in the lowest
-directory that contains all the code it constrains. Its scope is that
-subtree; an `intents.md` at the root is repo-scoped. An intent that concerns
-one file stays a comment in that file.
+Cross-file intents live in `intents/<ID>.md`, one file per intent, in the
+lowest directory that contains all the code the intent constrains. Its scope is
+the directory holding `intents/` and everything below it; `intents/` at the
+root is repo-scoped. An intent that concerns one file stays a comment in that
+file.
 
 ```markdown
-## PRICE-AGREE
+<!-- intents/PRICE-AGREE.md -->
 WHEN a customer checks out, the checkout page shall show exactly the amount the
 server charges.
 by: discounted_total, web/checkout.ts::displayTotal
 ```
 
-Each `## ID` heading declares one intent: one EARS sentence, then an optional
-`by:` line. Text before the first `##` is free prose. Code cites the intent
-exactly as it cites a comment-declared one.
+The filename is the ID, under the same rules as a comment ID; a file named
+otherwise is reported. The contents are one EARS sentence, then an optional
+`by:` line, with no heading. Code cites the intent exactly as it cites a
+comment-declared one.
 
-- **One ID space.** Comments and `intents.md` files share IDs. Declaring a
-  sentence for the same ID twice, in either place, is reported.
+- **One ID space.** Comments and intent files share IDs. Declaring a sentence
+  for the same ID twice, in either place, is reported.
 - **Scope.** Every lemma and `by:` target of a file-declared intent must live
-  under the file's directory.
-- **Orphans.** A file-declared intent nothing backs makes `telic intents` fail.
+  under its scope, judged by real path through symlinks.
+- **Orphans.** A file-declared intent nothing backs makes `telic intents` and
+  `telic ci` fail.
 - **Sprawl.** A file-declared intent whose lemmas all sit in one code file gets
   a note to declare it there as a comment instead.
-- **Partial checks.** Checking a file or directory also reads the `intents.md`
-  files above it, and reports their intents where the checked code cites them.
+- **Partial checks.** Checking a file or directory also reads every `intents/`
+  directory above it, and reports their intents where the checked code cites
+  them.
 
 `telic intents --for PATH` lists what governs a file or directory: intents
-declared in `intents.md` files above or inside it, declared or cited in its
+declared in `intents/` directories above or inside it, declared or cited in its
 code, or naming its functions in `by:`. It only parses; nothing is proved.
 
 **EARS.** The sentence is linted against the EARS patterns:

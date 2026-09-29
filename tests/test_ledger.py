@@ -58,9 +58,9 @@ CITES_OTHER = "def f(x: int) -> int:\n    #@ intent {iid}\n    #@ ensures result
     [
         ({"lib/cap.py": SRC.replace("the cap.", "the cap. by: capped, gone")}, "'gone' is listed in by:"),
         ({"lib/unrelated.py": "#@ intent CAP: A result never exceeds the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
-        ({"lib/intents.md": "## ORPH\nThe shop shall log.\n"}, "nothing backs it"),
-        ({"lib/sub/intents.md": "## SUBX\nThe shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
-        ({"lib/intents.md": "## Overview\nprose\n"}, "not an intent ID"),
+        ({"lib/intents/ORPH.md": "The shop shall log.\n"}, "nothing backs it"),
+        ({"lib/sub/intents/SUBX.md": "The shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
+        ({"lib/intents/Overview.md": "prose\n"}, "not an intent ID"),
     ],
 )
 def test_intent_link_problems_fail_ci_and_cannot_be_accepted(repo, files, problem):

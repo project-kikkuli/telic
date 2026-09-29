@@ -515,7 +515,7 @@ class Renderer:
             for msg in i.advice:
                 out.append(f"    {p.dim('note')}   {p.dim(msg)}")
             if i.status == "unbacked" and i.scope is not None:
-                out.append(f"    {p.yellow('orphan')} {p.dim('declared in an intents.md and nothing backs it: cite it from the code, or remove it')}")
+                out.append(f"    {p.yellow('orphan')} {p.dim('declared in an intents/ file and nothing backs it: cite it from the code, or remove it')}")
             out.append("")
         return out
 
