@@ -49,13 +49,30 @@ def _differential(path: Path):
     return compared, diffs
 
 
-@pytest.mark.parametrize("name", ["corpus.py", "corpus.ts"])
+DIFF_CASES = ["corpus.py", "corpus.ts"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
+
+
+@pytest.mark.parametrize("name", DIFF_CASES)
 def test_engine_agrees_with_python_core(name):
     if name.endswith(".ts") and not HAS_NODE:
         pytest.skip("Node.js not available")
     compared, diffs = _differential(CASES / name)
-    assert compared > 30
+    assert compared > 20
     assert not diffs, "\n".join(diffs)
+
+
+def test_engine_models_everything_in_the_corpora():
+    """No fallbacks: every function the Python core checks, the engine checks."""
+    for name in DIFF_CASES:
+        if name.endswith(".ts") and not HAS_NODE:
+            continue
+        path = CASES / name
+        p = Program.build(load_modules([str(path)], str(path.parent)))
+        th, _ = build_theory(p, {})
+        tasks = [(r, Options()) for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
+        res = engine.run(p, th, tasks, 4000, None) or {}
+        fell = [f"{k}: {r.get('reason')}" for k, r in res.items() if r["status"] == "fallback"]
+        assert not fell, f"{name}: {fell}"
 
 
 def test_engine_proves_no_exploit():

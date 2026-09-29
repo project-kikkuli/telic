@@ -371,7 +371,8 @@ class CheckOptions:
     progress: Callable[[str], None] | None = None
     receipts: bool = True  # reuse whole-function verdicts for unchanged functions
     jobs: int | None = None  # solver threads (default: every core)
-    engine: str = "python"  # "ox": the native engine (core/), where it applies
+    # "ox": the native engine (core/), where it applies
+    engine: str = field(default_factory=lambda: os.environ.get("TELIC_ENGINE", "python"))
 
 
 _POOL: dict[str, Any] = {}
@@ -635,13 +636,19 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             elif res.status == "unknown":
                 cache.put(key_, {"method": "unknown", "timeout": opts.timeout_ms, "reason": res.reason})
 
-    for rep, fkey, ft in staged:
-        # Escalate: counterexamples get executed, unknowns go to Lean.
-        ref = rep.ref
-        if opts.replay:
-            from .replay import replay_verdicts
+    # Escalate: counterexamples get executed (each replay is a subprocess,
+    # so they run side by side), unknowns go to Lean.
+    if opts.replay:
+        from concurrent.futures import ThreadPoolExecutor
 
-            replay_verdicts(program, rep)
+        from .replay import replay_verdicts
+
+        to_replay = [rep for rep, _, _ in staged if any(v.status == "refuted" for v in rep.verdicts)]
+        if to_replay:
+            with ThreadPoolExecutor(max_workers=min(len(to_replay), opts.jobs or os.cpu_count() or 4)) as ex:
+                list(ex.map(lambda r: replay_verdicts(program, r), to_replay))
+    for rep, fkey, ft in staged:
+        ref = rep.ref
         if opts.lean and any(v.status == "unknown" for v in rep.verdicts):
             from .lean import escalate
 

@@ -513,6 +513,16 @@ class VCGen:
         self.check_exits()
         return self.obligations
 
+    def entry_inputs(self) -> list[tuple[str, Val]]:
+        """The inputs as counterexamples show them (what ``run`` records)."""
+        env: dict[str, Val] = {}
+        self.heap_init(env)
+        for p in self.fn.params:
+            v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
+            env[p.name] = v
+            self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
+        return self.inputs
+
     def ctx(self, st: State, **kw) -> Ctx:
         c = Ctx(base=st.facts, env=st.env, module=self.module, state=st)
         for k, v in kw.items():

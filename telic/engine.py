@@ -23,7 +23,8 @@ from . import ir
 from . import irjson
 from . import logic as L
 from .program import FuncRef, Program
-from .vcgen import ListVal, Obligation, Options
+from .smt import solve
+from .vcgen import ListVal, Obligation, Options, VCGen
 
 CORE_DIR = Path(__file__).resolve().parent.parent / "core"
 
@@ -67,6 +68,40 @@ def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], time
     extra_by_key: dict[str, list[ir.Clause]] = {}
     for ref, opts in tasks:
         extra_by_key[ref.key] = [c for cs in opts.extra_invariants.values() for c in cs]
+    # Every name any module can call, resolved from every module: the engine
+    # resolves callee contracts and class invariants where they live.
+    names: set[str] = set()
+    for key, ref in program.funcs.items():
+        names |= _calls(ref.fn, extra_by_key.get(key, []))
+    for decl in program.classes.values():
+        for c in decl.invariants:
+            names |= {x.func for x in ir.walk_expr(c.expr) if isinstance(x, ir.Call)}
+    for cname in program.classes:
+        names |= {f"{cname}.__init__", f"{cname}.__post_init__"}
+    resolve_tbl: dict[str, dict[str, str]] = {}
+    for m in program.modules:
+        tbl = resolve_tbl.setdefault(m.path, {})
+        for name in sorted(names):
+            tgt = program.resolve(m, name)
+            if tgt is not None:
+                tbl[name] = tgt.key
+
+    def member(cname: str, meth: str) -> str | None:
+        home = program.class_module[cname]
+        tgt = program.resolve(home, f"{cname}.{meth}")
+        return tgt.key if tgt is not None else None
+
+    classes = [
+        {
+            "name": cname,
+            "module": program.class_module[cname].path,
+            "fields": [[f, irjson.ty(t)] for f, t in decl.fields],
+            "invariants": [irjson.clause(c) for c in decl.invariants],
+            "init": member(cname, "__init__"),
+            "post_init": member(cname, "__post_init__"),
+        }
+        for cname, decl in program.classes.items()
+    ]
     info: dict[str, Any] = {}
     for key, ref in program.funcs.items():
         resolve = {}
@@ -86,6 +121,11 @@ def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], time
     req = {
         "modules": [irjson.module(m) for m in program.modules],
         "program": info,
+        "classes": classes,
+        "resolve": resolve_tbl,
+        "heap_writes": {k: {cf: sorted(ts) for cf, ts in w.items()} for k, w in program.heap_writes.items()},
+        "allocates": sorted(program.allocates),
+        "def_heap": {k: program.def_heap_keys(k) for k in program.definitional},
         "theory": {**tw.dump(), "fundefs": fundefs, "axioms": axioms},
         "tasks": [
             {
@@ -128,25 +168,27 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
     reader = irjson.TermReader(ans["terms"])
     out: dict[str, dict[str, Any]] = {}
     by_key = {ref.key: (ref, opts) for ref, opts in tasks}
+    # obligations can be about other functions' clauses (a callee's
+    # @requires) and class invariants
+    shared: dict[tuple, ir.Clause] = {}
+    for other in program.funcs.values():
+        shared.update(_clause_index(other.fn, Options()))
+    for decl in program.classes.values():
+        for c in decl.invariants:
+            shared[(c.kind, c.loc.line, c.loc.col, c.text)] = c
     for r in ans["results"]:
         key = r["key"]
         if r["status"] != "ok":
             out[key] = r
             continue
         ref, opts = by_key[key]
-        clauses = _clause_index(ref.fn, opts)
+        clauses = {**shared, **_clause_index(ref.fn, opts)}
+        # Inputs are named the same in both cores; the Python side knows how
+        # to show them (objects, optionals, enums), so it builds them.
+        inputs = VCGen(program, ref).entry_inputs()
+        plain = all(isinstance(v, (L.Term, ListVal)) for _, v in inputs)
         obs = []
         for o in r["obligations"]:
-            inputs = []
-            params = {p.name: p.ty for p in ref.fn.params}
-            for name, enc in o["inputs"]:
-                if enc is None:
-                    continue
-                if "list" in enc:
-                    a, off, ln = (reader.terms[i] for i in enc["list"])
-                    inputs.append((name, ListVal(a, off, ln, params[name])))  # type: ignore[arg-type]
-                else:
-                    inputs.append((name, reader.terms[enc["t"]]))
             c = o["clause"]
             clause = None
             if c is not None:
@@ -162,12 +204,17 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
                 goal=reader.terms[o["goal"]],
                 clause=clause,
                 intents=tuple(o["intents"]),
-                inputs=inputs,
+                inputs=list(inputs),
                 deps=set(o["deps"]),
                 exclude_axioms=set(o["exclude"]),
                 inferred=o["inferred"],
             )
-            obs.append({"ob": ob, "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}})
+            entry = {"ob": ob, "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}}
+            if o["status"] == "refuted" and not plain:
+                # Objects/optionals in the model: decode them with the Python backend.
+                res = solve(ob, theory, timeout_ms)
+                entry.update(status=res.status, model=res.model, state=res.state, reason=res.reason)
+            obs.append(entry)
         out[key] = {"status": "ok", "obligations": obs, "assumptions": [(ir.Loc(line), text) for line, text in r["assumptions"]], "deps": set(r["deps"]), "loop_notes": [tuple(x) for x in r["loop_notes"]]}
     return out
 

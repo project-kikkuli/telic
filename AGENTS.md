@@ -21,7 +21,7 @@ Read [docs/design.md](docs/design.md) first.
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
 | `telic/intent.py` | intents: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
-| `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving for the core fragment, `--engine ox`; anything it does not model falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |
+| `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving, `--engine ox` / `TELIC_ENGINE=ox`; covers everything the Python core models (heap, optionals, dicts, opaque values, try, async); a function it cannot handle falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
 
 ## Rules

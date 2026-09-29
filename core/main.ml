@@ -122,7 +122,14 @@ let solve_job z (jb : job) : Smt.result =
           List.map
             (fun (name, v) ->
               match v with
-              | Vc.T t -> (name, Smt.value_json t.sort (List.hd (Smt.get_values_raw z [ Smt.term_text t ])))
+              | Vc.T t -> (
+                (* an input the obligation never mentions is not in the script: any value will do *)
+                match (Smt.value_json t.sort (List.hd (Smt.get_values_raw z [ Smt.term_text t ])), t.sort) with
+                | Json.Null, Int -> (name, Json.Int 0)
+                | Json.Null, Real -> (name, Json.Assoc [ ("__real__", Json.List [ Json.Int 0; Json.Int 1 ]) ])
+                | Json.Null, Bool -> (name, Json.Bool false)
+                | Json.Null, Str -> (name, Json.String "")
+                | v, _ -> (name, v))
               | Vc.L l ->
                 let n = match Smt.get_values_raw z [ Smt.term_text l.len ] with [ v ] -> (match Smt.value_json Int v with Json.Int n -> n | _ -> 0) | _ -> 0 in
                 if n > 256 then too_big := true;
@@ -131,7 +138,7 @@ let solve_job z (jb : job) : Smt.result =
                 let es = List.init n (fun i -> Printf.sprintf "(select %s (+ %s %d))" arr off i) in
                 let vals = Smt.get_values_raw z es in
                 (name, Json.List (List.map (Smt.value_json (elem_sort l.arr.sort)) vals))
-              | Vc.NoneV -> (name, Json.Null))
+              | Vc.NoneV | Vc.O _ | Vc.D _ -> (name, Json.Null))
             jb.probes
         in
         let state =
@@ -195,7 +202,33 @@ let () =
             })
         m.functions)
     modules;
-  let prog = { Vc.funcs } in
+  let classes =
+    List.map
+      (fun c ->
+        let opt k = match Json.member k c with Json.String s -> Some s | _ -> None in
+        {
+          Vc.cname = Json.to_str (Json.member "name" c);
+          cmod = Json.to_str (Json.member "module" c);
+          cfields = List.map (function Json.List [ Json.String f; t ] -> (f, Ir.ty_of t) | _ -> failwith "class field") (Json.to_list (Json.member "fields" c));
+          cinvs = List.map Ir.clause_of (Json.to_list (Json.member "invariants" c));
+          init = opt "init";
+          post_init = opt "post_init";
+        })
+      (match Json.member "classes" req with Json.List l -> l | _ -> [])
+  in
+  let resolve_tbl = Hashtbl.create 256 in
+  (match Json.member "resolve" req with
+   | Json.Assoc mods -> List.iter (fun (m, tbl) -> match tbl with Json.Assoc kvs -> List.iter (fun (n, k) -> Hashtbl.replace resolve_tbl (m, n) (Json.to_str k)) kvs | _ -> ()) mods
+   | _ -> ());
+  let heap_writes = Hashtbl.create 64 in
+  (match Json.member "heap_writes" req with
+   | Json.Assoc kvs -> List.iter (fun (k, w) -> match w with Json.Assoc cfs -> Hashtbl.replace heap_writes k (List.map (fun (cf, ts) -> (cf, List.map Json.to_str (Json.to_list ts))) cfs) | _ -> ()) kvs
+   | _ -> ());
+  let allocates = Hashtbl.create 16 in
+  (match Json.member "allocates" req with Json.List l -> List.iter (fun k -> Hashtbl.replace allocates (Json.to_str k) ()) l | _ -> ());
+  let def_heap = Hashtbl.create 16 in
+  (match Json.member "def_heap" req with Json.Assoc kvs -> List.iter (fun (k, v) -> Hashtbl.replace def_heap k (List.map Json.to_str (Json.to_list v))) kvs | _ -> ());
+  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap } in
   let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 8000 in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
   (* 1. VC generation, sequentially *)
@@ -224,7 +257,7 @@ let () =
                 if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, timeout) ]
                 else [ (fst without, snd without, max 300 (min 800 (timeout / 10))); (fst with_l, snd with_l, timeout) ]
               in
-              let input_consts = List.concat_map (fun (_, v) -> match v with Vc.T t -> [ t ] | Vc.L l -> [ l.arr; l.len ] | _ -> []) ob.inputs in
+              let input_consts = List.concat_map (fun (_, v) -> Vc.flatten v) ob.inputs in
               let state_consts =
                 List.concat_map consts terms_
                 |> List.sort_uniq (fun (a : term) b -> compare (match a.node with Const n -> n | _ -> "") (match b.node with Const n -> n | _ -> ""))
@@ -308,7 +341,7 @@ let () =
                              match v with
                              | Vc.T t -> Json.List [ Json.String name; Json.Assoc [ ("t", Json.Int (wterm w t)) ] ]
                              | Vc.L l -> Json.List [ Json.String name; Json.Assoc [ ("list", Json.List [ Json.Int (wterm w l.arr); Json.Int (wterm w l.off); Json.Int (wterm w l.len) ]) ] ]
-                             | Vc.NoneV -> Json.List [ Json.String name; Json.Null ])
+                             | Vc.NoneV | Vc.O _ | Vc.D _ -> Json.List [ Json.String name; Json.Null ])
                            ob.inputs) );
                   ])
               jobs
