@@ -49,13 +49,15 @@ def _differential(path: Path):
     return compared, diffs
 
 
-DIFF_CASES = ["corpus.py", "corpus.ts"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
+DIFF_CASES = ["corpus.py", "corpus.ts", "corpus.rs"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
 
 
 @pytest.mark.parametrize("name", DIFF_CASES)
 def test_engine_agrees_with_python_core(name):
     if name.endswith(".ts") and not HAS_NODE:
         pytest.skip("Node.js not available")
+    if name.endswith(".rs"):
+        pytest.importorskip("tree_sitter_rust")
     compared, diffs = _differential(CASES / name)
     assert compared > 20
     assert not diffs, "\n".join(diffs)
@@ -66,6 +68,11 @@ def test_engine_models_everything_in_the_corpora():
     for name in DIFF_CASES:
         if name.endswith(".ts") and not HAS_NODE:
             continue
+        if name.endswith(".rs"):
+            try:
+                import tree_sitter_rust  # noqa: F401
+            except ImportError:
+                continue
         path = CASES / name
         p = Program.build(load_modules([str(path)], str(path.parent)))
         th, _ = build_theory(p, {})

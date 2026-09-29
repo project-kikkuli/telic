@@ -25,6 +25,7 @@ TRUE_HELPERS = {
     "t19.py": {"Box.__init__", "weird", "decorated"},
     "t20.ts": {"Box.__init__"},
     "t22.py": {"Bag.__init__", "moved_ok"},
+    "t23.rs": {"Counter.bump", "set_through"},
     "t21.py": {"B.__init__", "B.value", "C.value", "B.shrink", "other_task"},
     "t2.py": {"bump", "grow", "abs", "two"},
     "t6.py": {"inc"},
@@ -41,7 +42,7 @@ TRUE_HELPERS = {
     "crash1.py": {"copy"},
 }
 
-FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts"))
+FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))
 
 
 @pytest.mark.parametrize("name", FILES)
@@ -51,6 +52,8 @@ def test_no_exploit_is_proved(name):
 
         if shutil.which("node") is None:
             pytest.skip("Node.js not available")
+    if name.endswith(".rs"):
+        pytest.importorskip("tree_sitter_rust")
     rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
     proved = {f.fn.name for f in rep.functions if f.status == "proved"}
     unexpected = proved - TRUE_HELPERS.get(name, set())

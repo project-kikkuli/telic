@@ -1152,10 +1152,12 @@ class VCGen:
             return L.gt(a, b)
         if op == "ge":
             return L.ge(a, b)
-        if op in ("rdiv", "floordiv", "fmod", "tmod"):
+        if op in ("rdiv", "floordiv", "fmod", "tmod", "tdiv"):
             zero = L.lit(0, b.sort)
-            sym = {"rdiv": "/", "floordiv": "//", "fmod": "%", "tmod": "%"}[op]
+            sym = {"rdiv": "/", "floordiv": "//", "fmod": "%", "tmod": "%", "tdiv": "/"}[op]
             self.oblige("div", ctx, L.ne(b, zero), e.loc, f"divisor of '{sym}' is non-zero")
+            if not (ctx.quiet or ctx.spec):
+                ctx.assume(L.ne(b, zero))  # past this point it was not: the program would have failed
             if op == "rdiv":
                 return L.rdiv(a, b)
             if a.sort == L.REAL:
@@ -1167,6 +1169,8 @@ class VCGen:
                 return L.sub(a, L.mul(b, L.to_real(qi)))
             if op == "floordiv":
                 return floordiv(a, b)
+            if op == "tdiv":  # integer division truncating toward zero (Rust, C)
+                return truncdiv(a, b)
             if op == "fmod":
                 return L.sub(a, L.mul(b, floordiv(a, b)))
             return L.sub(a, L.mul(b, truncdiv(a, b)))
@@ -1371,6 +1375,17 @@ class VCGen:
             ctx.assume(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, ln)), L.eq(L.select(vals, j), L.select(d.vals, L.select(keys, j)))), patterns=((L.select(vals, j),),)))
             return ListVal(vals, L.ZERO, ln, ir.TList(d.ty.val))
 
+        if name == "checked":  # fixed-width arithmetic: the result must fit the type
+            v, lo, hi, tyname = args[0], args[1], args[2], e.args[3]
+            assert isinstance(tyname, ir.Lit)
+            fits = L.and_(L.le(lo, v), L.le(v, hi))  # type: ignore[arg-type]
+            self.oblige("overflow", ctx, fits, e.loc, f"{tyname.value} arithmetic does not overflow")
+            ctx.assume(fits)  # (past this point it did not: the program would have panicked)
+            return v
+        if name == "in_range":  # a value of a fixed-width type is within its range (guaranteed by the type)
+            v, lo, hi = args
+            ctx.assume(L.and_(L.le(lo, v), L.le(v, hi)))  # type: ignore[arg-type]
+            return v
         if name == "same_len":  # r's elements, xs's length (Array.map with an unchecked callback)
             xs, r = args
             assert isinstance(xs, ListVal) and isinstance(r, ListVal)

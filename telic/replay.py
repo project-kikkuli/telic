@@ -269,7 +269,9 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
     if k in ("inv.entry", "inv.step"):
         return v == "invariant" and _same(out.get("text", ""), ob.clause)
     if k == "assert":
-        return (v in ("assert", "assume") and _same(out.get("text", ""), ob.clause)) or crash == "AssertionError"
+        return (v in ("assert", "assume") and _same(out.get("text", ""), ob.clause)) or crash == "AssertionError" or (lang == "rust" and crash == "panic")
+    if k == "overflow":
+        return crash == "overflow"
     if k == "div":
         return crash == "ZeroDivisionError" or (lang == "typescript" and bool(out.get("nonfinite")))
     if k == "index":
@@ -280,6 +282,8 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
             # JavaScript erases '!' and '?.': a missing value either crashes a
             # property read or flows on as undefined (NaN in arithmetic).
             return (crash == "TypeError" and ("undefined" in msg or "null" in msg)) or bool(out.get("returned_is_none")) or bool(out.get("nonfinite")) or "undefined" in str(out.get("returned_repr", "")) or "NaN" in str(out.get("returned_repr", ""))
+        if lang == "rust":
+            return crash == "unwrap on None"
         return crash in ("TypeError", "AttributeError") and ("NoneType" in msg or "None" in msg)
     if k == "key":
         return crash == "KeyError" or bool(out.get("missing_key"))
@@ -319,7 +323,7 @@ def describe(out: dict[str, Any], runtime: str) -> str:
 def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool, str, str | None]:
     """(confirmed, summary, violation). Confirmed only if the runtime failure
     is this obligation's failure: same clause, same kind of crash."""
-    runtime = "node" if lang == "typescript" else "python"
+    runtime = {"typescript": "node", "rust": "rustc"}.get(lang, "python")
     if out.get("timeout"):
         if ob.kind == "variant":
             return False, f"{runtime}: still running after {TIMEOUT_S:.0f}s (consistent with non-termination, not proof of it)", None
@@ -371,6 +375,15 @@ def replay_verdicts(program: Program, rep) -> None:
         if race:
             v.replay = Replay(False, False, f"another task may change these objects during the await at line {', '.join(race)}; a single run cannot reproduce a race", violation="race")
             continue
+        if lang == "rust":
+            from .frontend.rust_replay import run_rust
+
+            out = run_rust(full, fn, v.model)
+            if out is None:
+                continue  # not executable here (no toolchain, or a type the harness cannot build)
+            confirmed, summary, violation = classify(v.ob, out, fn, lang)
+            v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="rustc")
+            continue
         args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
         try:
             if lang == "python":
@@ -391,7 +404,7 @@ def replay_verdicts(program: Program, rep) -> None:
         )
     # The solver's state was unreachable? Search for a real failing input.
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
-    if pending:
+    if pending and lang != "rust":
         out = fuzz(full, fn, lang, module=rep.ref.module)
         if out.get("found"):
             what = out.get("violation") or out.get("crash")

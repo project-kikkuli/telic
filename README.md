@@ -2,7 +2,7 @@
 
 **Write what your code promises in a comment. telic proves it, or shows you the input that breaks it, after running your code on that input.**
 
-Python and TypeScript. The contracts are comments, so production code pays nothing for them.
+Python, TypeScript and Rust. The contracts are comments, so production code pays nothing for them.
 
 ```python
 def discount(total: int, code: str | None, codes: dict[str, int]) -> int:
@@ -33,7 +33,8 @@ Nobody wrote a test. telic took the counterexample from the solver, ran the real
 ## Use it
 
 ```bash
-pip install -e .        # Python ≥ 3.10. TypeScript also needs Node ≥ 18.
+pip install -e .        # Python ≥ 3.10. TypeScript also needs Node ≥ 18;
+                        # Rust needs pip install -e '.[rust]' (and rustc to replay)
 telic demo              # 20-second walkthrough on a small shop
 telic check src/        # check a project
 ```
@@ -42,7 +43,7 @@ Then follow this loop, or have your coding agent follow it:
 
 1. **Say what a function promises.** Add `#@ requires` (what callers guarantee) and
    `#@ ensures` (what it returns; `result` is the return value, `old(x)` is x at
-   entry). In TypeScript, write `//@`.
+   entry). In TypeScript and Rust, write `//@`.
 2. **Run `telic check`.** Each promise, and each place the code could crash, is
    either proved or comes back with a counterexample telic has actually executed.
 3. **Fix the code or the contract.** telic says which one disagrees and where.
@@ -112,8 +113,9 @@ telic run script.py        run with every contract checked at runtime
 
 ## What you are trusting
 
-- **Language models.** Python ints are exact. Floats and JavaScript numbers are
-  exact rationals: no rounding, NaN or Infinity.
+- **Language models.** Python ints are exact; Rust integers are their fixed
+  width, and overflow is a panic (debug semantics). Floats and JavaScript
+  numbers are exact rationals: no rounding, NaN or Infinity.
 - **Z3 and the Lean kernel.**
 - **The theory lemmas about sums and counts.** They are proved in
   [Theory.lean](telic/lean/Theory.lean).

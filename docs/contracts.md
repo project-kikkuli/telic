@@ -1,7 +1,7 @@
 # Contract reference
 
 A contract line is a line comment starting with `#@` (Python) or `//@`
-(TypeScript), followed by a keyword. The payload is an expression in the host
+(TypeScript, Rust), followed by a keyword. The payload is an expression in the host
 language. A line whose first word is not a keyword continues the previous clause:
 
 ```python
@@ -50,7 +50,9 @@ termination is reported as open.
 
 **`raises C`** is for exceptions you intend. A `raise`/`throw` must only be
 reachable when `C` holds, and the function must not return normally when `C`
-holds. Without `@raises`, any reachable `raise` is an error.
+holds. In a function with a contract, a reachable `raise` without `@raises` is
+an error; without any contract, raising is simply what the function does (a
+handler rejecting a request). A Rust `panic!` is always a crash to rule out.
 
 **`assert P`** is proved statically, then assumed. Native `assert` statements are
 treated the same way.
@@ -124,19 +126,22 @@ parameter against a `number` parameter is compared on integers.
 
 Everything the code can say, plus:
 
-| | Python | TypeScript |
-|---|---|---|
-| return value | `result` | `result` |
-| entry value | `old(e)` | `old(e)` |
-| implication | `implies(a, b)` | `implies(a, b)` |
-| for all / exists over a list | `all(p(x) for x in xs)`, `any(...)` | `xs.every(x => p(x))`, `xs.some(...)`, `xs.every((x, i) => ...)` |
-| over an integer range | `all(p(i) for i in range(lo, hi))` | `range(lo, hi).every(i => p(i))` |
-| with index | `all(p(i, x) for i, x in enumerate(xs))` | `xs.every((x, i) => p(i, x))` |
-| filter | `all(p(x) for x in xs if q(x))` | `xs.every(x => !q(x) \|\| p(x))` |
-| sum / count | `sum(xs)`, `sum(xs[a:b])`, `xs.count(v)` | `sum(xs)`, `count(xs, v)`, `xs.reduce((a, b) => a + b, 0)` |
-| membership | `v in xs` | `xs.includes(v)` |
-| slices | `xs[a:b]`, `xs[-1]` | `xs.slice(a, b)`, `xs.at(-1)` |
-| pure helpers | any loop-free, mutation-free function in the program, e.g. `ensures result == fib(n)` | same |
+| | Python | TypeScript | Rust |
+|---|---|---|---|
+| return value | `result` | `result` | `result` |
+| entry value | `old(e)` | `old(e)` | `old(e)` |
+| implication | `implies(a, b)` | `implies(a, b)` | `implies(a, b)` |
+| for all / exists over a list | `all(p(x) for x in xs)`, `any(...)` | `xs.every(x => p(x))`, `xs.some(...)`, `xs.every((x, i) => ...)` | `xs.iter().all(\|x\| p(x))`, `.any(...)` |
+| over an integer range | `all(p(i) for i in range(lo, hi))` | `range(lo, hi).every(i => p(i))` | `(lo..hi).all(\|i\| p(i))` |
+| with index | `all(p(i, x) for i, x in enumerate(xs))` | `xs.every((x, i) => p(i, x))` | `(0..xs.len()).all(\|i\| p(i, xs[i]))` |
+| filter | `all(p(x) for x in xs if q(x))` | `xs.every(x => !q(x) \|\| p(x))` | `xs.iter().all(\|x\| !q(x) \|\| p(x))` |
+| sum / count | `sum(xs)`, `sum(xs[a:b])`, `xs.count(v)` | `sum(xs)`, `count(xs, v)`, `xs.reduce((a, b) => a + b, 0)` | `xs.iter().sum::<u64>()`, `.filter(...).count()` |
+| membership | `v in xs` | `xs.includes(v)` | `xs.contains(&v)` |
+| slices | `xs[a:b]`, `xs[-1]` | `xs.slice(a, b)`, `xs.at(-1)` | `xs[a..b]` |
+| pure helpers | any loop-free, mutation-free function in the program, e.g. `ensures result == fib(n)` | same | same |
+
+In Rust specs, arithmetic is mathematical (a spec never overflows) and
+references dereference themselves (`x <= result` where `x: &i32`).
 
 Spec expressions must themselves be well-defined: an index inside a spec is
 checked like one in code.
@@ -187,12 +192,26 @@ doesn't check (a library, a decorated function, a local closure). Such a call:
 Every such assumption is listed under *trusted base* in the report.
 
 **Aliasing rules.** Lists and dicts are modelled as values. Binding a name to an
-existing one (`ys = xs`) is rejected; copy it with `xs[:]` / `.slice()`. The same
-goes for storing one in a field or returning a parameter. A loop may not change
-the collection it iterates over.
+existing one (`ys = xs`) is rejected unless `xs` is never used again (a move);
+otherwise copy it with `xs[:]` / `.slice()`. The same goes for storing one in a
+field. A loop may not change the collection it iterates over.
 
 **Strictness.** Falling off the end of a function that returns a value is an
-error, and so is a reachable `raise`/`throw` without `@raises`. In TypeScript,
-`var` is rejected and a declaration may not shadow an outer one. `a or b` /
-`a || b` used as a value must have boolean operands, unless the result type is
-clear from the operands (`x || 0`).
+error. In TypeScript, `var` is rejected and a declaration may not shadow an
+outer one. `x or default` / `x || default` are modelled with the language's
+truthiness. Without a contract, telic only looks for crashes: termination and
+intended raises are claims a contract makes.
+
+**Rust.** Integers are their fixed width: every `+ - * /` on them must not
+overflow, `/` and `%` truncate, and `as` wraps or saturates exactly as Rust
+does. Indexing, slicing, `unwrap`/`expect`, `HashMap[&k]`, `panic!`,
+`unreachable!` and `assert!` are panics to rule out. A value of an integer type
+is known to be in its range. `Vec`, slices and arrays are lists; `Option` is an
+optional; `HashMap` is a map; a non-`Copy` struct is an object (a move copies the
+reference, so no alias survives it); a `Copy` struct of scalars is a record.
+`&mut v` of a local list is `v` itself; a scalar behind `&mut` handed to a call
+is unknown afterwards. `match`, `if let`, `while let`, `?` on `Option` (and on an
+unchecked `Result`), shadowing, iterator chains (`map`, `filter`, `sum`,
+`count`, `all`, `any`, `collect`) and C-like enums are modelled. Refutations are
+replayed by compiling the file with `rustc` (overflow checks on) and calling the
+function on the counterexample.

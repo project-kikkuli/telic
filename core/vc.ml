@@ -452,10 +452,11 @@ let rec ev g ctx (e : Ir.expr) : value =
       | "le" -> T (le x y)
       | "gt" -> T (gt x y)
       | "ge" -> T (ge x y)
-      | "rdiv" | "floordiv" | "fmod" | "tmod" ->
+      | "rdiv" | "floordiv" | "fmod" | "tmod" | "tdiv" ->
         let z = lit_of_int 0 y.sort in
-        let sym = match op with "rdiv" -> "/" | "floordiv" -> "//" | _ -> "%" in
+        let sym = match op with "rdiv" | "tdiv" -> "/" | "floordiv" -> "//" | _ -> "%" in
         oblige g "div" ctx (ne y z) loc (Printf.sprintf "divisor of '%s' is non-zero" sym);
+        if not (ctx.quiet || ctx.spec) then assume ctx (ne y z);
         if op = "rdiv" then T (rdiv x y)
         else if x.sort = Real then begin
           let q = rdiv x y in
@@ -463,6 +464,7 @@ let rec ev g ctx (e : Ir.expr) : value =
           if op = "floordiv" then T (to_real qi) else T (sub x (mul y (to_real qi)))
         end
         else if op = "floordiv" then T (floordiv x y)
+        else if op = "tdiv" then T (truncdiv x y)
         else if op = "fmod" then T (sub x (mul y (floordiv x y)))
         else T (sub x (mul y (truncdiv x y)))
       | _ -> raise (Vc_error ("unknown operator " ^ op, loc))))
@@ -650,6 +652,17 @@ and builtin g ctx (e : Ir.expr) name args =
         assume_ (quant "forall" [ j ] (implies (and_ [ le zero j; lt j ln ]) (eq (select vs j) (select d.vals (select keys j)))) [ [| select vs j |] ]);
         L { arr = vs; off = zero; len = ln; lty = TList (dval d) }
       end
+    | "checked", [ v; lo; hi; _ ] ->
+      let tyname = match List.nth args 3 with { e = Lit (LStr t); _ } -> t | _ -> "integer" in
+      let v = tm v in
+      let fits = and_ [ le (tm lo) v; le v (tm hi) ] in
+      oblige g "overflow" ctx fits loc (Printf.sprintf "%s arithmetic does not overflow" tyname);
+      assume_ fits;
+      T v
+    | "in_range", [ v; lo; hi ] ->
+      let v = tm v in
+      assume_ (and_ [ le (tm lo) v; le v (tm hi) ]);
+      T v
     | "same_len", [ xs; r ] -> let a = lst xs and b = lst r in L { b with len = a.len }
     | "list_concat", [ xs; ys ] ->
       let a = lst xs and b = lst ys in

@@ -26,6 +26,8 @@ def language_of(path: str) -> str | None:
         return "python"
     if path.endswith((".ts", ".tsx", ".mts", ".cts")) and not path.endswith(".d.ts"):
         return "typescript"
+    if path.endswith(".rs"):
+        return "rust"
     return None
 
 
@@ -36,7 +38,7 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
     for p in paths:
         if os.path.isdir(p):
             for dirpath, dirnames, filenames in os.walk(p):
-                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build")]
+                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build", "target")]
                 for f in sorted(filenames):
                     full = os.path.join(dirpath, f)
                     if language_of(full):
@@ -98,6 +100,10 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
             mods.append(py_mods[f])
         elif lang == "typescript":
             mods.append(ts_mods[f])
+        elif lang == "rust":
+            from .frontend.rust import lower_rust
+
+            mods.append(lower_rust(os.path.relpath(f, root), Path(f).read_text()))
     return mods
 
 
