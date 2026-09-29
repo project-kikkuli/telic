@@ -92,6 +92,7 @@ class TDict:
 
     key: "Type"
     val: "Type"
+    js: str = field(default="", compare=False)  # "map" | "object" in TypeScript (replay only)
 
     def __str__(self) -> str:
         return f"dict[{self.key}, {self.val}]"
@@ -365,6 +366,7 @@ class FieldAssign(Stmt):
 class DictDel(Stmt):
     name: str
     key: Expr
+    strict: bool = True  # Python 'del d[k]' needs the key; JS 'm.delete(k)' does not
 
 
 @dataclass(frozen=True)

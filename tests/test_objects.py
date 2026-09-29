@@ -50,3 +50,22 @@ def test_vibecoded_shop():
     assert got["Order.add"].status == "refuted"  # the raise needs '@raises'
     race = [v for v in got["checkout"].verdicts if v.replay is not None and v.replay.violation == "race"]
     assert race and all(v.ob.kind == "call" for v in race)  # status can change during the await
+
+
+def test_vibecoded_cart_ts():
+    """The TypeScript side: classes with parameter properties and getters,
+    string enums, optional fields and chaining, Maps, async, switch,
+    try/catch, forEach, map/filter, unchecked imports."""
+    import shutil
+
+    import pytest
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    got = run("cart.ts")
+    for name in ("withTax", "noteLength", "summarize", "skus", "statusLabel", "totalPrice", "Cart.__init__", "Cart.pay", "Cart.label"):
+        assert got[name].status == "proved", (name, got[name].status, got[name].problems)
+    for name in ("discount", "badNote", "parseQty", "Cart.add"):
+        assert refuted_confirmed(got[name]), (name, got[name].status)
+    race = [v for v in got["checkout"].verdicts if v.replay is not None and v.replay.violation == "race"]
+    assert race

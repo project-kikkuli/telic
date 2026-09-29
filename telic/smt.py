@@ -296,6 +296,10 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
         if isinstance(ty, ir.TEnum):
             i = enc.value(model, val.val)
             return {"__enum__": ty.name, "member": ty.members[i] if isinstance(i, int) and 0 <= i < len(ty.members) else ty.members[0]}
+        if isinstance(ty, ir.TRecord):
+            return {"__record__": ty.name, "fields": decode(enc, model, val.val)}
+        if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TRecord) and isinstance(val.val, ListVal):
+            return [{"__record__": ty.elem.name, "fields": x} for x in decode(enc, model, val.val)]
         if isinstance(ty, ir.TList) and isinstance(val.val, ListVal):
             items = enc.list_value(model, val.val)
             if isinstance(ty.elem, ir.TEnum):
@@ -305,7 +309,10 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
         return decode(enc, model, val.val)
 
     if isinstance(val, ListVal):
-        return [x for x in enc.list_value(model, val)]
+        n = enc.value(model, val.len)
+        if not isinstance(n, int):
+            return []
+        return [decode(enc, model, L.select(val.arr, L.add(val.off, L.IntV(i)))) for i in range(max(0, min(n, 256)))]
     if isinstance(val, L.Term) and val.sort == L.OPAQUE:
         return {"__opaque__": True}
     if isinstance(val, OptVal):
@@ -335,6 +342,10 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
         return {k: enc.value(model, L.select(val.vals, _lit(k, val.has.sort.index))) for k in keys}
     if not isinstance(val, L.Term):
         return str(val)
+    if val.sort.name == "Rec" and str(val.sort.rec).startswith("Opt_"):
+        if enc.value(model, L.field(val, "some")) is not True:
+            return None
+        return decode(enc, model, L.field(val, "val"))
     if val.sort.name == "Rec":
         out = {}
         for fname, _ in val.sort.fields:

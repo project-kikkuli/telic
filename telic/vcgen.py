@@ -132,7 +132,7 @@ def sort_of(ty: ir.Type) -> L.Sort:
     if isinstance(ty, ir.TStr):
         return L.STR
     if isinstance(ty, ir.TRecord):
-        return L.REC(ty.name, tuple((n, sort_of(t)) for n, t in ty.fields))
+        return L.REC(ty.name, tuple((n, field_sort(t)) for n, t in ty.fields))
     if isinstance(ty, ir.TList):
         return L.ARRAY(sort_of(ty.elem))
     if isinstance(ty, ir.TClass):
@@ -142,6 +142,23 @@ def sort_of(ty: ir.Type) -> L.Sort:
     if isinstance(ty, ir.TEnum):
         return L.INT  # member index
     raise VCError(f"no single logical sort for {ty}")
+
+
+def field_sort(ty: ir.Type) -> L.Sort:
+    """A record field's sort: an optional field is a small (present, value)
+    record of its own."""
+    if isinstance(ty, ir.TOption):
+        inner = sort_of(ty.inner)
+        return L.REC(f"Opt_{_sort_tag(inner)}", (("some", L.BOOL), ("val", inner)))
+    return sort_of(ty)
+
+
+def _sort_tag(s: L.Sort) -> str:
+    if s.name == "Rec":
+        return str(s.rec)
+    if s.name == "Array":
+        return f"Arr{_sort_tag(s.elem)}"  # type: ignore[arg-type]
+    return s.name
 
 
 def flatten(v: Val) -> tuple[L.Term, ...]:
@@ -159,6 +176,18 @@ def ite_val(c: L.Term, a: Val, b: Val) -> Val:
     if ty is not None:
         return pack(ty, [L.ite(c, x, y) for x, y in zip(flatten(a), flatten(b))])
     return L.ite(c, a, b)  # type: ignore[arg-type]
+
+
+def rec_equal(a: L.Term, b: L.Term) -> L.Term:
+    """Equality as the language sees it: an absent optional field equals
+    another absent one, whatever junk its value slot holds."""
+    s = a.sort
+    if s.name != "Rec":
+        return L.eq(a, b)
+    if str(s.rec).startswith("Opt_"):
+        sa, sb = L.field(a, "some"), L.field(b, "some")
+        return L.and_(L.eq(sa, sb), L.implies(sa, rec_equal(L.field(a, "val"), L.field(b, "val"))))
+    return L.and_(*[rec_equal(L.field(a, n), L.field(b, n)) for n, _ in s.fields])
 
 
 def default_term(s: L.Sort) -> L.Term:
@@ -499,7 +528,7 @@ class VCGen:
             return ObjVal(v, ty.name, fs)  # type: ignore[arg-type]
         if isinstance(ty, ir.TOption) and isinstance(ty.inner, (ir.TClass, ir.TEnum)) and isinstance(v, OptVal):
             return OptVal(v.some, self.input_view(v.val, ty.inner, env, depth), ty)  # type: ignore[arg-type]
-        if isinstance(ty, ir.TEnum) or (isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum))):
+        if isinstance(ty, (ir.TEnum, ir.TRecord)) or (isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum, ir.TRecord))):
             return TypedView(v, ty)
         return v
 
@@ -604,7 +633,8 @@ class VCGen:
             assert isinstance(d, DictVal)
             ctx = self.ctx(st)
             k = self.ev(s.key, ctx)
-            self.oblige("key", ctx, L.select(d.has, k), s.loc, f"key being deleted from '{s.name}' is present")  # type: ignore[arg-type]
+            if s.strict:
+                self.oblige("key", ctx, L.select(d.has, k), s.loc, f"key being deleted from '{s.name}' is present")  # type: ignore[arg-type]
             st.env[s.name] = DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
             return st
         if isinstance(s, ir.IndexAssign) and isinstance(st.env.get(s.name), DictVal):
@@ -1140,7 +1170,7 @@ class VCGen:
             return L.and_(a.some, L.eq(a.val, b))  # type: ignore[arg-type]
         if isinstance(a, DictVal) or isinstance(b, DictVal):
             raise VCError("comparing whole dicts with == is not supported")
-        return L.eq(a, b)
+        return rec_equal(a, b)  # type: ignore[arg-type]
 
     def ev_Ite(self, e: ir.Ite, ctx: Ctx) -> Val:
         c = self.ev(e.cond, ctx)
@@ -1167,13 +1197,19 @@ class VCGen:
         if isinstance(e.obj.ty, ir.TClass):
             env = ctx.env if ctx.state is None else ctx.state.env
             return self.heap_read(env, e.obj.ty.name, e.name, obj)
-        return L.field(obj, e.name)
+        raw = L.field(obj, e.name)
+        if isinstance(e.ty, ir.TOption):
+            return OptVal(L.field(raw, "some"), L.field(raw, "val"), e.ty)
+        return raw
 
     def ev_RecordLit(self, e: ir.RecordLit, ctx: Ctx) -> Val:
         vals = []
-        for _, fe in e.fields:
-            v = self.ev(fe, ctx)
-            assert not isinstance(v, ListVal)
+        assert isinstance(e.ty, ir.TRecord)
+        for (fname, fty), (_, fe) in zip(e.ty.fields, e.fields):
+            v = coerce(self.ev(fe, ctx), fty)
+            if isinstance(v, OptVal):
+                v = L.mkrec(field_sort(fty), (v.some, v.val))
+            assert not isinstance(v, (ListVal, DictVal))
             vals.append(v)
         return L.mkrec(sort_of(e.ty), tuple(vals))
 
@@ -1330,6 +1366,10 @@ class VCGen:
             assert isinstance(d, DictVal)
             v = coerce(v, d.ty.val)
             return DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
+        if name == "dict_remove":  # JS Map.delete: no key needed
+            d, k = args
+            assert isinstance(d, DictVal)
+            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
         if name == "dict_del":
             d, k = args
             assert isinstance(d, DictVal)
@@ -1543,11 +1583,16 @@ class VCGen:
         args = [self.ev(a, ctx) for a in e.args]
         if ctx.spec:
             raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
-        self.note(e.loc, f"call:{e.name}")
+        if not e.name.startswith(("caught exception", "default of")):
+            self.note(e.loc, f"call:{e.name}")
         if ctx.state is not None:
             env = ctx.state.env
             # It may change any list/dict variable passed to it, and, if it
             # is handed anything that can reach objects, any object.
+            # Escaped closures may run now and reassign what they captured.
+            for n in sorted(self.fn.escaped):
+                if n in env and n in self.fn.locals and not isinstance(env[n], (ListVal, DictVal)):
+                    env[n] = self.fresh(n, self.fn.locals[n])
             touched = list(e.args) + [ir.Var(self.fn.locals[n], e.loc, n) for n in sorted(self.fn.escaped) if n in self.fn.locals]
             for a_e in touched:
                 if isinstance(a_e, ir.Var) and isinstance(env.get(a_e.name), (ListVal, DictVal)):

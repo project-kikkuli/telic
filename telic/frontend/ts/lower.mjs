@@ -26,9 +26,15 @@ const ts = require("typescript");
 
 const INT = { k: "int" }, REAL = { k: "real" }, BOOL = { k: "bool" }, STR = { k: "str" }, NONE = { k: "none" };
 const listOf = (elem) => ({ k: "list", elem });
-const tyEq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const optionOf = (inner) => (inner.k === "option" || inner.k === "opaque" ? inner : inner.k === "list" || inner.k === "dict" ? opaque("optional container") : { k: "option", inner });
+const opaque = (why = "") => ({ k: "opaque", why });
+const classOf = (name) => ({ k: "class", name });
+const tyKey = (t) => (t.k === "opaque" ? "opaque" : t.k === "dict" ? `dict<${tyKey(t.key)},${tyKey(t.val)}>` : t.k === "option" ? `option<${tyKey(t.inner)}>` : t.k === "list" ? `list<${tyKey(t.elem)}>` : t.k === "enum" || t.k === "class" || t.k === "record" ? `${t.k}:${t.name}` : t.k);
+const tyEq = (a, b) => tyKey(a) === tyKey(b);
 const isNum = (t) => t && (t.k === "int" || t.k === "real");
-const tyStr = (t) => (t.k === "list" ? `${tyStr(t.elem)}[]` : t.k === "record" ? t.name : t.k === "real" ? "number" : t.k === "int" ? "int" : t.k);
+const hasOpaque = (t) => t.k === "opaque" || (t.k === "list" && hasOpaque(t.elem)) || (t.k === "option" && hasOpaque(t.inner)) || (t.k === "dict" && (hasOpaque(t.key) || hasOpaque(t.val)));
+const tyStr = (t) => (t.k === "list" ? `${tyStr(t.elem)}[]` : t.k === "record" || t.k === "class" || t.k === "enum" ? t.name : t.k === "real" ? "number" : t.k === "int" ? "int" : t.k === "option" ? `${tyStr(t.inner)} | undefined` : t.k === "dict" ? `Map<${tyStr(t.key)}, ${tyStr(t.val)}>` : t.k);
+const GLOBALS = new Set(["Date", "JSON", "Math", "Number", "String", "Object", "Array", "Promise", "fetch", "console", "process", "window", "document", "crypto", "setTimeout", "clearTimeout", "setInterval", "parseInt", "parseFloat", "isNaN", "isFinite", "Symbol", "BigInt", "Error", "Intl", "URL", "URLSearchParams", "localStorage", "sessionStorage", "navigator", "location", "globalThis", "undefined", "NaN", "Infinity", "structuredClone", "encodeURIComponent", "decodeURIComponent", "require", "module", "exports", "__dirname", "__filename", "Buffer", "Set", "WeakMap", "WeakSet", "Reflect", "Proxy", "queueMicrotask", "alert", "performance"]);
 
 class LowerError extends Error {
   constructor(msg, line) {
@@ -128,9 +134,23 @@ class ModuleLowerer {
     this.sf = sf;
     this.src = sf.text;
     this.lines = sf.text.split(/\r?\n/);
-    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, problems: [], assumptions: JS_ASSUMPTIONS };
+    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [], assumptions: JS_ASSUMPTIONS };
     this.aliases = {};
     this.sigs = {}; // name -> {params, ret, node}
+    this.classes = {}; // name -> {node, fields: [[n, ty]], props, setters, statics, home: ModuleLowerer}
+    this.enums = {}; // name -> enum type
+    this.namespaces = {}; // `import * as ns` of a checked module -> ModuleLowerer
+    this.imported = {}; // local -> {mod, name}
+    this.importDecls = [];
+    this.constants = {}; // module-level `const X = <literal>`
+    this.globalsBound = new Set(); // module-level names that are not modelled
+  }
+
+  run() {
+    for (const _ of this.phases()) {
+      /* single module */
+    }
+    return this.module;
   }
 
   line(node) {
@@ -142,43 +162,115 @@ class ModuleLowerer {
     return [s.line + 1, s.character, e.line === s.line ? e.character : 0];
   }
 
-  run() {
+  // Lowering in three phases so a project can link imports between them:
+  // yields "names" once records, enums and class names are known, and
+  // "signatures" once fields and signatures are.
+  *phases() {
     try {
       this.contracts = parseContractLines(collectComments(this.sf));
     } catch (e) {
       this.module.problems.push([e.message, e.line || 0]);
-      return this.module;
+      return;
     }
-    // Records & aliases.
+    const isGen = (n) => !!n.asteriskToken;
+    for (const st of this.sf.statements) {
+      if (ts.isImportDeclaration(st) && ts.isStringLiteral(st.moduleSpecifier)) {
+        const spec = st.moduleSpecifier.text;
+        const cl = st.importClause;
+        if (!cl) continue;
+        if (cl.name) this.importDecls.push({ spec, local: cl.name.text, name: "default" });
+        const nb = cl.namedBindings;
+        if (nb && ts.isNamespaceImport(nb)) this.importDecls.push({ spec, local: nb.name.text, name: "*" });
+        else if (nb && ts.isNamedImports(nb)) for (const el of nb.elements) this.importDecls.push({ spec, local: el.name.text, name: (el.propertyName || el.name).text });
+        for (const d of this.importDecls) this.globalsBound.add(d.local);
+      } else if (ts.isVariableStatement(st)) {
+        for (const d of st.declarationList.declarations) {
+          if (!ts.isIdentifier(d.name)) continue;
+          const init = d.initializer;
+          const lit = init && (ts.isNumericLiteral(init) || ts.isStringLiteral(init) || init.kind === ts.SyntaxKind.TrueKeyword || init.kind === ts.SyntaxKind.FalseKeyword || (ts.isPrefixUnaryExpression(init) && init.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(init.operand)));
+          if (lit && st.declarationList.flags & ts.NodeFlags.Const) this.constants[d.name.text] = init;
+          else if (!(init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init)))) this.globalsBound.add(d.name.text);
+        }
+      }
+    }
+    // Records, aliases, enums, classes.
+    for (const st of this.sf.statements) {
+      if (ts.isEnumDeclaration(st)) this.enumDecl(st);
+    }
+    for (const st of this.sf.statements) {
+      if (ts.isClassDeclaration(st) && st.name) {
+        if (st.heritageClauses && st.heritageClauses.some((h) => h.token === ts.SyntaxKind.ExtendsKeyword)) {
+          this.globalsBound.add(st.name.text);
+          this.module.problems.push([`class ${st.name.text}: inheritance is not modelled yet (its methods are unchecked)`, this.line(st)]);
+          continue;
+        }
+        this.classes[st.name.text] = { node: st, fields: [], props: new Set(), setters: new Set(), statics: new Set(), home: this };
+      }
+    }
     for (const st of this.sf.statements) {
       if (ts.isInterfaceDeclaration(st)) this.record(st.name.text, st.members, st);
       else if (ts.isTypeAliasDeclaration(st)) {
-        if (ts.isTypeLiteralNode(st.type)) this.record(st.name.text, st.type.members, st);
+        if (ts.isTypeLiteralNode(st.type) && !st.type.members.some((m) => ts.isIndexSignatureDeclaration(m))) this.record(st.name.text, st.type.members, st);
         else this.aliases[st.name.text] = st.type;
       }
     }
-    // Function declarations (and `const f = (...) => ...`).
+    yield "names";
+    // Class fields.
+    for (const [name, c] of Object.entries(this.classes)) {
+      if (c.home !== this) continue;
+      try {
+        this.classFields(name, c);
+      } catch (e) {
+        if (!(e instanceof LowerError)) throw e;
+        this.module.problems.push([`class ${name}: ${e.message}`, e.line || this.line(c.node)]);
+        delete this.classes[name];
+      }
+    }
+    // Function declarations (and `const f = (...) => ...`), methods.
     const fns = [];
-    const isAsync = (n) => !!(n.modifiers && n.modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) || !!n.asteriskToken;
     for (const st of this.sf.statements) {
-      if ((ts.isFunctionDeclaration(st) && isAsync(st)) || (ts.isVariableStatement(st) && st.declarationList.declarations.some((d) => d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)) && isAsync(d.initializer)))) continue;
+      if (ts.isFunctionDeclaration(st) && isGen(st)) continue;
       if (ts.isFunctionDeclaration(st) && st.name && st.body) fns.push({ name: st.name.text, node: st, exported: !!(ts.getCombinedModifierFlags(st) & ts.ModifierFlags.Export) });
       else if (ts.isVariableStatement(st) && st.declarationList.declarations.length === 1) {
         const d = st.declarationList.declarations[0];
-        if (ts.isIdentifier(d.name) && d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)) && st.declarationList.flags & ts.NodeFlags.Const) {
+        if (ts.isIdentifier(d.name) && d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)) && st.declarationList.flags & ts.NodeFlags.Const && !isGen(d.initializer)) {
           fns.push({ name: d.name.text, node: d.initializer, stmt: st, exported: !!(ts.getCombinedModifierFlags(st) & ts.ModifierFlags.Export) });
         }
       }
+    }
+    for (const [cname, c] of Object.entries(this.classes)) {
+      if (c.home !== this) continue;
+      let ctor = null;
+      for (const m of c.node.members) {
+        const isStatic = !!(m.modifiers && m.modifiers.some((x) => x.kind === ts.SyntaxKind.StaticKeyword));
+        if (ts.isConstructorDeclaration(m) && m.body) ctor = m;
+        else if (ts.isMethodDeclaration(m) && m.body && ts.isIdentifier(m.name) && !m.asteriskToken) {
+          if (isStatic) c.statics.add(`${cname}.${m.name.text}`);
+          fns.push({ name: `${cname}.${m.name.text}`, node: m, cls: cname, isStatic, exported: true });
+        } else if (ts.isGetAccessorDeclaration(m) && m.body && ts.isIdentifier(m.name)) {
+          c.props.add(`${cname}.${m.name.text}`);
+          fns.push({ name: `${cname}.${m.name.text}`, node: m, cls: cname, exported: true });
+        } else if (ts.isSetAccessorDeclaration(m) && m.body && ts.isIdentifier(m.name)) {
+          c.setters.add(`${cname}.${m.name.text}`);
+          fns.push({ name: `${cname}.${m.name.text}.setter`, node: m, cls: cname, exported: true });
+        }
+      }
+      fns.push({ name: `${cname}.__init__`, node: ctor, cls: cname, ctor: true, classNode: c.node, exported: true });
     }
     for (const f of fns) {
       try {
         this.sigs[f.name] = this.signature(f);
       } catch (e) {
         if (!(e instanceof LowerError)) throw e;
-        this.module.problems.push([`${f.name}: ${e.message}`, e.line || this.line(f.node)]);
+        this.module.problems.push([`${f.name}: ${e.message}`, e.line || this.line(f.node || f.classNode)]);
       }
     }
-    this.inferIntegrality(fns);
+    this.inferIntegrality(fns.filter((f) => !f.ctor));
+    yield "signatures";
+    for (const [cname, c] of Object.entries(this.classes)) {
+      if (c.home !== this) continue;
+      this.module.classes[cname] = { fields: c.fields, invariants: this.classInvariants(cname, c), loc: this.loc(c.node) };
+    }
     for (const f of fns) {
       if (!this.sigs[f.name]) continue;
       const fl = new FunctionLowerer(this, f);
@@ -199,11 +291,9 @@ class ModuleLowerer {
     }
     const spans = [];
     const visit = (n) => {
-      if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+      if ((ts.isClassDeclaration(n) || ts.isClassExpression(n)) && !(n.name && this.classes[n.name.text])) {
         const name = n.name ? n.name.text : "class";
-        spans.push([n.getStart(this.sf), n.getEnd(), `methods are not checked yet (in '${name}'); telic checks top-level functions`]);
-      } else if ((ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n)) && n.modifiers && n.modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) {
-        spans.push([n.getFullStart(), n.getEnd(), "async functions are not checked yet"]);
+        spans.push([n.getStart(this.sf), n.getEnd(), `class '${name}' is not checked (see the problem reported for it)`]);
       }
       ts.forEachChild(n, visit);
     };
@@ -219,50 +309,189 @@ class ModuleLowerer {
       }
       this.module.problems.push([`stray '@${cl.keyword}' is not attached to any function, loop, or statement`, cl.line]);
     }
-    return this.module;
+  }
+
+  enumDecl(st) {
+    const members = [], values = [];
+    let next = 0;
+    for (const m of st.members) {
+      const name = m.name.getText(this.sf).replace(/^["']|["']$/g, "");
+      let v = next;
+      if (m.initializer) {
+        if (ts.isNumericLiteral(m.initializer)) v = Number(m.initializer.text);
+        else if (ts.isStringLiteral(m.initializer)) v = m.initializer.text;
+        else v = null;
+      }
+      members.push(name);
+      values.push(v);
+      next = typeof v === "number" ? v + 1 : next;
+    }
+    this.enums[st.name.text] = { k: "enum", name: st.name.text, members, values };
+  }
+
+  classFields(cname, c) {
+    const known = new Set();
+    const add = (n, t) => {
+      if (known.has(n)) return;
+      known.add(n);
+      c.fields.push([n, t]);
+    };
+    const litType = (init) => {
+      if (!init) return null;
+      if (ts.isNumericLiteral(init)) return /^\d+$/.test(init.text) ? REAL : REAL;
+      if (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init)) return STR;
+      if (init.kind === ts.SyntaxKind.TrueKeyword || init.kind === ts.SyntaxKind.FalseKeyword) return BOOL;
+      if (ts.isPropertyAccessExpression(init) && ts.isIdentifier(init.expression) && this.enums[init.expression.text]) return this.enums[init.expression.text];
+      return null;
+    };
+    for (const m of c.node.members) {
+      if (ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && !(m.modifiers && m.modifiers.some((x) => x.kind === ts.SyntaxKind.StaticKeyword))) {
+        let t = m.type ? this.typeOf(m.type) : litType(m.initializer) || opaque(`field ${m.name.text}`);
+        if (m.questionToken) t = optionOf(t);
+        add(m.name.text, t);
+      }
+      if (ts.isConstructorDeclaration(m)) {
+        for (const p of m.parameters) {
+          const isProp = p.modifiers && p.modifiers.some((x) => [ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.PrivateKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.ReadonlyKeyword].includes(x.kind));
+          if (isProp && ts.isIdentifier(p.name)) add(p.name.text, p.type ? this.typeOf(p.type) : opaque("unannotated"));
+        }
+      }
+    }
+    // `this.x = ...` anywhere in the class: a field
+    const visit = (n) => {
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(n.left) && n.left.expression.kind === ts.SyntaxKind.ThisKeyword) {
+        const name = n.left.name.text;
+        if (!known.has(name) && !c.props.has(`${cname}.${name}`)) {
+          const fn = ts.findAncestor(n, (x) => ts.isConstructorDeclaration(x) || ts.isMethodDeclaration(x));
+          let t = litType(n.right);
+          if (!t && fn && ts.isIdentifier(n.right)) {
+            const prm = fn.parameters.find((p) => ts.isIdentifier(p.name) && p.name.text === n.right.text);
+            if (prm && prm.type) t = this.typeOf(prm.type);
+          }
+          add(name, t || opaque(`field ${name}`));
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(c.node);
+  }
+
+  classInvariants(cname, c) {
+    const out = [];
+    const start = c.node.getStart(this.sf), end = c.node.getEnd();
+    const inMember = (pos) => c.node.members.some((m) => (ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) && m.body && pos > m.body.getStart(this.sf) && pos < m.body.getEnd());
+    for (const cl of this.contracts) {
+      if (cl.consumed || cl.keyword !== "invariant" || cl.pos < start || cl.pos > end || inMember(cl.pos)) continue;
+      cl.consumed = true;
+      try {
+        const fl = new FunctionLowerer(this, { name: `${cname}.<invariant>`, node: null, cls: cname, invariantScope: true });
+        const cls = fl.clause(cl, "invariant", cl.tags);
+        const walk = (x) => {
+          if (!x || typeof x !== "object") return;
+          if (x.e === "Field" && x.obj.ty.k === "class" && !(x.obj.e === "Var" && x.obj.name === "self")) throw new LowerError("a class invariant may only read fields of 'this', not of other objects", cl.line);
+          if (x.e === "Call" && x.args.some((a) => a.ty.k === "class")) throw new LowerError("a class invariant may not call methods; write the condition on this's fields", cl.line);
+          for (const v of Object.values(x)) if (Array.isArray(v)) v.forEach(walk);
+          else if (v && typeof v === "object") walk(v);
+        };
+        walk(cls.expr);
+        out.push(cls);
+      } catch (e) {
+        if (!(e instanceof LowerError)) throw e;
+        this.module.problems.push([`class ${cname}: invariant: ${e.message}`, e.line || cl.line]);
+      }
+    }
+    return out;
   }
 
   record(name, members, node) {
     const fields = [];
     for (const m of members) {
-      if (!ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name) || m.questionToken) return;
+      if (!ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return;
       let t;
       try {
         t = this.typeOf(m.type);
       } catch {
         return;
       }
-      if (t.k === "list") return;
+      if (m.questionToken) t = optionOf(t);
+      if (t.k === "list" || t.k === "dict" || t.k === "opaque" || t.k === "class") return;
       fields.push([m.name.text, t]);
     }
     this.module.records[name] = { k: "record", name, fields };
   }
 
-  typeOf(tn, intHint = false) {
+  typeOf(tn, intHint = false, depth = 0) {
     if (!tn) throw new LowerError("missing type annotation");
+    if (depth > 20) return opaque("recursive type");
+    const K = ts.SyntaxKind;
     switch (tn.kind) {
-      case ts.SyntaxKind.NumberKeyword:
+      case K.NumberKeyword:
         return intHint ? INT : REAL;
-      case ts.SyntaxKind.BooleanKeyword:
+      case K.BooleanKeyword:
         return BOOL;
-      case ts.SyntaxKind.StringKeyword:
+      case K.StringKeyword:
         return STR;
-      case ts.SyntaxKind.VoidKeyword:
+      case K.VoidKeyword:
+      case K.UndefinedKeyword:
+      case K.NullKeyword:
         return NONE;
+      case K.AnyKeyword:
+      case K.UnknownKeyword:
+      case K.ObjectKeyword:
+      case K.NeverKeyword:
+      case K.BigIntKeyword:
+      case K.SymbolKeyword:
+        return opaque(tn.getText(this.sf));
     }
-    if (ts.isArrayTypeNode(tn)) return listOf(this.typeOf(tn.elementType));
-    if (ts.isTypeOperatorNode(tn) && tn.operator === ts.SyntaxKind.ReadonlyKeyword) return this.typeOf(tn.type, intHint);
+    if (ts.isLiteralTypeNode(tn) && tn.literal.kind === K.NullKeyword) return NONE;
+    if (ts.isArrayTypeNode(tn)) {
+      const e = this.typeOf(tn.elementType, false, depth + 1);
+      return e.k === "list" || e.k === "dict" ? opaque(tn.getText(this.sf)) : listOf(e);
+    }
+    if (ts.isTypeOperatorNode(tn) && tn.operator === K.ReadonlyKeyword) return this.typeOf(tn.type, intHint, depth + 1);
     if (ts.isTypeReferenceNode(tn) && ts.isIdentifier(tn.typeName)) {
       const n = tn.typeName.text;
-      if ((n === "Array" || n === "ReadonlyArray") && tn.typeArguments && tn.typeArguments.length === 1) return listOf(this.typeOf(tn.typeArguments[0]));
-      if (["int", "Int", "integer", "Integer"].includes(n) && this.aliases[n] && this.aliases[n].kind === ts.SyntaxKind.NumberKeyword) return INT;
+      const targs = tn.typeArguments || [];
+      if ((n === "Array" || n === "ReadonlyArray") && targs.length === 1) {
+        const e = this.typeOf(targs[0], false, depth + 1);
+        return e.k === "list" || e.k === "dict" ? opaque(tn.getText(this.sf)) : listOf(e);
+      }
+      if ((n === "Map" || n === "Record" || n === "ReadonlyMap") && targs.length === 2) {
+        const k = this.typeOf(targs[0], false, depth + 1), v = this.typeOf(targs[1], false, depth + 1);
+        if (!["int", "real", "str", "bool"].includes(k.k) || ["list", "dict", "option"].includes(v.k)) return opaque(tn.getText(this.sf));
+        return { k: "dict", key: k, val: v, js: n === "Record" ? "object" : "map" };
+      }
+      if (n === "Promise" && targs.length === 1) return this.typeOf(targs[0], intHint, depth + 1);
+      if (n === "Readonly" && targs.length === 1) return this.typeOf(targs[0], intHint, depth + 1);
+      if (["int", "Int", "integer", "Integer"].includes(n) && this.aliases[n] && this.aliases[n].kind === K.NumberKeyword) return INT;
       if (this.module.records[n]) return this.module.records[n];
-      if (this.aliases[n]) return this.typeOf(this.aliases[n], intHint);
-      throw new LowerError(`unsupported type '${n}'`, this.line(tn));
+      if (this.classes[n]) return classOf(n);
+      if (this.enums[n]) return this.enums[n];
+      if (this.aliases[n]) return this.typeOf(this.aliases[n], intHint, depth + 1);
+      return opaque(n); // a library type: unchecked
     }
-    if (ts.isParenthesizedTypeNode(tn)) return this.typeOf(tn.type, intHint);
-    if (ts.isUnionTypeNode(tn) && tn.types.every((t) => ts.isLiteralTypeNode(t) && ts.isStringLiteral(t.literal))) return STR;
-    throw new LowerError(`unsupported type '${tn.getText(this.sf)}'`, this.line(tn));
+    if (ts.isTypeLiteralNode(tn) && tn.members.length === 1 && ts.isIndexSignatureDeclaration(tn.members[0])) {
+      const sig = tn.members[0];
+      const k = this.typeOf(sig.parameters[0].type, false, depth + 1), v = this.typeOf(sig.type, false, depth + 1);
+      if (["int", "real", "str"].includes(k.k) && !["list", "dict", "option"].includes(v.k)) return { k: "dict", key: k, val: v, js: "object" };
+      return opaque(tn.getText(this.sf));
+    }
+    if (ts.isParenthesizedTypeNode(tn)) return this.typeOf(tn.type, intHint, depth + 1);
+    if (ts.isUnionTypeNode(tn)) {
+      if (tn.types.every((t) => ts.isLiteralTypeNode(t) && ts.isStringLiteral(t.literal))) return STR;
+      const parts = tn.types.map((t) => this.typeOf(t, intHint, depth + 1));
+      const rest = parts.filter((t) => t.k !== "none");
+      const uniq = rest.filter((t, i) => rest.findIndex((u) => tyEq(u, t)) === i);
+      let inner;
+      if (uniq.length === 1) inner = uniq[0];
+      else if (uniq.length > 1 && uniq.every((t) => t.k === "str")) inner = STR;
+      else if (uniq.length > 1 && uniq.every(isNum)) inner = REAL;
+      else return opaque(tn.getText(this.sf));
+      return rest.length === parts.length ? inner : optionOf(inner);
+    }
+    if (ts.isLiteralTypeNode(tn) && ts.isStringLiteral(tn.literal)) return STR;
+    if (ts.isLiteralTypeNode(tn) && ts.isNumericLiteral(tn.literal)) return REAL;
+    return opaque(tn.getText(this.sf));
   }
 
   functionContracts(f) {
@@ -291,7 +520,7 @@ class ModuleLowerer {
 
   signature(f) {
     const node = f.node;
-    const cls = this.functionContracts(f);
+    const cls = node ? this.functionContracts(f) : [];
     // integrality hints from @requires: Number.isInteger(p) / isSafeInteger(p)
     // Only a top-level conjunct `Number.isInteger(p)` makes p an integer:
     // under `!` or `||` it guarantees nothing.
@@ -311,17 +540,42 @@ class ModuleLowerer {
       }
     }
     const params = [];
-    for (const p of node.parameters) {
+    const defaults = {};
+    let rest = null;
+    if (f.cls && !f.isStatic) params.push({ name: "self", ty: classOf(f.cls) });
+    for (const p of node ? node.parameters : []) {
       if (!ts.isIdentifier(p.name)) throw new LowerError("destructured parameters are not supported", this.line(p));
-      if (p.initializer || p.questionToken || p.dotDotDotToken) throw new LowerError("optional, default and rest parameters are not supported", this.line(p));
-      if (!p.type) throw new LowerError(`parameter '${p.name.text}' needs a type annotation`, this.line(p));
-      params.push({ name: p.name.text, ty: this.typeOf(p.type, ints.has(p.name.text)) });
+      const pname = p.name.text;
+      if (p.dotDotDotToken) {
+        params.push({ name: pname, ty: opaque("...rest") });
+        rest = pname;
+        continue;
+      }
+      let t = p.type ? this.typeOf(p.type, ints.has(pname)) : null;
+      if (p.initializer) {
+        const init = p.initializer;
+        const lit = ts.isNumericLiteral(init) || ts.isStringLiteral(init) || init.kind === ts.SyntaxKind.TrueKeyword || init.kind === ts.SyntaxKind.FalseKeyword || (ts.isPrefixUnaryExpression(init) && ts.isNumericLiteral(init.operand));
+        defaults[pname] = lit ? init : null; // null: computed at call time, unknown here
+        if (!t) t = ts.isStringLiteral(init) ? STR : init.kind === ts.SyntaxKind.TrueKeyword || init.kind === ts.SyntaxKind.FalseKeyword ? BOOL : lit ? REAL : opaque("unannotated");
+      }
+      if (!t) t = opaque("unannotated");
+      if (p.questionToken) t = optionOf(t);
+      params.push({ name: pname, ty: t });
     }
-    let ret = NONE, retInferred = false;
-    if (node.type) ret = this.typeOf(node.type);
-    else if (node.body && !ts.isBlock(node.body)) retInferred = true;
-    else retInferred = true;
-    return { params, ret, retInferred, node, contracts: cls, intsFromContract: ints };
+    let ret = NONE;
+    if (f.ctor || (node && ts.isSetAccessorDeclaration(node))) ret = NONE;
+    else if (node.type) ret = this.typeOf(node.type);
+    else {
+      let valued = !!(node.body && !ts.isBlock(node.body));
+      const visit = (n) => {
+        if (n !== node && ts.isFunctionLike(n)) return;
+        if (ts.isReturnStatement(n) && n.expression) valued = true;
+        ts.forEachChild(n, visit);
+      };
+      if (node.body) visit(node.body);
+      if (valued) ret = opaque("unannotated return");
+    }
+    return { params, ret, node, contracts: cls, intsFromContract: ints, defaults, rest, cls: f.cls, isStatic: !!f.isStatic };
   }
 
   // Greatest fixpoint: a number-typed function result is an int if every
@@ -358,7 +612,7 @@ class FunctionLowerer {
     this.ml = ml;
     this.f = f;
     this.node = f.node;
-    this.sig = ml.sigs[f.name];
+    this.sig = ml.sigs[f.name] || { params: f.cls ? [{ name: "self", ty: classOf(f.cls) }] : [], ret: NONE, contracts: [], defaults: {}, rest: null, cls: f.cls };
     this.env = {};
     this.probe = probe;
     this.tmp = 0;
@@ -366,16 +620,26 @@ class FunctionLowerer {
     this.usedIr = new Set(this.sig.params.map((p) => p.name));
     this.consts = new Set();
     this.srcNames = new Set();
+    this.closures = new Map(); // local function name -> captured source names
+    this.escaped = new Set();
+    this.tryDepth = 0;
     const collect = (n) => {
       if (ts.isIdentifier(n)) this.srcNames.add(n.text);
       ts.forEachChild(n, collect);
     };
-    if (f.node.body) collect(f.node.body);
+    if (f.node && f.node.body) collect(f.node.body);
     this.unsupported = [];
     this.intents = [];
     this.currentIntents = [];
-    const start = (f.stmt || f.node).getStart(ml.sf), end = f.node.getEnd();
-    this.localContracts = ml.contracts.filter((cl) => cl.pos >= start && cl.pos <= end);
+    const anchor = f.stmt || f.node;
+    if (anchor) {
+      const start = anchor.getStart(ml.sf), end = f.node.getEnd();
+      this.localContracts = ml.contracts.filter((cl) => cl.pos >= start && cl.pos <= end);
+    } else this.localContracts = [];
+  }
+
+  selfTy() {
+    return this.f.cls && !this.sig.isStatic ? classOf(this.f.cls) : null;
   }
 
   err(msg, node) {
@@ -411,7 +675,7 @@ class FunctionLowerer {
       }
       ts.forEachChild(n, visit);
     };
-    if (this.node.body) visit(this.node.body);
+    if (this.node && this.node.body) visit(this.node.body);
     const params = new Map(this.sig.params.map((p) => [p.name, p.ty]));
     let ints = new Set([...decls.keys()]);
     let changed = true;
@@ -461,10 +725,11 @@ class FunctionLowerer {
     const ml = this.ml, node = this.node, sig = this.sig;
     this.intSet = this.intVars();
     for (const p of sig.params) this.env[p.name] = p.ty;
+    const anchor = this.f.stmt || node || this.f.classNode;
     const fn = {
       name: this.f.name,
-      loc: ml.loc(this.f.stmt || node),
-      end_line: ml.sf.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+      loc: ml.loc(anchor),
+      end_line: ml.sf.getLineAndCharacterOfPosition(anchor.getEnd()).line + 1,
       params: sig.params.map((p) => [p.name, p.ty]),
       ret: sig.ret,
       requires: [],
@@ -477,8 +742,9 @@ class FunctionLowerer {
       unsupported: this.unsupported,
       trusted: false,
       exported: this.f.exported,
-      source: (this.f.stmt || node).getText(ml.sf),
+      source: anchor.getText(ml.sf),
       locals: {},
+      escaped: [],
     };
     this.fn = fn;
     for (const cl of sig.contracts) {
@@ -490,6 +756,13 @@ class FunctionLowerer {
         this.unsupported.push([`contract: ${e.message}`, e.line || cl.line]);
       }
     }
+    if (this.f.ctor) {
+      fn.body = this.constructorBody();
+      fn.locals = { ...this.env };
+      fn.intents = this.intents;
+      return fn;
+    }
+    this.scanClosures(node);
     const body = node.body;
     if (ts.isBlock(body)) fn.body = this.block(body.statements, body);
     else {
@@ -503,8 +776,104 @@ class FunctionLowerer {
       }
     }
     fn.locals = { ...this.env };
+    fn.escaped = Object.keys(this.env).filter((n) => this.escaped.has(n.split("$")[0]) && n !== "self");
     fn.intents = this.intents;
     return fn;
+  }
+
+  // A class's constructor: parameter properties, then field initializers,
+  // then the constructor body (JavaScript's order).
+  constructorBody() {
+    const ml = this.ml, cls = this.f.cls, node = this.node;
+    const c = ml.classes[cls];
+    const out = [];
+    const self = { e: "Var", ty: classOf(cls), loc: ml.loc(c.node), name: "self" };
+    const fieldTy = (n) => (c.fields.find((x) => x[0] === n) || [null, null])[1];
+    if (node) {
+      for (const p of node.parameters) {
+        const isProp = p.modifiers && p.modifiers.some((x) => [ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.PrivateKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.ReadonlyKeyword].includes(x.kind));
+        if (isProp && ts.isIdentifier(p.name)) {
+          const ft = fieldTy(p.name.text);
+          const v = { e: "Var", ty: this.env[p.name.text], loc: ml.loc(p), name: p.name.text };
+          out.push({ s: "FieldAssign", loc: ml.loc(p), obj: self, cls, field: p.name.text, value: this.coerce(v, ft) });
+        }
+      }
+    }
+    for (const m of c.node.members) {
+      if (ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && !(m.modifiers && m.modifiers.some((x) => x.kind === ts.SyntaxKind.StaticKeyword))) {
+        const ft = fieldTy(m.name.text);
+        if (!m.initializer) continue;
+        try {
+          const v = this.coerce(this.expr(m.initializer, ft), ft);
+          out.push({ s: "FieldAssign", loc: ml.loc(m), obj: self, cls, field: m.name.text, value: v });
+        } catch (e) {
+          if (!(e instanceof LowerError)) throw e;
+          this.unsupported.push([e.message, e.line || ml.line(m)]);
+          out.push({ s: "Unsupported", loc: ml.loc(m), reason: e.message });
+        }
+      }
+    }
+    if (node && node.body) {
+      this.scanClosures(node);
+      out.push(...this.block(node.body.statements, node.body));
+    }
+    return out;
+  }
+
+  // Closures capture enclosing variables by reference, and JavaScript lets
+  // them reassign those variables. A local function called directly may
+  // change what it captures; one that escapes (passed or stored anywhere)
+  // may be run by unchecked code at any later unchecked call.
+  scanClosures(node) {
+    if (!node || !node.body) return;
+    const called = new Set();
+    const walk = (n, inFn) => {
+      if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) called.add(n.expression);
+      ts.forEachChild(n, (x) => walk(x, inFn));
+    };
+    walk(node.body, false);
+    const captured = (fnNode) => {
+      const out = new Set();
+      const v = (n) => {
+        if (ts.isIdentifier(n)) out.add(n.text);
+        ts.forEachChild(n, v);
+      };
+      v(fnNode.body || fnNode);
+      return out;
+    };
+    const visit = (n) => {
+      if (n !== node && (ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n))) {
+        const caps = captured(n);
+        let name = null;
+        if (ts.isFunctionDeclaration(n) && n.name) name = n.name.text;
+        else if (ts.isVariableDeclaration(n.parent) && ts.isIdentifier(n.parent.name)) name = n.parent.name.text;
+        if (name) this.closures.set(name, caps);
+        // An inline callback is handed to whoever is called with it.
+        const inlineArg = ts.isCallExpression(n.parent) && n.parent.arguments.includes(n);
+        const isForEach = inlineArg && ts.isPropertyAccessExpression(n.parent.expression) && n.parent.expression.name.text === "forEach";
+        const quant = inlineArg && ts.isPropertyAccessExpression(n.parent.expression) && ["every", "some", "map", "filter", "reduce", "find", "findIndex", "sort"].includes(n.parent.expression.name.text);
+        if (inlineArg && !isForEach && !quant) caps.forEach((x) => this.escaped.add(x));
+        if (quant && this.mutatesCaptured(n)) caps.forEach((x) => this.escaped.add(x));
+        return; // nested functions are opaque; do not descend
+      }
+      if (ts.isIdentifier(n) && this.closures.has(n.text) && !called.has(n) && !(ts.isVariableDeclaration(n.parent) && n.parent.name === n) && !(ts.isFunctionDeclaration(n.parent) && n.parent.name === n)) {
+        this.closures.get(n.text).forEach((x) => this.escaped.add(x));
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(node.body);
+  }
+
+  mutatesCaptured(fnNode) {
+    let m = false;
+    const v = (n) => {
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) m = true;
+      if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) && (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)) m = true;
+      if (ts.isCallExpression(n)) m = true;
+      ts.forEachChild(n, v);
+    };
+    v(fnNode.body);
+    return m;
   }
 
   functionContract(cl) {
@@ -668,27 +1037,44 @@ class FunctionLowerer {
     if (!old) this.env[name] = ty;
     else if (!tyEq(old, ty)) {
       if (old.k === "real" && ty.k === "int") return;
+      if (old.k === "opaque" || ty.k === "opaque") return;
+      if (old.k === "option" && (tyEq(old.inner, ty) || ty.k === "none")) return;
       if (old.k === "list" && ty.k === "list" && ty.elem.k === "none") return;
       throw this.err(`variable '${name}' changes type from ${tyStr(old)} to ${tyStr(ty)}`, node);
     }
   }
 
   coerce(e, ty) {
-    if (ty && ty.k === "real" && e.ty.k === "int") return { e: "Builtin", ty: REAL, loc: e.loc, name: "to_real", args: [e] };
-    if (ty && ty.k === "list" && e.e === "ListLit" && e.elems.length === 0) return { ...e, ty };
+    if (!ty || tyEq(e.ty, ty)) return e;
+    if (ty.k !== "opaque" && e.ty.k !== "opaque" && e.ty.k !== "none" && (hasOpaque(e.ty) || hasOpaque(ty)) && !(ty.k === "option" && tyEq(ty.inner, e.ty))) return { e: "Builtin", ty, loc: e.loc, name: "from_opaque", args: [e] };
+    if (e.ty.k === "opaque" && ty.k !== "none") {
+      if (e.e === "Extern") return { ...e, ty };
+      return { e: "Builtin", ty, loc: e.loc, name: "from_opaque", args: [e] };
+    }
+    if (ty.k === "opaque") return { e: "Builtin", ty, loc: e.loc, name: "to_opaque", args: [e.ty.k === "none" ? { e: "Lit", ty: INT, loc: e.loc, value: 0 } : e] };
+    if (ty.k === "option") {
+      if (e.ty.k === "none") return { e: "Lit", ty, loc: e.loc, value: null };
+      if (e.ty.k !== "option") return { e: "Builtin", ty, loc: e.loc, name: "some", args: [this.coerce(e, ty.inner)] };
+      return e;
+    }
+    if (e.ty.k === "option" && ty.k !== "none") return this.coerce(this.unwrap(e), ty);
+    if (ty.k === "real" && e.ty.k === "int") return { e: "Builtin", ty: REAL, loc: e.loc, name: "to_real", args: [e] };
+    if (ty.k === "list" && e.e === "ListLit" && e.elems.length === 0) return { ...e, ty };
+    if (ty.k === "dict" && e.e === "Builtin" && e.name === "dict_lit" && e.args.length === 0) return { ...e, ty };
     return e;
   }
 
   // A list-valued expression that denotes a new array (binding it creates no alias).
   freshList(e) {
-    if (e.e === "ListLit" || e.e === "Call") return true;
-    if (e.e === "Builtin" && e.name === "slice") return true;
+    if (e.e === "Extern" && /^Array\.(sort|reverse|fill|copyWithin)$/.test(e.name)) return false;
+    if (e.e === "ListLit" || e.e === "Call" || e.e === "Extern" || e.e === "New") return true;
+    if (e.e === "Builtin" && ["slice", "comp", "dict_lit", "dict_copy", "from_opaque", "dict_keys", "dict_values", "list_append"].includes(e.name)) return true;
     if (e.e === "Ite") return this.freshList(e.then) && this.freshList(e.orelse);
     return false;
   }
 
   noAlias(name, v, node) {
-    if (v.ty.k !== "list") return;
+    if (v.ty.k !== "list" && v.ty.k !== "dict") return;
     if (!this.freshList(v)) throw this.err(`'${name} = ...' would alias an existing array; telic models arrays as values, so copy with .slice()`, node);
   }
 
@@ -771,8 +1157,17 @@ class FunctionLowerer {
     if (ts.isBinaryExpression(e)) {
       const k = e.operatorToken.kind;
       const ops = { [K.PlusEqualsToken]: "add", [K.MinusEqualsToken]: "sub", [K.AsteriskEqualsToken]: "mul", [K.SlashEqualsToken]: "rdiv", [K.PercentEqualsToken]: "tmod" };
+      if (k === K.QuestionQuestionEqualsToken || k === K.BarBarEqualsToken) {
+        // x ??= v  ==>  x = x ?? v
+        const fake = ts.factory.createBinaryExpression(e.left, k === K.QuestionQuestionEqualsToken ? K.QuestionQuestionToken : K.BarBarToken, e.right);
+        ts.setTextRange(fake, e);
+        fake.parent = e.parent;
+        return this.exprStatement(ts.factory.createBinaryExpression(e.left, K.EqualsToken, fake), node);
+      }
       if (k === K.EqualsToken || ops[k]) {
         if (ts.isIdentifier(e.left)) return this.assignTo(e.left.text, e.right, node, ops[k] || null);
+        if (ts.isPropertyAccessExpression(e.left)) return this.assignProperty(e.left, e.right, node, ops[k] || null);
+        if (ts.isElementAccessExpression(e.left) && !(ts.isIdentifier(e.left.expression) && this.env[this.resolve(e.left.expression.text)]?.k === "list")) return this.assignElement(e.left, e.right, node, ops[k] || null);
         if (ts.isElementAccessExpression(e.left) && ts.isIdentifier(e.left.expression)) {
           const name = this.varOf(e.left.expression.text, node);
           const t = this.env[name];
@@ -787,6 +1182,12 @@ class FunctionLowerer {
         throw this.err(`unsupported assignment target '${e.left.getText(this.ml.sf)}'`, node);
       }
     }
+    if ((ts.isPostfixUnaryExpression(e) || ts.isPrefixUnaryExpression(e)) && (e.operator === K.PlusPlusToken || e.operator === K.MinusMinusToken) && (ts.isPropertyAccessExpression(e.operand) || ts.isElementAccessExpression(e.operand))) {
+      const one = ts.factory.createNumericLiteral(1);
+      ts.setTextRange(one, e);
+      one.parent = e;
+      return ts.isPropertyAccessExpression(e.operand) ? this.assignProperty(e.operand, one, node, e.operator === K.PlusPlusToken ? "add" : "sub") : this.assignElement(e.operand, one, node, e.operator === K.PlusPlusToken ? "add" : "sub");
+    }
     if ((ts.isPostfixUnaryExpression(e) || ts.isPrefixUnaryExpression(e)) && (e.operator === K.PlusPlusToken || e.operator === K.MinusMinusToken)) {
       if (!ts.isIdentifier(e.operand)) throw this.err("++/-- is supported on variables only", node);
       const name = this.varOf(e.operand.text, node);
@@ -800,6 +1201,21 @@ class FunctionLowerer {
     if (ts.isCallExpression(e)) {
       const c = e.expression;
       if (ts.isPropertyAccessExpression(c) && ts.isIdentifier(c.expression) && c.expression.text === "console" && this.resolve("console") === null) return this.logEffects(e.arguments, loc);
+      if (ts.isPropertyAccessExpression(c) && c.name.text === "forEach" && e.arguments.length === 1 && (ts.isArrowFunction(e.arguments[0]) || ts.isFunctionExpression(e.arguments[0]))) {
+        const r = this.forEachLoop(c.expression, e.arguments[0], node);
+        if (r) return r;
+      }
+      if (ts.isPropertyAccessExpression(c) && ["set", "delete"].includes(c.name.text)) {
+        const target = this.expr(c.expression);
+        if (target.ty.k === "dict") return this.mapWrite(target, c.name.text, e.arguments, node);
+      }
+      if (ts.isPropertyAccessExpression(c) && c.name.text === "push" && ts.isPropertyAccessExpression(c.expression)) {
+        const fld = this.expr(c.expression);
+        if (fld.e === "Field" && fld.obj.ty.k === "class" && fld.ty.k === "list" && e.arguments.length === 1) {
+          const v = this.coerce(this.expr(e.arguments[0], fld.ty.elem), fld.ty.elem);
+          return [{ s: "FieldAssign", loc, obj: fld.obj, cls: fld.obj.ty.name, field: fld.name, value: { e: "Builtin", ty: fld.ty, loc, name: "list_append", args: [fld, v] } }];
+        }
+      }
       if (ts.isPropertyAccessExpression(c) && c.name.text === "push" && ts.isIdentifier(c.expression)) {
         const name = this.varOf(c.expression.text, node);
         let t = this.env[name];
@@ -815,7 +1231,94 @@ class FunctionLowerer {
       }
       return [{ s: "ExprStmt", loc, expr: this.expr(e) }];
     }
+    if (ts.isAwaitExpression(e) || ts.isNewExpression(e)) return [{ s: "ExprStmt", loc, expr: this.expr(e) }];
+    if (ts.isDeleteExpression(e) && ts.isElementAccessExpression(e.expression)) {
+      const target = this.expr(e.expression.expression);
+      if (target.ty.k === "dict") return this.mapWrite(target, "delete", [e.expression.argumentExpression], node);
+    }
+    if (ts.isIdentifier(e) || ts.isStringLiteral(e) || e.kind === K.VoidExpression) return [];
     throw this.err(`unsupported expression statement '${e.getText(this.ml.sf).slice(0, 40)}'`, node);
+  }
+
+  // obj.f = v / obj.f += v / this.f = v
+  assignProperty(target, valueNode, node, op) {
+    const loc = this.ml.loc(node);
+    const obj = this.unwrap(this.expr(target.expression));
+    const name = target.name.text;
+    if (obj.ty.k === "opaque") return [{ s: "ExprStmt", loc, expr: this.extern(`set .${name}`, [obj, this.coerce(this.expr(valueNode), opaque(""))], NONE, loc) }];
+    if (obj.ty.k === "dict" && obj.ty.js === "object") return this.mapWrite(obj, "set", [null, valueNode], node, { e: "Lit", ty: STR, loc, value: name }, op);
+    if (obj.ty.k !== "class") throw this.err(`cannot assign '.${name}' on ${tyStr(obj.ty)}`, node);
+    const cls = obj.ty.name;
+    const c = this.ml.classes[cls];
+    const key = `${cls}.${name}`;
+    if (c.setters.has(key)) {
+      const sig = this.ml.sigs[`${key}.setter`];
+      const pt = sig && sig.params[1] ? sig.params[1].ty : opaque("");
+      return [{ s: "ExprStmt", loc, expr: { e: "Call", ty: NONE, loc, func: `${key}.setter`, args: [obj, this.coerce(this.expr(valueNode, pt), pt)] } }];
+    }
+    if (c.props.has(key)) return [{ s: "Raise", loc, what: `TypeError: '${name}' of ${cls} has a getter and no setter`, caught: this.tryDepth > 0 }];
+    const f = c.fields.find((x) => x[0] === name);
+    if (!f) throw this.err(`${cls} has no field '${name}' (declare it in the class)`, node);
+    let v = this.expr(valueNode, f[1]);
+    if (op) v = this.arith(op, { e: "Field", ty: f[1], loc, obj, name }, v, node);
+    v = this.coerce(v, f[1]);
+    if (["list", "dict"].includes(f[1].k) && !this.freshList(v)) throw this.err(`storing an existing ${tyStr(f[1])} in a field would alias it; store a copy`, node);
+    return [{ s: "FieldAssign", loc, obj, cls, field: name, value: v }];
+  }
+
+  // d[k] = v for maps/records, obj.xs[i] = v, obj.d[k] = v, opaque[k] = v
+  assignElement(target, valueNode, node, op) {
+    const loc = this.ml.loc(node);
+    const base = this.unwrap(this.expr(target.expression));
+    if (base.ty.k === "opaque") return [{ s: "ExprStmt", loc, expr: this.extern("setitem", [base, this.expr(target.argumentExpression), this.coerce(this.expr(valueNode), opaque(""))], NONE, loc) }];
+    if (base.ty.k === "dict") return this.mapWrite(base, "set", [target.argumentExpression, valueNode], node, null, op);
+    if (base.ty.k === "list" && base.e === "Field" && base.obj.ty.k === "class") {
+      const i = this.index(target.argumentExpression);
+      let v = this.expr(valueNode, base.ty.elem);
+      if (op) v = this.arith(op, { e: "Index", ty: base.ty.elem, loc, seq: base, idx: i, wrap: false }, v, node);
+      v = this.coerce(v, base.ty.elem);
+      return [{ s: "FieldAssign", loc, obj: base.obj, cls: base.obj.ty.name, field: base.name, value: { e: "Builtin", ty: base.ty, loc, name: "list_set", args: [base, i, v] } }];
+    }
+    throw this.err(`unsupported assignment target '${target.getText(this.ml.sf).slice(0, 40)}'`, node);
+  }
+
+  // m.set(k, v) / m.delete(k) / d[k] = v on a variable or a field
+  mapWrite(d, m, args, node, keyExpr = null, op = null) {
+    const loc = this.ml.loc(node);
+    const t = d.ty;
+    const k = this.coerce(keyExpr || this.expr(args[0]), t.key);
+    if (m === "delete") {
+      if (d.e === "Var") return [{ s: "DictDel", loc, name: d.name, key: k, strict: false }];
+      if (d.e === "Field" && d.obj.ty.k === "class") return [{ s: "FieldAssign", loc, obj: d.obj, cls: d.obj.ty.name, field: d.name, value: { e: "Builtin", ty: t, loc, name: "dict_remove", args: [d, k] } }];
+      throw this.err("'.delete()' on a map that is not a variable or field is not tracked", node);
+    }
+    let v = this.expr(args[1], t.val);
+    if (op) v = this.arith(op, { e: "Index", ty: t.val, loc, seq: d, idx: k, wrap: false }, v, node);
+    v = this.coerce(v, t.val);
+    if (d.e === "Var") return [{ s: "IndexAssign", loc, name: d.name, idx: k, value: v, wrap: false }];
+    if (d.e === "Field" && d.obj.ty.k === "class") return [{ s: "FieldAssign", loc, obj: d.obj, cls: d.obj.ty.name, field: d.name, value: { e: "Builtin", ty: t, loc, name: "dict_set", args: [d, k, v] } }];
+    throw this.err("writing to a map that is not a variable or field is not tracked", node);
+  }
+
+  // xs.forEach((x, i) => { ... })  ==>  a for-of loop (return = continue)
+  forEachLoop(seqNode, fnNode, node) {
+    const seq = this.unwrap(this.expr(seqNode));
+    if (seq.ty.k !== "list" || fnNode.parameters.length > 2 || !fnNode.parameters.every((p) => ts.isIdentifier(p.name))) return null;
+    const loc = this.ml.loc(node);
+    return this.scoped(() => {
+      const idxName = fnNode.parameters[1] ? fnNode.parameters[1].name.text : null;
+      const idx = idxName ? this.bindLocal(idxName, INT, node) : `i$${++this.tmp}`;
+      if (!idxName) this.env[idx] = INT;
+      const elem = fnNode.parameters[0] ? this.bindLocal(fnNode.parameters[0].name.text, seq.ty.elem, node) : `x$${++this.tmp}`;
+      if (!fnNode.parameters[0]) this.env[elem] = seq.ty.elem;
+      this.callbackDepth = (this.callbackDepth || 0) + 1;
+      try {
+        const body = ts.isBlock(fnNode.body) ? this.scoped(() => this.blockBody(fnNode.body)) : [{ s: "ExprStmt", loc, expr: this.expr(fnNode.body) }];
+        return [{ s: "ForEach", loc, elem, idx, seq, invariants: [], body, idx_visible: !!idxName }];
+      } finally {
+        this.callbackDepth--;
+      }
+    });
   }
 
   varDecls(list, node, loc) {
@@ -823,13 +1326,22 @@ class FunctionLowerer {
     const isConst = !!(list.flags & ts.NodeFlags.Const);
     const out = [];
     for (const d of list.declarations) {
-      if (!ts.isIdentifier(d.name)) throw this.err("destructuring is not supported", node);
+      if ((ts.isObjectBindingPattern(d.name) || ts.isArrayBindingPattern(d.name)) && d.initializer) {
+        out.push(...this.destructure(d.name, d.initializer, node, loc, isConst));
+        continue;
+      }
+      if (!ts.isIdentifier(d.name)) throw this.err("unsupported declaration", node);
       const src = d.name.text;
+      if (d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))) {
+        const name = this.bindLocal(src, opaque("closure"), node);
+        this.consts.add(name);
+        out.push({ s: "Assign", loc, name, value: this.opaqueOp("closure", [{ e: "Lit", ty: STR, loc, value: src }], opaque("closure"), loc) });
+        continue;
+      }
       let ty = d.type ? this.ml.typeOf(d.type, this.intSet.has(src)) : null;
       if (ty && ty.k === "real" && this.intSet.has(src)) ty = INT;
       if (!d.initializer) {
-        if (!ty) throw this.err(`'${src}' needs a type or an initializer`, node);
-        this.bindLocal(src, ty, node);
+        this.bindLocal(src, ty || opaque("declared without a type"), node);
         continue;
       }
       let v = this.expr(d.initializer, ty);
@@ -847,9 +1359,76 @@ class FunctionLowerer {
     return out;
   }
 
+  destructure(pat, init, node, loc, isConst) {
+    const out = [];
+    let src = this.expr(init);
+    if (src.e !== "Var") {
+      const tmp = `destructure$${++this.tmp}`;
+      this.env[tmp] = src.ty;
+      out.push({ s: "Assign", loc, name: tmp, value: src });
+      src = { e: "Var", ty: src.ty, loc, name: tmp };
+    }
+    src = this.unwrap(src);
+    pat.elements.forEach((el, i) => {
+      if (ts.isOmittedExpression(el)) return;
+      if (!ts.isIdentifier(el.name) || el.dotDotDotToken) throw this.err("nested or rest destructuring is not supported", node);
+      let v;
+      if (ts.isObjectBindingPattern(pat)) {
+        const prop = el.propertyName ? el.propertyName.getText(this.ml.sf) : el.name.text;
+        v = src.ty.k === "record" || src.ty.k === "class" ? this.propertyOf(src, prop, node, loc) : src.ty.k === "dict" ? { e: "Builtin", ty: optionOf(src.ty.val), loc, name: "dict_get_opt", args: [src, this.coerce({ e: "Lit", ty: STR, loc, value: prop }, src.ty.key)] } : this.opaqueOp(`attr.${prop}`, [this.coerce(src, opaque(""))], opaque(""), loc);
+      } else {
+        if (src.ty.k === "list") v = { e: "Index", ty: src.ty.elem, loc, seq: src, idx: { e: "Lit", ty: INT, loc, value: i }, wrap: false };
+        else v = this.opaqueOp(`item${i}`, [this.coerce(src, opaque(""))], opaque(""), loc);
+      }
+      if (el.initializer && v.ty.k === "option") {
+        const dflt = this.coerce(this.expr(el.initializer, v.ty.inner), v.ty.inner);
+        v = { e: "Ite", ty: v.ty.inner, loc, cond: { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [v] }, then: dflt, orelse: this.unwrap(v) };
+      }
+      if (["list", "dict"].includes(v.ty.k) && !this.freshList(v)) throw this.err(`destructuring '${el.name.text}' would alias an existing ${tyStr(v.ty)}; copy it`, node);
+      const name = this.bindLocal(el.name.text, v.ty, node);
+      if (isConst) this.consts.add(name);
+      out.push({ s: "Assign", loc, name, value: v });
+    });
+    return out;
+  }
+
   _stmt(s) {
     const K = ts.SyntaxKind;
     const loc = this.ml.loc(s);
+    if (ts.isTryStatement(s)) {
+      this.tryDepth += s.catchClause ? 1 : 0;
+      let body;
+      try {
+        body = this.inner(s.tryBlock);
+      } finally {
+        this.tryDepth -= s.catchClause ? 1 : 0;
+      }
+      const handlers = [];
+      if (s.catchClause) {
+        handlers.push(
+          this.scoped(() => {
+            const pre = [];
+            const v = s.catchClause.variableDeclaration;
+            if (v && ts.isIdentifier(v.name)) {
+              const name = this.bindLocal(v.name.text, opaque("exception"), s);
+              pre.push({ s: "Assign", loc, name, value: { e: "Extern", ty: opaque("exception"), loc, name: "caught exception", args: [] } });
+            }
+            return pre.concat(this.blockBody(s.catchClause.block));
+          })
+        );
+      }
+      const fin = s.finallyBlock ? this.inner(s.finallyBlock) : [];
+      return [{ s: "Try", loc, body, handlers, orelse: [], finalbody: fin }];
+    }
+    if (ts.isSwitchStatement(s)) return this.switchStmt(s, loc);
+    if (ts.isFunctionDeclaration(s) && s.name) {
+      const name = this.bindLocal(s.name.text, opaque("closure"), s);
+      this.consts.add(name);
+      return [{ s: "Assign", loc, name, value: this.opaqueOp("closure", [{ e: "Lit", ty: STR, loc, value: s.name.text }], opaque("closure"), loc) }];
+    }
+    if (ts.isClassDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) return [];
+    if (ts.isForInStatement(s)) return this.scoped(() => this.forIn(s, loc));
+    if (ts.isReturnStatement(s) && this.callbackDepth) return [{ s: "Continue", loc }]; // return inside a forEach callback
     if (ts.isEmptyStatement(s)) return [];
     if (ts.isBlock(s)) return this.scoped(() => this.blockBody(s));
     if (ts.isVariableStatement(s)) return this.varDecls(s.declarationList, s, loc);
@@ -886,23 +1465,116 @@ class FunctionLowerer {
       if (s.label) throw this.err("labelled continue is not supported", s);
       return [{ s: "Continue", loc }];
     }
-    if (ts.isThrowStatement(s)) return [{ s: "Raise", loc, what: s.expression ? s.expression.getText(this.ml.sf).slice(0, 60) : "exception" }];
+    if (ts.isThrowStatement(s)) return [{ s: "Raise", loc, what: s.expression ? s.expression.getText(this.ml.sf).slice(0, 60) : "exception", caught: this.tryDepth > 0 }];
     throw this.err(`unsupported statement: ${K[s.kind]}`, s);
+  }
+
+  switchStmt(s, loc) {
+    // switch (x) { case a: ...; break; ... default: ... }  ==>  if-chain.
+    // Cases must end in break/return/throw/continue (or be empty, grouping
+    // with the next case): fall-through into code is rejected.
+    const subject = this.expr(s.expression);
+    const clauses = s.caseBlock.clauses;
+    const groups = [];
+    let pending = [];
+    for (const c of clauses) {
+      pending.push(c);
+      if (c.statements.length) {
+        groups.push(pending);
+        pending = [];
+      }
+    }
+    if (pending.length) groups.push(pending);
+    const ends = (stmts) => {
+      const last = stmts[stmts.length - 1];
+      return last && (last.kind === ts.SyntaxKind.BreakStatement || ts.isReturnStatement(last) || ts.isThrowStatement(last) || last.kind === ts.SyntaxKind.ContinueStatement || (ts.isBlock(last) && ends(last.statements)));
+    };
+    let chain = [];
+    for (let gi = groups.length - 1; gi >= 0; gi--) {
+      const g = groups[gi];
+      const body = g[g.length - 1].statements;
+      if (gi !== groups.length - 1 && body.length && !ends(body)) throw this.err("a switch case falls through into the next one; end it with break", g[0]);
+      const stripped = body.length && body[body.length - 1].kind === ts.SyntaxKind.BreakStatement ? body.slice(0, -1) : body;
+      const breaksOut = (x) => {
+        let b = false;
+        const v = (n) => {
+          if (n.kind === ts.SyntaxKind.BreakStatement && !n.label && ts.findAncestor(n.parent, (p) => p === s || ts.isIterationStatement(p, false) || ts.isSwitchStatement(p)) === s) b = true;
+          ts.forEachChild(n, v);
+        };
+        v(x);
+        return b;
+      };
+      if (stripped.some(breaksOut)) throw this.err("break inside a nested block of a switch case is not supported", g[0]);
+      const lowered = this.scoped(() => stripped.flatMap((x) => this.stmt(x)));
+      const isDefault = g.some((c) => ts.isDefaultClause(c));
+      if (isDefault) {
+        chain = lowered;
+        continue;
+      }
+      let cond = null;
+      for (const c of g) {
+        const v = this.coerce(this.expr(c.expression), subject.ty);
+        const eq = { e: "Binary", ty: BOOL, loc, op: "eq", left: subject, right: v };
+        cond = cond ? { e: "Binary", ty: BOOL, loc, op: "or", left: cond, right: eq } : eq;
+      }
+      chain = [{ s: "If", loc, cond, then: lowered, orelse: chain }];
+    }
+    return chain;
+  }
+
+  forIn(s, loc) {
+    const d = s.initializer;
+    if (!(ts.isVariableDeclarationList(d) && d.declarations.length === 1 && ts.isIdentifier(d.declarations[0].name))) throw this.err("use 'for (const k in obj)'", s);
+    const obj = this.unwrap(this.expr(s.expression));
+    if (obj.ty.k !== "dict") throw this.err("for-in is supported over Record objects", s);
+    const seq = { e: "Builtin", ty: listOf(obj.ty.key), loc, name: "dict_keys", args: [obj] };
+    const idx = `i$${++this.tmp}`;
+    this.env[idx] = INT;
+    const elem = this.bindLocal(d.declarations[0].name.text, obj.ty.key, s);
+    const body = this.inner(s.statement);
+    return [{ s: "ForEach", loc, elem, idx, seq, invariants: this.loopClauses(this.loopContracts(s)).invs, body, idx_visible: false }];
   }
 
   forOf(s, loc) {
     const cls = this.loopContracts(s);
     const d = s.initializer;
-    if (!(ts.isVariableDeclarationList(d) && d.declarations.length === 1 && ts.isIdentifier(d.declarations[0].name))) throw this.err("use 'for (const x of xs)'", s);
+    if (!(ts.isVariableDeclarationList(d) && d.declarations.length === 1)) throw this.err("use 'for (const x of xs)'", s);
     if (!(d.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) throw this.err("'var' is function-scoped and hoisted; use let or const", s);
-    const seq = this.expr(s.expression);
+    let seq = this.unwrap(this.expr(s.expression));
+    const pat = d.declarations[0].name;
+    // for (const [k, v] of map / map.entries() / Object.entries(rec))
+    let dictSrc = null;
+    const ex = s.expression;
+    if (seq.ty.k === "dict") dictSrc = seq;
+    else if (ts.isCallExpression(ex) && ts.isPropertyAccessExpression(ex.expression) && ex.expression.name.text === "entries" && !ex.arguments.length) {
+      const m = this.unwrap(this.expr(ex.expression.expression));
+      if (m.ty.k === "dict") dictSrc = m;
+    } else if (ts.isCallExpression(ex) && ts.isPropertyAccessExpression(ex.expression) && ts.isIdentifier(ex.expression.expression) && ex.expression.expression.text === "Object" && ex.expression.name.text === "entries" && ex.arguments.length === 1) {
+      const m = this.unwrap(this.expr(ex.arguments[0]));
+      if (m.ty.k === "dict") dictSrc = m;
+    }
+    if (dictSrc && ts.isArrayBindingPattern(pat) && pat.elements.length === 2 && pat.elements.every((e) => ts.isBindingElement(e) && ts.isIdentifier(e.name))) {
+      const keys = { e: "Builtin", ty: listOf(dictSrc.ty.key), loc, name: "dict_keys", args: [dictSrc] };
+      const idx = `i$${++this.tmp}`;
+      this.env[idx] = INT;
+      const kname = this.bindLocal(pat.elements[0].name.text, dictSrc.ty.key, s);
+      const vname = this.bindLocal(pat.elements[1].name.text, dictSrc.ty.val, s);
+      const pre = [{ s: "Assign", loc, name: vname, value: { e: "Index", ty: dictSrc.ty.val, loc, seq: dictSrc, idx: { e: "Var", ty: dictSrc.ty.key, loc, name: kname }, wrap: false } }];
+      const body = pre.concat(this.inner(s.statement));
+      const { invs } = this.loopClauses(cls);
+      return [{ s: "ForEach", loc, elem: kname, idx, seq: keys, invariants: invs, body, idx_visible: false }];
+    }
+    if (!ts.isIdentifier(pat)) throw this.err("use 'for (const x of xs)'", s);
+    if (seq.ty.k === "dict") throw this.err("iterate a Map with 'for (const [k, v] of m)'", s);
+    if (seq.ty.k === "opaque") seq = this.coerce(seq, listOf(opaque("")));
+    if (seq.ty.k === "str") throw this.err("iterating over a string's characters is not supported", s);
     if (seq.ty.k !== "list") throw this.err("for-of needs an array", s);
     let index = null;
     for (const cl of cls) if (cl.keyword === "index") index = cl.payload.trim();
     if (index && (this.resolve(index) !== null || this.srcNames.has(index))) throw this.err(`'@index ${index}' names an existing variable; pick a fresh name`, s);
     const idx = index ? this.bindLocal(index, INT, s) : `i$${++this.tmp}`;
     if (!index) this.env[idx] = INT;
-    const elem = this.bindLocal(d.declarations[0].name.text, seq.ty.elem, s);
+    const elem = this.bindLocal(pat.text, seq.ty.elem, s);
     const body = this.inner(s.statement);
     const { invs, dec } = this.loopClauses(cls);
     if (dec) throw this.err("a for-of loop terminates by construction; remove '@decreases'", s);
@@ -983,7 +1655,35 @@ class FunctionLowerer {
     if (e.ty.k === "bool") return e;
     if (isNum(e.ty)) return { e: "Binary", ty: BOOL, loc: e.loc, op: "ne", left: e, right: { e: "Lit", ty: e.ty, loc: e.loc, value: 0 } };
     if (e.ty.k === "str") return { e: "Binary", ty: BOOL, loc: e.loc, op: "ne", left: e, right: { e: "Lit", ty: STR, loc: e.loc, value: "" } };
-    throw this.err(`a ${tyStr(e.ty)} is always truthy in JavaScript; compare explicitly`, this.nline(node));
+    if (e.ty.k === "option") {
+      const present = { e: "Unary", ty: BOOL, loc: e.loc, op: "not", arg: { e: "Builtin", ty: BOOL, loc: e.loc, name: "is_none", args: [e] } };
+      if (["class", "record", "enum", "list", "dict"].includes(e.ty.inner.k)) return present;
+      return { e: "Binary", ty: BOOL, loc: e.loc, op: "and", left: present, right: this.truthy(this.unwrap(e), node) };
+    }
+    if (e.ty.k === "opaque") return this.opaqueOp("truthy", [e], BOOL, e.loc);
+    if (e.ty.k === "enum") {
+      // numeric enums: the member with value 0 is falsy
+      const zero = e.ty.values.indexOf(0), empty = e.ty.values.indexOf("");
+      const f = zero >= 0 ? zero : empty;
+      if (f < 0) return { e: "Lit", ty: BOOL, loc: e.loc, value: true };
+      return { e: "Binary", ty: BOOL, loc: e.loc, op: "ne", left: e, right: { e: "Lit", ty: e.ty, loc: e.loc, value: f } };
+    }
+    if (["class", "record", "list", "dict"].includes(e.ty.k)) return { e: "Lit", ty: BOOL, loc: e.loc, value: true };
+    if (e.ty.k === "none") return { e: "Lit", ty: BOOL, loc: e.loc, value: false };
+    throw this.err(`cannot use a ${tyStr(e.ty)} as a condition`, this.nline(node));
+  }
+
+  unwrap(e) {
+    return e.ty.k === "option" ? { e: "Builtin", ty: e.ty.inner, loc: e.loc, name: "unwrap", args: [e] } : e;
+  }
+
+  opaqueOp(op, parts, ty, loc) {
+    return { e: "Builtin", ty, loc, name: "opaque_op", args: [{ e: "Lit", ty: STR, loc, value: op }, ...parts] };
+  }
+
+  extern(name, args, ty, loc) {
+    if (this.spec) throw this.err(`specifications cannot call unchecked code ('${name}')`, loc[0]);
+    return { e: "Extern", ty: ty && ty.k !== "opaque" ? ty : opaque(`result of ${name}`), loc, name, args };
   }
 
   numPair(a, b, node) {
@@ -994,13 +1694,28 @@ class FunctionLowerer {
 
   arith(op, a, b, node) {
     const loc = this.nloc(node);
+    a = this.unwrap(a);
+    b = this.unwrap(b);
+    if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(op, [a, b], op === "add" ? opaque("") : REAL, loc);
+    if (op === "add" && (a.ty.k === "str" || b.ty.k === "str")) return { e: "Builtin", ty: STR, loc, name: "str_concat", args: [this.toStr(a, loc), this.toStr(b, loc)] };
     if (op === "rdiv") {
       const [x, y] = this.numPair(a, b, node);
       return { e: "Binary", ty: REAL, loc, op: "rdiv", left: this.coerce(x, REAL), right: this.coerce(y, REAL) };
     }
-    if (op === "add" && (a.ty.k === "str" || b.ty.k === "str")) throw this.err("string concatenation is not supported", this.nline(node));
     const [x, y, t] = this.numPair(a, b, node);
     return { e: "Binary", ty: t, loc, op, left: x, right: y };
+  }
+
+  // String(x) / `${x}` / "a" + x, as JavaScript converts it.
+  toStr(e, loc) {
+    if (e.ty.k === "str") return e;
+    if (e.ty.k === "int") return { e: "Builtin", ty: STR, loc, name: "str_of_int", args: [e] };
+    if (e.ty.k === "enum") {
+      const vals = e.ty.values;
+      if (vals.every((v) => typeof v === "string")) return { e: "Builtin", ty: STR, loc, name: "enum_value", args: [e] };
+    }
+    const part = ["list", "dict", "option", "class", "record", "none"].includes(e.ty.k) ? this.coerce(e, opaque("")) : e;
+    return { e: "Builtin", ty: STR, loc, name: "str_fn", args: [{ e: "Lit", ty: STR, loc, value: "String" }, part] };
   }
 
   index(n) {
@@ -1023,16 +1738,67 @@ class FunctionLowerer {
     }
     if (n.kind === K.TrueKeyword || n.kind === K.FalseKeyword) return { e: "Lit", ty: BOOL, loc, value: n.kind === K.TrueKeyword };
     if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return { e: "Lit", ty: STR, loc, value: n.text };
+    if (n.kind === K.ThisKeyword) {
+      const t = this.selfTy();
+      if (!t) throw this.err("'this' outside a method", this.nline(n));
+      return { e: "Var", ty: t, loc, name: "self" };
+    }
+    if (n.kind === K.NullKeyword) return { e: "Lit", ty: expect && expect.k === "option" ? expect : NONE, loc, value: null };
     if (ts.isIdentifier(n)) {
       if (this.spec && n.text === "result" && this.resultTy && !(this.bound && "result" in this.bound)) {
         if (this.resultTy.k === "none") throw this.err("'result' used but the function returns nothing", this.nline(n));
         return { e: "Result", ty: this.resultTy, loc };
       }
+      const local = (this.bound && n.text in this.bound) || this.resolve(n.text) !== null;
+      if (!local) {
+        if (n.text === "undefined") return { e: "Lit", ty: expect && expect.k === "option" ? expect : NONE, loc, value: null };
+        if (n.text in this.ml.constants) return this.expr(this.ml.constants[n.text], expect);
+        if (this.ml.enums[n.text] || this.ml.classes[n.text] || this.ml.sigs[n.text] || this.ml.globalsBound.has(n.text) || GLOBALS.has(n.text) || this.ml.imported[n.text] || this.ml.namespaces[n.text]) {
+          if (this.spec) throw this.err(`'${n.text}' is not a value a specification can use`, this.nline(n));
+          return this.extern(n.text, [], null, loc); // a module-level value: read fresh each time
+        }
+      }
       return { e: "Var", ty: this.lookup(n.text, n), loc, name: this.irName(n.text) };
     }
+    if (ts.isTemplateExpression(n)) {
+      let out = { e: "Lit", ty: STR, loc, value: n.head.text };
+      for (const sp of n.templateSpans) {
+        const v = this.toStr(this.expr(sp.expression), loc);
+        out = { e: "Builtin", ty: STR, loc, name: "str_concat", args: [out, v] };
+        if (sp.literal.text) out = { e: "Builtin", ty: STR, loc, name: "str_concat", args: [out, { e: "Lit", ty: STR, loc, value: sp.literal.text }] };
+      }
+      return out;
+    }
+    if (ts.isAwaitExpression(n)) {
+      const inner = this.expr(n.expression, expect);
+      return { e: "Builtin", ty: inner.ty, loc, name: "await", args: [inner] };
+    }
+    if (ts.isNonNullExpression(n)) {
+      // `x!` claims x is present: telic proves it
+      const x = this.expr(n.expression);
+      return x.ty.k === "option" ? this.unwrap(x) : x.ty.k === "opaque" ? x : x;
+    }
+    if (ts.isAsExpression(n) || (ts.isSatisfiesExpression && ts.isSatisfiesExpression(n)) || ts.isTypeAssertionExpression?.(n)) {
+      const x = this.expr(n.expression, expect);
+      if (ts.isSatisfiesExpression && ts.isSatisfiesExpression(n)) return x;
+      if (ts.isTypeReferenceNode(n.type) && ts.isIdentifier(n.type.typeName) && n.type.typeName.text === "const") return x;
+      const t = this.ml.typeOf(n.type);
+      if (tyEq(t, x.ty)) return x;
+      if (x.ty.k === "opaque" || t.k === "opaque") return this.coerce(x, t); // listed as an assumption
+      if (isNum(t) && isNum(x.ty)) return this.coerce(x, t);
+      throw this.err(`'as ${tyStr(t)}' on a ${tyStr(x.ty)} hides a type change telic would have to trust`, this.nline(n));
+    }
+    if (ts.isTypeOfExpression(n)) return this.opaqueOp("typeof", [this.expr(n.expression)], STR, loc);
+    if (ts.isVoidExpression(n)) return { e: "Lit", ty: NONE, loc, value: null };
+    if (ts.isArrowFunction(n) || ts.isFunctionExpression(n)) {
+      if (this.spec) throw this.err("functions are not values in specifications", this.nline(n));
+      return this.opaqueOp("closure", [], opaque("closure"), loc);
+    }
+    if (ts.isNewExpression(n)) return this.newExpr(n, loc, expect);
     if (ts.isPrefixUnaryExpression(n)) {
       if (n.operator === K.ExclamationToken) return { e: "Unary", ty: BOOL, loc, op: "not", arg: this.cond(n.operand) };
-      const a = this.expr(n.operand);
+      const a = this.unwrap(this.expr(n.operand));
+      if (a.ty.k === "opaque") return this.opaqueOp("unary", [a], opaque(""), loc);
       if (n.operator === K.MinusToken) {
         if (!isNum(a.ty)) throw this.err(`cannot negate ${tyStr(a.ty)}`, this.nline(n));
         if (a.e === "Lit") return a.frac ? { ...a, loc, frac: [-a.frac[0], a.frac[1]] } : { ...a, loc, value: -a.value };
@@ -1046,28 +1812,40 @@ class FunctionLowerer {
       const c = this.cond(n.condition);
       let a = this.expr(n.whenTrue, expect), b = this.expr(n.whenFalse, expect);
       if (!tyEq(a.ty, b.ty)) {
-        if (isNum(a.ty) && isNum(b.ty)) [a, b] = this.numPair(a, b, n);
+        const j = this.join(a.ty, b.ty);
+        if (j) [a, b] = [this.coerce(a, j), this.coerce(b, j)];
+        else if (isNum(a.ty) && isNum(b.ty)) [a, b] = this.numPair(a, b, n);
         else throw this.err(`conditional branches have types ${tyStr(a.ty)} and ${tyStr(b.ty)}`, this.nline(n));
       }
       return { e: "Ite", ty: a.ty, loc, cond: c, then: a, orelse: b };
     }
     if (ts.isCallExpression(n)) return this.call(n, loc, expect);
     if (ts.isElementAccessExpression(n)) {
-      const seq = this.expr(n.expression);
-      if (seq.ty.k !== "list") throw this.err(`cannot index a ${tyStr(seq.ty)}`, this.nline(n));
-      return { e: "Index", ty: seq.ty.elem, loc, seq, idx: this.index(n.argumentExpression), wrap: false };
+      let seq = this.expr(n.expression);
+      if (n.questionDotToken && seq.ty.k === "option") return this.optionalChain(seq, (x) => this.elementOf(x, n, loc), loc);
+      return this.elementOf(this.unwrap(seq), n, loc);
     }
     if (ts.isPropertyAccessExpression(n)) {
-      if (n.questionDotToken) throw this.err("optional chaining is not supported", this.nline(n));
       const name = n.name.text;
-      const obj = this.expr(n.expression);
-      if (obj.ty.k === "list" && name === "length") return { e: "Builtin", ty: INT, loc, name: "len", args: [obj] };
-      if (obj.ty.k === "record") {
-        const f = obj.ty.fields.find((x) => x[0] === name);
-        if (!f) throw this.err(`${obj.ty.name} has no field '${name}'`, this.nline(n));
-        return { e: "Field", ty: f[1], loc, obj, name };
+      if (ts.isIdentifier(n.expression) && !((this.bound && n.expression.text in this.bound) || this.resolve(n.expression.text) !== null)) {
+        const base = n.expression.text;
+        const et = this.ml.enums[base];
+        if (et) {
+          const i = et.members.indexOf(name);
+          if (i < 0) throw this.err(`${base} has no member '${name}'`, this.nline(n));
+          return { e: "Lit", ty: et, loc, value: i };
+        }
+        const ns = this.ml.namespaces[base];
+        if (ns && ns.constants[name]) return this.expr(ns.constants[name], expect);
       }
-      throw this.err(`unsupported property '.${name}' on ${tyStr(obj.ty)}`, this.nline(n));
+      const obj = this.expr(n.expression);
+      if (n.questionDotToken && obj.ty.k === "option") return this.optionalChain(obj, (x) => this.propertyOf(x, name, n, loc), loc);
+      return this.propertyOf(this.unwrap(obj), name, n, loc);
+    }
+    if (ts.isArrayLiteralExpression(n) && n.elements.some((e) => ts.isSpreadElement(e))) {
+      if (this.spec) throw this.err("spread is not supported in specifications", this.nline(n));
+      const parts = n.elements.map((e) => this.expr(ts.isSpreadElement(e) ? e.expression : e));
+      return this.coerce(this.opaqueOp("array", parts.map((x) => (["list", "dict", "class", "option", "record"].includes(x.ty.k) ? this.coerce(x, opaque("")) : x)), opaque("array"), loc), expect && expect.k === "list" ? expect : listOf(opaque("")));
     }
     if (ts.isArrayLiteralExpression(n)) {
       const elemExpect = expect && expect.k === "list" ? expect.elem : null;
@@ -1078,6 +1856,25 @@ class FunctionLowerer {
       elems = elems.map((e) => this.coerce(e, t));
       if (elems.some((e) => !tyEq(e.ty, t))) throw this.err("array elements must all have one type", this.nline(n));
       return { e: "ListLit", ty: listOf(t), loc, elems };
+    }
+    if (ts.isObjectLiteralExpression(n) && expect && expect.k === "dict") {
+      const args = [];
+      for (const p of n.properties) {
+        if (!ts.isPropertyAssignment(p) || !(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name))) throw this.err("unsupported entry in a dictionary literal", this.nline(p));
+        const key = ts.isNumericLiteral(p.name) ? { e: "Lit", ty: expect.key, loc, value: Number(p.name.text) } : { e: "Lit", ty: STR, loc, value: p.name.text };
+        args.push(this.coerce(key, expect.key), this.coerce(this.expr(p.initializer, expect.val), expect.val));
+      }
+      return { e: "Builtin", ty: expect, loc, name: "dict_lit", args };
+    }
+    if (ts.isObjectLiteralExpression(n) && (!expect || expect.k !== "record")) {
+      if (this.spec) throw this.err("object literals need a known record type here", this.nline(n));
+      const parts = [];
+      for (const p of n.properties) {
+        if (ts.isPropertyAssignment(p)) parts.push(this.expr(p.initializer));
+        else if (ts.isShorthandPropertyAssignment(p)) parts.push(this.expr(p.name));
+        else if (ts.isSpreadAssignment(p)) parts.push(this.expr(p.expression));
+      }
+      return this.opaqueOp("object", parts.map((x) => (["list", "dict", "class", "option", "record"].includes(x.ty.k) ? this.coerce(x, opaque("")) : x)), opaque("object literal"), loc);
     }
     if (ts.isObjectLiteralExpression(n)) {
       if (!expect || expect.k !== "record") throw this.err("object literals need a known record type here (annotate the variable)", this.nline(n));
@@ -1097,30 +1894,165 @@ class FunctionLowerer {
       if (missing.length) throw this.err(`${expect.name} literal is missing ${missing.join(", ")}`, this.nline(n));
       return { e: "RecordLit", ty: expect, loc, fields: expect.fields.map((f) => [f[0], vals[f[0]]]) };
     }
-    if (ts.isAsExpression(n) || ts.isNonNullExpression(n) || ts.isSatisfiesExpression?.(n)) throw this.err("type assertions ('as', '!') are not supported: they hide exactly what telic checks", this.nline(n));
     throw this.err(`unsupported expression: ${K[n.kind]}`, this.nline(n));
+  }
+
+  join(a, b) {
+    if (a.k === "opaque" || b.k === "opaque") return opaque("");
+    if (a.k === "none" && b.k !== "none") return optionOf(b);
+    if (b.k === "none" && a.k !== "none") return optionOf(a);
+    if (a.k === "option" && (tyEq(a.inner, b) || b.k === "none")) return a;
+    if (b.k === "option" && (tyEq(b.inner, a) || a.k === "none")) return b;
+    return null;
+  }
+
+  optionalChain(obj, f, loc) {
+    // x?.p: undefined when x is absent, else x.p (as an optional)
+    const inner = f(this.unwrap(obj));
+    const rt = optionOf(inner.ty.k === "option" ? inner.ty.inner : inner.ty);
+    if (rt.k === "opaque") return this.coerce(inner, rt);
+    return { e: "Ite", ty: rt, loc, cond: { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [obj] }, then: { e: "Lit", ty: rt, loc, value: null }, orelse: this.coerce(inner, rt) };
+  }
+
+  propertyOf(obj, name, n, loc) {
+    const t = obj.ty;
+    if (t.k === "list" && name === "length") return { e: "Builtin", ty: INT, loc, name: "len", args: [obj] };
+    if (t.k === "str" && name === "length") return { e: "Builtin", ty: INT, loc, name: "str_len", args: [obj] };
+    if (t.k === "dict" && name === "size") return this.opaqueOp("len", [obj], INT, loc);
+    if (t.k === "record") {
+      const f = t.fields.find((x) => x[0] === name);
+      if (!f) throw this.err(`${t.name} has no field '${name}'`, this.nline(n));
+      return { e: "Field", ty: f[1], loc, obj, name };
+    }
+    if (t.k === "class") {
+      const c = this.ml.classes[t.name];
+      const key = `${t.name}.${name}`;
+      if (c && c.props.has(key)) return this.callSig(key, [obj], [], n, loc);
+      const f = c && c.fields.find((x) => x[0] === name);
+      if (!f) throw this.err(`${t.name} has no field '${name}'`, this.nline(n));
+      return { e: "Field", ty: f[1], loc, obj, name };
+    }
+    if (t.k === "opaque") return this.opaqueOp(`attr.${name}`, [obj], opaque(""), loc);
+    if (t.k === "dict" && t.js === "object") return this.elementOfDict(obj, { e: "Lit", ty: STR, loc, value: name }, loc);
+    throw this.err(`unsupported property '.${name}' on ${tyStr(t)}`, this.nline(n));
+  }
+
+  elementOf(seq, n, loc) {
+    const t = seq.ty;
+    if (t.k === "list") return { e: "Index", ty: t.elem, loc, seq, idx: this.index(n.argumentExpression), wrap: false };
+    if (t.k === "dict") return this.elementOfDict(seq, this.expr(n.argumentExpression), loc);
+    if (t.k === "str") {
+      const i = this.index(n.argumentExpression);
+      return { e: "Builtin", ty: STR, loc, name: "str_index", args: [seq, i] };
+    }
+    if (t.k === "opaque") return this.opaqueOp("getitem", [seq, this.expr(n.argumentExpression)], opaque(""), loc);
+    throw this.err(`cannot index a ${tyStr(t)}`, this.nline(n));
+  }
+
+  elementOfDict(d, k, loc) {
+    const key = this.coerce(k, d.ty.key);
+    return { e: "Index", ty: d.ty.val, loc, seq: d, idx: key, wrap: false };
+  }
+
+  newExpr(n, loc, expect) {
+    const args = n.arguments || [];
+    if (ts.isIdentifier(n.expression)) {
+      const name = n.expression.text;
+      if (name === "Map" && this.resolve(name) === null) {
+        if (args.length) return this.extern("new Map", args.map((a) => this.expr(a)), expect, loc);
+        let t = expect && expect.k === "dict" ? expect : null;
+        if (!t && n.typeArguments && n.typeArguments.length === 2) {
+          const k = this.ml.typeOf(n.typeArguments[0]), v = this.ml.typeOf(n.typeArguments[1]);
+          t = ["int", "real", "str", "bool"].includes(k.k) && !["list", "dict", "option"].includes(v.k) ? { k: "dict", key: k, val: v, js: "map" } : null;
+          if (!t) return this.extern("new Map", [], opaque("Map"), loc);
+        }
+        return { e: "Builtin", ty: t || { k: "dict", key: NONE, val: NONE, js: "map" }, loc, name: "dict_lit", args: [] };
+      }
+      const c = this.ml.classes[name];
+      if (c && this.resolve(name) === null) {
+        if (this.spec) throw this.err("specifications cannot create objects", this.nline(n));
+        const key = `${name}.__init__`;
+        const sig = this.ml.sigs[key];
+        const bound = sig ? this.bindArgs(key, sig, sig.params.slice(1), args, n) : [];
+        return { e: "New", ty: classOf(name), loc, cls: name, args: bound };
+      }
+    }
+    return this.extern(`new ${n.expression.getText(this.ml.sf)}`, args.map((a) => this.expr(a)), expect, loc);
   }
 
   binary(n, loc) {
     const K = ts.SyntaxKind;
     const k = n.operatorToken.kind;
+    if (k === K.QuestionQuestionToken) {
+      const a = this.expr(n.left);
+      if (a.ty.k === "none") return this.expr(n.right);
+      if (a.ty.k === "opaque") return this.opaqueOp("??", [a, this.expr(n.right)], opaque(""), loc);
+      if (a.ty.k !== "option") return a; // never nullish: the right side is not evaluated
+      const b = this.expr(n.right, a.ty.inner);
+      let rt;
+      if (b.ty.k === "none" || b.ty.k === "option") rt = a.ty;
+      else if (tyEq(b.ty, a.ty.inner)) rt = a.ty.inner;
+      else if (isNum(b.ty) && isNum(a.ty.inner)) rt = REAL;
+      else if (b.ty.k === "opaque") rt = opaque("");
+      else throw this.err(`'??' mixes ${tyStr(a.ty)} and ${tyStr(b.ty)}`, this.nline(n));
+      return { e: "Ite", ty: rt, loc, cond: { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [a] }, then: this.coerce(b, rt), orelse: this.coerce(this.unwrap(a), rt) };
+    }
     if (k === K.AmpersandAmpersandToken || k === K.BarBarToken) {
       // As a value, `a || b` is one of its operands, not a boolean.
       const a = this.expr(n.left), b = this.expr(n.right);
-      if (a.ty.k !== "bool" || b.ty.k !== "bool") throw this.err(`'${k === K.BarBarToken ? "||" : "&&"}' on non-boolean values returns an operand, not a boolean; compare explicitly`, this.nline(n));
-      return { e: "Binary", ty: BOOL, loc, op: k === K.AmpersandAmpersandToken ? "and" : "or", left: a, right: b };
+      if (a.ty.k === "bool" && b.ty.k === "bool") return { e: "Binary", ty: BOOL, loc, op: k === K.AmpersandAmpersandToken ? "and" : "or", left: a, right: b };
+      if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(k === K.BarBarToken ? "||" : "&&", [a, b], opaque(""), loc);
+      if (k === K.BarBarToken) {
+        const base = a.ty.k === "option" ? a.ty.inner : a.ty;
+        const j = tyEq(base, b.ty) ? base : isNum(base) && isNum(b.ty) ? REAL : this.join(base, b.ty);
+        if (j) return { e: "Ite", ty: j, loc, cond: this.truthy(a, n.left), then: this.coerce(this.unwrap(a), j), orelse: this.coerce(b, j) };
+      }
+      throw this.err(`'${k === K.BarBarToken ? "||" : "&&"}' on ${tyStr(a.ty)} and ${tyStr(b.ty)} returns an operand, not a boolean; compare explicitly`, this.nline(n));
     }
+    if (k === K.InKeyword) {
+      const d = this.unwrap(this.expr(n.right));
+      if (d.ty.k === "dict") return { e: "Builtin", ty: BOOL, loc, name: "dict_has", args: [d, this.coerce(this.expr(n.left), d.ty.key)] };
+      return this.opaqueOp("in", [this.expr(n.left), this.coerce(d, opaque(""))], BOOL, loc);
+    }
+    if (k === K.InstanceOfKeyword) return this.opaqueOp("instanceof", [this.coerce(this.expr(n.left), opaque("")), { e: "Lit", ty: STR, loc, value: n.right.getText(this.spec ? this.specSf : this.ml.sf) }], BOOL, loc);
     const cmp = { [K.LessThanToken]: "lt", [K.LessThanEqualsToken]: "le", [K.GreaterThanToken]: "gt", [K.GreaterThanEqualsToken]: "ge", [K.EqualsEqualsEqualsToken]: "eq", [K.ExclamationEqualsEqualsToken]: "ne", [K.EqualsEqualsToken]: "eq", [K.ExclamationEqualsToken]: "ne" };
     if (cmp[k]) {
       let a = this.expr(n.left), b = this.expr(n.right);
+      const eqop = cmp[k] === "eq" || cmp[k] === "ne";
+      if (eqop && (a.ty.k === "none" || b.ty.k === "none")) {
+        const other = a.ty.k === "none" ? b : a;
+        let c;
+        if (other.ty.k === "none") c = { e: "Lit", ty: BOOL, loc, value: true };
+        else if (other.ty.k === "option") c = { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [other] };
+        else if (other.ty.k === "opaque") c = this.opaqueOp("is_nullish", [other], BOOL, loc);
+        else c = { e: "Lit", ty: BOOL, loc, value: false }; // a non-optional value is never null/undefined
+        return cmp[k] === "eq" ? c : { e: "Unary", ty: BOOL, loc, op: "not", arg: c };
+      }
+      if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(`cmp.${cmp[k]}`, [a, b], BOOL, loc);
+      if (eqop && (a.ty.k === "option" || b.ty.k === "option")) {
+        const j = this.join(a.ty, b.ty) || (isNum(a.ty.inner || a.ty) && isNum(b.ty.inner || b.ty) ? optionOf(REAL) : null);
+        if (!j) throw this.err(`comparing ${tyStr(a.ty)} with ${tyStr(b.ty)}`, this.nline(n));
+        return { e: "Binary", ty: BOOL, loc, op: cmp[k], left: this.coerce(a, j), right: this.coerce(b, j) };
+      }
+      if (!eqop) {
+        a = this.unwrap(a);
+        b = this.unwrap(b);
+      }
+      if (!eqop && a.ty.k === "str" && b.ty.k === "str") {
+        const [x, y] = cmp[k] === "lt" || cmp[k] === "le" ? [a, b] : [b, a];
+        return { e: "Builtin", ty: BOOL, loc, name: cmp[k] === "lt" || cmp[k] === "gt" ? "str_lt" : "str_le", args: [x, y] };
+      }
+      if (!eqop && a.ty.k === "enum") return this.opaqueOp(`cmp.${cmp[k]}`, [a, b], BOOL, loc);
+      if (eqop && a.ty.k === "class" && tyEq(a.ty, b.ty)) return { e: "Binary", ty: BOOL, loc, op: cmp[k], left: a, right: b }; // identity
       if (isNum(a.ty) && isNum(b.ty)) [a, b] = this.numPair(a, b, n);
       else if (!tyEq(a.ty, b.ty)) throw this.err(`comparing ${tyStr(a.ty)} with ${tyStr(b.ty)}`, this.nline(n));
       else if (!["eq", "ne"].includes(cmp[k]) && !isNum(a.ty)) throw this.err(`ordering comparison on ${tyStr(a.ty)} is not supported`, this.nline(n));
-      else if (a.ty.k === "list" || a.ty.k === "record") throw this.err("=== on arrays/objects compares identity, not contents; compare fields explicitly", this.nline(n));
+      else if (a.ty.k === "list" || a.ty.k === "record" || a.ty.k === "dict") throw this.err("=== on arrays/objects compares identity, not contents; compare fields explicitly", this.nline(n));
       return { e: "Binary", ty: BOOL, loc, op: cmp[k], left: a, right: b };
     }
     const ar = { [K.PlusToken]: "add", [K.MinusToken]: "sub", [K.AsteriskToken]: "mul", [K.SlashToken]: "rdiv", [K.PercentToken]: "tmod" };
     if (ar[k]) return this.arith(ar[k], this.expr(n.left), this.expr(n.right), n);
+    if ([K.AmpersandToken, K.BarToken, K.CaretToken, K.LessThanLessThanToken, K.GreaterThanGreaterThanToken, K.GreaterThanGreaterThanGreaterThanToken].includes(k) && !this.spec) return this.opaqueOp("bitwise", [this.expr(n.left), this.expr(n.right)], REAL, loc);
     if (k === K.AsteriskAsteriskToken && ts.isNumericLiteral(n.right) && /^[0-4]$/.test(n.right.text)) {
       const a = this.expr(n.left);
       const p = Number(n.right.text);
@@ -1129,6 +2061,7 @@ class FunctionLowerer {
       for (let i = 1; i < p; i++) out = { e: "Binary", ty: a.ty, loc, op: "mul", left: out, right: a };
       return out;
     }
+    if (k === K.AsteriskAsteriskToken && !this.spec) return this.opaqueOp("pow", [this.expr(n.left), this.expr(n.right)], REAL, loc);
     throw this.err(`unsupported operator '${n.operatorToken.getText(this.spec ? this.specSf : this.ml.sf)}'`, this.nline(n));
   }
 
@@ -1176,18 +2109,19 @@ class FunctionLowerer {
           if (x.ty.k !== "real") throw this.err(`Math.${m} needs a number`, this.nline(n));
           return { e: "Builtin", ty: INT, loc, name: m === "round" ? "round_up" : m, args: [x] };
         }
+        if (["abs", "min", "max"].includes(m) && args.some((a) => this.expr(a).ty.k === "opaque")) return this.opaqueOp(`Math.${m}`, args.map((a) => this.expr(a)), opaque(""), loc);
         if (m === "abs") {
           const x = this.expr(args[0]);
           if (!isNum(x.ty)) throw this.err("Math.abs needs a number", this.nline(n));
           return { e: "Builtin", ty: x.ty, loc, name: "abs", args: [x] };
         }
         if (m === "min" || m === "max") {
-          let xs = args.map((a) => this.expr(a));
-          if (xs.length < 2 || !xs.every((x) => isNum(x.ty))) throw this.err(`Math.${m} needs two or more numbers`, this.nline(n));
+          let xs = args.map((a) => this.unwrap(this.expr(a)));
+          if (xs.length < 2 || !xs.every((x) => isNum(x.ty))) return this.extern(`Math.${m}`, xs, REAL, loc);
           const t = xs.some((x) => x.ty.k === "real") ? REAL : INT;
           return { e: "Builtin", ty: t, loc, name: m, args: xs.map((x) => this.coerce(x, t)) };
         }
-        throw this.err(`Math.${m} is not supported`, this.nline(n));
+        return this.extern(`Math.${m}`, args.map((a) => this.expr(a)), REAL, loc);
       }
       if (ts.isIdentifier(c.expression) && c.expression.text === "Number" && (m === "isInteger" || m === "isSafeInteger")) {
         const x = this.expr(args[0]);
@@ -1201,6 +2135,28 @@ class FunctionLowerer {
         return out;
       }
       if (ts.isIdentifier(c.expression) && c.expression.text === "console") throw this.err("console.* has no value", this.nline(n));
+      if (ts.isIdentifier(c.expression) && this.resolve(c.expression.text) === null && !(this.bound && c.expression.text in this.bound)) {
+        const base = c.expression.text;
+        const key = `${base}.${m}`;
+        if (this.ml.classes[base] && this.ml.sigs[key] && this.ml.sigs[key].isStatic) return this.callSig(key, [], args, n, loc);
+        const ns = this.ml.namespaces[base];
+        if (ns && ns.sigs[m] && !m.includes(".")) {
+          if (!this.ml.sigs[key]) {
+            this.ml.sigs[key] = ns.sigs[m];
+            this.ml.module.imports[key] = [ns.rel, m];
+          }
+          return this.callSig(key, [], args, n, loc);
+        }
+        if (base === "Object" && ["keys", "values"].includes(m) && args.length === 1) {
+          const d = this.unwrap(this.expr(args[0]));
+          if (d.ty.k === "dict") return { e: "Builtin", ty: listOf(m === "keys" ? d.ty.key : d.ty.val), loc, name: m === "keys" ? "dict_keys" : "dict_values", args: [d] };
+        }
+        if (base === "Number" || base === "parseInt" || base === "parseFloat") return this.extern(key, args.map((a) => this.expr(a)), REAL, loc);
+        if (this.ml.globalsBound.has(base) || GLOBALS.has(base) || this.ml.imported[base] || this.ml.namespaces[base] || this.ml.enums[base] || this.ml.classes[base]) {
+          if (this.spec) throw this.err(`specifications cannot call unchecked code ('${key}')`, this.nline(n));
+          return this.extern(key, args.map((a) => this.argValue(a)), expect, loc);
+        }
+      }
       // range(lo, hi).every(i => ...)   (spec helper)
       if ((m === "every" || m === "some") && ts.isCallExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "range") {
         const ra = c.expression.arguments.map((a) => this.expr(a));
@@ -1209,7 +2165,10 @@ class FunctionLowerer {
         const idx = lam.names[0] || `_${++this.tmp}`;
         return { e: "Quant", ty: BOOL, loc, kind: m === "every" ? "forall" : "exists", idx, lo: ra[0], hi: ra[1], body: this.truthy(lam.body, args[0]), elem: null, seq: null };
       }
-      const obj = this.expr(c.expression);
+      let obj = this.expr(c.expression);
+      if (c.questionDotToken && obj.ty.k === "option") return this.optionalChain(obj, (x) => this.methodCall(x, m, n, loc, expect), loc);
+      obj = this.unwrap(obj);
+      if (obj.ty.k !== "list") return this.methodCall(obj, m, n, loc, expect);
       if (obj.ty.k === "list") {
         if (m === "every" || m === "some") {
           const lam = this.lambda(args[0], [{ ty: obj.ty.elem }, { ty: INT }]);
@@ -1246,11 +2205,14 @@ class FunctionLowerer {
           }
           throw this.err("only xs.reduce((a, b) => a + b, init) is supported", this.nline(n));
         }
-        throw this.err(`array method .${m}() is not supported`, this.nline(n));
+        return this.listMethod(obj, m, n, loc, expect);
       }
       throw this.err(`unsupported method call .${m}()`, this.nline(n));
     }
-    if (!ts.isIdentifier(c)) throw this.err("unsupported call", this.nline(n));
+    if (!ts.isIdentifier(c)) {
+      if (this.spec) throw this.err("unsupported call", this.nline(n));
+      return this.extern(c.getText(this.ml.sf).slice(0, 40), [this.coerce(this.expr(c), opaque("")), ...args.map((a) => this.argValue(a))], expect, loc);
+    }
     const name = c.text;
     if (this.spec && name === "old") {
       if (!this.resultTy) throw this.err("old(...) is only allowed in '@ensures'", this.nline(n));
@@ -1271,18 +2233,139 @@ class FunctionLowerer {
       if (x.ty.k !== "list") throw this.err("count() needs an array", this.nline(n));
       return { e: "Builtin", ty: INT, loc, name: "count", args: [x, this.coerce(this.expr(args[1]), x.ty.elem)] };
     }
-    const sig = this.ml.sigs[name];
-    if (!sig) throw this.err(`call to '${name}', which telic cannot see (define it in a checked file with a contract)`, this.nline(n));
-    if (args.length !== sig.params.length) throw this.err(`'${name}' takes ${sig.params.length} arguments, got ${args.length}`, this.nline(n));
-    const lowered = sig.params.map((p, i) => {
-      const v = this.coerce(this.expr(args[i], p.ty), p.ty);
-      if (!tyEq(v.ty, p.ty) && !(p.ty.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none")) {
-        if (p.ty.k === "int" && v.ty.k === "real") throw this.err(`argument '${p.name}' of '${name}' must be an integer; telic cannot show this number is one`, this.nline(n));
-        throw this.err(`argument '${p.name}' of '${name}' expects ${tyStr(p.ty)}, got ${tyStr(v.ty)}`, this.nline(n));
+    const isLocal = this.resolve(name) !== null || (this.bound && name in this.bound);
+    if (!isLocal && name === "String" && args.length === 1) return this.toStr(this.expr(args[0]), loc);
+    if (!isLocal && name === "Boolean" && args.length === 1) return this.cond(args[0]);
+    const sig = !isLocal ? this.ml.sigs[name] : null;
+    if (sig && !sig.cls) return this.callSig(name, [], args, n, loc);
+    if (this.spec) throw this.err(`call to '${name}', which telic cannot see (define it in a checked file with a contract)`, this.nline(n));
+    if (isLocal && this.closures.has(name)) {
+      // a local function: unchecked, and it may change what it captures
+      const caps = [...this.closures.get(name)].map((x) => this.resolve(x)).filter((x) => x && x in this.env && ["list", "dict", "class", "opaque"].includes(this.env[x].k));
+      for (const x of this.closures.get(name)) this.escaped.add(x);
+      return this.extern(`local ${name}`, [...caps.map((x) => ({ e: "Var", ty: this.env[x], loc, name: x })), ...args.map((a) => this.argValue(a))], expect, loc);
+    }
+    return this.extern(name, [...(isLocal ? [this.coerce(this.expr(c), opaque(""))] : []), ...args.map((a) => this.argValue(a))], expect, loc);
+  }
+
+  // An argument handed to unchecked code: functions become opaque values.
+  argValue(a) {
+    if (ts.isSpreadElement(a)) return this.coerce(this.expr(a.expression), opaque(""));
+    return this.expr(a);
+  }
+
+  callSig(key, pre, argNodes, n, loc) {
+    const sig = this.ml.sigs[key];
+    const bound = this.bindArgs(key, sig, sig.params.slice(pre.length), argNodes, n);
+    return { e: "Call", ty: sig.ret, loc, func: key, args: [...pre, ...bound] };
+  }
+
+  // Match arguments to parameters: optional parameters may be omitted
+  // (undefined), defaults fill in, extra arguments go to a rest parameter.
+  bindArgs(key, sig, params, argNodes, n) {
+    const out = [];
+    let i = 0;
+    for (const p of params) {
+      if (sig.rest === p.name) {
+        const extra = argNodes.slice(i).map((a) => this.argValue(a));
+        out.push(this.opaqueOp("rest", extra.map((x) => (["list", "dict", "class", "option", "record"].includes(x.ty.k) ? this.coerce(x, opaque("")) : x)), opaque("...rest"), this.nloc(n)));
+        i = argNodes.length;
+        continue;
       }
-      return v;
-    });
-    return { e: "Call", ty: sig.ret, loc, func: name, args: lowered };
+      const a = argNodes[i++];
+      let v;
+      if (a === undefined) {
+        if (p.name in (sig.defaults || {})) {
+          const d = sig.defaults[p.name];
+          v = d ? this.coerce(this.expr(d, p.ty), p.ty) : { e: "Extern", ty: p.ty, loc: this.nloc(n), name: `default of '${p.name}'`, args: [] };
+        } else if (p.ty.k === "option" || p.ty.k === "opaque") v = this.coerce({ e: "Lit", ty: NONE, loc: this.nloc(n), value: null }, p.ty);
+        else throw this.err(`'${key}' is missing argument '${p.name}'`, this.nline(n));
+      } else v = this.coerce(this.expr(a, p.ty), p.ty);
+      if (!tyEq(v.ty, p.ty) && !(p.ty.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none") && !(p.ty.k === "dict" && v.ty.k === "dict" && v.ty.key.k === "none")) {
+        if (p.ty.k === "int" && v.ty.k === "real") throw this.err(`argument '${p.name}' of '${key}' must be an integer; telic cannot show this number is one`, this.nline(n));
+        throw this.err(`argument '${p.name}' of '${key}' expects ${tyStr(p.ty)}, got ${tyStr(v.ty)}`, this.nline(n));
+      }
+      out.push(v);
+    }
+    if (i < argNodes.length) throw this.err(`'${key}' takes ${params.length} arguments, got ${argNodes.length}`, this.nline(n));
+    return out;
+  }
+
+  methodCall(obj, m, n, loc, expect) {
+    const args = n.arguments;
+    const t = obj.ty;
+    if (t.k === "class") {
+      const key = `${t.name}.${m}`;
+      const sig = this.ml.sigs[key];
+      if (!sig || sig.isStatic) throw this.err(`${t.name} has no checked method '${m}'`, this.nline(n));
+      return this.callSig(key, [obj], args, n, loc);
+    }
+    if (t.k === "str") return this.strMethod(obj, m, n, loc, expect);
+    if (t.k === "dict") return this.dictMethod(obj, m, n, loc, expect);
+    if (t.k === "opaque" || t.k === "enum" || t.k === "record") {
+      if (this.spec) throw this.err(`specifications cannot call unchecked code ('.${m}')`, this.nline(n));
+      return this.extern(`${n.expression.expression.getText(this.ml.sf).slice(0, 30)}.${m}`, [this.coerce(obj, opaque("")), ...args.map((a) => this.argValue(a))], expect, loc);
+    }
+    throw this.err(`unsupported method call .${m}() on ${tyStr(t)}`, this.nline(n));
+  }
+
+  strMethod(s0, m, n, loc, expect) {
+    const args = n.arguments.map((a) => this.expr(a));
+    const lit = (v) => ({ e: "Lit", ty: STR, loc, value: v });
+    const allStr = args.every((a) => a.ty.k === "str");
+    if (m === "includes" && args.length === 1 && allStr) return { e: "Builtin", ty: BOOL, loc, name: "str_contains", args: [s0, args[0]] };
+    if ((m === "startsWith" || m === "endsWith") && args.length === 1 && allStr) return { e: "Builtin", ty: BOOL, loc, name: m === "startsWith" ? "str_startswith" : "str_endswith", args: [s0, args[0]] };
+    if (m === "indexOf" && args.length === 1 && allStr) return { e: "Builtin", ty: INT, loc, name: "str_find", args: [s0, args[0]] };
+    if (m === "slice" && args.length <= 2 && args.every((a) => a.ty.k === "int")) {
+      const none = { e: "Lit", ty: NONE, loc, value: null };
+      return { e: "Builtin", ty: STR, loc, name: "str_slice", args: [s0, args[0] || none, args[1] || none] };
+    }
+    if (m === "toString" || m === "valueOf") return s0;
+    if (["toLowerCase", "toUpperCase", "trim", "trimStart", "trimEnd", "padStart", "padEnd", "replace", "replaceAll", "repeat", "normalize", "concat", "substring", "substr", "charAt", "toLocaleLowerCase", "toLocaleUpperCase"].includes(m) && args.every((a) => ["str", "int", "real"].includes(a.ty.k))) {
+      return { e: "Builtin", ty: STR, loc, name: "str_fn", args: [lit(m), s0, ...args] };
+    }
+    if (m === "split") return this.extern("String.split", [s0, ...args], listOf(STR), loc);
+    return this.extern(`String.${m}`, [s0, ...args.map((a) => (["list", "dict", "class", "option", "record"].includes(a.ty.k) ? this.coerce(a, opaque("")) : a))], expect, loc);
+  }
+
+  dictMethod(d, m, n, loc, expect) {
+    const args = n.arguments;
+    const t = d.ty;
+    if (m === "get" && args.length === 1) return { e: "Builtin", ty: optionOf(t.val), loc, name: "dict_get_opt", args: [d, this.coerce(this.expr(args[0]), t.key)] };
+    if (m === "has" && args.length === 1) return { e: "Builtin", ty: BOOL, loc, name: "dict_has", args: [d, this.coerce(this.expr(args[0]), t.key)] };
+    if (m === "keys" && !args.length) return { e: "Builtin", ty: listOf(t.key), loc, name: "dict_keys", args: [d] };
+    if (m === "values" && !args.length) return { e: "Builtin", ty: listOf(t.val), loc, name: "dict_values", args: [d] };
+    if (this.spec) throw this.err(`'.${m}()' is not supported in specifications`, this.nline(n));
+    if (d.e !== "Var" && ["set", "delete", "clear"].includes(m)) throw this.err(`'.${m}()' on a map that is not a variable is not tracked`, this.nline(n));
+    return this.extern(`Map.${m}`, [d, ...args.map((a) => this.argValue(a))], expect, loc);
+  }
+
+  listMethod(xs, m, n, loc, expect) {
+    const args = n.arguments;
+    const t = xs.ty;
+    if ((m === "map" || m === "filter") && args.length === 1 && (ts.isArrowFunction(args[0]) || ts.isFunctionExpression(args[0])) && args[0].parameters.length === 1 && ts.isIdentifier(args[0].parameters[0].name)) {
+      try {
+        const lam = this.lambda(args[0], [{ ty: t.elem }]);
+        const elem = lam.names[0];
+        if (m === "map" && !["list", "dict"].includes(lam.body.ty.k)) return { e: "Builtin", ty: listOf(lam.body.ty), loc, name: "comp", args: [xs, { e: "Lit", ty: STR, loc, value: elem }, lam.body] };
+        if (m === "filter") {
+          const saved = this.bound;
+          this.bound = { ...(this.bound || {}), [elem]: t.elem };
+          try {
+            const cond = this.truthy(lam.body, args[0]);
+            return { e: "Builtin", ty: t, loc, name: "comp", args: [xs, { e: "Lit", ty: STR, loc, value: elem }, { e: "Var", ty: t.elem, loc, name: elem }, cond] };
+          } finally {
+            this.bound = saved;
+          }
+        }
+      } catch (e) {
+        if (!(e instanceof LowerError) || this.spec) throw e;
+      }
+    }
+    if (this.spec) throw this.err(`array method .${m}() is not supported in specifications`, this.nline(n));
+    const res = { find: optionOf(t.elem), pop: optionOf(t.elem), shift: optionOf(t.elem), indexOf: INT, findIndex: INT, lastIndexOf: INT, join: STR, concat: t, map: listOf(opaque("")), filter: t, flatMap: listOf(opaque("")), push: REAL, unshift: REAL, toString: STR }[m];
+    if (["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && xs.e !== "Var") throw this.err(`'.${m}()' on an array that is not a variable is not tracked`, this.nline(n));
+    return this.extern(`Array.${m}`, [xs, ...args.map((a) => this.argValue(a))], res || expect, loc);
   }
 }
 
@@ -1406,26 +2489,97 @@ function varsIn(e) {
 
 // ---------------------------------------------------------------------------
 
+// Resolve `import ... from "./x"` to another module of this run.
+function resolveImport(ml, spec, byFile) {
+  if (!spec.startsWith(".")) return null;
+  const base = path.resolve(path.dirname(ml.file), spec);
+  for (const cand of [base, base + ".ts", base + ".tsx", path.join(base, "index.ts"), path.join(base, "index.tsx"), base.replace(/\.js$/, ".ts")]) {
+    if (byFile.has(cand)) return byFile.get(cand);
+  }
+  return null;
+}
+
+function link(mls, byFile, stage) {
+  for (const ml of mls) {
+    for (const d of ml.importDecls) {
+      const other = resolveImport(ml, d.spec, byFile);
+      if (!other || other === ml) continue;
+      if (stage === "names") {
+        if (d.name === "*") {
+          ml.namespaces[d.local] = other;
+          continue;
+        }
+        if (other.enums[d.name]) ml.enums[d.local] = other.enums[d.name];
+        else if (other.module.records[d.name]) ml.module.records[d.local] = other.module.records[d.name];
+        else if (other.classes[d.name] && d.local === d.name) ml.classes[d.name] = other.classes[d.name];
+        else if (d.name in other.constants) ml.constants[d.local] = other.constants[d.name];
+        else if (other.aliases[d.name]) ml.aliases[d.local] = other.aliases[d.name];
+        else ml.imported[d.local] = { mod: other, name: d.name };
+        ml.globalsBound.delete(d.local);
+        if (ml.imported[d.local] === undefined) delete ml.imported[d.local];
+      } else if (stage === "signatures") {
+        if (d.name !== "*" && other.sigs[d.name] && !other.sigs[d.name].cls) {
+          ml.sigs[d.local] = other.sigs[d.name];
+          ml.module.imports[d.local] = [other.rel, d.name];
+          delete ml.imported[d.local];
+        }
+        if (other.classes[d.name] && ml.classes[d.name] === other.classes[d.name]) {
+          for (const [k, sig] of Object.entries(other.sigs)) if (k.startsWith(d.name + ".")) ml.sigs[k] = sig;
+        }
+      }
+    }
+  }
+}
+
 function main() {
   const [root, ...files] = process.argv.slice(2);
-  const out = [];
+  const mls = [];
+  const byFile = new Map();
   for (const file of files) {
     const text = fs.readFileSync(file, "utf8");
     const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
     const rel = path.relative(root, file);
     const ml = new ModuleLowerer(file, rel, sf);
-    let mod;
-    try {
-      mod = ml.run();
-    } catch (e) {
-      mod = { path: rel, language: "typescript", source: text, functions: [], intents: [], records: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], assumptions: JS_ASSUMPTIONS };
+    ml.gen = ml.phases();
+    mls.push(ml);
+    byFile.set(path.resolve(file), ml);
+  }
+  const advance = (to) => {
+    for (const ml of mls) {
+      if (ml.stage === "done") continue;
+      try {
+        for (;;) {
+          const r = ml.gen.next();
+          if (r.done) {
+            ml.stage = "done";
+            break;
+          }
+          if (r.value === to) {
+            ml.stage = to;
+            break;
+          }
+        }
+      } catch (e) {
+        ml.stage = "done";
+        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], assumptions: JS_ASSUMPTIONS };
+      }
     }
+  };
+  advance("names");
+  link(mls, byFile, "names");
+  advance("signatures");
+  link(mls, byFile, "signatures");
+  advance("done");
+  const out = [];
+  for (const ml of mls) {
+    const mod = ml.module;
+    const sf = ml.sf;
     if (sf.parseDiagnostics && sf.parseDiagnostics.length) {
       const d = sf.parseDiagnostics[0];
       const lc = sf.getLineAndCharacterOfPosition(d.start || 0);
       mod.problems.push([`syntax error: ${ts.flattenDiagnosticMessageText(d.messageText, " ")}`, lc.line + 1]);
     }
-    mod.file = file;
+    mod.file = ml.file;
     out.push(mod);
   }
   process.stdout.write(JSON.stringify(out));

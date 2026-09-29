@@ -34,23 +34,91 @@ function guard(arr) {
   });
 }
 
-function decode(v) {
-  if (Array.isArray(v)) return guard(v.map(decode));
-  if (v && typeof v === "object" && "__real__" in v) return v.__real__[0] / v.__real__[1];
-  if (v && typeof v === "object" && "__record__" in v) {
+// A stand-in for anything telic knows nothing about (opaque values, modules
+// that are not installed): every property and call yields another stub.
+function stub(name = "stub") {
+  const f = function () {};
+  return new Proxy(f, {
+    get(t, p) {
+      if (p === Symbol.toPrimitive) return () => NaN;
+      if (p === "then") return undefined;
+      if (p === "toString") return () => `<${name}>`;
+      return stub(`${name}.${String(p)}`);
+    },
+    apply() {
+      return stub(`${name}()`);
+    },
+    construct() {
+      return stub(`new ${name}`);
+    },
+  });
+}
+
+let SCOPE = {};
+
+// JSON from the solver's model -> JavaScript values. `ty` (when known)
+// decides between a Map and a plain object; objects with the same reference
+// decode to the same JavaScript object, so aliasing is reproduced.
+function decode(v, ty = null, memo = new Map()) {
+  if (v === null || v === undefined) return undefined;
+  if (Array.isArray(v)) return guard(v.map((x) => decode(x, ty && ty.k === "list" ? ty.elem : null, memo)));
+  if (typeof v !== "object") return v;
+  if ("__real__" in v) return v.__real__[0] / v.__real__[1];
+  if ("__opaque__" in v) return stub("opaque");
+  if ("__enum__" in v) {
+    const E = SCOPE[v.__enum__];
+    return E ? E[v.member] : v.member;
+  }
+  if ("__object__" in v) {
+    const key = `${v.__object__}#${v.ref}`;
+    if (memo.has(key)) {
+      const o = memo.get(key);
+      if (v.fields) for (const [k, x] of Object.entries(v.fields)) o[k] = decode(x, null, memo);
+      return o;
+    }
+    const C = SCOPE[v.__object__];
+    const o = C && C.prototype ? Object.create(C.prototype) : {};
+    memo.set(key, o);
+    for (const [k, x] of Object.entries(v.fields || {})) {
+      try {
+        Object.defineProperty(o, k, { value: decode(x, null, memo), writable: true, enumerable: true, configurable: true });
+      } catch {}
+    }
+    return o;
+  }
+  if ("__dict__" in v) {
+    const asObject = ty && ty.k === "dict" && ty.js === "object";
+    if (asObject) {
+      const o = {};
+      for (const [k, x] of v.__dict__) o[k] = decode(x, ty.val, memo);
+      return o;
+    }
+    return new Map(v.__dict__.map(([k, x]) => [decode(k, null, memo), decode(x, ty && ty.val, memo)]));
+  }
+  if ("__record__" in v) {
     const o = {};
-    for (const [k, x] of Object.entries(v.fields)) o[k] = decode(x);
+    for (const [k, x] of Object.entries(v.fields)) {
+      const d = decode(x, null, memo);
+      if (d !== undefined) o[k] = d;
+    }
     return o;
   }
   return v;
 }
 
-function show(v) {
+function show(v, depth = 0) {
   if (v === undefined) return "undefined";
+  if (v === null) return "null";
   if (typeof v === "number") return Object.is(v, -0) ? "-0" : String(v);
   if (typeof v === "string") return JSON.stringify(v);
-  if (Array.isArray(v)) return "[" + Array.from({ length: v.length }, (_, i) => show(Reflect.get(v, i))).join(", ") + "]";
-  if (v && typeof v === "object") return "{ " + Object.entries(v).map(([k, x]) => `${k}: ${show(x)}`).join(", ") + " }";
+  if (typeof v === "function") return "<function>";
+  if (depth > 3) return "…";
+  if (Array.isArray(v)) return "[" + Array.from({ length: v.length }, (_, i) => show(Reflect.get(v, i), depth + 1)).join(", ") + "]";
+  if (v instanceof Map) return "Map { " + [...v.entries()].map(([k, x]) => `${show(k)} => ${show(x, depth + 1)}`).join(", ") + " }";
+  if (v && typeof v === "object") {
+    const name = v.constructor && v.constructor !== Object ? v.constructor.name + " " : "";
+    return name + "{ " + Object.entries(v).map(([k, x]) => `${k}: ${show(x, depth + 1)}`).join(", ") + " }";
+  }
   return String(v);
 }
 
@@ -103,9 +171,11 @@ function compileSpec(params, text) {
   return new Function(...params, "result", "__old", ...Object.keys(helpers), `return (${js});`);
 }
 
+// Enforce a function's (or method's) @requires/@ensures. For a method the
+// contract's `this` is the receiver.
 function wrap(name, fn, c) {
   if (!c || (!c.requires.length && !c.ensures.length)) return fn;
-  const params = c.params;
+  const params = c.params[0] === "self" ? c.params.slice(1) : c.params;
   const reqs = c.requires.map((t) => [t, compileSpec(params, t)]);
   const ens = c.ensures.map((t) => {
     const [rewritten, olds] = extractOld(t);
@@ -113,13 +183,17 @@ function wrap(name, fn, c) {
   });
   const H = Object.values(helpers);
   return function (...args) {
-    for (const [t, f] of reqs) if (!f(...args, undefined, [], ...H)) throw new Violation("requires", t, name);
-    const olds = ens.map(([, , os]) => os.map((o) => structuredCloneSafe(o(...args, undefined, [], ...H))));
+    for (const [t, f] of reqs) if (!f.call(this, ...args, undefined, [], ...H)) throw new Violation("requires", t, name);
+    const olds = ens.map(([, , os]) => os.map((o) => structuredCloneSafe(o.call(this, ...args, undefined, [], ...H))));
+    const self = this;
     const r = fn.apply(this, args);
-    ens.forEach(([t, f], k) => {
-      if (!f(...args, r, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(r)}`);
-    });
-    return r;
+    const done = (v) => {
+      ens.forEach(([t, f], k) => {
+        if (!f.call(self, ...args, v, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(v)}`);
+      });
+      return v;
+    };
+    return r && typeof r.then === "function" ? r.then(done) : done(r);
   };
 }
 
@@ -129,32 +203,98 @@ function structuredCloneSafe(v) {
   return v;
 }
 
+// Load a module (and the checked .ts modules it imports) into one sandbox;
+// packages that are not installed become stubs.
+const nodePath = require("node:path");
+function makeRequire(fromFile, cache, sandbox) {
+  return (spec) => {
+    if (spec.startsWith(".")) {
+      const base = nodePath.resolve(nodePath.dirname(fromFile), spec);
+      for (const cand of [base, base + ".ts", base + ".tsx", nodePath.join(base, "index.ts"), base.replace(/\.js$/, ".ts")]) {
+        if (fs.existsSync(cand) && fs.statSync(cand).isFile() && /\.tsx?$/.test(cand)) return loadModule(cand, cache, sandbox).exports;
+      }
+    }
+    try {
+      return require(spec);
+    } catch {
+      return new Proxy({}, { get: (t, p) => (p === "__esModule" ? true : stub(`${spec}.${String(p)}`)) });
+    }
+  };
+}
+
+function loadModule(file, cache, sandbox) {
+  if (cache.has(file)) return cache.get(file);
+  const mod = { exports: {} };
+  cache.set(file, mod);
+  const src = fs.readFileSync(file, "utf8");
+  const js = ts.transpileModule(src, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const fn = vm.runInContext(`(function (exports, require, module, __filename, __dirname) {${js}\n})`, sandbox, { filename: file, timeout: 4000 });
+  fn(mod.exports, makeRequire(file, cache, sandbox), mod, file, nodePath.dirname(file));
+  return mod;
+}
+
 function load(path, contracts) {
   const src = fs.readFileSync(path, "utf8");
   const sf = ts.createSourceFile(path, src, ts.ScriptTarget.Latest, true);
-  const decls = [], consts = [];
+  const decls = [], consts = [], classes = [];
   for (const st of sf.statements) {
     if (ts.isFunctionDeclaration(st) && st.name && st.body) decls.push(st.name.text);
-    else if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) consts.push(d.name.text);
+    else if (ts.isVariableStatement(st)) {
+      for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) consts.push(d.name.text);
+    } else if ((ts.isClassDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) classes.push(st.name.text);
   }
   let suffix = "\n;";
   for (const n of decls) if (contracts[n]) suffix += `${n} = (globalThis as any).__telic_wrap(${JSON.stringify(n)}, ${n});\n`;
-  suffix += `(globalThis as any).__telic_fns = { ${decls.concat(consts).join(", ")} };\n`;
-  const js = ts.transpileModule(src + suffix, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const sandbox = { module: { exports: {} }, exports: {}, require, console: { log() {}, error() {}, warn() {}, info() {}, debug() {} }, structuredClone };
+  suffix += `(globalThis as any).__telic_fns = { ${decls.concat(consts, classes).join(", ")} };\n`;
+  const js = ts.transpileModule(src + suffix, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const sandbox = { console: { log() {}, error() {}, warn() {}, info() {}, debug() {} }, structuredClone, Map, Set, Date, JSON, Math, Promise, Error, TypeError, RangeError, Number, String, Object, Array, Symbol, parseInt, parseFloat, isNaN, isFinite, setTimeout, clearTimeout };
   sandbox.globalThis = sandbox;
   sandbox.__telic_wrap = (n, f) => wrap(n, f, contracts[n]);
   vm.createContext(sandbox);
-  vm.runInContext(js, sandbox, { filename: path, timeout: 4000 });
+  const cache = new Map();
+  const mod = { exports: {} };
+  cache.set(path, mod);
+  const fn = vm.runInContext(`(function (exports, require, module, __filename, __dirname) {${js}\n})`, sandbox, { filename: path, timeout: 4000 });
+  fn(mod.exports, makeRequire(path, cache, sandbox), mod, path, nodePath.dirname(path));
   const fns = sandbox.__telic_fns;
+  SCOPE = fns;
   // const-declared functions cannot be rebound; wrap them at the boundary
   for (const n of consts) if (contracts[n] && typeof fns[n] === "function") fns[n] = wrap(n, fns[n], contracts[n]);
+  // methods: wrap on the prototype
+  for (const [key, c] of Object.entries(contracts)) {
+    const parts = key.split(".");
+    if (parts.length < 2 || !fns[parts[0]] || !fns[parts[0]].prototype) continue;
+    const C = fns[parts[0]], m = parts[1];
+    if (m === "__init__" || parts.length > 2) continue;
+    const desc = Object.getOwnPropertyDescriptor(C.prototype, m);
+    if (desc && typeof desc.value === "function") C.prototype[m] = wrap(key, desc.value, c);
+    else if (typeof C[m] === "function") C[m] = wrap(key, C[m], c);
+  }
   return fns;
 }
 
-function outcome(fn, args) {
+// "f", "Cls.method", "Cls.prop" (a getter), "Cls.prop.setter", "Cls.__init__".
+function resolveFn(fns, name) {
+  if (typeof fns[name] === "function" && !name.includes(".")) return fns[name];
+  const [cls, m, extra] = name.split(".");
+  const C = fns[cls];
+  if (!C) return null;
+  if (m === "__init__") return (self, ...args) => new C(...args);
+  if (typeof C[m] === "function" && !(C.prototype && Object.getOwnPropertyDescriptor(C.prototype, m))) return (...args) => C[m](...args);
+  const desc = C.prototype && Object.getOwnPropertyDescriptor(C.prototype, m);
+  if (!desc) return null;
+  if (extra === "setter") return (self, v) => {
+    self[m] = v;
+  };
+  if (desc.get) return (self) => self[m];
+  if (typeof desc.value === "function") return (self, ...args) => desc.value.apply(self, args);
+  return null;
+}
+
+async function outcome(fn, args) {
   try {
-    const r = fn(...args);
+    let r = fn(...args);
+    if (r && typeof r.then === "function") r = await r;
     return { value: plain(r), returned_repr: show(r), nonfinite: typeof r === "number" && !Number.isFinite(r), returned_is_none: r === undefined };
   } catch (e) {
     if (e && e.telic) return { ...e.telic };
@@ -195,9 +335,36 @@ function gen(ty, r) {
     }
     case "record": {
       const o = {};
-      for (const [f, t] of ty.fields) o[f] = gen(t, r);
+      for (const [f, t] of ty.fields) {
+        const v = gen(t, r);
+        if (v !== undefined) o[f] = v;
+      }
       return o;
     }
+    case "option":
+      return r() < 0.25 ? undefined : gen(ty.inner, r);
+    case "dict": {
+      const n = pick([0, 1, 1, 2, 3]);
+      const entries = Array.from({ length: n }, () => [gen(ty.key, r), gen(ty.val, r)]);
+      return ty.js === "object" ? Object.fromEntries(entries) : new Map(entries);
+    }
+    case "enum": {
+      const E = SCOPE[ty.name];
+      const m = pick(ty.members);
+      return E ? E[m] : m;
+    }
+    case "class": {
+      const C = SCOPE[ty.name];
+      const o = C && C.prototype ? Object.create(C.prototype) : {};
+      for (const [f, t] of ty.fields || []) {
+        try {
+          Object.defineProperty(o, f, { value: gen(t, r), writable: true, enumerable: true, configurable: true });
+        } catch {}
+      }
+      return o;
+    }
+    case "opaque":
+      return stub("opaque");
   }
   return null;
 }
@@ -222,16 +389,16 @@ function* smaller(v) {
   }
 }
 
-const deep = (v) => (Array.isArray(v) ? guard(v.map(deep)) : v && typeof v === "object" ? { ...v } : v);
+const deep = (v) => (Array.isArray(v) ? guard(v.map(deep)) : v instanceof Map ? new Map(v) : v && typeof v === "object" && Object.getPrototypeOf(v) === Object.prototype ? { ...v } : v && typeof v === "object" && typeof v !== "function" ? Object.assign(Object.create(Object.getPrototypeOf(v)), v) : v);
 const failed = (o, fname) => o && (o.crash || (o.violation && !(o.violation === "requires" && o.func === fname)) || o.nonfinite);
 const plain = (v) => (Array.isArray(v) ? Array.from({ length: v.length }, (_, i) => plain(Reflect.get(v, i))) : v);
 
-function fuzz(fn, types, n, fname) {
+async function fuzz(fn, types, n, fname) {
   const r = rng(0xc0ffee);
   let accepted = 0;
   for (let t = 0; t < n * 20 && accepted < n; t++) {
     let args = types.map((ty) => gen(ty, r));
-    let o = outcome(fn, args.map(deep));
+    let o = await outcome(fn, args.map(deep));
     if (o.violation === "requires" && o.func === fname) continue;
     accepted++;
     if (!failed(o, fname)) continue;
@@ -241,7 +408,7 @@ function fuzz(fn, types, n, fname) {
       outer: for (let i = 0; i < args.length; i++) {
         for (const b of smaller(args[i])) {
           const cand = args.slice(0, i).concat([b], args.slice(i + 1));
-          const o2 = outcome(fn, cand.map(deep));
+          const o2 = await outcome(fn, cand.map(deep));
           if (failed(o2, fname) && JSON.stringify([o2.violation, o2.text, o2.crash, !!o2.nonfinite]) === key) {
             args = cand;
             o = o2;
@@ -261,7 +428,7 @@ function fuzz(fn, types, n, fname) {
 
 let input = "";
 process.stdin.on("data", (d) => (input += d));
-process.stdin.on("end", () => {
+process.stdin.on("end", async () => {
   const req = JSON.parse(input);
   let fns;
   try {
@@ -270,24 +437,30 @@ process.stdin.on("end", () => {
     console.log(JSON.stringify({ harness_error: `${e.name}: ${e.message}` }));
     return;
   }
-  const fn = fns[req.func];
+  const fn = resolveFn(fns, req.func);
   if (typeof fn !== "function") {
     console.log(JSON.stringify({ harness_error: `no function '${req.func}'` }));
     return;
   }
+  const types = req.types || [];
+  const dec = (raw) => {
+    const memo = new Map();
+    return raw.map((a, i) => decode(a, types[i] || null, memo));
+  };
   if (req.batch) {
-    const results = req.batch.map((raw) => {
-      const o = outcome(fn, raw.map(decode));
+    const results = [];
+    for (const raw of req.batch) results.push(await (async () => {
+      const o = await outcome(fn, dec(raw));
       if (o.violation === "requires" && o.func === req.func) return { rejected: true };
       if (o.violation || o.crash) return { error: o.violation ? `@${o.violation} ${o.text} failed` : `${o.crash}: ${o.msg}` };
       return { ok: true, value: o.value, repr: o.returned_repr };
-    });
+    })());
     console.log(JSON.stringify({ results }));
     return;
   }
   if (req.fuzz) {
-    console.log(JSON.stringify(fuzz(fn, req.types, req.fuzz, req.func)));
+    console.log(JSON.stringify(await fuzz(fn, req.types, req.fuzz, req.func)));
     return;
   }
-  console.log(JSON.stringify(outcome(fn, (req.args || []).map(decode))));
+  console.log(JSON.stringify(await outcome(fn, dec(req.args || []))));
 });

@@ -187,8 +187,17 @@ export function label(paid: boolean, shipped: boolean): string {
   return "open";
 }
 
-// expect: unsupported
+// expect: proved
 export function usesMap(x: number): number {
+  //@ ensures result === x
   const m = new Map<string, number>();
-  return x;
+  m.set("a", x);
+  return m.get("a")!;
+}
+
+// expect: refuted
+export function missingKey(x: number): number {
+  const m = new Map<string, number>();
+  m.set("a", x);
+  return m.get("b")!;
 }

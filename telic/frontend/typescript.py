@@ -60,6 +60,16 @@ def _type(t: dict[str, Any]) -> ir.Type:
         return ir.TList(_type(t["elem"]))
     if k == "record":
         return ir.TRecord(t["name"], tuple((n, _type(ft)) for n, ft in t["fields"]))
+    if k == "option":
+        return ir.TOption(_type(t["inner"]))
+    if k == "dict":
+        return ir.TDict(_type(t["key"]), _type(t["val"]), t.get("js", "object"))
+    if k == "class":
+        return ir.TClass(t["name"])
+    if k == "opaque":
+        return ir.TOpaque(t.get("why", ""))
+    if k == "enum":
+        return ir.TEnum(t["name"], tuple(t["members"]), tuple(t.get("values") or ()))
     raise ValueError(f"unknown type {t}")
 
 
@@ -119,6 +129,10 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
         return ir.ListLit(ty, loc, tuple(_expr(a) for a in d["elems"]))
     if kind == "RecordLit":
         return ir.RecordLit(ty, loc, tuple((n, _expr(v)) for n, v in d["fields"]))
+    if kind == "New":
+        return ir.New(ty, loc, d["cls"], tuple(_expr(a) for a in d["args"]))
+    if kind == "Extern":
+        return ir.Extern(ty, loc, d["name"], tuple(_expr(a) for a in d["args"]))
     raise ValueError(f"unknown expression {kind}")
 
 
@@ -160,7 +174,13 @@ def _stmt(d: dict[str, Any]) -> ir.Stmt:
     if k == "AssumeStmt":
         return ir.AssumeStmt(loc, _clause(d["clause"]))  # type: ignore[arg-type]
     if k == "Raise":
-        return ir.Raise(loc, d.get("what", "exception"))
+        return ir.Raise(loc, d.get("what", "exception"), bool(d.get("caught")))
+    if k == "FieldAssign":
+        return ir.FieldAssign(loc, _expr(d["obj"]), d["cls"], d["field"], _expr(d["value"]))
+    if k == "DictDel":
+        return ir.DictDel(loc, d["name"], _expr(d["key"]), bool(d.get("strict", False)))
+    if k == "Try":
+        return ir.Try(loc, _stmts(d["body"]), tuple(_stmts(h) for h in d["handlers"]), _stmts(d.get("orelse") or []), _stmts(d.get("finalbody") or []))
     if k == "ExprStmt":
         return ir.ExprStmt(loc, _expr(d["expr"]))
     if k == "Unsupported":
@@ -187,6 +207,7 @@ def _function(d: dict[str, Any]) -> ir.Function:
         exported=bool(d.get("exported", True)),
         source=d.get("source", ""),
         locals={n: _type(t) for n, t in (d.get("locals") or {}).items()},
+        escaped=set(d.get("escaped") or []),
     )
 
 
@@ -196,6 +217,9 @@ def _module(d: dict[str, Any]) -> ir.Module:
     for f in d["functions"]:
         fn = _function(f)
         m.functions[fn.name] = fn
+    for cname, c in (d.get("classes") or {}).items():
+        m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")))  # type: ignore[misc]
+    m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.intents = [ir.IntentDecl(i["id"], i["text"], ir.Loc(int(i["line"]), int(i.get("col", 0)))) for i in d.get("intents", [])]
     m.problems = [(msg, ir.Loc(int(line))) for msg, line in d.get("problems", [])]
     m.assumptions = list(d.get("assumptions", []))

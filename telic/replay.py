@@ -31,6 +31,8 @@ def _encode_any(v: Any) -> Any:
     """Encode a decoded model value whose static type is not at hand."""
     if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
         return v
+    if isinstance(v, dict) and "__record__" in v:
+        return {"__record__": v["__record__"], "fields": {k: _encode_any(x) for k, x in v["fields"].items()}}
     if isinstance(v, dict) and "__class__" in v:
         fields = None if v.get("__stub__") else {k: _encode_any(x) for k, x in v.items() if not k.startswith("__")}
         return {"__object__": v["__class__"], "ref": v.get("__ref__"), "fields": fields}
@@ -46,10 +48,14 @@ def _encode_any(v: Any) -> Any:
 def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
         return v
+    if isinstance(v, dict) and "__record__" in v and isinstance(ty, ir.TRecord):
+        return encode_value(v["fields"], ty)
     if isinstance(ty, ir.TOpaque):
         return {"__opaque__": True}
     if isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum)):
         return [_encode_any(x) for x in (v or [])]
+    if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TRecord):
+        return [encode_value(x, ty.elem) for x in (v or [])]
     if isinstance(ty, ir.TOption):
         return None if v is None else encode_value(v, ty.inner)
     if isinstance(ty, ir.TClass):
@@ -150,7 +156,11 @@ def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth
     if isinstance(ty, ir.TOption):
         return {"k": "option", "inner": type_desc(ty.inner, classes, depth)}
     if isinstance(ty, ir.TDict):
-        return {"k": "dict", "key": type_desc(ty.key), "val": type_desc(ty.val, classes, depth + 1)}
+        return {"k": "dict", "key": type_desc(ty.key), "val": type_desc(ty.val, classes, depth + 1), "js": ty.js or "map"}
+    if isinstance(ty, ir.TEnum):
+        return {"k": "enum", "name": ty.name, "members": list(ty.members)}
+    if isinstance(ty, ir.TOpaque):
+        return {"k": "opaque"}
     if isinstance(ty, ir.TClass):
         decl = (classes or {}).get(ty.name)
         fields = [[f, type_desc(t, classes, depth + 1)] for f, t in decl.fields] if decl is not None and depth < 3 else None
@@ -265,7 +275,12 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
     if k == "index":
         return crash == "IndexError" or bool(out.get("oob"))
     if k == "none":
-        return crash in ("TypeError", "AttributeError") and ("NoneType" in str(out.get("msg", "")) or "None" in str(out.get("msg", "")))
+        msg = str(out.get("msg", ""))
+        if lang == "typescript":
+            # JavaScript erases '!' and '?.': a missing value either crashes a
+            # property read or flows on as undefined (NaN in arithmetic).
+            return (crash == "TypeError" and ("undefined" in msg or "null" in msg)) or bool(out.get("returned_is_none")) or bool(out.get("nonfinite")) or "undefined" in str(out.get("returned_repr", "")) or "NaN" in str(out.get("returned_repr", ""))
+        return crash in ("TypeError", "AttributeError") and ("NoneType" in msg or "None" in msg)
     if k == "key":
         return crash == "KeyError" or bool(out.get("missing_key"))
     if k == "class.inv":
@@ -361,7 +376,7 @@ def replay_verdicts(program: Program, rep) -> None:
             if lang == "python":
                 out = run_python(full, fn.name, args)
             else:
-                out = run_typescript(full, fn.name, args, extra={"contracts": ts_contracts(rep.ref.module)})
+                out = run_typescript(full, fn.name, args, extra={"contracts": ts_contracts(rep.ref.module), "types": [type_desc(p.ty, rep.ref.module.classes) for p in fn.params]})
         except Exception as e:  # pragma: no cover - defensive
             v.replay = Replay(False, False, f"could not replay: {e}")
             continue
