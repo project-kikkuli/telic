@@ -103,8 +103,8 @@ prover can't answer it, so telic records an answer instead:
 ```
 telic intents --accept REFUND-CAP      # you reviewed it: pinned to a digest of
                                        # the sentence and the lemma set
-telic intents --judge                  # a cheap model's opinion, cached by the same
-                                       # digest, always labelled "judged"
+telic intents --judge                  # an oracle's opinion, cached by the same
+                                       # digest, labelled "judged" with who and p
 ```
 
 **How the layers line up.** An intent says *what* the system must do, in
@@ -122,17 +122,57 @@ the lemmas add up to the sentence. That is what the review records.
   written down.
 - *crash-free preconditions*: for each function that can crash, the weakest
   simple `requires` that removes every crash (callers then owe it).
-- *draft intents* (`--intents`): EARS sentences a model drafts from the
-  functions and the proved facts. A draft lists the facts that would back it
-  (each already proved), or is shown as unbacked when nothing does yet.
-  Drafts are EARS-linted and never written to your code.
+- *draft intents* (`--intents`): each proved fact written as an EARS
+  sentence ("WHEN saturating returns, the result shall be at most a"), then
+  sorted by an oracle into requirements, implementation details and likely
+  bugs (shown as *suspicious*). A generative oracle may rephrase a draft
+  (kept only if it passes the EARS lint) and name requirements nothing proves
+  yet (shown as unbacked). Drafts are never written to your code.
 
 `--write` inserts the facts (and, with `--with-fixes`, the first precondition);
 `--json` is for agents.
 
-A review goes stale when either the sentence or the lemma set changes. The
-judge reads `ANTHROPIC_API_KEY` (model: `TELIC_JUDGE_MODEL`, default a Haiku
-model), or `TELIC_JUDGE_CMD`, any command that reads the prompt on stdin.
+A review goes stale when either the sentence or the lemma set changes.
+
+## Oracles
+
+Two steps need judgment no proof gives: whether an intent's lemmas cover it,
+and which proved facts read as requirements. Both go through one protocol:
+typed questions about a state, the shape of a System One classifier.
+
+```json
+{"task": "coverage",
+ "state": {"requirement": "WHEN ..., the shop shall ...", "facts": [...]},
+ "questions": {"covers": {"type": "noul", "instructions": "...",
+                          "criteria": {"true": "...", "false": "..."}}}}
+```
+
+The answer is `{"answers": {"covers": {"noul": 0.91}}}`. Question types are
+`noul` (yes/no, a probability), `choice` (one of the criteria's keys, with
+probabilities), `score` (a rating over levels) and `text` (free text, which
+only generative backends answer). A backend may leave any question out, and
+the next one in the chain gets it. Coverage asks one `noul` per part of the
+EARS response, so an insufficient verdict names the missing part without
+generating text. Probability ≥ 0.6 is "sufficient", ≤ 0.4 "insufficient",
+and anything between is "uncertain".
+
+| `--oracle` / `TELIC_ORACLE` | |
+|---|---|
+| `builtin` | deterministic rules: word overlap for coverage, clause shape for facts; local and free |
+| `jev[:MODEL]` | TypeSafe's Jev System One classifier; `JEV_API_KEY` (or `TYPESAFE_API_KEY`) |
+| `http:URL` | POSTs the request above; `TELIC_ORACLE_TOKEN` is sent as a bearer token |
+| `cmd:COMMAND` | the request on stdin, the answers on stdout |
+| `py:MODULE:FUNC` | `FUNC(task, state, questions)` returns the answers |
+| `anthropic[:MODEL]` | an LLM prompted for the typed answers; `ANTHROPIC_API_KEY` |
+| `llm-cmd:COMMAND` | the same prompt on stdin, the model's reply on stdout |
+| `NAME[:ARG]` | a plugin under the `telic.oracles` entry point group |
+
+Chain backends with `then` (`jev then anthropic`); the builtin always ends
+the chain. `TELIC_ORACLE_COVERAGE` and `TELIC_ORACLE_CLASSIFY_FACTS` override
+one task. With nothing set, telic uses `TELIC_JUDGE_CMD`, then Jev, then
+Anthropic, whichever credentials are present, and the builtin otherwise.
+Answers are cached under `.telic/`, so CI asks once per change. `telic oracle
+--probe` shows what answers each task and sends one sample question.
 
 ## Mirrors
 

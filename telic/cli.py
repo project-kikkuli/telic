@@ -6,6 +6,8 @@
     telic prove [PATH...]          discharge open obligations in Lean (auto tactics / --agent)
     telic gaps [PATH...]           attack the specs: find wrong code the contracts still accept
     telic propose [PATH...]        propose contracts (proved facts) and draft intents for code without them
+    telic intents [PATH...]        requirements, the lemmas backing them, --judge coverage with an oracle
+    telic oracle [--probe]         which classifier or model answers the judgment tasks
     telic run SCRIPT [ARGS...]     run a Python program with every contract enforced
 """
 
@@ -194,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
     from .propose import add_command as add_propose
 
     add_propose(sub, _common, _options)
+    from .oracle import add_command as add_oracle
+
+    add_oracle(sub)
     from .ledger import add_commands as add_ledger
 
     add_ledger(sub, _common, _options)

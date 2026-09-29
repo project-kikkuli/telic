@@ -482,7 +482,10 @@ class Renderer:
                 summary.append(p.green(f"reviewed by {cov.get('by') or 'a person'}") if cov.get("fresh") else p.yellow("review stale (lemmas or wording changed)"))
             elif cov is not None and cov.get("kind") == "judged":
                 v = cov.get("verdict")
-                summary.append(p.cyan("judged sufficient") if v == "sufficient" else p.yellow("judged insufficient"))
+                who = cov.get("model") or "oracle"
+                prob = f" p={cov['p']:.2f}" if isinstance(cov.get("p"), (int, float)) else ""
+                word = p.cyan("judged sufficient") if v == "sufficient" else p.yellow(f"judged {v}")
+                summary.append(word + p.dim(f" ({who}{prob})"))
             elif i.status == "backed":
                 summary.append(p.dim("coverage not reviewed"))
             where = f"{i.loc[0]}:{i.loc[1]}" if i.loc else ""

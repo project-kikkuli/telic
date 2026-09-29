@@ -35,7 +35,7 @@ invariant, or a Lean goal.
    or until you decide the remaining freedom is intended.
 5. **Check the intents with `telic intents`.** Each should be `backed` (every
    lemma proved) with its links intact. Whether the lemmas cover the sentence is
-   the user's review (`--accept`), or at most a model's labelled judgment
+   the user's review (`--accept`), or at most an oracle's labelled judgment
    (`--judge`); never claim an intent is proved.
 6. **Commit when `telic check --strict` passes.**
 

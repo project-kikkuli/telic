@@ -38,6 +38,8 @@ class Program:
     heap_writes: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     heap_reads: dict[str, set[str]] = field(default_factory=dict)
     allocates: set[str] = field(default_factory=set)
+    # class name defined in more than one checked file -> why functions that use it are not checked
+    ambiguous: dict[str, str] = field(default_factory=dict)
     # method key -> keys of every override (a call through the base may run any of them)
     dispatch: dict[str, set[str]] = field(default_factory=dict)
 
@@ -52,6 +54,7 @@ class Program:
             for cname, decl in m.classes.items():
                 if cname in p.classes and p.class_module[cname] is not m:
                     m.problems.append((f"class {cname} is also defined in {p.class_module[cname].path}; telic needs class names to be unique across checked files", decl.loc))
+                    p.ambiguous[cname] = f"class {cname} is defined in both {p.class_module[cname].path} and {m.path}; telic cannot tell them apart yet (rename one, or check the files separately)"
                     continue
                 p.classes[cname] = decl
                 p.class_module[cname] = m
@@ -143,6 +146,17 @@ class Program:
             home = self.class_module.get(cls)
             if home is not None and home is not module:
                 return self.funcs.get(f"{home.path}::{name}")
+        return None
+
+    def ambiguity(self, ref: FuncRef) -> str | None:
+        """Why ``ref`` cannot be checked soundly: it mentions a class name two
+        checked files define (conservatively, by any mention in its IR)."""
+        if not self.ambiguous:
+            return None
+        text = repr(ref.fn)
+        for cname, why in self.ambiguous.items():
+            if f"'{cname}'" in text or ref.fn.name.startswith(cname + "."):
+                return why
         return None
 
     def ref(self, key: str) -> FuncRef:
@@ -380,6 +394,8 @@ class Program:
                 continue
             if key in self.allocates or fn.name.endswith(".__init__") or key in self.dispatch:
                 continue  # an overridden method's body is not what every call runs
+            if self.ambiguity(ref) is not None:
+                continue
             if any(isinstance(sub, ir.Extern) for st in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st) for sub in ir.walk_expr(e)):
                 continue
             ok = True

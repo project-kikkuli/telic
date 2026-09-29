@@ -34,7 +34,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -261,53 +260,87 @@ def accept(root: str, r: IntentReport, who: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Judgments (a cheap model) -- cached by digest, never trusted as proof
+# Judgments (an oracle: a classifier or a model) -- cached by digest, never proof
 
 JUDGE_CACHE = os.path.join(".telic", "judgments.json")
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 
-def judge_prompt(r: IntentReport) -> str:
-    facts = "\n".join(f"- {x.name} ({x.path}:{x.line}), {x.kind}: {x.text}  [{x.status}]" for x in r.lemmas)
-    return (
-        "You are reviewing whether facts proved about a codebase establish one of its requirements.\n\n"
-        f"Requirement ({r.id}): {r.text}\n\n"
-        "Proved facts (each is a contract clause on the named function, checked by a static verifier; "
-        "the bracket says whether it was proved):\n"
-        f"{facts}\n\n"
-        "Taken together, do the proved facts establish the requirement? Every condition the requirement "
-        "imposes must be covered by some fact; facts about unrelated behaviour do not count. "
-        "Answer on the first line with exactly SUFFICIENT or INSUFFICIENT, and on the second line name "
-        "what is missing (or 'nothing')."
-    )
+def ears_conditions(text: str) -> tuple[str, list[str]]:
+    """(trigger, response conditions) of an EARS sentence: "WHEN a refund is
+    issued, the shop shall refund at most what was paid and log it" ->
+    ("WHEN a refund is issued", ["the shop shall refund at most what was
+    paid", "the shop shall log it"]). A split for asking about each part,
+    not a grammar."""
+    t = " ".join(text.split()).rstrip(".")
+    m = re.match(r"^(?P<trig>(?:when|while|if|where)\b.*?)(?:,\s*|\s+then\s+)(?P<resp>[^,]*\bshall\b.*)$", t, re.I)
+    trigger, response = (m.group("trig"), m.group("resp")) if m else ("", t)
+    sm = re.match(r"^(?P<subj>.*?\bshall\b)\s+(?P<rest>.*)$", response, re.I)
+    if not sm:
+        return trigger, [response]
+    subj, rest = sm.group("subj"), sm.group("rest")
+    parts = [x.strip() for x in re.split(r",?\s+and\s+(?=[a-z]+\b)", rest) if x.strip()]
+    return trigger, [f"{subj} {x}" for x in parts] or [response]
 
 
-def judge(root: str, reports: list[IntentReport], model: str | None = None, command: str | None = None) -> list[str]:
-    """Ask a cheap model whether each intent's lemmas cover it. Returns
-    messages about anything that could not be judged."""
-    model = model or os.environ.get("TELIC_JUDGE_MODEL") or DEFAULT_MODEL
-    command = command or os.environ.get("TELIC_JUDGE_CMD")
+def coverage_request(r: IntentReport) -> tuple[dict[str, Any], dict[str, Any]]:
+    trigger, conds = ears_conditions(r.text or "")
+    state = {
+        "requirement": r.text,
+        "facts": [{"function": x.name, "clause": f"{x.kind} {x.text}", "status": x.status} for x in r.lemmas],
+        "note": "Each fact is a contract clause on the named function, checked by a static verifier; status says whether it was proved. Only proved facts count.",
+    }
+    questions: dict[str, Any] = {
+        "covers": {
+            "type": "noul",
+            "instructions": "Taken together, do the proved facts establish every condition the requirement imposes? Facts about unrelated behaviour do not count.",
+            "criteria": {"true": "every condition of the requirement is established by some proved fact", "false": "some condition of the requirement is not established"},
+        }
+    }
+    for i, c in enumerate(conds):
+        sentence = f"{trigger}, {c}" if trigger else c
+        questions[f"part{i + 1}"] = {
+            "type": "noul",
+            "instructions": f"Is this part of the requirement established by some proved fact: \"{sentence}\"?",
+            "criteria": {"true": "a proved fact establishes it", "false": "no proved fact establishes it"},
+            "condition": c,
+        }
+    return state, questions
+
+
+def judge(root: str, reports: list[IntentReport], oracle: str | None = None) -> list[str]:
+    """Ask the oracle whether each intent's lemmas cover it. Returns messages
+    about anything that could not be judged. A review (``--accept``) always
+    outranks a judgment."""
+    from . import oracle as oracles
+
     path = os.path.join(root, JUDGE_CACHE)
     try:
         with open(path) as fh:
             cache = json.load(fh)
     except (OSError, ValueError):
         cache = {}
+    chain = oracles.resolve(oracle, "coverage").name
     notes: list[str] = []
     for r in reports:
         if r.text is None or not r.lemmas:
             continue
-        key = f"{model if not command else 'cmd:' + command}:{r.digest}"
+        key = f"{chain}:{r.digest}"
         if key not in cache:
-            prompt = judge_prompt(r)
-            try:
-                answer = _ask(prompt, model, command)
-            except Exception as e:  # network, no key, bad command
-                notes.append(f"{r.id}: not judged ({e})")
+            state, questions = coverage_request(r)
+            got = oracles.consult("coverage", state, questions, spec=oracle)
+            notes += [f"{r.id}: {n}" for n in got.notes]
+            p = oracles.noul(got.answers.get("covers"))
+            if p is None:
+                notes.append(f"{r.id}: not judged (no oracle answered)")
                 continue
-            lines = [x.strip() for x in answer.strip().splitlines() if x.strip()]
-            verdict = "sufficient" if lines and lines[0].upper().startswith("SUFFICIENT") else "insufficient"
-            cache[key] = {"verdict": verdict, "missing": lines[1] if len(lines) > 1 else "", "model": model if not command else command}
+            parts = {k: q["condition"] for k, q in questions.items() if k != "covers"}
+            weak = [c for k, c in parts.items() if (oracles.noul(got.answers.get(k)) or 0.0) < 0.5]
+            cache[key] = {
+                "verdict": "sufficient" if p >= 0.6 else "insufficient" if p <= 0.4 else "uncertain",
+                "p": round(p, 2),
+                "missing": "; ".join(weak) if weak else ("" if p >= 0.5 else "not named"),
+                "model": got.answers["covers"].get("by", got.oracle),
+            }
         j = cache[key]
         if r.coverage is None or r.coverage.get("kind") != "reviewed" or not r.coverage.get("fresh"):
             r.coverage = {"kind": "judged", **j}
@@ -331,28 +364,6 @@ def attach_cached_judgments(root: str, reports: list[IntentReport]) -> None:
             if key.endswith(":" + r.digest):
                 r.coverage = {"kind": "judged", **j}
                 break
-
-
-def _ask(prompt: str, model: str, command: str | None, max_tokens: int = 200) -> str:
-    if command:
-        p = subprocess.run(command, shell=True, input=prompt, capture_output=True, text=True, timeout=120)
-        if p.returncode != 0:
-            raise RuntimeError(f"judge command failed: {p.stderr.strip()[-200:]}")
-        return p.stdout
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("set ANTHROPIC_API_KEY, or TELIC_JUDGE_CMD to a command that reads the prompt on stdin")
-    import urllib.request
-
-    body = json.dumps({"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-    return "".join(part.get("text", "") for part in data.get("content", []))
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +391,7 @@ def cmd_intents(args: Any, options: Any) -> int:
             r.coverage = {"kind": "reviewed", "by": who, "fresh": True}
             print(f"reviewed {iid} ({len(r.lemmas)} lemmas, digest {r.digest}) -> {REVIEWS}")
     if args.judge:
-        notes = judge(root, rep.intents)
+        notes = judge(root, rep.intents, oracle=args.oracle)
     if args.json:
         print(json.dumps([_intent_json(r) for r in rep.intents], indent=2))
     else:
@@ -410,7 +421,8 @@ def _intent_json(r: IntentReport) -> dict[str, Any]:
 def add_commands(sub: Any, common: Any, options: Any) -> None:
     i = sub.add_parser("intents", help="requirements, the lemmas backing them, and whether their links hold")
     common(i)
-    i.add_argument("--judge", action="store_true", help="ask a cheap model whether each intent's lemmas cover it (cached)")
+    i.add_argument("--judge", action="store_true", help="ask the oracle whether each intent's lemmas cover it (cached; never proof)")
+    i.add_argument("--oracle", default=None, help="oracle spec (builtin, jev, anthropic, cmd:..., http:..., py:...; default TELIC_ORACLE)")
     i.add_argument("--accept", nargs="+", metavar="ID", help="record that you reviewed these intents' lemmas and they cover the requirement")
     i.add_argument("--as", dest="who", help="reviewer name for --accept")
     i.add_argument("--json", action="store_true")

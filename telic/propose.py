@@ -11,10 +11,12 @@ Three things, in increasing order of judgment:
    can crash (division by zero, an index, a missing key, None, overflow),
    candidate ``requires`` are tried one at a time; the ones that remove every
    crash are reported. Adopting one moves the obligation to the callers.
-3. **Draft intents** (``--intents``, with the cheap model the judge uses).
-   The model reads the functions and the proved facts and drafts EARS
-   requirements, each backed only by facts telic proved. The drafts are
-   linted and clearly labelled: a requirement is the reader's decision.
+3. **Draft intents** (``--intents``). Each proved fact is rendered as an
+   EARS sentence, and an oracle (a classifier such as Jev, the builtin
+   rules, or an LLM; see ``oracle.py``) sorts them into requirements,
+   details and likely bugs. A generative oracle may also rephrase them and
+   name requirements nothing proves yet. A requirement is the reader's
+   decision.
 
 Nothing is written to the source unless ``--write`` is given, and then only
 the facts and preconditions (never a model's intent draft).
@@ -411,61 +413,118 @@ def write_back(root: str, props: list[Proposal], with_fixes: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Drafting intents (a model's proposal, never a proof)
+# Drafting intents (an oracle's classification of proved facts, never a proof)
+
+KIND_CRITERIA = {
+    "requirement": "a behaviour a product owner would state as a requirement of the system",
+    "detail": "true, but an implementation detail, a type-level range or a frame condition nobody would write down as a requirement",
+    "bug": "looks wrong: no sensible product wants this behaviour, so the code probably has a bug",
+}
 
 
-INTENT_PROMPT = """You are helping write requirements for a codebase. Below are functions, each
-with facts that a verifier has PROVED about the code as it is now.
-
-Draft at most {k} top-level requirements a product owner would recognise, in
-EARS form: exactly one "shall", starting with The / WHEN / WHILE / IF ... THEN
-/ WHERE, e.g. "WHEN a refund is issued, the shop shall refund at most what was
-paid." A requirement describes what the system must do, not how a function is
-written. For each, list the ids of the facts that support it; a requirement
-the code clearly aims at but no fact supports yet may have an empty list (it
-will be shown as unbacked). A fact may describe a bug; if a fact looks wrong
-for any sensible product, list it under "suspicious".
-
-Answer with JSON only:
-{{"intents": [{{"id": "UPPER-KEBAB-ID", "text": "EARS sentence", "facts": ["F1", "F3"]}}],
-  "suspicious": [{{"fact": "F2", "why": "one line"}}]}}
-
-{body}
-"""
-
-
-def draft_intents(props: list[Proposal], root: str, model: str | None = None, command: str | None = None, k: int = 6) -> dict[str, Any]:
-    from .intent import _ask, ears_problems
+def draft_intents(props: list[Proposal], root: str, oracle: str | None = None, k: int = 6) -> dict[str, Any]:
+    """Draft EARS intents from the proved facts. Every draft starts as a
+    literal rendering of one proved clause (``phrase.requirement``); the
+    oracle classifies each as a requirement, a detail or a likely bug, and a
+    generative oracle may rephrase it and name requirements nothing proves
+    yet. Drafts that cite facts only ever cite facts telic proved."""
+    from . import oracle as oracles
+    from .intent import ears_problems
+    from .phrase import requirement
 
     facts: dict[str, tuple[Proposal, str]] = {}
-    parts = []
+    sources: dict[str, str] = {}
     for p in props[:80]:
-        if p.skipped and not p.facts:
+        clauses = p.facts + [f for f, _ in p.fixes[:1]]
+        if not clauses:
             continue
-        src = _function_source(root, p)
-        ids = []
-        for c in p.facts + [f for f, _ in p.fixes[:1]]:
-            fid = f"F{len(facts) + 1}"
-            facts[fid] = (p, c)
-            ids.append(f"  {fid}: {c}" + ("   (needed to be crash-free)" if c.startswith("requires") else ""))
-        parts.append(f"### {p.func} ({p.module})\n```\n{src}\n```\nproved facts:\n" + ("\n".join(ids) or "  (none)"))
-    if not facts and not parts:
-        return {"intents": [], "unbacked": [], "suspicious": [], "facts": {}}
-    prompt = INTENT_PROMPT.format(k=k, body="\n\n".join(parts))
-    raw = _ask(prompt, model or os.environ.get("TELIC_JUDGE_MODEL", "claude-haiku-4-5-20251001"), command, max_tokens=2000)
-    m = re.search(r"\{.*\}", raw, re.S)
-    data = json.loads(m.group(0)) if m else {}
-    intents, unbacked = [], []
-    for it in data.get("intents", []):
-        cited = [f for f in it.get("facts", []) if f in facts]
-        (intents if cited else unbacked).append({
-            "id": str(it.get("id", "INTENT")).upper(),
-            "text": " ".join(str(it.get("text", "")).split()),
-            "facts": cited,
-            "lint": ears_problems(str(it.get("text", ""))),
-        })
-    sus = [s for s in data.get("suspicious", []) if s.get("fact") in facts]
-    return {"intents": intents, "unbacked": unbacked, "suspicious": sus, "facts": {k: {"func": p.func, "module": p.module, "clause": c} for k, (p, c) in facts.items()}}
+        sources[p.func] = _function_source(root, p)
+        for c in clauses:
+            facts[f"F{len(facts) + 1}"] = (p, c)
+    if not facts:
+        return {"intents": [], "unbacked": [], "suspicious": [], "details": [], "facts": {}, "oracle": None, "notes": []}
+    literal = {fid: requirement(p.func, c) for fid, (p, c) in facts.items()}
+    state = {
+        "functions": sources,
+        "candidates": {
+            fid: {"function": p.func, "clause": c, "sentence": literal[fid], "proved": True, "needed_to_be_crash_free": c.startswith("requires")}
+            for fid, (p, c) in facts.items()
+        },
+        "note": "Each candidate is a fact a static verifier proved about the function as written. A fact can faithfully describe a bug.",
+    }
+    questions: dict[str, Any] = {}
+    for fid in facts:
+        questions[f"{fid}_kind"] = {
+            "type": "choice",
+            "instructions": f"Candidate {fid}: \"{literal[fid]}\" (from `{facts[fid][1]}` on {facts[fid][0].func}). What is it?",
+            "criteria": KIND_CRITERIA,
+        }
+        questions[f"{fid}_phrase"] = {
+            "type": "text",
+            "instructions": f"Rewrite candidate {fid} as one EARS requirement a product owner would recognise (exactly one 'shall'; start with The / WHEN / WHILE / IF ... THEN / WHERE). Keep its meaning; do not claim more than the fact.",
+        }
+    questions["gaps"] = {
+        "type": "text",
+        "instructions": f"List up to {k} requirements the code clearly aims at that no candidate establishes, as a JSON array of EARS sentences.",
+    }
+    got = oracles.consult("classify-facts", state, questions, spec=oracle, root=root)
+    ans = got.answers
+
+    ranked = []
+    suspicious = []
+    details: list[str] = []
+    for fid, (p, c) in facts.items():
+        a = ans.get(f"{fid}_kind") or {}
+        kind = a.get("choice", "requirement")
+        conf = a.get("confidence")
+        if kind == "bug":
+            suspicious.append({"fact": fid, "why": f"classified as a likely bug by {a.get('by', got.oracle)}" + (f" (p={conf:.2f})" if isinstance(conf, (int, float)) else "")})
+        if kind == "detail":
+            details.append(fid)
+        if kind != "requirement":
+            continue
+        text = literal[fid]
+        phrased = (ans.get(f"{fid}_phrase") or {}).get("text")
+        if phrased and not ears_problems(phrased):
+            text = " ".join(phrased.split())
+        ranked.append((-(conf if isinstance(conf, (int, float)) else 0.5), fid, text, a.get("by", got.oracle)))
+    ranked.sort()
+    intents = []
+    seen: set[str] = set()
+    for _, fid, text, by in ranked[:k]:
+        p = facts[fid][0]
+        base = re.sub(r"[^A-Z0-9]+", "-", p.func.split(".")[-1].upper()).strip("-") or "INTENT"
+        iid, n = base, 2
+        while iid in seen:
+            iid, n = f"{base}-{n}", n + 1
+        seen.add(iid)
+        intents.append({"id": iid, "text": text, "facts": [fid], "lint": ears_problems(text), "by": by})
+    unbacked = []
+    gaps = (ans.get("gaps") or {}).get("text")
+    for sentence in _sentences(gaps):
+        wid = "-".join(w.upper() for w in re.findall(r"[A-Za-z]+", sentence) if w.lower() not in ("when", "the", "shall", "a", "an", "if", "then", "while", "where", "system"))[:40].strip("-")
+        unbacked.append({"id": wid or "INTENT", "text": sentence, "facts": [], "lint": ears_problems(sentence), "by": ans["gaps"].get("by", got.oracle)})
+    return {
+        "intents": intents,
+        "unbacked": unbacked,
+        "suspicious": suspicious,
+        "details": details,
+        "facts": {fid: {"func": p.func, "module": p.module, "clause": c} for fid, (p, c) in facts.items()},
+        "oracle": got.oracle,
+        "notes": got.notes,
+    }
+
+
+def _sentences(text: str | None) -> list[str]:
+    if not text:
+        return []
+    m = re.search(r"\[.*\]", text, re.S)
+    if m:
+        try:
+            return [" ".join(str(x).split()) for x in json.loads(m.group(0)) if str(x).strip()]
+        except ValueError:
+            pass
+    return [" ".join(x.lstrip("-* ").split()) for x in text.splitlines() if "shall" in x.lower()]
 
 
 def _function_source(root: str, p: Proposal) -> str:
@@ -494,7 +553,7 @@ def cmd_propose(args: Any, options: Any) -> int:
     drafted = None
     if args.intents:
         try:
-            drafted = draft_intents(props, root, model=args.model, command=os.environ.get("TELIC_JUDGE_CMD"))
+            drafted = draft_intents(props, root, oracle=args.oracle)
         except Exception as e:  # noqa: BLE001 - reported, the facts still stand
             drafted = {"error": str(e)}
     if args.json:
@@ -540,7 +599,7 @@ def render_proposals(props: list[Proposal], drafted: dict[str, Any] | None, p: A
         if "error" in drafted:
             out.append(p.yellow(f"intents: could not draft ({drafted['error']})"))
         else:
-            out.append(p.bold("Draft intents") + p.dim("  (a model's proposal from the proved facts: requirements are yours to decide)"))
+            out.append(p.bold("Draft intents") + p.dim(f"  (proved facts in words, sorted by {drafted.get('oracle') or 'an oracle'}: requirements are yours to decide)"))
             out.append("")
             facts = drafted.get("facts", {})
             for it in drafted.get("intents", []):
@@ -564,6 +623,11 @@ def render_proposals(props: list[Proposal], drafted: dict[str, Any] | None, p: A
             for s in drafted.get("suspicious", []):
                 f = facts.get(s["fact"], {})
                 out.append(p.red(f"  suspicious: {f.get('func')}: {f.get('clause')}") + p.dim(f" -- {s.get('why', '')}"))
+            if drafted.get("details"):
+                n = len(drafted["details"])
+                out.append(p.dim(f"  {n} fact{'s' * (n != 1)} read as implementation detail{'s' * (n != 1)}, not drafted"))
+            for n in drafted.get("notes", []):
+                out.append(p.dim(f"  oracle: {n}"))
     return "\n".join(out)
 
 
@@ -571,8 +635,8 @@ def add_command(sub: Any, common: Any, options: Any) -> None:
     c = sub.add_parser("propose", help="propose contracts (proved facts, crash-free preconditions) and draft intents for code without them")
     common(c)
     c.add_argument("--color", choices=["auto", "always", "never"], default="auto")
-    c.add_argument("--intents", action="store_true", help="also draft EARS intents from the proved facts (uses the judge model)")
-    c.add_argument("--model", default=None)
+    c.add_argument("--intents", action="store_true", help="also draft EARS intents from the proved facts (classified by the oracle)")
+    c.add_argument("--oracle", default=None, help="oracle spec (builtin, jev, anthropic, cmd:..., http:..., py:...; default TELIC_ORACLE)")
     c.add_argument("--write", action="store_true", help="insert the proved facts into the source")
     c.add_argument("--with-fixes", action="store_true", help="with --write, also insert the first crash-free precondition")
     c.add_argument("--json", action="store_true")

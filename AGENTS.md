@@ -21,6 +21,8 @@ Read [docs/design.md](docs/design.md) first.
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
 | `telic/intent.py` | intents: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
+| `telic/propose.py`, `telic/phrase.py` | `telic propose`: proved facts, crash-free preconditions, facts rendered as EARS drafts |
+| `telic/oracle.py` | the only place a judgment is delegated to a model: typed questions, pluggable backends (builtin, Jev, HTTP, command, Python, LLM), cache. Answers are labelled, never proof |
 | `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving, `--engine ox` / `TELIC_ENGINE=ox`; covers everything the Python core models (heap, optionals, dicts, opaque values, try, async); a function it cannot handle falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
 
@@ -39,6 +41,10 @@ Read [docs/design.md](docs/design.md) first.
 - **Verdict changes go through the corpora.** `tests/cases/corpus.py`,
   `corpus.ts` and `corpus.rs` pin the expected verdict of every function; add a
   case for every bug you fix.
+- **Models only through `oracle.py`.** Ask typed questions (noul / choice /
+  score) with a builtin rule as the fallback; `text` questions are optional
+  extras a System One classifier won't answer. Never let an answer change a
+  proof verdict. Credentials come from the environment and never go in the repo.
 - **Output is product.** Messages are one line, source-anchored, and say what to
   do next. Keep success quiet.
 

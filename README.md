@@ -88,15 +88,23 @@ def refund_amount(paid: int, refunded: int, requested: int) -> int:
 intent back. telic checks both directions. An intent is **backed** when every
 lemma is proved, and **broken** when one is refuted. It is never "proved": whether
 the lemmas cover the requirement is a separate verdict, recorded by a person
-(`telic intents --accept ID`) or by a cheap model (`--judge`). Both are pinned to
+(`telic intents --accept ID`) or by an oracle (`--judge`). Both are pinned to
 the exact sentence and lemma set.
 
 **Starting from code with no contracts,** `telic propose src/` lists facts it
 has proved about the code as it is (a proposed contract is only shown once it
 is proved) and the preconditions that would make each crashing function
-crash-free. With `--intents`, the cheap model drafts EARS requirements from
-them. A fact can faithfully describe a bug, and a requirement is a decision, so
+crash-free. With `--intents`, each proved fact is written as an EARS
+requirement and an oracle sorts them into requirements, details and likely
+bugs. A fact can faithfully describe a bug, and a requirement is a decision, so
 you (or your agent) choose what to keep; `--write` inserts the facts.
+
+**Oracles.** The judgment steps (coverage, sorting facts) ask typed
+questions (yes/no, choice, score) and get calibrated answers. Any backend
+plugs in: the builtin deterministic classifier (the default), a System One
+classifier such as TypeSafe's Jev (`--oracle jev`, with `JEV_API_KEY`), an
+LLM, an HTTP endpoint, a command, or a Python function. Their answers are
+labelled and never count as proof. See [docs/contracts.md](docs/contracts.md#oracles).
 
 ## When the solver can't decide
 

@@ -61,11 +61,22 @@ def test_review_goes_stale_when_lemmas_change(tmp_path):
 def test_judge_is_cached_and_labelled(tmp_path):
     shutil.copy(CASES / "app.py", tmp_path / "app.py")
     counter = tmp_path / "calls"
-    cmd = f"{sys.executable} -c \"import sys; sys.stdin.read(); open('{counter}', 'a').write('x'); print('INSUFFICIENT'); print('nothing about logging')\""
+    # a cmd: oracle reads the typed request on stdin and answers every noul question "no"
+    script = tmp_path / "oracle.py"
+    script.write_text(
+        "import json, sys\n"
+        f"open({str(counter)!r}, 'a').write('x')\n"
+        "req = json.load(sys.stdin)\n"
+        "assert req['task'] == 'coverage' and 'covers' in req['questions']\n"
+        "print(json.dumps({'answers': {k: {'noul': 0.1} for k in req['questions']}}))\n"
+    )
+    spec = f"cmd:{sys.executable} {script}"
     _, got = intents(tmp_path)
-    judge(str(tmp_path), [got["CAP"]], command=cmd)
-    assert got["CAP"].coverage["kind"] == "judged" and got["CAP"].coverage["verdict"] == "insufficient"
+    judge(str(tmp_path), [got["CAP"]], oracle=spec)
+    cov = got["CAP"].coverage
+    assert cov["kind"] == "judged" and cov["verdict"] == "insufficient"
+    assert cov["model"].startswith("cmd:") and cov["missing"]  # labelled with the oracle, and says which part is missing
     _, got = intents(tmp_path)  # a fresh run shows the cached judgment
     assert got["CAP"].coverage["kind"] == "judged"
-    judge(str(tmp_path), [got["CAP"]], command=cmd)
+    judge(str(tmp_path), [got["CAP"]], oracle=spec)
     assert counter.read_text() == "x"  # asked once

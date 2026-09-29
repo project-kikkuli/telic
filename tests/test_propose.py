@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 from telic.checker import CheckOptions, check
@@ -67,23 +68,41 @@ def test_written_facts_are_proved(tmp_path):
         assert by[name].status == "proved", (name, by[name].status, [(v.ob.id, v.status) for v in by[name].verdicts])
 
 
-def test_drafted_intents_only_cite_proved_facts(tmp_path, monkeypatch):
+def test_drafted_intents_only_cite_proved_facts(tmp_path):
     (tmp_path / "shop.py").write_text(SHOP)
     props = propose([str(tmp_path / "shop.py")], str(tmp_path), opts())
-    fake = tmp_path / "judge.sh"
+    # a generative oracle: classifies, rephrases (once badly), and names a gap
+    fake = tmp_path / "oracle.py"
     fake.write_text(
-        "#!/bin/sh\ncat > /dev/null\ncat <<'J'\n"
-        + json.dumps({"intents": [
-            {"id": "SAFE-AVG", "text": "WHEN an average is requested, the system shall compute it over a non-empty list.", "facts": ["F1"]},
-            {"id": "MADE-UP", "text": "The system shall be fast.", "facts": ["F999"]},
-            {"id": "SLOPPY", "text": "averages are fine", "facts": ["F1"]}]})
-        + "\nJ\n"
+        "import json, sys\n"
+        "req = json.load(sys.stdin)\n"
+        "out = {}\n"
+        "for k, q in req['questions'].items():\n"
+        "    if k.endswith('_kind'):\n"
+        "        c = req['state']['candidates'][k[:-5]]\n"
+        "        out[k] = {'choice': 'bug' if 'evens' in c['function'] else 'requirement', 'confidence': 0.9}\n"
+        "    elif k == 'F1_phrase':\n"
+        "        out[k] = {'text': 'averages are fine'}\n"
+        "    elif k == 'gaps':\n"
+        "        out[k] = {'text': json.dumps(['The shop shall be fast.'])}\n"
+        "print(json.dumps({'answers': out}))\n"
     )
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    d = draft_intents(props, str(tmp_path), command=str(fake))
-    ids = [i["id"] for i in d["intents"]]
-    assert "MADE-UP" not in ids  # nothing proved supports it: shown as unbacked, never as backed
-    assert "MADE-UP" in [i["id"] for i in d["unbacked"]]
-    assert "SAFE-AVG" in ids
-    sloppy = next(i for i in d["intents"] if i["id"] == "SLOPPY")
-    assert sloppy["lint"]  # not EARS: flagged
+    d = draft_intents(props, str(tmp_path), oracle=f"cmd:{sys.executable} {fake}")
+    for it in d["intents"]:
+        assert it["facts"] and all(f in d["facts"] for f in it["facts"])  # backed drafts cite proved facts only
+        assert not it["lint"]  # a rephrasing that is not EARS is dropped for the literal one
+    assert "averages are fine" not in [i["text"] for i in d["intents"]]
+    assert [i["text"] for i in d["unbacked"]] == ["The shop shall be fast."]
+    assert d["suspicious"] and all("evens" in d["facts"][s["fact"]]["func"] for s in d["suspicious"])
+    assert d["oracle"].startswith("cmd:")
+
+
+def test_drafted_intents_with_builtin_oracle(tmp_path, monkeypatch):
+    for v in ("TELIC_ORACLE", "JEV_API_KEY", "TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "TELIC_JUDGE_CMD"):
+        monkeypatch.delenv(v, raising=False)
+    (tmp_path / "shop.py").write_text(SHOP)
+    props = propose([str(tmp_path / "shop.py")], str(tmp_path), opts())
+    d = draft_intents(props, str(tmp_path))
+    assert d["oracle"] == "builtin" and d["intents"] and not d["unbacked"]
+    assert all(not i["lint"] for i in d["intents"])
+    assert not any("old(self.owner)" in d["facts"][i["facts"][0]]["clause"] for i in d["intents"])  # frame facts are details

@@ -124,8 +124,10 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         inner_ty = ty.elem if isinstance(ty, ir.TList) else None
         shown = [format_value(x, inner_ty, lang, names) for x in v]
         if len(shown) > 8 and len(set(shown)) == 1:
+            if lang == "rust":
+                return f"vec![{shown[0]}; {len(shown)}]"
             return f"[{shown[0]}] * {len(shown)}" if lang == "python" else f"Array({len(shown)}).fill({shown[0]})"
-        return "[" + ", ".join(shown) + "]"
+        return ("vec![" if lang == "rust" else "[") + ", ".join(shown) + "]"
     if isinstance(v, str):
         return json.dumps(v) if lang != "python" else repr(v)
     return str(v)

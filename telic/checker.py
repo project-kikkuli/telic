@@ -533,12 +533,23 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         """Generate and triage one function's obligations with the Python core.
         False when the function could not be verified (the report says why)."""
         nonlocal hits, solved
+        why = program.ambiguity(ref)
+        if why is not None:
+            rep.status = "unsupported"
+            rep.problems.append((why, ref.fn.loc))
+            return False
         try:
             gen = VCGen(program, ref, inf.options)
             obs = gen.run()
         except VCError as e:
             rep.status = "error"
             rep.problems.append((str(e), e.loc or ref.fn.loc))
+            return False
+        except Exception as e:  # noqa: BLE001 - a bug in telic must not block the other functions
+            if os.environ.get("TELIC_DEBUG"):
+                raise
+            rep.status = "error"
+            rep.problems.append((f"internal error in telic ({type(e).__name__}: {e or 'no message'}); this is a telic bug, set TELIC_DEBUG=1 for the trace", ref.fn.loc))
             return False
         rep.assumptions = gen.assumptions
         rep.deps = set(gen.deps)
@@ -607,7 +618,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             rep.from_receipt = True
             reports.append(rep)
             continue
-        if use_engine:
+        if use_engine and program.ambiguity(ref) is None:
             engine_tasks.append((rep, ref, inf, fkey, ft))
             reports.append(rep)
             continue
