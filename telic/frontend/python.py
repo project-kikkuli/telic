@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import sys
 import io
 import os
 import tokenize
@@ -159,7 +160,8 @@ class PythonFrontend:
         try:
             tree = ast.parse(self.source, filename=self.path)
         except SyntaxError as e:
-            self.module.problems.append((f"syntax error: {e.msg}", ir.Loc(e.lineno or 0)))
+            v = f"{sys.version_info.major}.{sys.version_info.minor}"
+            self.module.problems.append((f"syntax error: {e.msg} (telic parses with Python {v}; newer syntax needs telic running on a newer Python)", ir.Loc(e.lineno or 0)))
             return
         try:
             self.contract_lines = parse_comment_lines(self._comments(), "#")
@@ -922,6 +924,8 @@ class FunctionLowerer:
                 return  # int value stored in a float variable: promoted on assignment
             if isinstance(old, ir.TList) and isinstance(ty, ir.TList) and ty.elem == ir.NONE:
                 return
+            if isinstance(old, ir.TDict) and isinstance(ty, ir.TDict) and ty.key == ir.NONE:
+                return
             raise LowerError(f"variable '{name}' changes type from {old} to {ty}; telic requires one type per variable", node)
 
     def coerce(self, e: ir.Expr, ty: ir.Type) -> ir.Expr:
@@ -1113,6 +1117,12 @@ class FunctionLowerer:
             c = self.cond(s.test)
             text = ast.get_source_segment(self.fe.source, s.test) or ast.unparse(s.test)
             clause = ir.Clause("assert", c, _loc(s.test), " ".join(text.split()))
+            if _about_unchecked(c):
+                # an assert about configuration / library data is a runtime
+                # check of the environment: it raises AssertionError, which
+                # (like any raise) needs a contract to be a claim
+                yield ir.If(loc, ir.Unary(ir.BOOL, loc, "not", c), (ir.Raise(loc, f"AssertionError: {clause.text}", caught=self.try_depth > 0),), ())
+                return
             yield ir.AssertStmt(loc, clause, native=True)
             return
         if isinstance(s, ast.Delete):
@@ -1276,6 +1286,9 @@ class FunctionLowerer:
             name = target.value.id
             dt = self.env[name]
             assert isinstance(dt, ir.TDict)
+            if dt.key == ir.NONE and dt.val == ir.NONE:  # d = {} ... d[k] = v: the first store decides the type
+                dt = ir.TDict(self.expr(target.slice).ty, self.expr(value).ty)
+                self.env[name] = dt
             k = self.coerce(self.expr(target.slice), dt.key)
             if k.ty != dt.key:
                 raise LowerError(f"key of '{name}' must be {dt.key}, got {k.ty}", s)
@@ -1555,6 +1568,16 @@ def _desc(n: ast.expr) -> str:
         return ast.unparse(n)[:40]
     except Exception:  # pragma: no cover
         return "value"
+
+
+def _about_unchecked(e: ir.Expr) -> bool:
+    """Does a condition depend on values from unchecked code?"""
+    for x in ir.walk_expr(e):
+        if isinstance(x, ir.Extern) or (isinstance(x, ir.Builtin) and x.name in ("opaque_op", "from_opaque")):
+            return True
+        if isinstance(x, ir.Var) and isinstance(x.ty, ir.TOpaque):
+            return True
+    return False
 
 
 def _is_generator(fn: ast.AST) -> bool:

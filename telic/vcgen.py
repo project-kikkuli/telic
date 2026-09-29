@@ -211,7 +211,14 @@ def default_term(s: L.Sort) -> L.Term:
 
 def coerce(v: Val, ty: ir.Type | None) -> Val:
     """Lift a plain value into an optional slot (``None`` -> absent, ``x`` ->
-    present ``x``). Frontends need not insert the wrapping themselves."""
+    present ``x``). Frontends need not insert the wrapping themselves. An
+    empty literal (``[]``, ``{}``) takes the type of the variable it is
+    stored in."""
+    if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList) and ty.elem != ir.NONE:
+        return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty)
+    if isinstance(v, DictVal) and v.ty.key == ir.NONE and isinstance(ty, ir.TDict) and ty.key != ir.NONE:
+        ks, vs = sort_of(ty.key), sort_of(ty.val)
+        return DictVal(L.const_array(L.ARRAY(vs, ks), default_term(vs)), L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE), ty)
     if isinstance(ty, ir.TOption) and not isinstance(v, OptVal):
         if v is NONE_V:
             return OptVal(L.FALSE, default_term(sort_of(ty.inner)), ty)
@@ -1227,18 +1234,18 @@ class VCGen:
 
     def ev_ListLit(self, e: ir.ListLit, ctx: Ctx) -> Val:
         assert isinstance(e.ty, ir.TList)
-        if e.ty.elem == ir.NONE:
-            ty = ir.TList(ir.INT)
-        else:
-            ty = e.ty
+        # an empty [] of unknown type is a placeholder until it is stored (see coerce)
+        ty = ir.TList(ir.INT) if e.ty.elem == ir.NONE else e.ty
         base = self.fresh("lit", ty, len_=L.ZERO)
         assert isinstance(base, ListVal)
+        if e.ty.elem == ir.NONE:
+            base = ListVal(base.arr, base.off, base.len, e.ty)
         arr = base.arr
         for i, x in enumerate(e.elems):
             v = self.ev(x, ctx)
             assert not isinstance(v, ListVal)
             arr = L.store(arr, L.IntV(i), v)
-        return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), ty)
+        return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
         lo = self.ev(e.lo, ctx)
@@ -1262,6 +1269,8 @@ class VCGen:
         name = e.name
         if name == "comp":
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
+        if name == "dict_lit" and e.ty.key == ir.NONE:  # type: ignore[union-attr]
+            return DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), e.ty)  # type: ignore[arg-type]
         if name == "dict_lit":
             assert isinstance(e.ty, ir.TDict)
             ks = sort_of(e.ty.key)
