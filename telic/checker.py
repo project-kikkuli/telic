@@ -32,7 +32,7 @@ def language_of(path: str) -> str | None:
 
 
 def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
-    from .frontend.aim_file import is_aim_file
+    from .frontend.aim_file import DIR, aim_files, is_aim_file
 
     files: list[str] = []
     for p in paths:
@@ -43,6 +43,8 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
                     full = os.path.join(dirpath, f)
                     if language_of(full) or is_aim_file(full):
                         files.append(full)
+                if DIR in dirnames and os.path.islink(os.path.join(dirpath, DIR)):  # os.walk does not enter it
+                    files += aim_files(os.path.join(dirpath, DIR))
         else:
             files.append(p)
     root = root or os.getcwd()
@@ -113,7 +115,7 @@ def aims_modules(paths: list[str], named: list[str], root: str) -> list[ir.Modul
     """The aims/<ID>.md files named or walked, plus those in the aims/
     directories of ancestors up to the root. Ancestors come as context: their
     aims are reported only where the checked code cites them."""
-    from .frontend.aim_file import DIR, is_aim_file, lower_aim_file
+    from .frontend.aim_file import DIR, aim_files, lower_aim_file
 
     own = {os.path.normpath(os.path.abspath(f)) for f in named}
     top = os.path.normpath(os.path.abspath(root))
@@ -124,7 +126,7 @@ def aims_modules(paths: list[str], named: list[str], root: str) -> list[ir.Modul
         while d == top or d.startswith(top + os.sep):
             above = os.path.join(d, DIR)
             if os.path.isdir(above):
-                ancestors.update(f for f in (os.path.join(above, n) for n in os.listdir(above)) if is_aim_file(f))
+                ancestors.update(aim_files(above))
             if d == top:
                 break
             d = os.path.dirname(d)

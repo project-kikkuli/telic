@@ -30,6 +30,11 @@ def is_aim_file(path: str) -> bool:
     return name.endswith(".md") and name.lower() != "readme.md" and os.path.basename(os.path.dirname(os.path.normpath(path))) == DIR
 
 
+def aim_files(directory: str) -> list[str]:
+    """The aim files in an aims/ directory, read through a symlink."""
+    return sorted(p for p in (os.path.join(directory, f) for f in os.listdir(directory)) if is_aim_file(p) and os.path.isfile(p))
+
+
 def scope_of(path: str) -> str:
     """The directory an aim file governs, relative to the root ('' = all)."""
     return os.path.dirname(os.path.dirname(os.path.normpath(path))).replace(os.sep, "/")

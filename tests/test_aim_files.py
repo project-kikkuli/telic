@@ -174,3 +174,11 @@ def test_missing_path_is_one_line_error(tmp_path, capsys, args):
     assert main([a.format(root=tmp_path) for a in args]) == 2
     err = capsys.readouterr().err.strip()
     assert "nope" in err and "no such file" in err and "\n" not in err
+
+
+@pytest.mark.parametrize("paths", [["."], ["a"], ["a/x.py"]])
+def test_a_symlinked_aims_dir_is_read_from_every_check(tmp_path, paths):
+    tree(tmp_path, {"shared/PAY.md": f"{SAME}\n", "shared/NOTES.md/x": "", "a/x.py": fn("charge", "PAY")})
+    (tmp_path / "aims").symlink_to("shared")
+    _, got = report(tmp_path, paths)
+    assert (got["PAY"].status, got["PAY"].loc, got["PAY"].pointers) == ("backed", ("aims/PAY.md", 1), [])
