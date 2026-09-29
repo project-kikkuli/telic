@@ -179,7 +179,7 @@ def git(root: str, *args: str) -> str:
 
 
 def changed_files(root: str, base: str) -> set[str]:
-    out = git(root, "diff", "--name-only", f"{base}...HEAD") + git(root, "diff", "--name-only", "HEAD") + git(root, "ls-files", "--others", "--exclude-standard")
+    out = git(root, "diff", "--name-only", "--no-renames", f"{base}...HEAD") + git(root, "diff", "--name-only", "--no-renames", "HEAD") + git(root, "ls-files", "--others", "--exclude-standard")
     return {l.strip() for l in out.splitlines() if l.strip()}
 
 
@@ -205,12 +205,17 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     override. Importers of importers are unaffected: a proof depends on its
     callees' contracts, not on what those rest on."""
     from .frontend.aim_file import is_aim_file, lower_aim_file
+    from .aim import _match, split_by
 
     files = {f for f in changed if (language_of(f) or is_aim_file(f)) and os.path.exists(os.path.join(root, f))}
     deleted = {f for f in changed if (language_of(f) or is_aim_file(f)) and not os.path.exists(os.path.join(root, f))}
-    # an edited aim file affects the code backing its aims, before and after
+    # an edited aim file affects the code backing its aims, before and after, and the code its by: names
     md = {f for f in files | deleted if is_aim_file(f)}
-    ids = {d.id for f in md & files for d in lower_aim_file(f, Path(root, f).read_text()).aims}
+    decls = [d for f in md & files for d in lower_aim_file(f, Path(root, f).read_text()).aims]
+    ids = {d.id for d in decls}
+    known = (ledger or {}).get("functions", {})
+    for item in {item for d in decls for item in split_by(d.text)[1]}:
+        files |= {k.split("::")[0] for k in known if _match(item, k, k.split("::", 1)[1]) and os.path.exists(os.path.join(root, k.split("::")[0]))}
     ids |= {k for k, v in (ledger or {}).get("aims", {}).items() if v.get("declared") in md}
     for k in ids:
         for key in (ledger or {}).get("aims", {}).get(k, {}).get("functions", []):

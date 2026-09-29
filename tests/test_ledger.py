@@ -157,3 +157,32 @@ def test_changed_override_rechecks_callers_through_the_base(tmp_path, parent, cl
     out = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never")
     assert out.returncode == 1, out.stdout
     assert "aim POS: backed →" in out.stdout
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        [("git", "mv", "lib/aims/PAY.md", "lib/aims/PAYS.md")],
+        [("mkdir", "aims"), ("git", "mv", "lib/aims/PAY.md", "aims/PAY.md")],
+        [("git", "rm", "-q", "lib/aims/PAY.md")],
+        [("write", "lib/aims/NEW.md", "The shop shall log.\nby: f\n")],
+    ],
+)
+def test_since_judges_aim_file_changes_as_a_full_check_does(repo, change):
+    sh(repo, "git", "checkout", "-q", "main")
+    (repo / "lib" / "aims").mkdir()
+    (repo / "lib" / "aims" / "PAY.md").write_text("The shop shall pay.\nby: f\n")
+    (repo / "lib" / "unrelated.py").write_text(CITES_OTHER.format(iid="PAY"))
+    assert telic(repo, "ledger").returncode == 0
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "pay")
+    sh(repo, "git", "checkout", "-qb", "change")
+    for cmd, *rest in change:
+        if cmd == "write":
+            (repo / rest[0]).write_text(rest[1])
+        else:
+            sh(repo, cmd, *rest)
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "change")
+    since, full = telic(repo, "ci", "--since", "main", "--color", "never"), telic(repo, "ci", "--color", "never")
+    assert (since.returncode, since.stdout.splitlines()[1:]) == (full.returncode, full.stdout.splitlines()[1:])
