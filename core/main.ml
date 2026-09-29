@@ -1,7 +1,7 @@
 (* telic-core: the native verification engine.
 
    stdin:  {"modules": [...], "program": {...}, "theory": {...}, "tasks": [...],
-            "timeout_ms": N, "jobs": N}
+            "timeout_ms": N, "jobs": N, "salt": S, "cached": [key, ...]}
    stdout: {"results": [...], "terms": {"sorts": [...], "terms": [...]}}
 
    VC generation runs on the main domain; obligations are solved on up to
@@ -172,6 +172,42 @@ let make_job th timeout (ob : Vc.obligation) =
            && match c.sort with Array _ | Rec _ -> false | _ -> true)
   in
   { ob; neg_goal = not_ ob.goal; phases; probes = ob.inputs; state_consts }
+
+(* A job's cache key: a structural digest of everything the solver sees
+   (definitions, axioms, hypotheses, goal) and [salt] (the toolchain), so it
+   does not depend on term ids or on the rest of the request. *)
+let job_key salt (jb : job) : string =
+  let memo = Hashtbl.create 1024 in
+  let rec h (t : term) =
+    match Hashtbl.find_opt memo t.id with
+    | Some d -> d
+    | None ->
+      let kids xs = String.concat "," (Array.to_list (Array.map h xs)) in
+      let node =
+        match t.node with
+        | Const n -> "c" ^ n
+        | Num q -> Printf.sprintf "n%d/%d" q.n q.d
+        | Big s -> "B" ^ s
+        | BoolV b -> if b then "T" else "F"
+        | StrV s -> "s" ^ String.escaped s
+        | App (op, xs) -> "a" ^ op ^ "(" ^ kids xs ^ ")"
+        | Fn (n, xs) -> "f" ^ n ^ "(" ^ kids xs ^ ")"
+        | Quant (k, vs, b, ps) -> "q" ^ k ^ "(" ^ kids vs ^ ")" ^ h b ^ "[" ^ String.concat ";" (List.map kids ps) ^ "]"
+      in
+      let d = Digest.to_hex (Digest.string (node ^ ":" ^ Smt.sort_smt t.sort)) in
+      Hashtbl.add memo t.id d;
+      d
+  in
+  let b = Buffer.create 1024 in
+  Buffer.add_string b salt;
+  List.iter
+    (fun ((defs : Smt.fundef list), (axioms : Smt.axiom list), _) ->
+      List.iter (fun (d : Smt.fundef) -> Buffer.add_string b ("\ndef " ^ d.fname ^ "(" ^ String.concat "," (List.map h d.params) ^ ")" ^ Smt.sort_smt d.fsort ^ "=" ^ match d.body with Some x -> h x | None -> "?")) defs;
+      List.iter (fun (a : Smt.axiom) -> Buffer.add_string b ("\nax " ^ h a.formula)) axioms)
+    jb.phases;
+  List.iter (fun x -> Buffer.add_string b ("\nhyp " ^ h x)) jb.ob.hyps;
+  Buffer.add_string b ("\ngoal " ^ h jb.neg_goal);
+  Digest.to_hex (Digest.string (Buffer.contents b))
 
 (* Solve jobs on up to [jobs_n] domains, each driving its own z3. *)
 let debug = Sys.getenv_opt "TELIC_CORE_DEBUG" <> None
@@ -472,12 +508,27 @@ let () =
       | exception Vc.Fallback why -> results := (key, `Fallback why) :: !results
       | exception Vc.Vc_error (msg, loc) -> results := (key, `Error (msg, loc)) :: !results)
     (Json.to_list (Json.member "tasks" req));
-  (* 2. solve, in parallel *)
-  let jobs_arr = Array.of_list (List.rev !all_jobs) in
-  let solved = solve_parallel jobs_n jobs_arr in
-  let out = Array.map Option.some solved in
+  (* 2. solve, in parallel, what the cache has not proved already *)
+  let salt = match Json.member "salt" req with Json.String s -> s | _ -> "" in
+  let cached = Hashtbl.create 256 in
+  (match Json.member "cached" req with Json.List l -> List.iter (fun k -> Hashtbl.replace cached (Json.to_str k) ()) l | _ -> ());
+  let key_of = Hashtbl.create 256 in
   let result_of = Hashtbl.create 256 in
-  Array.iteri (fun i jb -> Hashtbl.replace result_of jb.ob.oid (Option.get out.(i))) jobs_arr;
+  let todo =
+    List.filter
+      (fun jb ->
+        let k = job_key salt jb in
+        Hashtbl.replace key_of jb.ob.oid k;
+        if Hashtbl.mem cached k then begin
+          Hashtbl.replace result_of jb.ob.oid { Smt.status = "proved"; seconds = 0.; model = []; state = []; reason = "cache" };
+          false
+        end
+        else true)
+      (List.rev !all_jobs)
+  in
+  let jobs_arr = Array.of_list todo in
+  let solved = solve_parallel jobs_n jobs_arr in
+  Array.iteri (fun i jb -> Hashtbl.replace result_of jb.ob.oid solved.(i)) jobs_arr;
   (* 3. answer *)
   let w = writer () in
   let clause_json = function
@@ -509,6 +560,7 @@ let () =
                     ("deps", Json.List (List.map (fun s -> Json.String s) ob.deps));
                     ("exclude", Json.List (List.map (fun s -> Json.String s) ob.exclude));
                     ("status", Json.String r.status);
+                    ("key", Json.String (Hashtbl.find key_of ob.oid));
                     ("seconds", Json.Float r.seconds);
                     ("reason", Json.String r.reason);
                     ("model", Json.Assoc r.model);

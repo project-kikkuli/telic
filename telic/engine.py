@@ -225,11 +225,15 @@ def _value(v: Any) -> Any:
     return v
 
 
-def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, jobs: int | None) -> dict[str, dict[str, Any]] | None:
+def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, jobs: int | None, cached: list[str] = (), salt: str = "") -> dict[str, dict[str, Any]] | None:
+    """``cached``: engine keys of obligations proved before (skipped, and
+    answered 'proved' by 'cache'); every obligation comes back with its key.
+    ``salt`` binds the keys to the toolchain."""
     exe = binary()
     if exe is None or not tasks:
         return None
     req, _ = request(program, theory, tasks, timeout_ms, jobs)
+    req["cached"], req["salt"] = list(cached), salt
     ans = _call(req)
     reader = irjson.TermReader(ans["terms"])
     out: dict[str, dict[str, Any]] = {}
@@ -275,7 +279,7 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
                 exclude_axioms=set(o["exclude"]),
                 inferred=o["inferred"],
             )
-            entry = {"ob": ob, "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}}
+            entry = {"ob": ob, "key": o["key"], "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}}
             if o["status"] == "refuted" and not plain:
                 # Objects/optionals in the model: decode them with the Python backend.
                 res = solve(ob, theory, timeout_ms)

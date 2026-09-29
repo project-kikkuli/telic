@@ -114,3 +114,16 @@ def test_engine_infers_what_python_infers(name):
         elif mine.summary() != infer(p, r, th, 1000).summary():
             diffs.append(f"{r.key}: {mine.summary()} vs {infer(p, r, th, 1000).summary()}")
     assert not diffs, "\n".join(diffs)
+
+
+@pytest.mark.parametrize("name", ["corpus.py", "objects/bank.py"])
+def test_engine_reuses_the_obligation_cache(tmp_path, monkeypatch, name):
+    monkeypatch.setenv("TELIC_ENGINE", "ox")
+    path = CASES / name
+    opts = CheckOptions(cache_path=str(tmp_path / "cache.json"), lean=False, replay=False, receipts=False, engine="ox")
+    first = check([str(path)], opts, root=str(path.parent))
+    second = check([str(path)], opts, root=str(path.parent))
+    proved = lambda rep: {v.ob.id for f in rep.functions for v in f.verdicts if v.status == "proved"}  # noqa: E731
+    assert proved(first) and proved(first) == proved(second)
+    assert {f.fn.name: f.status for f in first.functions} == {f.fn.name: f.status for f in second.functions}
+    assert second.cache_hits >= len(proved(first))

@@ -219,6 +219,9 @@ class Report:
 # does not change what has to be proved.
 
 
+ENGINE_KEY = "ox:"  # cache keys the native engine computes for its own obligations
+
+
 class ProofCache:
     VERSION = 3
 
@@ -352,6 +355,9 @@ def toolchain_id() -> str:
             if f.suffix in (".py", ".mjs", ".lean") and "node_modules" not in f.parts and "demo" not in f.parts:
                 h.update(f.relative_to(pkg).as_posix().encode())
                 h.update(f.read_bytes())
+        for f in sorted((pkg.parent / "core").glob("*.ml")):  # the native engine, where it is used
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
         _TOOLCHAIN = h.hexdigest()[:16]
     return _TOOLCHAIN
 
@@ -729,7 +735,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     # The native engine: VC generation and solving for its functions; the
     # ones it does not model yet go through the Python core.
     if engine_tasks:
-        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.jobs) or {}
+        cached = [k[len(ENGINE_KEY) :] for k, v in cache.data.items() if k.startswith(ENGINE_KEY) and v.get("method") == "z3"]
+        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.jobs, cached, toolchain_id()) or {}
         for rep, ref, inf, fkey, ft in engine_tasks:
             a = answers.get(ref.key)
             if a is None or a["status"] != "ok":
@@ -749,10 +756,15 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                     rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
             for o in a["obligations"]:
                 ob = o["ob"]
+                if o["status"] == "proved" and o["reason"] == "cache":
+                    hits += 1
+                    rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason="z3"))
+                    continue
                 solved += 1
                 v = Verdict(ob, o["status"], "z3", o["seconds"], o["model"], o["state"], o["reason"])
                 rep.verdicts.append(v)
                 if o["status"] == "proved":
+                    cache.put(ENGINE_KEY + o["key"], {"method": "z3"})
                     cache.put(obligation_key(ob, theory), {"method": "z3"})
             staged.append((rep, fkey, ft))
 
