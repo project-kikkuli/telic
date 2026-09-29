@@ -37,7 +37,7 @@ ACTS: list[Step] = [
         where the code lives, and contracts in comments. The runtime never
         executes a comment, so they cost nothing in production.
         """,
-        show=("server/billing.py", 5, 25),
+        show=("server/billing.py", 5, 26),
     ),
     # -- Act 1 -------------------------------------------------------------
     Step(
@@ -88,9 +88,16 @@ ACTS: list[Step] = [
     Step(
         title="ACT 2 · Your frontend and your backend disagree",
         say="""
-        The checkout page re-implements the discount in TypeScript, and declares that
-        it mirrors the server. Both functions meet their own contracts. Do they
-        agree with each other?
+        The checkout page re-implements the discount in TypeScript. That
+        requirement spans the server and the page, so it is declared in the
+        intents.md at the top of the shop, whose scope is everything below it.
+        """,
+        show=("intents.md", 6, 9),
+    ),
+    Step(
+        say="""
+        The page declares that it mirrors the server. Both functions meet their
+        own contracts. Do they agree with each other?
         """,
         show=("web/checkout.ts", 3, 10),
         run=["check", "web/checkout.ts"],
@@ -126,7 +133,7 @@ ACTS: list[Step] = [
         translated into Lean definitions, an unfolding lemma per definition, and
         callee contracts as explicit hypotheses:
         """,
-        run=["lean", "chained_bonus_is_product/ensures@18>19", "server/referrals.py", "--timeout", "2"],
+        run=["lean", "chained_bonus_is_product/ensures@20>21", "server/referrals.py", "--timeout", "2"],
     ),
     Step(
         say="""
@@ -181,7 +188,7 @@ def show_file(o: Out, root: Path, rel: str, lo: int, hi: int) -> str:
     out = [o.c("2", f"  {rel}")]
     for i in range(lo, min(hi, len(lines)) + 1):
         text = lines[i - 1]
-        if "@" in text and text.lstrip().startswith(("#@", "//@")):
+        if ("@" in text and text.lstrip().startswith(("#@", "//@"))) or (rel.endswith(".md") and text.startswith("## ")):
             text = o.c("36", text)
         out.append(o.c("2", f"  {i:>3} │ ") + text)
     return "\n".join(out)

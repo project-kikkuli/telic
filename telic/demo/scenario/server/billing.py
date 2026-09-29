@@ -5,9 +5,6 @@ from dataclasses import dataclass
 #@ intent REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
 #@   what the customer paid, net of earlier refunds.
 #@   by: refund_amount
-#@ intent PRICE-AGREE: WHEN a customer checks out, the checkout page shall show
-#@   exactly the amount the server charges.
-#@   by: discounted_total, web/checkout.ts::displayTotal
 #@ intent ORDER-NONNEG: The shop shall never compute a negative order total.
 #@   by: order_total
 
