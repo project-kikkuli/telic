@@ -25,7 +25,9 @@ _ID = re.compile(rf"^{INTENT_ID}$")
 
 
 def is_intent_file(path: str) -> bool:
-    return path.endswith(".md") and os.path.basename(os.path.dirname(os.path.normpath(path))) == DIR
+    """An .md file directly in an intents/ directory; its README is a plain doc."""
+    name = os.path.basename(path)
+    return name.endswith(".md") and name.lower() != "readme.md" and os.path.basename(os.path.dirname(os.path.normpath(path))) == DIR
 
 
 def scope_of(path: str) -> str:

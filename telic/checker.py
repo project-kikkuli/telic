@@ -113,7 +113,7 @@ def intents_modules(paths: list[str], named: list[str], root: str) -> list[ir.Mo
     """The intents/<ID>.md files named or walked, plus those in the intents/
     directories of ancestors up to the root. Ancestors come as context: their
     intents are reported only where the checked code cites them."""
-    from .frontend.intent_file import DIR, lower_intent_file
+    from .frontend.intent_file import DIR, is_intent_file, lower_intent_file
 
     own = {os.path.normpath(os.path.abspath(f)) for f in named}
     top = os.path.normpath(os.path.abspath(root))
@@ -124,7 +124,7 @@ def intents_modules(paths: list[str], named: list[str], root: str) -> list[ir.Mo
         while d == top or d.startswith(top + os.sep):
             above = os.path.join(d, DIR)
             if os.path.isdir(above):
-                ancestors.update(os.path.join(above, f) for f in os.listdir(above) if f.endswith(".md"))
+                ancestors.update(f for f in (os.path.join(above, n) for n in os.listdir(above)) if is_intent_file(f))
             if d == top:
                 break
             d = os.path.dirname(d)

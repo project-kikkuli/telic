@@ -52,7 +52,6 @@ def run(root: Path, *args: str, capsys=None) -> tuple[int, str]:
         ("CAP", f"## CAP\n{SAME}\n", [], ["has a heading"]),
         ("cap", f"{SAME}\n", [], ["not an intent ID"]),
         ("CAP_2", f"{SAME}\n", [], ["not an intent ID"]),
-        ("README", f"{SAME}\n", [("README", SAME, 1)], []),
     ],
 )
 def test_parse(name, source, decls, problems):
@@ -126,6 +125,14 @@ def test_a_deep_check_reads_every_intents_dir_above_it(tmp_path):
     tree(tmp_path, {**intents("", ("TOP", SAME, "")), **intents("a/", ("MID", SAME, "")), **intents("a/b/c/", ("LOW", SAME, "")), "a/b/c/x.py": fn("f", "TOP") + fn("g", "MID") + fn("h", "LOW")})
     _, got = report(tmp_path, ["a/b/c/x.py"])
     assert {k: (i.status, i.loc[0]) for k, i in got.items()} == {"TOP": ("backed", "intents/TOP.md"), "MID": ("backed", "a/intents/MID.md"), "LOW": ("backed", "a/b/c/intents/LOW.md")}
+
+@pytest.mark.parametrize("name", ["README.md", "readme.md", "ReadMe.md"])
+@pytest.mark.parametrize("check", [".", "a/x.py"])
+def test_readme_in_intents_is_a_doc(tmp_path, capsys, name, check):
+    tree(tmp_path, {**intents("", ("PAY", SAME, "")), f"intents/{name}": "# Intents\n\nOne file per intent.\n", "a/x.py": fn("charge", "PAY")})
+    rep, got = report(tmp_path, [check])
+    assert set(got) == {"PAY"} and not any(m.problems for m in rep.modules)
+    assert run(tmp_path, capsys=capsys)[0] == 0
 
 @pytest.mark.parametrize(
     "target, expected",
