@@ -598,9 +598,10 @@ class VCGen:
             if fn.raises:
                 ctx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ctx) for r in fn.raises])
+                # (evaluated quietly; the obligation itself must not be quiet)
                 self.oblige(
                     "raises",
-                    ctx,
+                    ctx.sub(quiet=False),
                     L.not_(cond),
                     fn.raises[0].loc,
                     f"returns normally although '@raises {fn.raises[0].text}' holds",

@@ -1,0 +1,328 @@
+(* telic-core: the native verification engine.
+
+   stdin:  {"modules": [...], "program": {...}, "theory": {...}, "tasks": [...],
+            "timeout_ms": N, "jobs": N}
+   stdout: {"results": [...], "terms": {"sorts": [...], "terms": [...]}}
+
+   VC generation runs on the main domain; obligations are solved on up to
+   [jobs] domains, each driving its own z3 process. *)
+
+open Term
+
+(* -- reading terms ---------------------------------------------------------- *)
+
+let read_terms (j : Json.t) : term array =
+  let sorts = ref [||] in
+  let sl = Json.to_list (Json.member "sorts" j) in
+  let sa = Array.make (List.length sl) Int in
+  List.iteri
+    (fun i enc ->
+      sa.(i) <-
+        (match enc with
+         | Json.List [ Json.String "Array"; ix; e ] -> Array (sa.(Json.to_int ix), sa.(Json.to_int e))
+         | Json.List [ Json.String "Rec"; Json.String n; Json.List fs ] -> Rec (n, List.map (function Json.List [ Json.String f; s ] -> (f, sa.(Json.to_int s)) | _ -> failwith "rec field") fs)
+         | Json.List [ Json.String "Int" ] -> Int
+         | Json.List [ Json.String "Real" ] -> Real
+         | Json.List [ Json.String "Bool" ] -> Bool
+         | Json.List [ Json.String "Str" ] -> Str
+         | Json.List [ Json.String "Opaque" ] -> Opaque
+         | Json.List [ Json.String "None" ] -> Unit
+         | _ -> failwith ("unknown sort " ^ Json.to_string enc)))
+    sl;
+  sorts := sa;
+  let tl = Json.to_list (Json.member "terms" j) in
+  let ta = Array.make (List.length tl) tt in
+  let ids xs = Array.of_list (List.map (fun x -> ta.(Json.to_int x)) (Json.to_list xs)) in
+  List.iteri
+    (fun i enc ->
+      ta.(i) <-
+        (match enc with
+         | Json.List [ Json.String "c"; Json.String n; s ] -> const n !sorts.(Json.to_int s)
+         | Json.List [ Json.String "i"; Json.String v ] -> ( match int_of_string_opt v with Some n -> int_ n | None -> mk (Big v) Int)
+         | Json.List [ Json.String "r"; Json.String n; Json.String d ] -> (
+           match (int_of_string_opt n, int_of_string_opt d) with Some n, Some d -> real (Q.make n d) | _ -> mk (Big (n ^ "/" ^ d)) Real)
+         | Json.List [ Json.String "b"; Json.Bool b ] -> bool_ b
+         | Json.List [ Json.String "s"; Json.String s ] -> str s
+         | Json.List [ Json.String "a"; Json.String op; s; xs ] -> app op (ids xs) !sorts.(Json.to_int s)
+         | Json.List [ Json.String "f"; Json.String n; s; xs ] -> fn n (ids xs) !sorts.(Json.to_int s)
+         | Json.List [ Json.String "q"; Json.String k; vs; b; ps ] -> quant k (Array.to_list (ids vs)) ta.(Json.to_int b) (List.map ids (Json.to_list ps))
+         | _ -> failwith ("unknown term " ^ Json.to_string enc)))
+    tl;
+  ta
+
+(* -- writing terms (a DAG table) ---------------------------------------------- *)
+
+type writer = { sorts : (sort, int) Hashtbl.t; mutable sl : Json.t list; mutable ns : int; tids : (int, int) Hashtbl.t; mutable tl : Json.t list; mutable nt : int }
+
+let writer () = { sorts = Hashtbl.create 16; sl = []; ns = 0; tids = Hashtbl.create 1024; tl = []; nt = 0 }
+
+let rec wsort w s =
+  match Hashtbl.find_opt w.sorts s with
+  | Some i -> i
+  | None ->
+    let enc =
+      match s with
+      | Array (i, e) -> Json.List [ Json.String "Array"; Json.Int (wsort w i); Json.Int (wsort w e) ]
+      | Rec (n, fs) -> Json.List [ Json.String "Rec"; Json.String n; Json.List (List.map (fun (f, fs) -> Json.List [ Json.String f; Json.Int (wsort w fs) ]) fs) ]
+      | s -> Json.List [ Json.String (sort_name s) ]
+    in
+    let i = w.ns in
+    Hashtbl.add w.sorts s i;
+    w.sl <- enc :: w.sl;
+    w.ns <- i + 1;
+    i
+
+let rec wterm w (t : term) =
+  match Hashtbl.find_opt w.tids t.id with
+  | Some i -> i
+  | None ->
+    let ids xs = Json.List (Array.to_list (Array.map (fun x -> Json.Int (wterm w x)) xs)) in
+    let enc =
+      match t.node with
+      | Const n -> Json.List [ Json.String "c"; Json.String n; Json.Int (wsort w t.sort) ]
+      | Num q -> if t.sort = Int then Json.List [ Json.String "i"; Json.String (string_of_int q.n) ] else Json.List [ Json.String "r"; Json.String (string_of_int q.n); Json.String (string_of_int q.d) ]
+      | Big s -> (
+        match String.index_opt s '/' with
+        | Some k -> Json.List [ Json.String "r"; Json.String (String.sub s 0 k); Json.String (String.sub s (k + 1) (String.length s - k - 1)) ]
+        | None -> Json.List [ Json.String "i"; Json.String s ])
+      | BoolV b -> Json.List [ Json.String "b"; Json.Bool b ]
+      | StrV s -> Json.List [ Json.String "s"; Json.String s ]
+      | App (op, xs) -> Json.List [ Json.String "a"; Json.String op; Json.Int (wsort w t.sort); ids xs ]
+      | Fn (n, xs) -> Json.List [ Json.String "f"; Json.String n; Json.Int (wsort w t.sort); ids xs ]
+      | Quant (k, vs, b, ps) -> Json.List [ Json.String "q"; Json.String k; ids vs; Json.Int (wterm w b); Json.List (List.map ids ps) ]
+    in
+    let i = w.nt in
+    Hashtbl.add w.tids t.id i;
+    w.tl <- enc :: w.tl;
+    w.nt <- i + 1;
+    i
+
+(* -- the request ------------------------------------------------------------ *)
+
+let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.Int l.end_col ]
+
+type job = { ob : Vc.obligation; neg_goal : term; phases : (Smt.fundef list * Smt.axiom list * int) list; probes : (string * Vc.value) list; state_consts : term list }
+
+let solve_job z (jb : job) : Smt.result =
+  let t0 = Unix.gettimeofday () in
+  let rec go = function
+    | [] -> { Smt.status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "no phases" }
+    | (defs, axioms, timeout) :: rest -> (
+      let text = Smt.script defs axioms jb.ob.hyps jb.neg_goal in
+      (match Sys.getenv_opt "TELIC_CORE_DUMP" with
+       | Some dir -> Out_channel.with_open_text (Filename.concat dir (String.map (fun c -> if c = '/' || c = '>' || c = '#' then '_' else c) jb.ob.oid ^ Printf.sprintf ".%d.smt2" timeout)) (fun oc -> output_string oc text)
+       | None -> ());
+      let ans, err = Smt.check z ~timeout_ms:timeout text in
+      match ans with
+      | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
+      | "sat" ->
+        (* inputs: scalars first, then list lengths, then list elements *)
+        let too_big = ref false in
+        let model =
+          List.map
+            (fun (name, v) ->
+              match v with
+              | Vc.T t -> (name, Smt.value_json t.sort (List.hd (Smt.get_values_raw z [ Smt.term_text t ])))
+              | Vc.L l ->
+                let n = match Smt.get_values_raw z [ Smt.term_text l.len ] with [ v ] -> (match Smt.value_json Int v with Json.Int n -> n | _ -> 0) | _ -> 0 in
+                if n > 256 then too_big := true;
+                let n = max 0 (min n 256) in
+                let arr = Smt.term_text l.arr and off = Smt.term_text l.off in
+                let es = List.init n (fun i -> Printf.sprintf "(select %s (+ %s %d))" arr off i) in
+                let vals = Smt.get_values_raw z es in
+                (name, Json.List (List.map (Smt.value_json (elem_sort l.arr.sort)) vals))
+              | Vc.NoneV -> (name, Json.Null))
+            jb.probes
+        in
+        let state =
+          if jb.state_consts = [] then []
+          else
+            let vals = Smt.get_values_raw z (List.map Smt.term_text jb.state_consts) in
+            List.map2 (fun (c : term) v -> ((match c.node with Const n -> n | _ -> "?"), Smt.value_json c.sort v)) jb.state_consts vals
+        in
+        { status = "refuted"; seconds = Unix.gettimeofday () -. t0; model; state; reason = (if !too_big then "the model's list input is too large to replay" else "") }
+      | _ ->
+        if rest <> [] then go rest
+        else { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = (if err <> "" then err else Smt.reason_unknown z) })
+  in
+  go jb.phases
+
+let () =
+  let input = In_channel.input_all stdin in
+  let req = Json.parse input in
+  let terms = read_terms (Json.member "theory" req) in
+  let th =
+    let fundefs = Hashtbl.create 16 in
+    List.iter
+      (fun d ->
+        let name = Json.to_str (Json.member "name" d) in
+        let body = match Json.member "body" d with Json.Int i -> Some terms.(i) | _ -> None in
+        let params = List.map (fun i -> terms.(Json.to_int i)) (Json.to_list (Json.member "params" d)) in
+        let fsort = match body with Some b -> b.sort | None -> Int in
+        let fsort = match Json.member "sort" d with Json.Int i -> terms.(i).sort | _ -> fsort in
+        Hashtbl.replace fundefs name { Smt.fname = name; params; fsort; body })
+      (Json.to_list (Json.member "fundefs" (Json.member "theory" req)));
+    let axioms =
+      List.map
+        (fun a ->
+          { Smt.aname = Json.to_str (Json.member "name" a); formula = terms.(Json.to_int (Json.member "formula" a)); about = Json.to_str (Json.member "about" a); symbol = (match Json.member "symbol" a with Json.String s -> s | _ -> "") })
+        (Json.to_list (Json.member "axioms" (Json.member "theory" req)))
+    in
+    { Smt.fundefs; axioms }
+  in
+  let modules = List.map Ir.module_of (Json.to_list (Json.member "modules" req)) in
+  let funcs = Hashtbl.create 64 in
+  let pinfo = Json.member "program" req in
+  List.iter
+    (fun (m : Ir.modul) ->
+      List.iter
+        (fun (f : Ir.func) ->
+          let key = m.path ^ "::" ^ f.name in
+          let pj = Json.member key pinfo in
+          let strs k = List.map Json.to_str (Json.to_list (Json.member k pj)) in
+          Hashtbl.replace funcs key
+            {
+              Vc.key;
+              fn = f;
+              modpath = m.path;
+              mutated = strs "mutated";
+              appends = strs "appends";
+              definitional = Json.to_bool (Json.member "definitional" pj);
+              logic_name = (match Json.member "logic_name" pj with Json.String s -> s | _ -> f.name);
+              scc = strs "scc";
+              recursive = Json.to_bool (Json.member "recursive" pj);
+              resolve = (match Json.member "resolve" pj with Json.Assoc kvs -> List.map (fun (k, v) -> (k, Json.to_str v)) kvs | _ -> []);
+            })
+        m.functions)
+    modules;
+  let prog = { Vc.funcs } in
+  let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 8000 in
+  let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
+  (* 1. VC generation, sequentially *)
+  let results = ref [] and all_jobs = ref [] in
+  List.iter
+    (fun task ->
+      let key = Json.to_str (Json.member "key" task) in
+      let info = Hashtbl.find funcs key in
+      let oj = Json.member "options" task in
+      let opts =
+        {
+          Vc.extra_invariants = (match Json.member "extra_invariants" oj with Json.Assoc kvs -> List.map (fun (l, cs) -> (int_of_string l, List.map Ir.clause_of (Json.to_list cs))) kvs | _ -> []);
+          variants = (match Json.member "variants" oj with Json.Assoc kvs -> List.map (fun (l, e) -> (int_of_string l, Ir.expr_of e)) kvs | _ -> []);
+          measures = (match Json.member "measures" oj with Json.Assoc kvs -> List.map (fun (k, e) -> (k, Ir.expr_of e)) kvs | _ -> []);
+        }
+      in
+      let g = Vc.make prog info opts in
+      match Vc.run g with
+      | obs ->
+        let jobs =
+          List.map
+            (fun (ob : Vc.obligation) ->
+              let terms_ = ob.hyps @ [ ob.goal ] in
+              let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
+              let phases =
+                if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, timeout) ]
+                else [ (fst without, snd without, max 300 (min 800 (timeout / 10))); (fst with_l, snd with_l, timeout) ]
+              in
+              let input_consts = List.concat_map (fun (_, v) -> match v with Vc.T t -> [ t ] | Vc.L l -> [ l.arr; l.len ] | _ -> []) ob.inputs in
+              let state_consts =
+                List.concat_map consts terms_
+                |> List.sort_uniq (fun (a : term) b -> compare (match a.node with Const n -> n | _ -> "") (match b.node with Const n -> n | _ -> ""))
+                |> List.filter (fun (c : term) ->
+                       (not (List.memq c input_consts))
+                       && (match c.node with Const n -> not (String.contains n '!') | _ -> false)
+                       && match c.sort with Array _ | Rec _ -> false | _ -> true)
+              in
+              { ob; neg_goal = not_ ob.goal; phases; probes = ob.inputs; state_consts })
+            obs
+        in
+        all_jobs := List.rev_append jobs !all_jobs;
+        results := (key, `Ok (g, jobs)) :: !results
+      | exception Vc.Fallback why -> results := (key, `Fallback why) :: !results
+      | exception Vc.Vc_error (msg, loc) -> results := (key, `Error (msg, loc)) :: !results)
+    (Json.to_list (Json.member "tasks" req));
+  (* 2. solve, in parallel *)
+  let jobs_arr = Array.of_list (List.rev !all_jobs) in
+  let n = Array.length jobs_arr in
+  let out = Array.make n None in
+  let next = Atomic.make 0 in
+  let worker () =
+    let z = Smt.spawn () in
+    let rec loop () =
+      let i = Atomic.fetch_and_add next 1 in
+      if i < n then begin
+        out.(i) <- Some (try solve_job z jobs_arr.(i) with e -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "engine: " ^ Printexc.to_string e });
+        loop ()
+      end
+    in
+    loop ();
+    Smt.close z
+  in
+  let k = max 1 (min jobs_n n) in
+  let doms = (List.init (k - 1) (fun _ -> (Domain.spawn [@alert "-do_not_spawn_domains"] [@alert "-unsafe_multidomain"]) worker)) in
+  if n > 0 then worker ();
+  List.iter Domain.join doms;
+  let result_of = Hashtbl.create 256 in
+  Array.iteri (fun i jb -> Hashtbl.replace result_of jb.ob.oid (Option.get out.(i))) jobs_arr;
+  (* 3. answer *)
+  let w = writer () in
+  let clause_json = function
+    | None -> Json.Null
+    | Some (c : Ir.clause) -> Json.Assoc [ ("kind", Json.String c.ckind); ("loc", loc_json c.cloc); ("text", Json.String c.text); ("inferred", Json.Bool c.inferred) ]
+  in
+  let res_json =
+    List.rev_map
+      (fun (key, r) ->
+        match r with
+        | `Fallback why -> Json.Assoc [ ("key", Json.String key); ("status", Json.String "fallback"); ("reason", Json.String why) ]
+        | `Error (msg, loc) -> Json.Assoc [ ("key", Json.String key); ("status", Json.String "error"); ("reason", Json.String msg); ("loc", loc_json loc) ]
+        | `Ok ((g : Vc.gen), jobs) ->
+          let obs =
+            List.map
+              (fun jb ->
+                let ob = jb.ob in
+                let r = Hashtbl.find result_of ob.oid in
+                Json.Assoc
+                  [
+                    ("id", Json.String ob.oid);
+                    ("kind", Json.String ob.kind);
+                    ("loc", loc_json ob.oloc);
+                    ("site", match ob.site with Some s -> loc_json s | None -> Json.Null);
+                    ("message", Json.String ob.message);
+                    ("clause", clause_json ob.clause);
+                    ("intents", Json.List (List.map (fun s -> Json.String s) ob.intents));
+                    ("inferred", Json.Bool ob.inferred);
+                    ("deps", Json.List (List.map (fun s -> Json.String s) ob.deps));
+                    ("exclude", Json.List (List.map (fun s -> Json.String s) ob.exclude));
+                    ("status", Json.String r.status);
+                    ("seconds", Json.Float r.seconds);
+                    ("reason", Json.String r.reason);
+                    ("model", Json.Assoc r.model);
+                    ("state", Json.Assoc r.state);
+                    ("hyps", Json.List (List.map (fun h -> Json.Int (wterm w h)) ob.hyps));
+                    ("goal", Json.Int (wterm w ob.goal));
+                    ( "inputs",
+                      Json.List
+                        (List.map
+                           (fun (name, v) ->
+                             match v with
+                             | Vc.T t -> Json.List [ Json.String name; Json.Assoc [ ("t", Json.Int (wterm w t)) ] ]
+                             | Vc.L l -> Json.List [ Json.String name; Json.Assoc [ ("list", Json.List [ Json.Int (wterm w l.arr); Json.Int (wterm w l.off); Json.Int (wterm w l.len) ]) ] ]
+                             | Vc.NoneV -> Json.List [ Json.String name; Json.Null ])
+                           ob.inputs) );
+                  ])
+              jobs
+          in
+          Json.Assoc
+            [
+              ("key", Json.String key);
+              ("status", Json.String "ok");
+              ("obligations", Json.List obs);
+              ("assumptions", Json.List (List.map (fun (l, t) -> Json.List [ Json.Int l; Json.String t ]) (List.rev g.assumptions)));
+              ("deps", Json.List (List.map (fun s -> Json.String s) g.deps));
+              ("loop_notes", Json.List (List.map (fun (l, t) -> Json.List [ Json.Int l; Json.String t ]) (List.rev g.loop_notes)));
+            ])
+      !results
+  in
+  let answer = Json.Assoc [ ("results", Json.List res_json); ("terms", Json.Assoc [ ("sorts", Json.List (List.rev w.sl)); ("terms", Json.List (List.rev w.tl)) ]) ] in
+  print_string (Json.to_string answer)

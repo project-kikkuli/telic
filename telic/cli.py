@@ -32,6 +32,7 @@ def _options(args: argparse.Namespace, root: str) -> CheckOptions:
         cache_path=None if args.no_cache else _cache_path(root),
         only=set(args.only) if args.only else None,
         jobs=getattr(args, "jobs", None),
+        engine=getattr(args, "engine", None) or os.environ.get("TELIC_ENGINE", "python"),
     )
 
 
@@ -44,6 +45,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--only", action="append", metavar="FUNC", help="check only these functions")
     ap.add_argument("--root", default=None, help="project root for relative paths and the cache (default: cwd)")
     ap.add_argument("-j", "--jobs", type=int, default=None, help="solver threads (default: every core)")
+    ap.add_argument("--engine", choices=["python", "ox"], default=None, help="'ox': the native OxCaml engine (core/), where it applies")
 
 
 def report_json(rep: Report) -> dict[str, Any]:

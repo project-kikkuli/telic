@@ -371,6 +371,7 @@ class CheckOptions:
     progress: Callable[[str], None] | None = None
     receipts: bool = True  # reuse whole-function verdicts for unchanged functions
     jobs: int | None = None  # solver threads (default: every core)
+    engine: str = "python"  # "ox": the native engine (core/), where it applies
 
 
 _POOL: dict[str, Any] = {}
@@ -505,6 +506,57 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     pending: list[tuple[Verdict, str]] = []
     staged: list[tuple[FunctionReport, str | None, float]] = []
+    engine_tasks: list[tuple[FunctionReport, FuncRef, Inferred, str | None, float]] = []
+    use_engine = opts.engine == "ox"
+    if use_engine:
+        from . import engine as _engine
+
+        use_engine = _engine.binary() is not None
+
+    def python_gather(rep: FunctionReport, ref: FuncRef, inf: Inferred) -> bool:
+        """Generate and triage one function's obligations with the Python core.
+        False when the function could not be verified (the report says why)."""
+        nonlocal hits, solved
+        try:
+            gen = VCGen(program, ref, inf.options)
+            obs = gen.run()
+        except VCError as e:
+            rep.status = "error"
+            rep.problems.append((str(e), e.loc or ref.fn.loc))
+            return False
+        rep.assumptions = gen.assumptions
+        rep.deps = set(gen.deps)
+        for line, note in gen.loop_notes:
+            if note == "no-variant":
+                rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
+        for ob in obs:
+            key_ = obligation_key(ob, theory)
+            hit = cache.get(key_)
+            if hit is not None and hit.get("method") == "unknown":
+                if hit.get("timeout", 0) >= opts.timeout_ms:
+                    hits += 1
+                    rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'timeout')} (cached)"))
+                    continue
+                hit = None
+            if hit is not None and hit.get("method") == "lean:proof" and hit.get("proof_hash") != sidecar_proof_hash(ref, ob.id, root):
+                # The sidecar proof was edited or removed: Z3 already failed
+                # on this exact formula, so go straight back to Lean.
+                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason="needs Lean"))
+                continue
+            if hit is not None:
+                if cache.fresh(key_):
+                    solved += 1  # a duplicate obligation proved earlier in this run
+                else:
+                    hits += 1
+                rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=hit.get("method", "")))
+                continue
+            solved += 1
+            v = Verdict(ob, "pending", "z3", 0.0)
+            pending.append((v, key_))
+            rep.verdicts.append(v)
+        return True
+
+
     for key, ref in program.funcs.items():
         fn = ref.fn
         if opts.only and fn.name not in opts.only:
@@ -537,46 +589,39 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             rep.from_receipt = True
             reports.append(rep)
             continue
-        try:
-            gen = VCGen(program, ref, inf.options)
-            obs = gen.run()
-        except VCError as e:
-            rep.status = "error"
-            rep.problems.append((str(e), e.loc or fn.loc))
+        if use_engine:
+            engine_tasks.append((rep, ref, inf, fkey, ft))
             reports.append(rep)
             continue
-        rep.assumptions = gen.assumptions
-        rep.deps = set(gen.deps)
-        for line, note in gen.loop_notes:
-            if note == "no-variant":
-                rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
-        for ob in obs:
-            key_ = obligation_key(ob, theory)
-            hit = cache.get(key_)
-            if hit is not None and hit.get("method") == "unknown":
-                if hit.get("timeout", 0) >= opts.timeout_ms:
-                    hits += 1
-                    rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'timeout')} (cached)"))
-                    continue
-                hit = None
-            if hit is not None and hit.get("method") == "lean:proof" and hit.get("proof_hash") != sidecar_proof_hash(ref, ob.id, root):
-                # The sidecar proof was edited or removed: Z3 already failed
-                # on this exact formula, so go straight back to Lean.
-                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason="needs Lean"))
-                continue
-            if hit is not None:
-                if cache.fresh(key_):
-                    solved += 1  # a duplicate obligation proved earlier in this run
-                else:
-                    hits += 1
-                rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=hit.get("method", "")))
-                continue
-            solved += 1
-            v = Verdict(ob, "pending", "z3", 0.0)
-            pending.append((v, key_))
-            rep.verdicts.append(v)
+        if not python_gather(rep, ref, inf):
+            reports.append(rep)
+            continue
         staged.append((rep, fkey, ft))
         reports.append(rep)
+
+    # The native engine: VC generation and solving for its functions; the
+    # ones it does not model yet go through the Python core.
+    if engine_tasks:
+        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.jobs) or {}
+        for rep, ref, inf, fkey, ft in engine_tasks:
+            a = answers.get(ref.key)
+            if a is None or a["status"] != "ok":
+                if python_gather(rep, ref, inf):
+                    staged.append((rep, fkey, ft))
+                continue
+            rep.assumptions = a["assumptions"]
+            rep.deps = a["deps"]
+            for line, note in a["loop_notes"]:
+                if note == "no-variant":
+                    rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
+            for o in a["obligations"]:
+                ob = o["ob"]
+                solved += 1
+                v = Verdict(ob, o["status"], "z3", o["seconds"], o["model"], o["state"], o["reason"])
+                rep.verdicts.append(v)
+                if o["status"] == "proved":
+                    cache.put(obligation_key(ob, theory), {"method": "z3"})
+            staged.append((rep, fkey, ft))
 
     # Solve everything pending at once: each obligation gets its own Z3
     # context, and Z3 releases the GIL while it works, so threads use every

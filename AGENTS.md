@@ -21,6 +21,7 @@ Read [docs/design.md](docs/design.md) first.
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
 | `telic/intent.py` | intents: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
+| `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving for the core fragment, `--engine ox`; anything it does not model falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
 
 ## Rules
@@ -47,4 +48,5 @@ Read [docs/design.md](docs/design.md) first.
 pip install -e '.[test]'
 pytest -q                           # Lean tests skip if Lean is not installed
 telic demo --no-pause               # the end-to-end story must stay green
+make -C core                        # native engine; needs an OxCaml switch (5.2.0+ox)
 ```

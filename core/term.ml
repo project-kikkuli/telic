@@ -1,0 +1,392 @@
+(* Logical terms, hash-consed: every distinct term exists once, so equality
+   is physical ([==]) and a term's id is a perfect hash. Smart constructors
+   fold and simplify exactly like telic/logic.py, so the two cores build the
+   same obligations. *)
+
+type sort =
+  | Int
+  | Real
+  | Bool
+  | Str
+  | Opaque
+  | Unit  (** Python None *)
+  | Array of sort * sort  (** index, element *)
+  | Rec of string * (string * sort) list
+
+let rec sort_name = function
+  | Int -> "Int"
+  | Real -> "Real"
+  | Bool -> "Bool"
+  | Str -> "Str"
+  | Opaque -> "Opaque"
+  | Unit -> "None"
+  | Array (i, e) -> if i = Int then Printf.sprintf "Array[%s]" (sort_name e) else Printf.sprintf "Array[%s->%s]" (sort_name i) (sort_name e)
+  | Rec (n, _) -> n
+
+let elem_sort = function Array (_, e) -> e | s -> failwith ("not an array: " ^ sort_name s)
+let index_sort = function Array (i, _) -> i | _ -> Int
+
+(* exact rationals over native ints; None on overflow *)
+module Q = struct
+  type t = { n : int; d : int }
+
+  let rec gcd a b = if b = 0 then abs a else gcd b (a mod b)
+
+  let make n d =
+    if d = 0 then invalid_arg "Q.make";
+    let g = gcd n d in
+    let g = if g = 0 then 1 else g in
+    let n, d = (n / g, d / g) in
+    if d < 0 then { n = -n; d = -d } else { n; d }
+
+  let of_int n = { n; d = 1 }
+  let is_int q = q.d = 1
+
+  (* overflow-checked arithmetic *)
+  let mul_ok a b = if a = 0 || b = 0 then Some 0 else let r = a * b in if r / b = a && not (a = -1 && b = min_int) && not (b = -1 && a = min_int) then Some r else None
+  let add_ok a b = let r = a + b in if (a >= 0) = (b >= 0) && (r >= 0) <> (a >= 0) then None else Some r
+
+  let ( let* ) = Option.bind
+
+  let add x y =
+    let* a = mul_ok x.n y.d in
+    let* b = mul_ok y.n x.d in
+    let* n = add_ok a b in
+    let* d = mul_ok x.d y.d in
+    Some (make n d)
+
+  let neg x = if x.n = min_int then None else Some { x with n = -x.n }
+  let sub x y = let* ny = neg y in add x ny
+
+  let mul x y =
+    let* n = mul_ok x.n y.n in
+    let* d = mul_ok x.d y.d in
+    Some (make n d)
+
+  let div x y =
+    if y.n = 0 then None
+    else
+      let* n = mul_ok x.n y.d in
+      let* d = mul_ok x.d y.n in
+      Some (make n d)
+
+  let compare x y =
+    (* sign of x - y without overflow worries for the common case *)
+    match sub x y with Some r -> compare r.n 0 | None -> compare (float_of_int x.n /. float_of_int x.d) (float_of_int y.n /. float_of_int y.d)
+
+  let floor x = if x.d = 1 then x.n else if x.n >= 0 then x.n / x.d else -(((-x.n) + x.d - 1) / x.d)
+  let to_string x = if x.d = 1 then string_of_int x.n else Printf.sprintf "%d/%d" x.n x.d
+end
+
+type term = { id : int; node : node; sort : sort }
+
+and node =
+  | Const of string
+  | Num of Q.t  (** Int or Real literal (by sort) *)
+  | Big of string  (** a literal too large to fold: kept as text *)
+  | BoolV of bool
+  | StrV of string
+  | App of string * term array
+  | Fn of string * term array
+  | Quant of string * term array * term * term array list  (** kind, bound vars, body, patterns *)
+
+(* -- hash-consing ------------------------------------------------------ *)
+
+module Key = struct
+  type t = node * sort
+
+  let equal (a, sa) (b, sb) =
+    sa = sb
+    &&
+    match (a, b) with
+    | Const x, Const y -> String.equal x y
+    | Num x, Num y -> x.n = y.n && x.d = y.d
+    | Big x, Big y -> String.equal x y
+    | BoolV x, BoolV y -> x = y
+    | StrV x, StrV y -> String.equal x y
+    | App (o, xs), App (p, ys) | Fn (o, xs), Fn (p, ys) -> String.equal o p && Array.length xs = Array.length ys && Array.for_all2 ( == ) xs ys
+    | Quant (k, vs, b, ps), Quant (k', vs', b', ps') ->
+      String.equal k k' && b == b' && Array.length vs = Array.length vs' && Array.for_all2 ( == ) vs vs'
+      && List.length ps = List.length ps'
+      && List.for_all2 (fun p q -> Array.length p = Array.length q && Array.for_all2 ( == ) p q) ps ps'
+    | _ -> false
+
+  let ids xs = Array.fold_left (fun h (t : term) -> (h * 31) + t.id) 7 xs
+
+  let hash (n, s) =
+    let h =
+      match n with
+      | Const x -> Hashtbl.hash (0, x)
+      | Num q -> Hashtbl.hash (1, q.n, q.d)
+      | Big x -> Hashtbl.hash (2, x)
+      | BoolV b -> Hashtbl.hash (3, b)
+      | StrV x -> Hashtbl.hash (4, x)
+      | App (o, xs) -> Hashtbl.hash (5, o, ids xs)
+      | Fn (o, xs) -> Hashtbl.hash (6, o, ids xs)
+      | Quant (k, vs, b, ps) -> Hashtbl.hash (7, k, ids vs, b.id, List.length ps)
+    in
+    (h * 17) + Hashtbl.hash s
+end
+
+module H = Hashtbl.Make (Key)
+
+let table : term H.t = H.create 65536
+let counter = ref 0
+
+let mk node sort =
+  let key = (node, sort) in
+  match H.find_opt table key with
+  | Some t -> t
+  | None ->
+    incr counter;
+    let t = { id = !counter; node; sort } in
+    H.add table key t;
+    t
+
+(* -- leaves ------------------------------------------------------------- *)
+
+let const name sort = mk (Const name) sort
+let int_ n = mk (Num (Q.of_int n)) Int
+let real q = mk (Num q) Real
+let bool_ b = mk (BoolV b) Bool
+let str s = mk (StrV s) Str
+let tt = bool_ true
+let ff = bool_ false
+let zero = int_ 0
+let one = int_ 1
+
+let num t = match t.node with Num q -> Some q | _ -> None
+
+let lit_q (q : Q.t) sort = match sort with Int -> int_ (Q.floor q) | Real -> real q | _ -> invalid_arg "lit_q"
+
+let lit_or_app op sort (r : Q.t option) args = match r with Some q -> lit_q q sort | None -> mk (App (op, args)) sort
+
+let app op args sort = mk (App (op, args)) sort
+let fn name args sort = mk (Fn (name, args)) sort
+
+let is_bool_lit t = match t.node with BoolV _ -> true | _ -> false
+
+(* -- smart constructors (mirror telic/logic.py) ------------------------- *)
+
+let rec add a b =
+  match (num a, num b) with
+  | Some x, Some y -> lit_or_app "add" a.sort (Q.add x y) [| a; b |]
+  | Some x, _ when x.n = 0 -> b
+  | _, Some y when y.n = 0 -> a
+  | _, Some y -> (
+    match a.node with
+    | App ("add", [| e; c |]) when num c <> None -> (
+      match Q.add (Option.get (num c)) y with Some s -> add e (lit_q s a.sort) | None -> app "add" [| a; b |] a.sort)
+    | _ -> if Q.compare y (Q.of_int 0) < 0 then (match Q.neg y with Some ny -> app "sub" [| a; lit_q ny a.sort |] a.sort | None -> app "add" [| a; b |] a.sort) else app "add" [| a; b |] a.sort)
+  | _ -> app "add" [| a; b |] a.sort
+
+and sub a b =
+  match (num a, num b) with
+  | Some x, Some y -> lit_or_app "sub" a.sort (Q.sub x y) [| a; b |]
+  | _, Some y when y.n = 0 -> a
+  | _ when a == b -> lit_q (Q.of_int 0) a.sort
+  | _, Some y -> (
+    match a.node with
+    | App ("add", [| e; c |]) when num c <> None -> (
+      match Q.sub (Option.get (num c)) y with Some s -> add e (lit_q s a.sort) | None -> app "sub" [| a; b |] a.sort)
+    | App ("sub", [| e; c |]) when num c <> None -> (
+      match Q.add (Option.get (num c)) y with Some s -> sub e (lit_q s a.sort) | None -> app "sub" [| a; b |] a.sort)
+    | _ -> if Q.compare y (Q.of_int 0) < 0 then (match Q.neg y with Some ny -> add a (lit_q ny a.sort) | None -> app "sub" [| a; b |] a.sort) else app "sub" [| a; b |] a.sort)
+  | _ -> app "sub" [| a; b |] a.sort
+
+let mul a b =
+  match (num a, num b) with
+  | Some x, Some y -> lit_or_app "mul" a.sort (Q.mul x y) [| a; b |]
+  | Some x, _ when x.n = 0 -> lit_q (Q.of_int 0) a.sort
+  | _, Some y when y.n = 0 -> lit_q (Q.of_int 0) a.sort
+  | Some x, _ when x.n = 1 && x.d = 1 -> b
+  | _, Some y when y.n = 1 && y.d = 1 -> a
+  | _ -> app "mul" [| a; b |] a.sort
+
+let neg a =
+  match (num a, a.node) with
+  | Some x, _ -> lit_or_app "neg" a.sort (Q.neg x) [| a |]
+  | _, App ("neg", [| x |]) -> x
+  | _ -> app "neg" [| a |] a.sort
+
+let rdiv a b =
+  match (num a, num b) with
+  | Some x, Some y when y.n <> 0 -> (match Q.div x y with Some q -> real q | None -> app "rdiv" [| a; b |] Real)
+  | _, Some y when y.n = 1 && y.d = 1 -> a
+  | _ -> app "rdiv" [| a; b |] Real
+
+let ediv a b =
+  match (num a, num b) with
+  | Some x, Some y when y.n <> 0 ->
+    let fl p q = if (p >= 0) = (q > 0) || p mod q = 0 then p / q else (p / q) - 1 in
+    let q = if y.n > 0 then fl x.n y.n else -fl x.n (-y.n) in
+    int_ q
+  | _, Some y when y.n = 1 -> a
+  | _ -> app "ediv" [| a; b |] Int
+
+let emod a b =
+  match (num a, num b) with
+  | Some x, Some y when y.n <> 0 ->
+    let m = abs y.n in
+    let r = x.n mod m in
+    int_ (if r < 0 then r + m else r)
+  | _ -> app "emod" [| a; b |] Int
+
+let to_real a = match a.node with Num q when a.sort = Int -> real q | _ -> app "to_real" [| a |] Real
+
+let floor a =
+  match a.node with
+  | Num q when a.sort = Real -> int_ (Q.floor q)
+  | App ("to_real", [| x |]) -> x
+  | _ -> app "floor" [| a |] Int
+
+let is_int a =
+  match a.node with
+  | Num q when a.sort = Real -> bool_ (Q.is_int q)
+  | App ("to_real", _) -> tt
+  | _ -> app "is_int" [| a |] Bool
+
+let lt a b =
+  match (num a, num b) with
+  | Some x, Some y -> bool_ (Q.compare x y < 0)
+  | _ when a == b -> ff
+  | _ -> app "lt" [| a; b |] Bool
+
+let le a b =
+  match (num a, num b) with
+  | Some x, Some y -> bool_ (Q.compare x y <= 0)
+  | _ when a == b -> tt
+  | _ -> app "le" [| a; b |] Bool
+
+let gt a b = lt b a
+let ge a b = le b a
+
+let not_ a = match a.node with BoolV b -> bool_ (not b) | App ("not", [| x |]) -> x | _ -> app "not" [| a |] Bool
+
+let is_value t = match t.node with Num _ | BoolV _ | StrV _ -> true | _ -> false
+
+let eq a b =
+  if a == b then tt
+  else if is_value a && is_value b then ff (* distinct hash-consed values *)
+  else if a.sort = Bool then
+    if b == tt then a else if b == ff then not_ a else if a == tt then b else if a == ff then not_ b else app "eq" [| a; b |] Bool
+  else app "eq" [| a; b |] Bool
+
+let ne a b = not_ (eq a b)
+
+let and_ (xs : term list) =
+  let out = ref [] in
+  let seen = Hashtbl.create 8 in
+  let push y = if not (Hashtbl.mem seen y.id) then (Hashtbl.add seen y.id (); out := y :: !out) in
+  let exception False in
+  try
+    List.iter
+      (fun x ->
+        if x == tt then ()
+        else if x == ff then raise False
+        else match x.node with App ("and", ys) -> Array.iter push ys | _ -> push x)
+      xs;
+    match List.rev !out with [] -> tt | [ y ] -> y | ys -> app "and" (Array.of_list ys) Bool
+  with False -> ff
+
+let or_ (xs : term list) =
+  let out = ref [] in
+  let seen = Hashtbl.create 8 in
+  let push y = if not (Hashtbl.mem seen y.id) then (Hashtbl.add seen y.id (); out := y :: !out) in
+  let exception True in
+  try
+    List.iter
+      (fun x ->
+        if x == ff then ()
+        else if x == tt then raise True
+        else match x.node with App ("or", ys) -> Array.iter push ys | _ -> push x)
+      xs;
+    match List.rev !out with [] -> ff | [ y ] -> y | ys -> app "or" (Array.of_list ys) Bool
+  with True -> tt
+
+let implies a b = if a == tt then b else if a == ff || b == tt then tt else if b == ff then not_ a else app "implies" [| a; b |] Bool
+
+let ite c a b =
+  if c == tt then a
+  else if c == ff then b
+  else if a == b then a
+  else if a.sort = Bool && a == tt && b == ff then c
+  else if a.sort = Bool && a == ff && b == tt then not_ c
+  else app "ite" [| c; a; b |] a.sort
+
+let rec select arr idx =
+  match arr.node with
+  | App ("K", [| v |]) -> v
+  | App ("store", [| base; k; v |]) ->
+    if k == idx then v
+    else if (match (k.node, idx.node) with Num _, Num _ -> true | _ -> false) && k.sort = Int then select base idx
+    else app "select" [| arr; idx |] (elem_sort arr.sort)
+  | _ -> app "select" [| arr; idx |] (elem_sort arr.sort)
+
+let store arr idx v = app "store" [| arr; idx; v |] arr.sort
+let const_array sort v = app "K" [| v |] sort
+
+let field obj name =
+  match obj.sort with
+  | Rec (rname, fields) -> (
+    match obj.node with
+    | App (op, args) when String.length op > 3 && String.sub op 0 3 = "mk:" ->
+      let rec find i = function [] -> raise Not_found | (f, _) :: r -> if f = name then args.(i) else find (i + 1) r in
+      find 0 fields
+    | _ ->
+      let fs = try List.assoc name fields with Not_found -> failwith (Printf.sprintf "%s has no field %s" rname name) in
+      app ("field:" ^ name) [| obj |] fs)
+  | s -> failwith ("field of a non-record " ^ sort_name s)
+
+let mkrec sort vals = match sort with Rec (n, _) -> app ("mk:" ^ n) (Array.of_list vals) sort | _ -> invalid_arg "mkrec"
+
+let rec occurs (v : term) (t : term) =
+  t == v || match t.node with App (_, xs) | Fn (_, xs) -> Array.exists (occurs v) xs | Quant (_, _, b, _) -> occurs v b | _ -> false
+
+let quant kind vs body pats = mk (Quant (kind, Array.of_list vs, body, pats)) Bool
+
+let forall vs body =
+  let vs = List.filter (fun v -> occurs v body) vs in
+  if vs = [] || is_bool_lit body then body else quant "forall" vs body []
+
+let exists vs body =
+  let vs = List.filter (fun v -> occurs v body) vs in
+  if vs = [] || is_bool_lit body then body else quant "exists" vs body []
+
+let abs_ a = ite (le (lit_q (Q.of_int 0) a.sort) a) a (neg a)
+let min_ a b = ite (le a b) a b
+let max_ a b = ite (le a b) b a
+
+let lit_of_int n sort = lit_q (Q.of_int n) sort
+
+(* -- traversal ---------------------------------------------------------- *)
+
+let children t = match t.node with App (_, xs) | Fn (_, xs) -> Array.to_list xs | Quant (_, _, b, _) -> [ b ] | _ -> []
+
+(* free constants, respecting binders *)
+let consts (t : term) : term list =
+  let out = Hashtbl.create 64 in
+  let order = ref [] in
+  let rec go bound t =
+    match t.node with
+    | Const _ -> if not (List.memq t bound) && not (Hashtbl.mem out t.id) then (Hashtbl.add out t.id (); order := t :: !order)
+    | Quant (_, vs, b, _) -> go (Array.to_list vs @ bound) b
+    | App (_, xs) | Fn (_, xs) -> Array.iter (go bound) xs
+    | _ -> ()
+  in
+  go [] t;
+  List.rev !order
+
+let fns (t : term) : string list =
+  let seen = Hashtbl.create 64 and out = ref [] in
+  let names = Hashtbl.create 16 in
+  let rec go t =
+    if not (Hashtbl.mem seen t.id) then begin
+      Hashtbl.add seen t.id ();
+      (match t.node with Fn (n, _) -> if not (Hashtbl.mem names n) then (Hashtbl.add names n (); out := n :: !out) | _ -> ());
+      List.iter go (children t);
+      match t.node with Quant (_, _, _, ps) -> List.iter (Array.iter go) ps | _ -> ()
+    end
+  in
+  go t;
+  List.rev !out
