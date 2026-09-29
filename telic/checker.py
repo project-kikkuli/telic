@@ -495,7 +495,21 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         except VCError:
             return key, None, Inferred()
 
-    inf_results = run_parallel(infer_one, todo_inf, opts.jobs)
+    use_engine = opts.engine == "ox"
+    if use_engine:
+        from . import engine as _engine
+
+        use_engine = _engine.binary() is not None
+    if use_engine:
+        # Cached inferences are rebuilt locally; the rest run in the engine,
+        # and whatever it cannot decide falls back to Python.
+        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference"]
+        by_engine = _engine.infer(program, theory, [r for _, r in fresh], min(opts.timeout_ms, 1000), opts.jobs)
+        inf_results = [(k, inference_key(program, k), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
+        done = {k for k, _, _ in inf_results}
+        inf_results += run_parallel(infer_one, [x for x in todo_inf if x[0] not in done], opts.jobs)
+    else:
+        inf_results = run_parallel(infer_one, todo_inf, opts.jobs)
     for key, ikey, res in inf_results:
         inferred[key] = res
         if ikey is not None:
@@ -508,11 +522,6 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     pending: list[tuple[Verdict, str]] = []
     staged: list[tuple[FunctionReport, str | None, float]] = []
     engine_tasks: list[tuple[FunctionReport, FuncRef, Inferred, str | None, float]] = []
-    use_engine = opts.engine == "ox"
-    if use_engine:
-        from . import engine as _engine
-
-        use_engine = _engine.binary() is not None
 
     def python_gather(rep: FunctionReport, ref: FuncRef, inf: Inferred) -> bool:
         """Generate and triage one function's obligations with the Python core.

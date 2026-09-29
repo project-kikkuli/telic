@@ -97,6 +97,7 @@ let rec wterm w (t : term) =
     w.nt <- i + 1;
     i
 
+
 (* -- the request ------------------------------------------------------------ *)
 
 let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.Int l.end_col ]
@@ -153,6 +154,167 @@ let solve_job z (jb : job) : Smt.result =
         else { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = (if err <> "" then err else Smt.reason_unknown z) })
   in
   go jb.phases
+
+let make_job th timeout (ob : Vc.obligation) =
+  let terms_ = ob.hyps @ [ ob.goal ] in
+  let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
+  let phases =
+    if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, timeout) ]
+    else [ (fst without, snd without, max 300 (min 800 (timeout / 10))); (fst with_l, snd with_l, timeout) ]
+  in
+  let input_consts = List.concat_map (fun (_, v) -> Vc.flatten v) ob.inputs in
+  let state_consts =
+    List.concat_map consts terms_
+    |> List.sort_uniq (fun (a : term) b -> compare (match a.node with Const n -> n | _ -> "") (match b.node with Const n -> n | _ -> ""))
+    |> List.filter (fun (c : term) ->
+           (not (List.memq c input_consts))
+           && (match c.node with Const n -> not (String.contains n '!') | _ -> false)
+           && match c.sort with Array _ | Rec _ -> false | _ -> true)
+  in
+  { ob; neg_goal = not_ ob.goal; phases; probes = ob.inputs; state_consts }
+
+(* Solve jobs on up to [jobs_n] domains, each driving its own z3. *)
+let debug = Sys.getenv_opt "TELIC_CORE_DEBUG" <> None
+
+let rec solve_parallel jobs_n (jobs_arr : job array) : Smt.result array =
+  let t0 = Unix.gettimeofday () in
+  let res = solve_parallel_ jobs_n jobs_arr in
+  if debug then begin
+    let slow = Array.to_list (Array.mapi (fun i (r : Smt.result) -> (r.seconds, jobs_arr.(i).ob.oid, r.status)) res) |> List.sort compare |> List.rev in
+    Printf.eprintf "batch: %d jobs in %.2fs; slowest: %s\n%!" (Array.length jobs_arr) (Unix.gettimeofday () -. t0)
+      (String.concat ", " (List.filteri (fun i _ -> i < 3) (List.map (fun (s, id, st) -> Printf.sprintf "%s %s %.2fs" id st s) slow)))
+  end;
+  res
+
+and solve_parallel_ jobs_n (jobs_arr : job array) : Smt.result array =
+  let n = Array.length jobs_arr in
+  let out = Array.make n None in
+  let next = Atomic.make 0 in
+  let worker () =
+    let z = Smt.spawn () in
+    let rec loop () =
+      let i = Atomic.fetch_and_add next 1 in
+      if i < n then begin
+        out.(i) <- Some (try solve_job z jobs_arr.(i) with e -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "engine: " ^ Printexc.to_string e });
+        loop ()
+      end
+    in
+    loop ();
+    Smt.close z
+  in
+  let k = max 1 (min jobs_n n) in
+  let doms = List.init (k - 1) (fun _ -> (Domain.spawn [@alert "-do_not_spawn_domains"] [@alert "-unsafe_multidomain"]) worker) in
+  if n > 0 then worker ();
+  List.iter Domain.join doms;
+  Array.map Option.get out
+
+(* -- inference: Houdini over candidate invariants, then loop variants and
+   recursion measures, batch-synchronous across every function: each round
+   generates VCs on this domain and solves all candidate obligations at once *)
+
+type itask = {
+  ikey : string;
+  iinfo : Vc.finfo;
+  mutable cands : (int * Ir.clause list) list;
+  vcands : (int * Ir.expr list) list;
+  mcands : Ir.expr list;
+  mutable istatus : string;  (** ok | fallback *)
+  mutable why : string;
+  mutable variant : (int * int) list;
+  mutable measure : int option;
+  mutable calls : int;
+}
+
+let max_rounds = 8
+
+let infer prog th jobs_n timeout (tasks : itask list) =
+  let gen (t : itask) opts = match Vc.run (Vc.make prog t.iinfo opts) with obs -> Ok obs | exception Vc.Vc_error _ -> Error `Vc | exception Vc.Fallback w -> Error (`Fallback w) in
+  let fallback t w = t.istatus <- "fallback"; t.why <- w in
+  (* 1. Houdini: failing candidates drop out; a function goes round again only if something of it failed *)
+  let rec rounds_some r (only : itask list) =
+    let only = List.filter (fun t -> t.istatus = "ok" && t.cands <> []) only in
+    if r < max_rounds && only <> [] then begin
+      let batch =
+        List.filter_map
+          (fun t ->
+            match gen t { Vc.extra_invariants = t.cands; variants = []; measures = [] } with
+            | Error `Vc -> t.cands <- []; None
+            | Error (`Fallback w) -> fallback t w; None
+            | Ok obs -> Some (t, List.filter (fun (o : Vc.obligation) -> (o.kind = "inv.entry" || o.kind = "inv.step") && match o.clause with Some c -> c.inferred | None -> false) obs))
+          only
+      in
+      let jobs = Array.of_list (List.concat_map (fun (_, obs) -> List.map (make_job th timeout) obs) batch) in
+      let res = solve_parallel jobs_n jobs in
+      let failed = Hashtbl.create 64 in
+      Array.iteri (fun i (jb : job) -> if res.(i).status <> "proved" then match jb.ob.clause with Some c -> Hashtbl.replace failed (Obj.repr c) () | None -> ()) jobs;
+      let next_round = ref [] in
+      List.iter
+        (fun (t, obs) ->
+          t.calls <- t.calls + List.length obs;
+          let bad c = Hashtbl.mem failed (Obj.repr c) in
+          if List.exists (fun (_, cs) -> List.exists bad cs) t.cands then begin
+            t.cands <- List.filter (fun (_, cs) -> cs <> []) (List.map (fun (l, cs) -> (l, List.filter (fun c -> not (bad c)) cs)) t.cands);
+            next_round := t :: !next_round
+          end)
+        batch;
+      rounds_some (r + 1) (List.rev !next_round)
+    end
+  in
+  rounds_some 0 tasks;
+  (* 2. loop variants: every (loop, candidate) at once; the first candidate
+     (in order) whose obligations all prove wins, and a candidate the
+     generator rejects ends the search for that loop *)
+  let spec_batch (mk_opts : itask -> int -> Ir.expr -> Vc.options) (select : itask -> int -> Vc.obligation -> bool) (sites : itask -> (int * Ir.expr list) list) (choose : itask -> int -> int -> unit) =
+    let entries = ref [] in
+    List.iter
+      (fun t ->
+        if t.istatus = "ok" then
+          List.iter
+            (fun (line, cs) ->
+              let stop = ref false in
+              List.iteri
+                (fun i cand ->
+                  if not !stop then
+                    match gen t (mk_opts t line cand) with
+                    | Error `Vc -> stop := true; entries := (t, line, i, None) :: !entries
+                    | Error (`Fallback w) -> stop := true; fallback t w
+                    | Ok obs -> entries := (t, line, i, Some (List.filter (select t line) obs)) :: !entries)
+                cs)
+            (sites t))
+      tasks;
+    let entries = List.rev !entries in
+    let jobs = Array.of_list (List.concat_map (fun (_, _, _, obs) -> match obs with Some obs -> List.map (make_job th timeout) obs | None -> []) entries) in
+    let res = solve_parallel jobs_n jobs in
+    let pos = ref 0 in
+    let decided = Hashtbl.create 16 in
+    List.iter
+      (fun (t, line, i, obs) ->
+        let k = (t.ikey, line) in
+        match obs with
+        | None -> Hashtbl.replace decided k ()
+        | Some obs ->
+          let n = List.length obs in
+          let ok = n > 0 && Array.for_all (fun (r : Smt.result) -> r.status = "proved") (Array.sub res !pos n) in
+          pos := !pos + n;
+          t.calls <- t.calls + n;
+          if ok && (not (Hashtbl.mem decided k)) && t.istatus = "ok" then begin
+            Hashtbl.replace decided k ();
+            choose t line i
+          end)
+      entries
+  in
+  spec_batch
+    (fun t line cand -> { Vc.extra_invariants = t.cands; variants = [ (line, cand) ]; measures = [] })
+    (fun _ line (o : Vc.obligation) -> o.kind = "variant" && o.oloc.line = line)
+    (fun t -> t.vcands)
+    (fun t line i -> t.variant <- (line, i) :: t.variant);
+  (* 3. recursion measures for self-recursive functions *)
+  spec_batch
+    (fun t _ cand -> { Vc.extra_invariants = t.cands; variants = List.map (fun (l, i) -> (l, List.nth (List.assoc l t.vcands) i)) t.variant; measures = [ (t.ikey, cand) ] })
+    (fun _ _ (o : Vc.obligation) -> o.kind = "variant" && o.site = None && (let m = o.message in let rec has i = i + 6 <= String.length m && (String.sub m i 6 = "recurs" || has (i + 1)) in has 0))
+    (fun t -> if t.mcands <> [] && t.iinfo.recursive && t.iinfo.fn.decreases = None && t.iinfo.scc = [] then [ (0, t.mcands) ] else [])
+    (fun t _ i -> t.measure <- Some i)
+
 
 let () =
   let input = In_channel.input_all stdin in
@@ -231,6 +393,57 @@ let () =
   let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap } in
   let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 8000 in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
+  if Json.member "mode" req = Json.String "infer" then begin
+    let by_line f j = match j with Json.Assoc kvs -> List.map (fun (l, xs) -> (int_of_string l, List.map f (Json.to_list xs))) kvs | _ -> [] in
+    let tasks =
+      List.map
+        (fun t ->
+          let key = Json.to_str (Json.member "key" t) in
+          {
+            ikey = key;
+            iinfo = Hashtbl.find funcs key;
+            cands = by_line Ir.clause_of (Json.member "invariants" t);
+            vcands = by_line Ir.expr_of (Json.member "variants" t);
+            mcands = List.map Ir.expr_of (match Json.member "measures" t with Json.List l -> l | _ -> []);
+            istatus = "ok";
+            why = "";
+            variant = [];
+            measure = None;
+            calls = 0;
+          })
+        (Json.to_list (Json.member "tasks" req))
+    in
+    (* remember candidate positions: survivors are reported by index *)
+    let original = List.map (fun t -> (t.ikey, t.cands)) tasks in
+    infer prog th jobs_n timeout tasks;
+    let res =
+      List.map
+        (fun t ->
+          if t.istatus <> "ok" then Json.Assoc [ ("key", Json.String t.ikey); ("status", Json.String t.istatus); ("reason", Json.String t.why) ]
+          else begin
+            let orig = List.assoc t.ikey original in
+            let inv =
+              List.map
+                (fun (line, cs) ->
+                  let all = List.assoc line orig in
+                  (string_of_int line, Json.List (List.filter_map (fun c -> Option.map (fun i -> Json.Int i) (List.find_index (fun c' -> c' == c) all)) cs)))
+                t.cands
+            in
+            Json.Assoc
+              [
+                ("key", Json.String t.ikey);
+                ("status", Json.String "ok");
+                ("invariants", Json.Assoc inv);
+                ("variants", Json.Assoc (List.map (fun (l, i) -> (string_of_int l, Json.Int i)) t.variant));
+                ("measure", match t.measure with Some i -> Json.Int i | None -> Json.Null);
+                ("solver_calls", Json.Int t.calls);
+              ]
+          end)
+        tasks
+    in
+    print_string (Json.to_string (Json.Assoc [ ("results", Json.List res) ]));
+    exit 0
+  end;
   (* 1. VC generation, sequentially *)
   let results = ref [] and all_jobs = ref [] in
   List.iter
@@ -249,25 +462,7 @@ let () =
       match Vc.run g with
       | obs ->
         let jobs =
-          List.map
-            (fun (ob : Vc.obligation) ->
-              let terms_ = ob.hyps @ [ ob.goal ] in
-              let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
-              let phases =
-                if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, timeout) ]
-                else [ (fst without, snd without, max 300 (min 800 (timeout / 10))); (fst with_l, snd with_l, timeout) ]
-              in
-              let input_consts = List.concat_map (fun (_, v) -> Vc.flatten v) ob.inputs in
-              let state_consts =
-                List.concat_map consts terms_
-                |> List.sort_uniq (fun (a : term) b -> compare (match a.node with Const n -> n | _ -> "") (match b.node with Const n -> n | _ -> ""))
-                |> List.filter (fun (c : term) ->
-                       (not (List.memq c input_consts))
-                       && (match c.node with Const n -> not (String.contains n '!') | _ -> false)
-                       && match c.sort with Array _ | Rec _ -> false | _ -> true)
-              in
-              { ob; neg_goal = not_ ob.goal; phases; probes = ob.inputs; state_consts })
-            obs
+          List.map (make_job th timeout) obs
         in
         all_jobs := List.rev_append jobs !all_jobs;
         results := (key, `Ok (g, jobs)) :: !results
@@ -276,25 +471,8 @@ let () =
     (Json.to_list (Json.member "tasks" req));
   (* 2. solve, in parallel *)
   let jobs_arr = Array.of_list (List.rev !all_jobs) in
-  let n = Array.length jobs_arr in
-  let out = Array.make n None in
-  let next = Atomic.make 0 in
-  let worker () =
-    let z = Smt.spawn () in
-    let rec loop () =
-      let i = Atomic.fetch_and_add next 1 in
-      if i < n then begin
-        out.(i) <- Some (try solve_job z jobs_arr.(i) with e -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "engine: " ^ Printexc.to_string e });
-        loop ()
-      end
-    in
-    loop ();
-    Smt.close z
-  in
-  let k = max 1 (min jobs_n n) in
-  let doms = (List.init (k - 1) (fun _ -> (Domain.spawn [@alert "-do_not_spawn_domains"] [@alert "-unsafe_multidomain"]) worker)) in
-  if n > 0 then worker ();
-  List.iter Domain.join doms;
+  let solved = solve_parallel jobs_n jobs_arr in
+  let out = Array.map Option.some solved in
   let result_of = Hashtbl.create 256 in
   Array.iteri (fun i jb -> Hashtbl.replace result_of jb.ob.oid (Option.get out.(i))) jobs_arr;
   (* 3. answer *)
