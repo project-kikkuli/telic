@@ -56,5 +56,5 @@ for the known gaps.
 pip install -e '.[test]'
 pytest -q                           # Lean tests skip if Lean is not installed
 telic demo --no-pause               # the end-to-end story must stay green
-make -C core                        # native engine; needs an OxCaml switch (5.2.0+ox)
+make -C core                        # native engine; any OCaml >= 5.1 (OxCaml 5.2.0+ox adds flambda2)
 ```

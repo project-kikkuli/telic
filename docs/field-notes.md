@@ -5,14 +5,17 @@ apps shaped like typical generated code: CRUD backends and a React front end.
 
 | app | stack | before | after | time |
 |---|---|---|---|---|
-| fastapi-realworld-example-app | FastAPI, pydantic, asyncpg | frontend crash; then 14 false refutations, 37 problems, 28 unsupported | 8 proved, 96 with nothing to check | 0.8s |
-| full-stack-fastapi-template (backend) | FastAPI, SQLModel | 2 false refutations, 1 unsupported | 7 proved, 49 with nothing to check, 1 file in Python 3.14 syntax | 0.5s |
-| node-express-realworld-example-app | Express, Prisma | 7 unsupported, 1 problem, 1 spurious error | 7 proved, 24 with nothing to check | 0.7s |
-| chatbot-ui (lib/, components/utility) | Next.js, React | 17 unsupported, 9 problems | 11 proved, 36 with nothing to check, **1 real crash** | 2.0s |
+| fastapi-realworld-example-app | FastAPI, pydantic, asyncpg | frontend crash; then 14 false refutations, 37 problems, 28 unsupported | 8 proved, 96 with nothing to check | 0.5s |
+| full-stack-fastapi-template (backend) | FastAPI, SQLModel | 2 false refutations, 1 unsupported | 7 proved, 52 with nothing to check | 0.2s |
+| node-express-realworld-example-app | Express, Prisma | 7 unsupported, 1 problem, 1 spurious error | 7 proved, 24 with nothing to check | 0.3s |
+| chatbot-ui (lib/, components/utility) | Next.js, React | 17 unsupported, 9 problems | 11 proved, 36 with nothing to check, **1 real crash** | 0.8s |
 
-"Before" is telic as it was when these runs started. Each gap found was fixed
-in the frontends or engines, with a regression case or soundness exploit
-added to the test suite.
+"Before" is telic as it was when these runs started; "after" was re-measured
+at `16f1cf5` (Python 3.14, `--no-lean --no-cache`, upstream `main` of each
+app on 2026-09-29). Each gap found was fixed in the frontends or engines,
+with a regression case or soundness exploit added to the test suite. The
+full-stack template's file in Python 3.14 syntax now parses, which is where
+its three extra functions come from.
 
 ## What it found
 
@@ -36,6 +39,44 @@ A few were soundness bugs, now fixed:
 - `await` assuming invariants across shared field maps;
 - an uninterpreted function used at two signatures, which made z3 reject
   the query.
+
+## telic on itself
+
+`telic check telic/` (`--no-lean --no-cache`, 38 files, 734 functions):
+
+| | refuted | open | proved | nothing to check | unsupported | problems |
+|---|---|---|---|---|---|---|
+| `9bf7e76` | 17 | 51 | 106 | 230 | 314 | 5 |
+| `16f1cf5` | 6 | 92 | 144 | 254 | 239 | 4 |
+
+The 17 refuted functions were triaged:
+
+- **A real bug.** `lean._first_error` raised `IndexError` when the first
+  error was blank.
+- **A soundness bug in telic.** A method's `@ensures` lemma held for every
+  heap, not only for objects satisfying the class invariant, so the theory
+  could prove a false contract (`tests/cases/soundness/t27.py`).
+- **Missing preconditions**, now stated with `@requires` or a class
+  invariant: `restore_receipt`, `Program.ref`, `VCGen.alloc_facts`,
+  `VCGen.apply_def`, `_lower_safely`, `_block_end`, `value_boolop` and
+  `propose.Syntax`. `VCGen.heap_keys` now reports an unknown class as a
+  `VCError` instead of a `KeyError`.
+- **Verifier false positives**, fixed in the verifier: a termination
+  counterexample reported as a refutation (no finite run witnesses one),
+  and a field telic cannot model failing every function in the program
+  instead of only the ones touching it.
+
+Six remain refuted: the demo's planted bug (`refund_amount` and its
+`@mirrors` pair), and four whose preconditions telic cannot state yet:
+`vcgen.pack` (arity depends on the type), `typescript._type` and `_expr`
+(well-formed JSON from `lower.mjs`), and `html._line_status` (needs a loop
+invariant quantifying over a dict's keys).
+
+Unsupported fell by 75: 37 functions from telling telic's same-named
+classes apart (`FunctionLowerer`, `ExprLowerer` in the Python and Rust
+frontends), and 39 from `for a, b in pairs` loops. Open rose because functions that became checkable, and
+callers of the new preconditions, have obligations Z3 cannot close without
+loop invariants.
 
 ## What it means
 

@@ -1,43 +1,40 @@
 # Handoff: known gaps
 
-This lists what telic does not do yet, or does only partly, as of the oracle
-commit (`1c40d4d`) plus this docs pass. Each item says where it lives and what
+This lists what telic does not do yet, or does only partly, as of `16f1cf5`. Each item says where it lives and what
 done looks like. Soundness items come first: they can make telic say
 `proved` when it shouldn't.
 
 ## Soundness
 
-- **Duplicate class names across files.** When two checked files define a
-  class with the same name, every function that mentions that name is reported
-  unsupported (`Program.ambiguity` in `telic/program.py`). This is sound but
-  blunt: telic's own `FunctionLowerer` (in both `frontend/python.py` and
-  `frontend/rust.py`) is unchecked because of it. *Done:* classes are keyed by
-  module (e.g. `rust.FunctionLowerer`) in the IR, the heap keys and the engine,
-  and imports resolve to the right one.
-- **`telic ci` misses overrides in other files.** A call through a base class
-  depends on every override (`Program.dispatch`). `affected_files` in
-  `telic/ledger.py` adds the files that import a changed file, but not the files
-  that call a method a changed file overrides. If a subclass in `c.py` changes
-  an override's contract, a caller in `a.py` that only imports the base from
-  `b.py` is not re-checked by `telic ci --since`. A full `telic check` is
-  correct. *Done:* the affected set includes callers of overridden methods,
-  with a test.
+- **Classes several files define.** `Program.build` qualifies them
+  (`Box@a_shapes`, methods `Box@a_shapes.get`) in the defining module and in
+  modules that import them (`qualify_classes` in `telic/program.py`); replay
+  maps names back with `ir.source_name`. What stays unsupported: a module
+  that uses such a name without defining or importing it, or through a
+  declaration borrowed from a file that means the other class
+  (`Module.ambiguous_classes`). Exceptions are matched by name, not
+  qualified: a `raise` of one file's `LowerError` caught as another's is not
+  told apart.
+- **Vacuity is checked at entry only.** A function whose `@requires` and
+  object-parameter invariants are unsatisfiable is `vacuous`
+  (`Vacuity` in `telic/checker.py`). Not checked: an `@assume` or a
+  `@trusted` callee's `@ensures` that is unsatisfiable mid-body; an entry
+  check Z3 cannot decide leaves the verdict alone.
 
 ## Dogfooding (task 15)
 
-`telic check telic/` now runs to completion: 105 proved, 59 refuted, 12 open,
-5 problems, 312 unsupported, 223 with nothing to check. Nobody has triaged the
-results yet. The 59 refutations are mostly crash obligations (index, key,
-None) in functions without contracts, so some will be real bugs and some will
-be modelling gaps. *Next:*
+`docs/field-notes.md` has the numbers and the triage. Remaining:
 
-1. Triage the refutations: fix real bugs, and turn modelling gaps into
-   frontend fixes with a corpus case.
-2. Reduce the unsupported count: list the top reasons
-   (`telic check telic/ --json`) and fix the most common idioms.
+1. The four refuted functions whose preconditions telic cannot state
+   (`vcgen.pack`, `typescript._type`/`_expr`, `html._line_status`): they need
+   specs over `components()`, a JSON schema, and quantifiers over dict keys.
+2. 92 open, mostly loops without invariants and termination of recursion
+   over ASTs (opaque, so no measure).
 3. Put contracts and aims on the pure helpers (`telic/phrase.py`,
    `ears_problems`, `ears_conditions`, `split_by`, `oracle._one`), then add a
    CI job that ratchets `telic.ledger.json` for telic itself.
+4. Replaying telic's own counterexamples fails on relative imports inside
+   the `telic` package ("could not run").
 
 ## Frontends
 
@@ -61,16 +58,16 @@ be modelling gaps. *Next:*
 
 ## Engine (OxCaml, `core/`)
 
-- **No unboxed types yet.** The Makefile passes `-unboxed-types`, but the
-  sources use no unboxed layouts, and if the flag is rejected the build
-  silently falls back without it. What makes the engine fast today is native
-  code, hash-consing and one Z3 per domain. *Done:* hot records such as terms
-  and obligations use unboxed layouts, the fallback is not silent, and
-  `TELIC_CORE_DEBUG` timings show the difference.
-- **The engine does not read the obligation cache.** It writes receipts for
-  proved obligations, but it re-solves every obligation of a function it
-  handles. Function-level receipts are still reused. *Done:* obligation keys
-  are sent to the engine and cached obligations are skipped.
+- **No unboxed types.** The sources use no unboxed layouts, so the Makefile
+  no longer passes `-unboxed-types`; any OCaml >= 5.1 builds the engine
+  (`OCAMLFLAGS` passes local flags). What makes it fast is native code,
+  hash-consing and one Z3 per domain. *Done:* hot records such as terms and
+  obligations use unboxed layouts, and `TELIC_CORE_DEBUG` timings show the
+  difference.
+- The engine reads the obligation cache through its own keys (`ox:` in the
+  cache, a structural digest in `job_key` in `core/main.ml`). Engine-proved
+  obligations are also stored under the Python key, but Python-proved ones
+  are not visible to the engine.
 
 ## Oracles and aims
 
@@ -93,9 +90,11 @@ work. Re-run them to refresh the numbers when the frontends change.
 
 ## Local setup reminders
 
-- The OxCaml engine needs an OxCaml switch (`opam switch 5.2.0+ox`) and
-  `make -C core`. Without it, telic uses the Python core
-  (`TELIC_ENGINE=ox` selects the engine).
+- The engine builds with `make -C core` from any OCaml >= 5.1 (an OxCaml
+  switch, `opam switch 5.2.0+ox`, adds flambda2). Homebrew's OCaml on a
+  newer macOS than its SDK needs
+  `OCAMLFLAGS="-ccopt -Wl,-U,_dup3 -ccopt -Wl,-U,_pipe2"`. Without the
+  binary, telic uses the Python core (`TELIC_ENGINE=ox` selects the engine).
 - Jev: set `JEV_API_KEY` in your environment (never in the repo).
   `telic oracle --probe` checks it.
 - Rust replay needs `rustc`; TypeScript needs Node ≥ 18; Lean tests skip
