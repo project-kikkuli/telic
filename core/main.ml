@@ -329,7 +329,8 @@ let () =
         let params = List.map (fun i -> terms.(Json.to_int i)) (Json.to_list (Json.member "params" d)) in
         let fsort = match body with Some b -> b.sort | None -> Int in
         let fsort = match Json.member "sort" d with Json.Int i -> terms.(i).sort | _ -> fsort in
-        Hashtbl.replace fundefs name { Smt.fname = name; params; fsort; body })
+        Hashtbl.replace fundefs name { Smt.fname = name; params; fsort; body };
+        Hashtbl.replace Smt.defined_fns name ())
       (Json.to_list (Json.member "fundefs" (Json.member "theory" req)));
     let axioms =
       List.map

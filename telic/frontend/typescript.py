@@ -222,6 +222,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
     m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.intents = [ir.IntentDecl(i["id"], i["text"], ir.Loc(int(i["line"]), int(i.get("col", 0)))) for i in d.get("intents", [])]
     m.problems = [(msg, ir.Loc(int(line))) for msg, line in d.get("problems", [])]
+    m.notes = [(msg, ir.Loc(int(line))) for msg, line in d.get("notes", [])]
     m.assumptions = list(d.get("assumptions", []))
     return m
 

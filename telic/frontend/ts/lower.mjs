@@ -134,7 +134,7 @@ class ModuleLowerer {
     this.sf = sf;
     this.src = sf.text;
     this.lines = sf.text.split(/\r?\n/);
-    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [], assumptions: JS_ASSUMPTIONS };
+    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
     this.aliases = {};
     this.sigs = {}; // name -> {params, ret, node}
     this.classes = {}; // name -> {node, fields: [[n, ty]], props, setters, statics, home: ModuleLowerer}
@@ -199,9 +199,12 @@ class ModuleLowerer {
     }
     for (const st of this.sf.statements) {
       if (ts.isClassDeclaration(st) && st.name) {
-        if (st.heritageClauses && st.heritageClauses.some((h) => h.token === ts.SyntaxKind.ExtendsKeyword)) {
+        const ext = st.heritageClauses && st.heritageClauses.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
+        if (ext) {
           this.globalsBound.add(st.name.text);
-          this.module.problems.push([`class ${st.name.text}: inheritance is not modelled yet (its methods are unchecked)`, this.line(st)]);
+          const base = ext.types[0] ? ext.types[0].expression.getText(this.sf) : "?";
+          // an Error subclass is only ever thrown; other subclasses are library-like values
+          if (!/(Error|Exception)$/.test(base)) this.module.notes.push([`class ${st.name.text}: subclass of ${base}; inheritance is not modelled for TypeScript yet, so its instances are treated as library values`, this.line(st)]);
           continue;
         }
         this.classes[st.name.text] = { node: st, fields: [], props: new Set(), setters: new Set(), statics: new Set(), home: this };
@@ -1113,9 +1116,17 @@ class FunctionLowerer {
   assignTo(srcName, valueNode, node, op = null) {
     const loc = this.ml.loc(node);
     const name = this.varOf(srcName, node);
-    const known = this.env[name];
+    let known = this.env[name];
     if (this.sig.params.some((p) => p.name === name) && known.k === "list") throw this.err(`rebinding array parameter '${srcName}' is not supported`, node);
     if (this.consts.has(name)) throw this.err(`cannot assign to const '${srcName}'`, node);
+    if (known.k === "none" && !op) {
+      // let x = null; ... x = v: an optional of v's type
+      const v0 = this.expr(valueNode, null);
+      if (v0.ty.k !== "none" && !["option", "list", "dict"].includes(v0.ty.k)) {
+        known = v0.ty.k === "opaque" ? v0.ty : optionOf(v0.ty);
+        this.env[name] = known;
+      }
+    }
     let v = this.expr(valueNode, known);
     if (op) {
       const cur = { e: "Var", ty: known, loc, name };
@@ -1219,6 +1230,7 @@ class FunctionLowerer {
       if (ts.isPropertyAccessExpression(c) && c.name.text === "push" && ts.isIdentifier(c.expression)) {
         const name = this.varOf(c.expression.text, node);
         let t = this.env[name];
+        if (t && t.k === "opaque") return [{ s: "ExprStmt", loc, expr: this.extern(`${c.expression.text}.push`, [{ e: "Var", ty: t, loc, name }, ...e.arguments.map((a) => this.coerce(this.expr(a), opaque("")))], NONE, loc) }];
         if (!t || t.k !== "list") throw this.err(`'${c.expression.text}.push' needs an array`, node);
         if (e.arguments.length !== 1) throw this.err("push takes one argument here", node);
         const v0 = this.expr(e.arguments[0], t.elem.k === "none" ? null : t.elem);
@@ -1341,7 +1353,10 @@ class FunctionLowerer {
       let ty = d.type ? this.ml.typeOf(d.type, this.intSet.has(src)) : null;
       if (ty && ty.k === "real" && this.intSet.has(src)) ty = INT;
       if (!d.initializer) {
-        this.bindLocal(src, ty || opaque("declared without a type"), node);
+        // `let x;` holds undefined until assigned (a declared non-optional type must be assigned before use)
+        const t = ty || opaque("declared without a type");
+        const name = this.bindLocal(src, t, node);
+        if (t.k === "opaque" || t.k === "option") out.push({ s: "Assign", loc, name, value: this.coerce({ e: "Lit", ty: NONE, loc, value: null }, t) });
         continue;
       }
       let v = this.expr(d.initializer, ty);
@@ -1368,10 +1383,23 @@ class FunctionLowerer {
       out.push({ s: "Assign", loc, name: tmp, value: src });
       src = { e: "Var", ty: src.ty, loc, name: tmp };
     }
+    this.destructureFrom(pat, src, node, loc, isConst, out);
+    return out;
+  }
+
+  destructureFrom(pat, src, node, loc, isConst, out) {
     src = this.unwrap(src);
     pat.elements.forEach((el, i) => {
       if (ts.isOmittedExpression(el)) return;
-      if (!ts.isIdentifier(el.name) || el.dotDotDotToken) throw this.err("nested or rest destructuring is not supported", node);
+      if (el.dotDotDotToken) {
+        // ...rest: the remaining properties/elements
+        if (!ts.isIdentifier(el.name)) throw this.err("nested rest destructuring is not supported", node);
+        const rest = src.ty.k === "list" && ts.isArrayBindingPattern(pat) ? { e: "Builtin", ty: src.ty, loc, name: "slice", args: [src, { e: "Lit", ty: INT, loc, value: i }, { e: "Lit", ty: NONE, loc, value: null }] } : this.opaqueOp("rest", [this.coerce(src, opaque(""))], opaque(""), loc);
+        const name = this.bindLocal(el.name.text, rest.ty, node);
+        if (isConst) this.consts.add(name);
+        out.push({ s: "Assign", loc, name, value: rest });
+        return;
+      }
       let v;
       if (ts.isObjectBindingPattern(pat)) {
         const prop = el.propertyName ? el.propertyName.getText(this.ml.sf) : el.name.text;
@@ -1384,12 +1412,19 @@ class FunctionLowerer {
         const dflt = this.coerce(this.expr(el.initializer, v.ty.inner), v.ty.inner);
         v = { e: "Ite", ty: v.ty.inner, loc, cond: { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [v] }, then: dflt, orelse: this.unwrap(v) };
       }
+      if (!ts.isIdentifier(el.name)) {
+        // a nested pattern: destructure the property's value in turn
+        const tmp = `destructure$${++this.tmp}`;
+        this.env[tmp] = v.ty;
+        out.push({ s: "Assign", loc, name: tmp, value: v });
+        this.destructureFrom(el.name, { e: "Var", ty: v.ty, loc, name: tmp }, node, loc, isConst, out);
+        return;
+      }
       if (["list", "dict"].includes(v.ty.k) && !this.freshList(v)) throw this.err(`destructuring '${el.name.text}' would alias an existing ${tyStr(v.ty)}; copy it`, node);
       const name = this.bindLocal(el.name.text, v.ty, node);
       if (isConst) this.consts.add(name);
       out.push({ s: "Assign", loc, name, value: v });
     });
-    return out;
   }
 
   _stmt(s) {
@@ -1876,6 +1911,12 @@ class FunctionLowerer {
       }
       return this.opaqueOp("object", parts.map((x) => (["list", "dict", "class", "option", "record"].includes(x.ty.k) ? this.coerce(x, opaque("")) : x)), opaque("object literal"), loc);
     }
+    if (ts.isObjectLiteralExpression(n) && n.properties.some((p) => !(ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) && !ts.isShorthandPropertyAssignment(p))) {
+      // {...base, k: v}, computed keys, methods: built by the runtime; its fields have their declared types
+      if (this.spec) throw this.err("object literals with spreads are not supported in specifications", this.nline(n));
+      const parts = n.properties.map((p) => (ts.isPropertyAssignment(p) ? this.expr(p.initializer) : ts.isShorthandPropertyAssignment(p) ? this.expr(p.name) : ts.isSpreadAssignment(p) ? this.expr(p.expression) : null)).filter((x) => x);
+      return this.coerce(this.opaqueOp("object", parts.map((x) => (x.ty.k === "opaque" ? x : this.coerce(x, opaque("")))), opaque("object literal"), loc), expect);
+    }
     if (ts.isObjectLiteralExpression(n)) {
       if (!expect || expect.k !== "record") throw this.err("object literals need a known record type here (annotate the variable)", this.nline(n));
       const vals = {};
@@ -1890,6 +1931,7 @@ class FunctionLowerer {
           vals[p.name.text] = this.coerce({ e: "Var", ty: this.lookup(p.name.text, p), loc, name: this.irName(p.name.text) }, ft[1]);
         } else throw this.err("unsupported object literal member", this.nline(p));
       }
+      for (const f of expect.fields) if (!(f[0] in vals) && f[1].k === "option") vals[f[0]] = { e: "Lit", ty: f[1], loc, value: null };  // optional fields left out are undefined
       const missing = expect.fields.filter((f) => !(f[0] in vals)).map((f) => f[0]);
       if (missing.length) throw this.err(`${expect.name} literal is missing ${missing.join(", ")}`, this.nline(n));
       return { e: "RecordLit", ty: expect, loc, fields: expect.fields.map((f) => [f[0], vals[f[0]]]) };
@@ -2561,7 +2603,7 @@ function main() {
         }
       } catch (e) {
         ml.stage = "done";
-        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], assumptions: JS_ASSUMPTIONS };
+        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
       }
     }
   };

@@ -142,10 +142,15 @@ class Z3Encoder:
                 return z3.ForAll(vs, body, patterns=pats)
             return z3.ForAll(vs, body) if t.kind == "forall" else z3.Exists(vs, body)
         if isinstance(t, L.Fn):
-            f = self.funcs.get(t.name)
+            f = self.funcs.get(t.name)  # a defined function
             if f is None:
-                f = z3.Function(t.name, *[self.sort(a.sort) for a in t.args], self.sort(t.sort))
-                self.funcs[t.name] = f
+                # uninterpreted: one symbol per signature (str.lower of a str
+                # here, of an opaque value there)
+                key = (t.name, tuple(a.sort for a in t.args), t.sort)
+                f = self.funcs.get(key)  # type: ignore[call-overload]
+                if f is None:
+                    f = z3.Function(t.name, *[self.sort(a.sort) for a in t.args], self.sort(t.sort))
+                    self.funcs[key] = f  # type: ignore[index]
             return f(*[self.term(a) for a in t.args])
         assert isinstance(t, L.App)
         a = [self.term(x) for x in t.args]

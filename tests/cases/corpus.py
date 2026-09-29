@@ -363,3 +363,10 @@ def pymod_neg(a: int, b: int) -> int:
     #@ requires b != 0
     #@ ensures 0 <= result
     return a % b
+
+
+# expect: proved
+def overloaded_format(x: float, n: int) -> int:
+    #@ ensures result >= 0
+    # the same formatting operation applied to a float and to an int
+    return len(f"{x:>5}" + f"{n:>5}")

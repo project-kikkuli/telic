@@ -43,6 +43,20 @@ let quote name = "|" ^ String.concat "" (List.map (fun c -> if c = '|' || c = '\
    with SMT-LIB's own (a user function called abs, a variable called div). *)
 let q_const n = quote ("c!" ^ n)
 let q_fn n = quote ("f!" ^ n)
+
+(* Uninterpreted functions may be used at several signatures (str.lower of a
+   str here, of an opaque value there): each signature is its own symbol.
+   Functions the theory defines keep their names. *)
+let defined_fns : (string, unit) Hashtbl.t = Hashtbl.create 64
+
+let rec sort_tag = function
+  | Int -> "I" | Real -> "R" | Bool -> "B" | Str -> "S" | Opaque -> "O" | Unit -> "U"
+  | Array (i, e) -> "A" ^ sort_tag i ^ sort_tag e
+  | Rec (n, _) -> "{" ^ n ^ "}"
+
+let fn_symbol n (args : term array) (ret : sort) =
+  if Hashtbl.mem defined_fns n then q_fn n
+  else q_fn (n ^ "#" ^ String.concat "" (Array.to_list (Array.map (fun (a : term) -> sort_tag a.sort) args)) ^ ">" ^ sort_tag ret)
 let q_rec n = quote ("r!" ^ n)
 let q_mk n = quote ("mk!" ^ n)
 let q_field r f = quote ("fld!" ^ r ^ "." ^ f)
@@ -113,7 +127,9 @@ and pr_node p t =
     let rn = String.sub op 3 (String.length op - 3) in
     if Array.length xs = 0 then Buffer.add_string b (q_mk rn) else (Buffer.add_string b ("(" ^ q_mk rn); args xs; Buffer.add_char b ')')
   | App (op, xs) -> Buffer.add_string b ("(" ^ op_smt op); args xs; Buffer.add_char b ')'
-  | Fn (n, xs) -> if Array.length xs = 0 then Buffer.add_string b (q_fn n) else (Buffer.add_string b ("(" ^ q_fn n); args xs; Buffer.add_char b ')')
+  | Fn (n, xs) ->
+    let sym = fn_symbol n xs t.sort in
+    if Array.length xs = 0 then Buffer.add_string b sym else (Buffer.add_string b ("(" ^ sym); args xs; Buffer.add_char b ')')
   | Quant (k, vs, body, pats) ->
     Buffer.add_string b ("(" ^ k ^ " (");
     Array.iter (fun v -> match v.node with Const n -> Buffer.add_string b (Printf.sprintf "(%s %s)" (q_const n) (sort_smt v.sort)) | _ -> ()) vs;
@@ -159,7 +175,8 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
       | App (_, xs) -> Array.iter visit xs
       | Fn (n, xs) ->
         Array.iter visit xs;
-        if not (Hashtbl.mem defined n) && not (Hashtbl.mem ufs n) then Hashtbl.add ufs n (Array.to_list (Array.map (fun x -> x.sort) xs), t.sort)
+        let sym = fn_symbol n xs t.sort in
+        if not (Hashtbl.mem defined n) && not (Hashtbl.mem ufs sym) then Hashtbl.add ufs sym (Array.to_list (Array.map (fun x -> x.sort) xs), t.sort)
       | Quant (_, vs, body, pats) ->
         Array.iter (fun v -> Hashtbl.replace bound v.id (); see_sort v.sort) vs;
         visit body;
@@ -188,7 +205,7 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
       add (Printf.sprintf "(declare-datatypes ((%s 0)) (((%s %s))))" (q_rec n) (q_mk n) fields))
     (List.rev !recs);
   List.iter (fun c -> match c.node with Const n -> add (Printf.sprintf "(declare-const %s %s)" (q_const n) (sort_smt c.sort)) | _ -> ()) (List.rev !consts);
-  Hashtbl.iter (fun n (args, r) -> add (Printf.sprintf "(declare-fun %s (%s) %s)" (q_fn n) (String.concat " " (List.map sort_smt args)) (sort_smt r))) ufs;
+  Hashtbl.iter (fun sym (args, r) -> add (Printf.sprintf "(declare-fun %s (%s) %s)" sym (String.concat " " (List.map sort_smt args)) (sort_smt r))) ufs;
   let p = { buf = b; names = Hashtbl.create 64 } in
   if defs <> [] then begin
     Buffer.add_string b "(define-funs-rec (";
