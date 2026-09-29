@@ -143,42 +143,56 @@ checked like one in code.
 
 ## Types and semantics
 
-**Python.** Parameters need annotations: `int`, `float`, `bool`, `str`,
-`list[T]` (also `List[T]`, `Sequence[T]`), and `@dataclass(frozen=True)` /
-`NamedTuple` records. `int` is exact. `float` is an exact rational. `/` is real
-division, `//` floors, `%` takes the divisor's sign, `round` rounds halves to
-even, `int(x)` truncates, and negative indices wrap.
+**Numbers.** Python `int` is exact; `float` and JavaScript `number` are exact
+rationals. `/` is real division; Python `//` floors and `%` takes the divisor's
+sign; JavaScript `%` truncates; `round` rounds halves to even, `Math.round` rounds
+them up. In TypeScript a `number` is an integer when telic can show it
+(integer literals, `.length`, `Math.floor/…`, `Number.isInteger(p)` in a
+`@requires`, or a `type int = number` alias).
 
-**TypeScript.** `number` is an exact rational unless telic can show it's an
-integer: integer literals, `.length`, `Math.floor/ceil/trunc/round`, integer
-`+ - * %`, parameters whose contract says `Number.isInteger(p)`, and parameters
-typed with an alias named `int` (`type int = number`). For locals and return
-values, integrality is inferred. `/` is real division, `%` truncates (takes the
-dividend's sign), `Math.round` rounds halves up, and `Math.floor(a / b)` on
-integers is floor division. Reading `xs[i]` out of bounds (which JavaScript
-silently turns into `undefined`) is an error. Interfaces and object type aliases
-with scalar fields are records. `as` and `!` are rejected: they hide exactly
-what telic checks.
+**Objects.** Classes are references: two parameters may be the same object, and
+counterexamples show it (`f(a=<Box v=0>, b=a)`). A class invariant (`#@ invariant`
+in the class body, over `self`/`this` only) is assumed for objects passed in,
+proved when they are handed back or passed on, and proved for any object a
+function writes. A call changes only the fields the callee may write, and only
+on objects it can reach. Dataclasses, pydantic models, TypeScript parameter
+properties, getters and setters work as in the language.
 
-**Both.** Lists are values. Binding a name to an existing list (`ys = xs`,
-`ys = xs if c else zs`, `ys, k = xs, 0`) would create an alias the model can't
-track, so it's rejected. Only a fresh list (a literal, a slice copy, or a call
-result) can be bound. Copy with `xs[:]` / `xs.slice()`. A function may not
-return one of its list parameters, and the same list may not be passed twice to
-a function that mutates a list parameter. A loop may not iterate over a list
-that its body changes, directly or through a call.
+**Optionals.** `T | None`, `Optional[T]`, `T | undefined`, `x?: T`. Using an
+optional where a value is needed (`x + 1`, `x.f`, `x!`) is an obligation that it
+is present. Proving it uses whatever checks came before, so no narrowing syntax
+is needed. `?.` and `??` work.
 
-`a or b` / `a || b` must have boolean operands when used as a value, because
-both languages return an operand there, not a boolean. In a condition,
-truthiness applies as usual. A variable that is assigned on only some paths
-cannot be read afterwards. Builtins rebound in the module (`def abs(...)`,
-`from x import round`) are not treated as builtins. Records must be immutable
-(`@dataclass(frozen=True)` without custom dunder methods, or `NamedTuple`).
+**Dicts and Maps.** `d[k]` / `m.get(k)!` must find the key. `get`, `in`/`has`,
+assignment, `del`/`delete`, `keys()`/`values()`/`items()` and iteration are
+modelled.
 
-In TypeScript, `var` is rejected (use `let`/`const`), a declaration may not
-shadow an outer variable, and `const` bindings cannot be reassigned. Only a
-top-level conjunct `Number.isInteger(p)` of a `@requires` makes `p` an
-integer. Distinct list arguments are assumed not to alias. A callee that
-mutates a list parameter is modelled at the call site: the argument gets fresh
-contents constrained by the callee's `@ensures` (with `old`). `print` and
-`console.*` are ignored.
+**Strings.** Concatenation, f-strings and template literals, `len`/`.length`,
+`in`/`includes`, `startswith`, slicing, and comparison are exact (Z3's string
+theory). Other methods (`lower()`, `replace`, …) are deterministic but
+uninterpreted.
+
+**Async.** At every `await`, other tasks may change any object that existed
+before the call. They leave class invariants intact, but anything else is
+re-checked. That is how a check-then-act race shows up.
+
+**Unchecked code.** A value telic knows nothing about (unannotated, `Any`,
+`unknown`, a library type) is opaque. So is the result of a call into code it
+doesn't check (a library, a decorated function, a local closure). Such a call:
+
+- may change every list, dict or object it is handed;
+- is assumed not to raise;
+- leaves its result unconstrained.
+
+Every such assumption is listed under *trusted base* in the report.
+
+**Aliasing rules.** Lists and dicts are modelled as values. Binding a name to an
+existing one (`ys = xs`) is rejected; copy it with `xs[:]` / `.slice()`. The same
+goes for storing one in a field or returning a parameter. A loop may not change
+the collection it iterates over.
+
+**Strictness.** Falling off the end of a function that returns a value is an
+error, and so is a reachable `raise`/`throw` without `@raises`. In TypeScript,
+`var` is rejected and a declaration may not shadow an outer one. `a or b` /
+`a || b` used as a value must have boolean operands, unless the result type is
+clear from the operands (`x || 0`).

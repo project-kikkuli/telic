@@ -11,7 +11,7 @@ Read [docs/design.md](docs/design.md) first.
 |---|---|
 | `telic/ir.py` | the IR. Language differences are distinct operators, never shared names |
 | `telic/contracts.py` | `@`-comment grammar shared by all frontends |
-| `telic/frontend/python.py`, `telic/frontend/ts/lower.mjs` | lowering; anything not modelled exactly becomes `Unsupported(reason)` |
+| `telic/frontend/python.py`, `telic/frontend/ts/lower.mjs` | lowering; what can't be modelled exactly becomes opaque (with its assumption recorded) or `Unsupported(reason)` |
 | `telic/logic.py` | VC terms, smart constructors, theory definitions and lemmas |
 | `telic/vcgen.py` | symbolic execution → `Obligation`s; pure functions → definitions |
 | `telic/infer.py` | Houdini invariants, loop variants, recursion measures |
@@ -20,13 +20,16 @@ Read [docs/design.md](docs/design.md) first.
 | `telic/equiv.py`, `telic/gaps.py` | `@mirrors` and spec-gap mutation |
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
+| `telic/intent.py` | intents: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
 
 ## Rules
 
 - **Soundness first.** A change that can make telic report `proved` for a false
   claim is a bug, whatever else it fixes. When a construct can't be modelled
-  exactly, reject it with a reason and a line.
+  exactly, make it opaque with a conservative effect and record the assumption
+  (`VCGen.note`), or reject it with a reason and a line. Add an exploit to
+  `tests/cases/soundness/` for every such case.
 - **New semantics need differential tests.** Any operator or builtin you add to a
   frontend gets cases in `tests/test_semantics.py`, compared against the real
   interpreter.
