@@ -370,6 +370,63 @@ class CheckOptions:
     only: set[str] | None = None  # function names to check
     progress: Callable[[str], None] | None = None
     receipts: bool = True  # reuse whole-function verdicts for unchanged functions
+    jobs: int | None = None  # solver threads (default: every core)
+
+
+_POOL: dict[str, Any] = {}
+
+
+def _pool_call(item: Any) -> Any:
+    return _POOL["fn"](item)
+
+
+def run_parallel(fn: Callable[[Any], Any], items: list[Any], jobs: int | None) -> list[Any]:
+    """Map ``fn`` over ``items`` on every core (fork: the function and what it
+    closes over are inherited, only items and results are pickled)."""
+    workers = max(1, min(jobs or (os.cpu_count() or 1), len(items)))
+    if workers == 1 or len(items) < 2:
+        return [fn(x) for x in items]
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    if "fork" in mp.get_all_start_methods():
+        _POOL["fn"] = fn
+        try:
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as pool:
+                return list(pool.map(_pool_call, items, chunksize=max(1, len(items) // (workers * 4))))
+        except Exception:  # pragma: no cover
+            pass
+        finally:
+            _POOL.pop("fn", None)
+    with ThreadPoolExecutor(max_workers=workers) as tp:
+        return list(tp.map(fn, items))
+
+
+def _pool_solve(ob: Obligation) -> SmtResult:
+    return solve(ob, _POOL["theory"], _POOL["timeout"])
+
+
+def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, jobs: int | None) -> list[SmtResult]:
+    """Solve independent obligations on every core. Worker processes (fork)
+    sidestep the GIL, which the Python half of each solve holds; threads are
+    the fallback where fork is unavailable."""
+    workers = max(1, min(jobs or (os.cpu_count() or 1), len(obs)))
+    if workers == 1 or len(obs) < 4:
+        return [solve(ob, theory, timeout_ms) for ob in obs]
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    if "fork" in mp.get_all_start_methods():
+        _POOL["theory"], _POOL["timeout"] = theory, timeout_ms
+        try:
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as pool:
+                return list(pool.map(_pool_solve, obs, chunksize=max(1, len(obs) // (workers * 4))))
+        except Exception:  # pragma: no cover - e.g. a sandbox without fork
+            pass
+        finally:
+            _POOL.clear()
+    with ThreadPoolExecutor(max_workers=workers) as tp:
+        return list(tp.map(lambda ob: solve(ob, theory, timeout_ms), obs))
 
 
 def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory, list[tuple[str, str]]]:
@@ -422,23 +479,32 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     # needs them), so infer them first for recursive definitional functions.
     measures: dict[str, ir.Expr] = {}
     inferred: dict[str, Inferred] = {}
-    for key, ref in program.funcs.items():
-        if opts.only and ref.fn.name not in opts.only:
-            continue
-        if ref.fn.unsupported or ref.fn.trusted or ref.module.context:
-            continue
-        if opts.infer:
-            ikey = inference_key(program, key)
-            try:
-                inferred[key] = infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 1000), cached=cache.get(ikey))
-                cache.put(ikey, inferred[key].summary())
-            except VCError:
-                inferred[key] = Inferred()
-            if key in inferred[key].options.measures:
-                measures[key] = inferred[key].options.measures[key]
+    todo_inf = [
+        (key, ref)
+        for key, ref in program.funcs.items()
+        if opts.infer and not (opts.only and ref.fn.name not in opts.only) and not (ref.fn.unsupported or ref.fn.trusted or ref.module.context)
+    ]
+
+    def infer_one(item):
+        key, ref = item
+        ikey = inference_key(program, key)
+        try:
+            return key, ikey, infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 1000), cached=cache.get(ikey))
+        except VCError:
+            return key, None, Inferred()
+
+    inf_results = run_parallel(infer_one, todo_inf, opts.jobs)
+    for key, ikey, res in inf_results:
+        inferred[key] = res
+        if ikey is not None:
+            cache.put(ikey, res.summary())
+        if key in res.options.measures:
+            measures[key] = res.options.measures[key]
     if measures:
         theory, theory_problems = build_theory(program, measures)
 
+    pending: list[tuple[Verdict, str]] = []
+    staged: list[tuple[FunctionReport, str | None, float]] = []
     for key, ref in program.funcs.items():
         fn = ref.fn
         if opts.only and fn.name not in opts.only:
@@ -506,14 +572,27 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=hit.get("method", "")))
                 continue
             solved += 1
-            res: SmtResult = solve(ob, theory, opts.timeout_ms)
-            v = Verdict(ob, res.status, "z3", res.seconds, res.model, res.state, res.reason)
+            v = Verdict(ob, "pending", "z3", 0.0)
+            pending.append((v, key_))
+            rep.verdicts.append(v)
+        staged.append((rep, fkey, ft))
+        reports.append(rep)
+
+    # Solve everything pending at once: each obligation gets its own Z3
+    # context, and Z3 releases the GIL while it works, so threads use every
+    # core.
+    if pending:
+        results = solve_all([v.ob for v, _ in pending], theory, opts.timeout_ms, opts.jobs)
+        for (v, key_), res in zip(pending, results):
+            v.status, v.seconds, v.model, v.state, v.reason = res.status, res.seconds, res.model, res.state, res.reason
             if res.status == "proved":
                 cache.put(key_, {"method": "z3"})
             elif res.status == "unknown":
                 cache.put(key_, {"method": "unknown", "timeout": opts.timeout_ms, "reason": res.reason})
-            rep.verdicts.append(v)
+
+    for rep, fkey, ft in staged:
         # Escalate: counterexamples get executed, unknowns go to Lean.
+        ref = rep.ref
         if opts.replay:
             from .replay import replay_verdicts
 
@@ -529,7 +608,6 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         rep.seconds = time.perf_counter() - ft
         if fkey and rep.status == "proved" and not rep.problems:
             cache.put(fkey, make_receipt(rep))
-        reports.append(rep)
 
     # Transitive dependency status: a proof that assumes an unproved contract
     # is only as good as that contract.

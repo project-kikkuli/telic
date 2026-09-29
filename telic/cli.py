@@ -31,6 +31,7 @@ def _options(args: argparse.Namespace, root: str) -> CheckOptions:
         lean=not args.no_lean,
         cache_path=None if args.no_cache else _cache_path(root),
         only=set(args.only) if args.only else None,
+        jobs=getattr(args, "jobs", None),
     )
 
 
@@ -42,6 +43,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--no-cache", action="store_true", help="ignore and do not write .telic/cache.json")
     ap.add_argument("--only", action="append", metavar="FUNC", help="check only these functions")
     ap.add_argument("--root", default=None, help="project root for relative paths and the cache (default: cwd)")
+    ap.add_argument("-j", "--jobs", type=int, default=None, help="solver threads (default: every core)")
 
 
 def report_json(rep: Report) -> dict[str, Any]:

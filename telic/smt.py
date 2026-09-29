@@ -365,7 +365,9 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
     if len(with_lemmas[1]) == len(without[1]):
         return _solve(ob, with_lemmas, timeout_ms, t0)
-    first = _solve(ob, without, max(500, timeout_ms // 3), t0)
+    # Phase one only needs long enough to find a model or a quick proof;
+    # quantified lemmas are what unlock the rest.
+    first = _solve(ob, without, max(300, min(800, timeout_ms // 10)), t0)
     if first.status != "unknown":
         return first
     second = _solve(ob, with_lemmas, timeout_ms, t0)
