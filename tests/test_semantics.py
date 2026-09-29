@@ -149,3 +149,26 @@ def test_python_float_rounding_model():
     for a in range(-11, 12):
         for b in (1, 2, 4):
             assert model_value(mod, "f", a, b) == round(a / b), (a, b)
+
+
+VALUE_IDIOMS = [
+    "(a or b)",
+    "(a and b)",
+    "(a or b or 3)",
+    "len(('x' if a > 0 else '') + ('yz' if b > 0 else ''))",
+    "len(('x' if a > 0 else '') or 'yy')",
+    "len([a, b] + [a])",
+    "len([a] + [])",
+    "((a if a > 1 else None) or b)",
+    "(1 if (a > 0 and 'q' or '') else 0)",
+]
+
+
+@pytest.mark.parametrize("e", VALUE_IDIOMS)
+def test_python_value_idioms_match_cpython(e):
+    """`x or default`, str and list `+`: values as CPython computes them."""
+    src = f"def f(a: int, b: int) -> int:\n    return {e}\n"
+    mod = lower_python("v.py", src)
+    assert not mod.functions["f"].unsupported, (e, mod.functions["f"].unsupported)
+    for a, b in INPUTS:
+        assert model_value(mod, "f", a, b) == eval(e, {"a": a, "b": b}), (e, a, b)

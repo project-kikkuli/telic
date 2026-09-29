@@ -11,6 +11,7 @@ guesses at semantics it does not model.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import io
 import os
 import tokenize
@@ -97,6 +98,14 @@ class PythonFrontend:
         self.linked_functions: dict[str, tuple["PythonFrontend", str]] = {}
         self.module_aliases: dict[str, "PythonFrontend"] = {}
         self.imports: list[tuple[str, int, str, str | None]] = []  # (module, level, name, asname)
+        self.class_bases: dict[str, list[str]] = {}  # checked bases, also of foreign ancestors
+        self.pydantic: set[str] = set()
+        self._own: dict[str, tuple[bool, bool, dict[str, ast.expr], bool]] = {}  # cls -> (dataclass, has __init__, defaults, pydantic)
+        self._flat: set[str] = set()
+        self.generators: set[str] = set()  # functions containing yield: their body runs later, driven by the consumer
+        # every checked class in the project (name -> owner), for types that
+        # reach a module through fields without being imported there
+        self.project: dict[str, "PythonFrontend"] = {}
 
     def import_class_info(self, other: "PythonFrontend", cname: str) -> None:
         """Make a class from another checked module usable here: its
@@ -131,9 +140,10 @@ class PythonFrontend:
     def classes(self) -> dict[str, ir.ClassDecl]:
         """Classes usable here: this module's and those imported from other
         checked modules."""
-        if not self.foreign_classes:
+        if not self.foreign_classes and not self.project:
             return self.module.classes
-        return {**self.foreign_classes, **self.module.classes}
+        reach = {n: o.module.classes[n] for n, o in self.project.items() if n in o.module.classes}
+        return {**reach, **self.foreign_classes, **self.module.classes}
 
     # -- entry --------------------------------------------------------------
 
@@ -218,9 +228,16 @@ class PythonFrontend:
         for node in classes:
             try:
                 self._class_fields(node)
+            except NotModelled as e:
+                self.class_names.discard(node.name)
+                self.module.notes.append((f"class {node.name}: {e}", ir.Loc(e.line or node.lineno)))
             except LowerError as e:
                 self.class_names.discard(node.name)
                 self.module.problems.append((f"class {node.name}: {e}", ir.Loc(e.line or node.lineno)))
+        yield "fields"
+        for node in classes:
+            if node.name in self.module.classes:
+                self.flatten(node.name)
         classes = [c for c in classes if c.name in self.module.classes]
         methods: list[tuple[ast.FunctionDef, str]] = []
         for node in tree.body:
@@ -230,10 +247,15 @@ class PythonFrontend:
                 except LowerError as e:
                     self.module.problems.append((f"{node.name}: {e}", ir.Loc(e.line)))
         for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures and _is_generator(node):
+                self.generators.add(node.name)
+        for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures:
                 unknown = {_decorator_name(d) for d in node.decorator_list} - TRANSPARENT_DECORATORS
                 if unknown and not all(_route_decorator(d) for d in node.decorator_list if _decorator_name(d) in unknown):
                     self.wrapped[node.name] = sorted(unknown)[0]
+                elif node.name in self.generators:
+                    self.wrapped[node.name] = "generator"  # calling it only creates the generator
         for c in classes:
             for sub in c.body:
                 if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -252,6 +274,9 @@ class PythonFrontend:
                     unknown = decos - TRANSPARENT_DECORATORS
                     if unknown:
                         self.wrapped[key] = sorted(unknown)[0]
+                    if _is_generator(sub):
+                        self.generators.add(key)
+                        self.wrapped.setdefault(key, "generator")
                     methods.append((sub, c.name, key))
                 except LowerError as e:
                     self.module.problems.append((f"{key}: {e}", ir.Loc(e.line or sub.lineno)))
@@ -260,10 +285,10 @@ class PythonFrontend:
             self._class_invariants(c)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.signatures:
-                fn = FunctionLowerer(self, node).lower()
+                fn = self._lower_safely(node, None, node.name)
                 self.module.functions[fn.name] = fn
         for node, cname, key in methods:
-            fn = FunctionLowerer(self, node, cname, key).lower()
+            fn = self._lower_safely(node, cname, key)
             self.module.functions[fn.name] = fn
 
         # Module-level intent declarations (anything not consumed by a function).
@@ -348,13 +373,17 @@ class PythonFrontend:
         """Fields of a mutable class: class-level annotations (dataclass
         style) plus 'self.x = ...' assignments in __init__."""
         bases = [_decorator_name(b) for b in node.bases]
-        model_base = bool(set(bases) & {"BaseModel", "SQLModel"})  # pydantic: a validated dataclass
-        if any(b not in ("object", "BaseModel", "SQLModel") for b in bases) or (node.keywords and not model_base):
-            raise LowerError("inheritance is not modelled yet", node)
+        model_base = bool(set(bases) & MODEL_BASES)  # pydantic: a validated dataclass
+        checked = [b for b in bases if b in self.class_names and b != node.name]
+        library = [b for b in bases if b not in checked and b not in MODEL_BASES and b not in NEUTRAL_BASES]
+        if library:
+            raise NotModelled(f"subclass of {library[0]}, which telic does not check: its instances are treated as library values", node)
+        if node.keywords and not (model_base or checked):
+            raise NotModelled("class keywords (metaclass=...) are not modelled: its instances are treated as library values", node)
+        self.class_bases[node.name] = checked
         decos = {_decorator_name(d) for d in node.decorator_list}
         if decos - {"dataclass"}:
             raise LowerError(f"class decorator @{sorted(decos - {'dataclass'})[0]} is not modelled", node)
-        is_dc = "dataclass" in decos or model_base
         magic = {st.name for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))} & {"__setattr__", "__getattr__", "__getattribute__", "__delattr__", "__new__", "__init_subclass__", "__class_getitem__"}
         if magic:
             raise LowerError(f"{sorted(magic)[0]} changes what attribute access means; not modelled", node)
@@ -401,13 +430,103 @@ class PythonFrontend:
                 fields.append((tgt.attr, ty))
                 known.add(tgt.attr)
         self.module.classes[node.name] = ir.ClassDecl(node.name, fields, [], ir.Loc(node.lineno, node.col_offset))
-        if is_dc:
-            self.dataclasses.add(node.name)
         dunders = {st.name for st in node.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef))}
         self.custom_eq[node.name] = "__eq__" in dunders
         self.custom_bool[node.name] = bool(dunders & {"__bool__", "__len__"})
-        if is_dc and init is None:
-            self.dataclass_defaults[node.name] = defaults
+        self._own[node.name] = ("dataclass" in decos, init is not None, defaults, model_base)
+
+    def flatten(self, cname: str) -> None:
+        """Inherited fields (base fields first, as Python orders them), which
+        class owns each field, and how instances are constructed."""
+        if cname in self._flat:
+            return
+        self._flat.add(cname)
+        decl = self.module.classes[cname]
+        own_dc, own_init, own_defaults, pyd = self._own[cname]
+        fields: list[tuple[str, ir.Type]] = []
+        owner: dict[str, str] = {}
+        base_defaults: dict[str, ast.expr] = {}
+        dc_base = False
+        for b in self.class_bases.get(cname, []):
+            ofe = self if b in self.module.classes else self.linked_classes.get(b)
+            if ofe is None or b not in ofe.module.classes:
+                del self.module.classes[cname]
+                self.class_names.discard(cname)
+                self.module.notes.append((f"class {cname}: subclass of {b}, which telic could not model: its instances are treated as library values", decl.loc))
+                return
+            ofe.flatten(b)
+            if b not in ofe.module.classes:  # dropped while flattening
+                del self.module.classes[cname]
+                self.class_names.discard(cname)
+                self.module.notes.append((f"class {cname}: subclass of {b}, which telic could not model: its instances are treated as library values", decl.loc))
+                return
+            bdecl = ofe.module.classes[b]
+            for f, t in bdecl.fields:
+                if f not in owner:
+                    fields.append((f, t))
+                    owner[f] = bdecl.field_owner(f)
+            pyd = pyd or b in ofe.pydantic
+            dc_base = dc_base or b in ofe.dataclasses
+            base_defaults.update(ofe.dataclass_defaults.get(b, {}))
+            self.custom_eq[cname] = self.custom_eq.get(cname, False) or ofe.custom_eq.get(b, False)
+            self.custom_bool[cname] = self.custom_bool.get(cname, False) or ofe.custom_bool.get(b, False)
+        for f, t in decl.fields:
+            if f in owner:
+                fields = [(g, t if g == f else u) for g, u in fields]  # a redeclared field keeps its place
+            else:
+                fields.append((f, t))
+                owner[f] = cname
+        decl.fields = fields
+        decl.owner = owner
+        decl.bases = list(self.class_bases.get(cname, []))
+        if pyd:
+            self.pydantic.add(cname)
+        if pyd or own_dc:
+            self.dataclasses.add(cname)
+            if not own_init:
+                self.dataclass_defaults[cname] = {**base_defaults, **own_defaults}
+        elif dc_base and not own_init:
+            self.dataclasses.add(cname)
+            if cname in self.dataclass_defaults or not any(owner[f] == cname for f, _ in fields):
+                self.dataclass_defaults[cname] = dict(base_defaults)
+
+    def mro(self, cls: str) -> list[str]:
+        """Method resolution order over checked classes (left to right,
+        depth first, each class once: C3 for the hierarchies telic models)."""
+        out: list[str] = []
+
+        def walk(c: str) -> None:
+            if c in out:
+                return
+            out.append(c)
+            bases = self.class_bases.get(c)
+            if bases is None and c in self.project:
+                bases = self.project[c].class_bases.get(c, [])
+            for b in bases or []:
+                walk(b)
+
+        walk(cls)
+        return out
+
+    def library_derived(self, cls: str) -> bool:
+        """Does ``cls`` get members from a library base (pydantic's BaseModel)?"""
+        for c in self.mro(cls):
+            owner = self if c in self.module.classes else self.project.get(c) or self.linked_classes.get(c)
+            if owner is not None and c in owner.pydantic:
+                return True
+        return False
+
+    def member(self, cls: str, attr: str) -> str:
+        """The key of the method/property ``attr`` of ``cls``, inherited or its own."""
+        for c in self.mro(cls):
+            key = f"{c}.{attr}"
+            if key in self.signatures or key in self.properties or key in self.setters:
+                return key
+            owner = self.project.get(c)
+            if owner is not None and owner is not self and c not in self.module.classes and (key in owner.signatures or key in owner.properties):
+                self.import_class_info(owner, c)  # a class reached through a field type
+                return key
+        return f"{cls}.{attr}"
 
     def _class_invariants(self, node: ast.ClassDef) -> None:
         decl = self.module.classes[node.name]
@@ -426,6 +545,17 @@ class PythonFrontend:
                 decl.invariants.append(c)
             except (LowerError, ContractSyntaxError) as e:
                 self.module.problems.append((f"class {node.name}: invariant: {e}", ir.Loc(cl.line, cl.col)))
+
+    def _lower_safely(self, node: ast.FunctionDef, cname: str | None, key: str) -> ir.Function:
+        """Lower one function; a bug in telic on one function leaves that
+        function unchecked (with the reason) instead of stopping the run."""
+        try:
+            return FunctionLowerer(self, node, cname, key).lower() if cname else FunctionLowerer(self, node).lower()
+        except Exception as e:  # noqa: BLE001 - reported on the function, never swallowed
+            params, ret = self.signatures[key]
+            fn = ir.Function(key, ir.Loc(node.lineno, node.col_offset), node.end_lineno or node.lineno, params, ret, source=ast.get_source_segment(self.source, node) or "")
+            fn.unsupported.append((f"telic could not model this function ({type(e).__name__}: {e}); please report it", ir.Loc(node.lineno)))
+            return fn
 
     def type_of_annotation(self, ann: ast.expr | None) -> ir.Type:
         if ann is None:
@@ -619,6 +749,9 @@ class FunctionLowerer:
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
             body = body[1:]
         self._scan_closures(node)
+        if self.key in self.fe.generators:
+            self.fn.ret = ir.NONE  # the body is checked as a procedure; values leave through yield
+            self.fe.wrapped.setdefault(self.key, "generator")
         self.fn.body = list(self.block(body, node))
         self.fn.locals = dict(self.env)
         self.fn.escaped = {n for n in self.escaped if isinstance(self.env.get(n), (ir.TList, ir.TDict, ir.TClass, ir.TOpaque))}
@@ -792,6 +925,9 @@ class FunctionLowerer:
             raise LowerError(f"variable '{name}' changes type from {old} to {ty}; telic requires one type per variable", node)
 
     def coerce(self, e: ir.Expr, ty: ir.Type) -> ir.Expr:
+        up = self._upcast(e.ty, ty)
+        if up is not None:
+            return dataclasses.replace(e, ty=up)  # a subclass object where its base is expected
         if e.ty != ty and not isinstance(e.ty, ir.TOpaque) and not isinstance(ty, ir.TOpaque) and (_has_opaque(e.ty) or _has_opaque(ty)) and e.ty != ir.NONE:
             return ir.Builtin(ty, e.loc, "from_opaque", (e,))  # e.g. list[opaque] used as list[str]
         if isinstance(e.ty, ir.TOpaque) and not isinstance(ty, ir.TOpaque) and ty != ir.NONE:
@@ -818,6 +954,14 @@ class FunctionLowerer:
         if isinstance(ty, ir.TList) and isinstance(e, ir.ListLit) and not e.elems:
             return ir.ListLit(ty, e.loc, ())
         return e
+
+    def _upcast(self, have: ir.Type, want: ir.Type) -> ir.Type | None:
+        if isinstance(have, ir.TOption) and isinstance(want, ir.TOption):
+            inner = self._upcast(have.inner, want.inner)
+            return ir.TOption(inner) if inner is not None else None
+        if isinstance(have, ir.TClass) and isinstance(want, ir.TClass) and have != want and want.name in self.fe.mro(have.name):
+            return want
+        return None
 
     def fresh(self, base: str) -> str:
         self.tmp += 1
@@ -887,6 +1031,11 @@ class FunctionLowerer:
                 return
             if isinstance(v, ast.Await):
                 yield ir.ExprStmt(loc, self.expr(v))
+                return
+            if isinstance(v, (ast.Yield, ast.YieldFrom)):
+                # a generator hands control (and the value) to its consumer: unchecked code
+                args = (self.expr(v.value),) if v.value is not None else ()
+                yield ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, "yield", args))
                 return
             if isinstance(v, (ast.Constant, ast.Name)):
                 return  # a bare name / Ellipsis: no effect
@@ -1081,7 +1230,7 @@ class FunctionLowerer:
                 raise LowerError(f"{obj.ty.name} is frozen; build a new one with dataclasses.replace or the constructor", s)
             if not isinstance(obj.ty, ir.TClass):
                 raise LowerError(f"cannot assign an attribute of {obj.ty}", s)
-            prop = f"{obj.ty.name}.{target.attr}"
+            prop = self.fe.member(obj.ty.name, target.attr)
             if prop in self.fe.setters:
                 sk = prop + ".setter"
                 params, _ = self.fe.signatures[sk]
@@ -1098,7 +1247,7 @@ class FunctionLowerer:
                 raise LowerError(f"{obj.ty.name} has no field '{target.attr}' (declare it in the class or __init__)", s)
             val = self.coerce(self.expr(value, ft), ft)
             self._check_assignable(f"{obj.ty.name}.{target.attr}", ft, val, s)
-            if isinstance(ft, (ir.TList, ir.TDict)) and not fresh_list(val):
+            if isinstance(ft, (ir.TList, ir.TDict)) and not fresh_list(val) and not self.moved(val, s):
                 raise LowerError(f"storing an existing {ft} in a field would alias it; store a copy", s)
             yield ir.FieldAssign(loc, obj, obj.ty.name, target.attr, val)
             return
@@ -1159,7 +1308,10 @@ class FunctionLowerer:
                 yield ir.Assign(loc, t, v)
                 src = ir.Var(v.ty, loc, t)
             ln = ir.Binary(ir.BOOL, loc, "eq", ir.Builtin(ir.INT, loc, "len", (src,)), ir.Lit(ir.INT, loc, k))
-            yield ir.AssertStmt(loc, ir.Clause("assert", ln, loc, f"unpacking needs exactly {k} elements"), native=True)
+            if self.try_depth > 0:  # the ValueError goes to a handler
+                yield ir.If(loc, ir.Unary(ir.BOOL, loc, "not", ln), (ir.Raise(loc, "ValueError: wrong number of values to unpack", caught=True),), ())
+            else:
+                yield ir.AssertStmt(loc, ir.Clause("assert", ln, loc, f"unpacking needs exactly {k} elements"), native=True)
             for i, tgt in enumerate(target.elts):
                 if not isinstance(tgt, ast.Name):
                     raise LowerError("unpacking targets must be names", s)
@@ -1200,12 +1352,38 @@ class FunctionLowerer:
             return
         raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
 
+    def moved(self, val: ir.Expr, node: ast.AST) -> bool:
+        """Is ``val`` a local list/dict variable that is never used after
+        ``node``? Then binding it elsewhere moves it: no alias survives."""
+        if not isinstance(val, ir.Var) or any(p.name == val.name for p in self.fn.params) or val.name in self.escaped:
+            return False
+        name = val.name
+        end = (getattr(node, "end_lineno", None) or node.lineno, getattr(node, "end_col_offset", None) or 0)
+        for x in ast.walk(self.node):
+            if isinstance(x, ast.Name) and x.id == name and (x.lineno, x.col_offset) > end:
+                return False
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and x is not self.node:
+                if any(isinstance(y, ast.Name) and y.id == name for y in ast.walk(x)):
+                    return False  # a closure may still read it
+        # inside a loop, the next iteration would see the moved list again,
+        # unless the loop body binds it afresh before this point
+        for loop in ast.walk(self.node):
+            if isinstance(loop, (ast.For, ast.AsyncFor, ast.While)) and loop.lineno <= node.lineno <= (loop.end_lineno or loop.lineno):
+                fresh = any(
+                    isinstance(st, (ast.Assign, ast.AnnAssign)) and st.lineno < node.lineno and loop.lineno < st.lineno
+                    and any(isinstance(t, ast.Name) and t.id == name for t in (st.targets if isinstance(st, ast.Assign) else [st.target]))
+                    for st in ast.walk(loop)
+                )
+                if not fresh:
+                    return False
+        return True
+
     def _no_alias(self, name: str, val: ir.Expr, node: ast.AST) -> None:
         if not isinstance(val.ty, (ir.TList, ir.TDict)):
             return
         if any(p.name == name for p in self.fn.params):
             raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it, or copy it to a new name)", node)
-        if not fresh_list(val):
+        if not fresh_list(val) and not self.moved(val, node):
             raise LowerError(
                 f"'{name} = ...' would alias an existing list; telic models lists as values, so copy explicitly (xs[:])",
                 node,
@@ -1336,8 +1514,10 @@ def fresh_list(e: ir.Expr) -> bool:
     may not return their list parameters)."""
     if isinstance(e, (ir.ListLit, ir.Call)):
         return True
-    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append"):
+    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat"):
         return True
+    if isinstance(e, ir.Builtin) and e.name == "await":
+        return fresh_list(e.args[0])
     if isinstance(e, ir.Extern):
         return True
     if isinstance(e, ir.Ite):
@@ -1375,6 +1555,10 @@ def _desc(n: ast.expr) -> str:
         return ast.unparse(n)[:40]
     except Exception:  # pragma: no cover
         return "value"
+
+
+def _is_generator(fn: ast.AST) -> bool:
+    return any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in _own_nodes(fn))
 
 
 def _own_nodes(fn: ast.AST):
@@ -1422,7 +1606,17 @@ def _route_decorator(d: ast.expr) -> bool:
     return isinstance(f, ast.Attribute) and f.attr in ROUTE_VERBS
 
 
+class NotModelled(LowerError):
+    """A construct telic deliberately treats as library code (a note, not a problem)."""
+
+
+MODEL_BASES = {"BaseModel", "SQLModel"}
+NEUTRAL_BASES = {"object", "ABC", "Generic", "Protocol"}
+
+
 def _decorator_name(d: ast.expr) -> str:
+    if isinstance(d, ast.Subscript):
+        d = d.value  # Generic[T]
     if isinstance(d, ast.Call):
         d = d.func
     if isinstance(d, ast.Name):
@@ -1589,7 +1783,7 @@ class ExprLowerer:
             if any(isinstance(v.ty, ir.TOpaque) for v in vals):
                 return self.opaque(op, vals, ir.TOpaque(""), loc)
             if not all(isinstance(v.ty, ir.TBool) for v in vals):
-                raise self.err(f"'{op}' on non-bool values returns an operand, not a bool; compare explicitly", n)
+                return self.value_boolop(op, vals, n, loc)
             out = vals[0]
             for v in vals[1:]:
                 out = ir.Binary(ir.BOOL, loc, op, out, v)
@@ -1673,7 +1867,7 @@ class ExprLowerer:
                     return self.opaque("enum_value", [obj], ir.TOpaque(""), loc)
                 raise self.err(f"unsupported attribute '.{n.attr}' of an enum", n)
             if isinstance(obj.ty, ir.TClass):
-                key = f"{obj.ty.name}.{n.attr}"
+                key = self.fl.fe.member(obj.ty.name, n.attr)
                 if key in self.fl.fe.properties:
                     return self.method_call(key, obj, [], [], n, loc)
                 ft = self.fl.fe.classes[obj.ty.name].field_type(n.attr)
@@ -1700,10 +1894,15 @@ class ExprLowerer:
                 raise self.err("list elements must all have one type", n)
             return ir.ListLit(ir.TList(t), loc, tuple(elems))
         if isinstance(n, ast.Dict):
+            if any(k is None for k in n.keys) and not isinstance(expect, ir.TDict):
+                # {**base, "k": v}: a JSON-like payload, not a checked map
+                return self.opaque("dict", [self.expr(x) for x in list(filter(None, n.keys)) + n.values], ir.TOpaque("dict"), loc)
             if any(k is None for k in n.keys):
                 raise self.err("'**' in dict literals is not supported", n)
             ks = [self.expr(k) for k in n.keys]  # type: ignore[arg-type]
             vs = [self.expr(v) for v in n.values]
+            if not isinstance(expect, ir.TDict) and (len({k.ty for k in ks}) > 1 or len({v.ty for v in vs}) > 1) and not all(ir.is_numeric(v.ty) for v in vs):
+                return self.opaque("dict", ks + vs, ir.TOpaque("dict"), loc)  # mixed value types: a JSON-like payload
             if isinstance(expect, ir.TDict):
                 dt = expect
             elif ks:
@@ -1748,9 +1947,17 @@ class ExprLowerer:
                 return out
             return self.opaque("pow", [a, b], ir.TOpaque("") if not (isinstance(a.ty, ir.TReal) or isinstance(b.ty, ir.TReal)) else ir.REAL, loc)
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TList):
-            raise self.err("list concatenation is not supported", n)
+            if isinstance(b, ir.ListLit) and not b.elems:
+                b = ir.ListLit(a.ty, b.loc, ())
+            if isinstance(a, ir.ListLit) and not a.elems and isinstance(b.ty, ir.TList):
+                a = ir.ListLit(b.ty, a.loc, ())
+            if b.ty != a.ty:
+                raise self.err(f"cannot concatenate {a.ty} and {b.ty}", n)
+            return ir.Builtin(a.ty, loc, "list_concat", (a, b))
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TStr):
-            raise self.err("string concatenation is not supported", n)
+            if b.ty != ir.STR:
+                raise self.err(f"cannot concatenate str and {b.ty}", n)
+            return ir.Builtin(ir.STR, loc, "str_concat", (a, b))
         if isinstance(op, (ast.Add, ast.Sub, ast.Mult)):
             a, b, t = self.numeric_pair(a, b, n)
             name = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul"}[type(op)]
@@ -1767,6 +1974,10 @@ class ExprLowerer:
         if isinstance(op, ast.Mod):
             a, b, t = self.numeric_pair(a, b, n)
             return ir.Binary(t, loc, "fmod", a, b)
+        if isinstance(op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift, ast.MatMult)):
+            # bit operations (and operator overloads of library values): deterministic, uninterpreted
+            ty = ir.INT if a.ty == ir.INT and b.ty == ir.INT else ir.TOpaque("")
+            return self.opaque(type(op).__name__.lower(), [a, b], ty, loc)
         raise self.err(f"unsupported operator {type(op).__name__}", n)
 
     def compare(self, n: ast.Compare, loc: ir.Loc) -> ir.Expr:
@@ -1879,7 +2090,7 @@ class ExprLowerer:
         cls = a.ty.name  # type: ignore[union-attr]
         if identity:
             return ir.Binary(ir.BOOL, loc, "eq", a, b)
-        if f"{cls}.__eq__" in fe.signatures or fe.custom_eq.get(cls):
+        if fe.member(cls, "__eq__") in fe.signatures or fe.custom_eq.get(cls):
             raise self.err(f"{cls} defines __eq__, which telic does not model; compare fields explicitly", n)
         if cls not in fe.dataclasses:
             return ir.Binary(ir.BOOL, loc, "eq", a, b)
@@ -1914,7 +2125,9 @@ class ExprLowerer:
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr not in ("floor", "ceil", "trunc"):
             return self.extern(f"math.{f.attr}", [], n, loc, expect or ir.REAL)
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.class_names and f.value.id not in self.fl.env:
-            key = f"{f.value.id}.{f.attr}"  # a static method
+            key = fe.member(f.value.id, f.attr)  # a static method
+            if key not in fe.signatures and fe.library_derived(f.value.id):
+                return self.extern(f"{f.value.id}.{f.attr}", [], n, loc, expect or ir.TOpaque(f"result of {f.value.id}.{f.attr}"))  # e.g. Model.from_orm
             if key not in fe.signatures:
                 raise self.err(f"'{key}' is not a checked static method", n)
             return self.method_call(key, None, n.args, n.keywords, n, loc)
@@ -1925,7 +2138,9 @@ class ExprLowerer:
             if isinstance(obj.ty, ir.TEnum):
                 return self.extern(f"{obj.ty.name}.{f.attr}", [obj], n, loc, expect)
             if isinstance(obj.ty, ir.TClass):
-                key = f"{obj.ty.name}.{f.attr}"
+                key = fe.member(obj.ty.name, f.attr)
+                if (key not in fe.signatures or key in fe.properties) and fe.library_derived(obj.ty.name):
+                    return self.extern(f"{obj.ty.name}.{f.attr}", [obj], n, loc, expect)  # e.g. pydantic's .dict(), .copy()
                 if key not in fe.signatures or key in fe.properties:
                     raise self.err(f"{obj.ty.name} has no checked method '{f.attr}'", n)
                 return self.method_call(key, obj, n.args, n.keywords, n, loc)
@@ -2104,6 +2319,32 @@ class ExprLowerer:
             return ir.Extern(ret, loc, f"@{self.fl.fe.wrapped[name]} {name}", tuple(args))
         return ir.Call(ret, loc, name, tuple(args))
 
+    def bind_unknown(self, key: str, params: list[ir.Param], pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST) -> list[ir.Expr]:
+        """``f(*xs)`` / ``f(**d)``: arguments before the first star bind as
+        usual; every other parameter gets some value of its type from the
+        unpacked data (an assumption, shown in the trusted base)."""
+        loc = _loc(n)
+        star, dstar = self.fl.fe.varargs.get(key, (None, None))
+        plain = [p for p in params if p.name not in (star, dstar)]
+        given: dict[str, ir.Expr] = {}
+        for p, a in zip(plain, pos):
+            if isinstance(a, ast.Starred):
+                break
+            given[p.name] = self.fl.coerce(self.expr(a, p.ty), p.ty)
+        for k in kws:
+            if k.arg is not None and k.arg in {p.name for p in plain}:
+                p = next(p for p in plain if p.name == k.arg)
+                given[k.arg] = self.fl.coerce(self.expr(k.value, p.ty), p.ty)
+        unpacked = [self.expr(a.value) for a in pos if isinstance(a, ast.Starred)] + [self.expr(k.value) for k in kws if k.arg is None]
+        out = []
+        for p in plain:
+            if p.name in given:
+                out.append(given[p.name])
+            else:
+                raw = self.opaque(f"arg:{p.name}", unpacked, ir.TOpaque(""), loc)
+                out.append(ir.Builtin(p.ty, loc, "from_opaque", (raw,)))
+        return out
+
     def bind_args(self, key: str, params: list[ir.Param], pos: list[ast.expr], kws: list[ast.keyword], n: ast.AST) -> list[ir.Expr]:
         """Match positional and keyword arguments to parameters, filling in
         defaults; then lower and type-check each argument."""
@@ -2114,7 +2355,7 @@ class ExprLowerer:
         chosen: dict[str, ast.expr] = {}
         positional = [p for p in params if p.name not in kwonly and p.name not in (star, dstar)]
         if any(isinstance(a, ast.Starred) for a in pos) or any(k.arg is None for k in kws):
-            raise self.err("*args / **kwargs at call sites are not supported", n)
+            return self.bind_unknown(key, params, pos, kws, n)
         extra_pos = pos[len(positional):]
         if extra_pos and star is None:
             raise self.err(f"'{key}' takes {len(positional)} positional arguments, got {len(pos)}", n)
@@ -2172,7 +2413,7 @@ class ExprLowerer:
         fe = self.fl.fe
         if self.spec:
             raise self.err("specifications cannot create objects", n)
-        init = f"{cls}.__init__"
+        init = fe.member(cls, "__init__")
         if init in fe.signatures:
             params, _ = fe.signatures[init]
             args = self.bind_args(init, params[1:], n.args, n.keywords, n)
@@ -2182,7 +2423,7 @@ class ExprLowerer:
             fe.defaults.setdefault(f"{cls}()", fe.dataclass_defaults[cls])
             args = self.bind_args(f"{cls}()", params, n.args, n.keywords, n)
             for (fname, fty), a in zip(decl.fields, args):
-                if isinstance(fty, (ir.TList, ir.TDict)) and not fresh_list(a):
+                if isinstance(fty, (ir.TList, ir.TDict)) and not fresh_list(a) and not self.fl.moved(a, n):
                     raise self.err(f"passing an existing {fty} as field '{fname}' would alias it; pass a copy", n)
         else:
             if n.args or n.keywords:
@@ -2198,6 +2439,30 @@ class ExprLowerer:
         return [self.expr(a) for a in n.args]
 
     # -- gradual fallbacks ------------------------------------------------
+
+    def value_boolop(self, op: str, vals: list[ir.Expr], n: ast.AST, loc: ir.Loc) -> ir.Expr:
+        """``a or b`` is ``a`` if ``a`` is truthy, else ``b`` (``and`` the
+        reverse): the usual defaulting idiom."""
+        out = vals[-1]
+        for v in reversed(vals[:-1]):
+            if op == "or":
+                # x or default: when x is truthy its value (unwrapped from an optional)
+                val = ir.Builtin(v.ty.inner, loc, "unwrap", (v,)) if isinstance(v.ty, ir.TOption) and not isinstance(out.ty, ir.TOption) else v
+                if val.ty != out.ty:
+                    val, out = self.fl.coerce(val, out.ty), out
+                if val.ty != out.ty:
+                    raise self.err(f"'or' of {v.ty} and {out.ty}: the operands need one type", n)
+                out = ir.Ite(out.ty, loc, self.truthy(v, n), val, out)
+            else:
+                if isinstance(v.ty, ir.TOption) and isinstance(v.ty.inner, ir.TClass) and not self.fl.fe.custom_bool.get(v.ty.inner.name):
+                    # obj and obj.attr: None when obj is None
+                    rty = out.ty if isinstance(out.ty, ir.TOption) else ir.TOption(out.ty)
+                    out = ir.Ite(rty, loc, ir.Builtin(ir.BOOL, loc, "is_none", (v,)), ir.Lit(rty, loc, None), self.fl.coerce(out, rty))
+                elif v.ty == out.ty:
+                    out = ir.Ite(out.ty, loc, self.truthy(v, n), out, v)
+                else:
+                    raise self.err(f"'and' of {v.ty} and {out.ty} returns either operand; compare explicitly", n)
+        return out
 
     def opaque(self, op: str, parts: list[ir.Expr], ty: ir.Type, loc: ir.Loc) -> ir.Expr:
         """An operation telic does not interpret: deterministic, unknown result."""
@@ -2470,17 +2735,60 @@ def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
                 fe.ignored_classes.add(local)
             else:
                 fe.linked_functions[local] = (other, name)
+    advance("fields")
     advance("signatures")
     for fe in fes:
-        for cname, other in fe.linked_classes.items():
+        for cname, other in list(fe.linked_classes.items()):
             decl = other.module.classes.get(cname)
             if decl is None:
                 fe.class_names.discard(cname)
                 continue
             fe.foreign_classes[cname] = decl
             fe.import_class_info(other, cname)
+            # ... and its ancestors, wherever they live: inherited members resolve through them
+            todo = [(cname, other)]
+            while todo:
+                c, owner_fe = todo.pop()
+                fe.class_bases[c] = list(owner_fe.class_bases.get(c, []))
+                for b in fe.class_bases[c]:
+                    bfe = owner_fe if b in owner_fe.module.classes else owner_fe.linked_classes.get(b)
+                    if bfe is None or b not in bfe.module.classes or b in fe.foreign_classes or b in fe.module.classes:
+                        continue
+                    fe.foreign_classes[b] = bfe.module.classes[b]
+                    fe.import_class_info(bfe, b)
+                    todo.append((b, bfe))
         for local, (other, name) in fe.linked_functions.items():
             if name in other.signatures and local == name:
                 fe.import_function(other, name)
+    owners: dict[str, PythonFrontend | None] = {}
+    for fe in fes:
+        for cname in fe.module.classes:
+            owners[cname] = fe if cname not in owners else None  # ambiguous names reach nowhere
+    registry = {n: o for n, o in owners.items() if o is not None}
+    for fe in fes:
+        fe.project = registry
+    # A class can be dropped as unmodelable after other types mention it
+    # (a field of type Settings, where Settings subclasses a library base):
+    # those mentions become opaque, like any other library type.
+    for fe in fes:
+        valid = set(fe.classes)
+        fe.signatures = {k: ([ir.Param(p.name, _forget_classes(p.ty, valid)) for p in ps], _forget_classes(r, valid)) for k, (ps, r) in fe.signatures.items()}
+        for decl in fe.module.classes.values():
+            decl.fields = [(f, _forget_classes(t, valid)) for f, t in decl.fields]
     advance("done")
     return [fe.module for fe in fes]
+
+
+def _forget_classes(t: ir.Type, valid: set[str]) -> ir.Type:
+    if isinstance(t, ir.TClass):
+        return t if t.name in valid else ir.TOpaque(t.name)
+    if isinstance(t, ir.TList):
+        e = _forget_classes(t.elem, valid)
+        return t if e is t.elem else ir.TList(e)
+    if isinstance(t, ir.TOption):
+        i = _forget_classes(t.inner, valid)
+        return t if i is t.inner else ir.TOption(i)
+    if isinstance(t, ir.TDict):
+        v = _forget_classes(t.val, valid)
+        return t if v is t.val else ir.TDict(t.key, v, t.js)
+    return t

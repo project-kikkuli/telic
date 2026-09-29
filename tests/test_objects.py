@@ -69,3 +69,13 @@ def test_vibecoded_cart_ts():
         assert refuted_confirmed(got[name]), (name, got[name].status)
     race = [v for v in got["checkout"].verdicts if v.replay is not None and v.replay.violation == "race"]
     assert race
+
+
+def test_inheritance():
+    got = run("inherit.py")
+    for name in ("Account.deposit", "Account.withdraw", "Savings.__init__", "Savings.add_interest", "Capped.withdraw", "savings_deposit", "new_article", "liked"):
+        assert got[name].status == "proved", (name, got[name].status, got[name].problems, [(v.ob.id, v.status) for v in got[name].verdicts])
+    assert got["Leaky.withdraw"].status == "refuted"
+    # a call through the base depends on every override, and one is broken
+    tb = got["through_base"]
+    assert any("Leaky.withdraw" in d for d in tb.open_deps), tb.open_deps

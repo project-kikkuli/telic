@@ -24,6 +24,8 @@ TRUE_HELPERS = {
     "t17.py": {"P.__post_init__"},
     "t19.py": {"Box.__init__", "weird", "decorated"},
     "t20.ts": {"Box.__init__"},
+    "t22.py": {"Bag.__init__", "moved_ok"},
+    "t21.py": {"B.__init__", "B.value", "C.value", "B.shrink", "other_task"},
     "t2.py": {"bump", "grow", "abs", "two"},
     "t6.py": {"inc"},
     "t7.py": {"setz", "first", "arith", "chained"},

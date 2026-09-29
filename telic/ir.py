@@ -533,15 +533,22 @@ class ClassDecl:
     ``self``), and a constructor ``Class.__init__``."""
 
     name: str
-    fields: list[tuple[str, Type]]
-    invariants: list[Clause] = field(default_factory=list)
+    fields: list[tuple[str, Type]]  # inherited fields first, as Python orders them
+    invariants: list[Clause] = field(default_factory=list)  # its own; bases' apply too
     loc: Loc = NOLOC
+    bases: list[str] = field(default_factory=list)  # checked base classes
+    owner: dict[str, str] = field(default_factory=dict)  # field -> the class that introduced it
 
     def field_type(self, name: str) -> Type | None:
         for f, t in self.fields:
             if f == name:
                 return t
         return None
+
+    def field_owner(self, name: str) -> str:
+        """The class a field belongs to: objects of a subclass keep inherited
+        fields in the same place as the base class does."""
+        return self.owner.get(name, self.name)
 
 
 @dataclass
@@ -558,6 +565,8 @@ class Module:
     # loaded only for what other modules import from it (not checked this run)
     context: bool = False
     problems: list[tuple[str, Loc]] = field(default_factory=list)
+    # what is deliberately not modelled (library subclasses, ...): reported quietly
+    notes: list[tuple[str, Loc]] = field(default_factory=list)
     # Assumptions the language model makes, listed verbatim in reports.
     assumptions: list[str] = field(default_factory=list)
 

@@ -690,6 +690,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                     r.open_deps.add(d)
             if dr is not None:
                 todo.extend(dr.deps)
+            todo.extend(program.dispatch.get(d, ()))  # a call through a base may run any override
 
     mirrors = []
     if any(f.mirrors for m in modules for f in m.functions.values()):

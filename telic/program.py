@@ -38,6 +38,8 @@ class Program:
     heap_writes: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     heap_reads: dict[str, set[str]] = field(default_factory=dict)
     allocates: set[str] = field(default_factory=set)
+    # method key -> keys of every override (a call through the base may run any of them)
+    dispatch: dict[str, set[str]] = field(default_factory=dict)
 
     @classmethod
     def build(cls, modules: list[ir.Module]) -> "Program":
@@ -53,6 +55,7 @@ class Program:
                     continue
                 p.classes[cname] = decl
                 p.class_module[cname] = m
+        p._overrides()
         p._call_graph()
         p._sccs()
         p._mutation()
@@ -60,6 +63,73 @@ class Program:
         p._definitional()
         p._names()
         return p
+
+    def mro(self, cls: str) -> list[str]:
+        out: list[str] = []
+
+        def walk(c: str) -> None:
+            if c in out or c not in self.classes:
+                return
+            out.append(c)
+            for b in self.classes[c].bases:
+                walk(b)
+
+        walk(cls)
+        return out
+
+    def member(self, cls: str, meth: str) -> "FuncRef | None":
+        """``cls.meth``, its own or inherited (constructors included)."""
+        for c in self.mro(cls):
+            ref = self.funcs.get(f"{self.class_module[c].path}::{c}.{meth}")
+            if ref is not None:
+                return ref
+        return None
+
+    def in_hierarchy(self, cls: str) -> bool:
+        """Does ``cls`` share field maps with other classes (bases or subclasses)?"""
+        decl = self.classes.get(cls)
+        return bool(decl and decl.bases) or any(cls in d.bases for d in self.classes.values())
+
+    def _overrides(self) -> None:
+        """Calls resolve by static type, so a call through a base class may run
+        an override: an override without a contract inherits its base's (and
+        is checked against it); one with a different contract is reported;
+        and every call through the base depends on all overrides."""
+        for cname in self.classes:
+            m = self.class_module[cname]
+            ancestors = self.mro(cname)[1:]
+            if not ancestors:
+                continue
+            for fn in m.functions.values():
+                if not fn.name.startswith(cname + "."):
+                    continue
+                meth = fn.name[len(cname) + 1 :]
+                if meth in ("__init__", "__post_init__"):
+                    continue
+                for a in ancestors:
+                    base = self.funcs.get(f"{self.class_module[a].path}::{a}.{meth}")
+                    if base is None:
+                        continue
+                    self.dispatch.setdefault(base.key, set()).add(f"{m.path}::{fn.name}")
+                    bf = base.fn
+                    has = lambda f: bool(f.requires or f.ensures or f.raises)  # noqa: E731
+                    if has(bf) and not has(fn):
+                        if [x.name for x in bf.params] != [x.name for x in fn.params]:
+                            fn.unsupported.append((f"overrides {bf.name} with different parameter names, so it cannot inherit its contract; use the same names", fn.loc))
+                        else:
+                            fn.requires, fn.ensures, fn.raises = list(bf.requires), list(bf.ensures), list(bf.raises)
+                    elif has(bf) and [c.text for c in bf.requires + bf.ensures + bf.raises] != [c.text for c in fn.requires + fn.ensures + fn.raises]:
+                        fn.unsupported.append((f"overrides {bf.name} with a different contract; calls through {a} are checked against {bf.name}'s, so keep it (or remove this one to inherit it)", fn.loc))
+                    break
+        # transitively: overrides of overrides
+        changed = True
+        while changed:
+            changed = False
+            for k, subs in self.dispatch.items():
+                more = set().union(*(self.dispatch.get(x, set()) for x in subs)) - subs
+                if more:
+                    subs |= more
+                    changed = True
 
     def resolve(self, module: ir.Module, name: str) -> FuncRef | None:
         hit = self.funcs.get(f"{module.path}::{name}")
@@ -220,14 +290,14 @@ class Program:
                                 w.setdefault(f"{cname}.{fname}", set()).add("*")
                     elif isinstance(sub, ir.New):
                         self.allocates.add(key)
-                        init = self.resolve(self.class_module.get(sub.cls, ref.module), f"{sub.cls}.__init__")
+                        init = self.member(sub.cls, "__init__")
                         if init is not None:
                             cs.append((init.key, sub.args, True))
                         else:
                             decl = self.classes.get(sub.cls)
                             for fname, _ in decl.fields if decl else []:
                                 w.setdefault(f"{sub.cls}.{fname}", set()).add("@new")
-                            post = self.resolve(self.class_module.get(sub.cls, ref.module), f"{sub.cls}.__post_init__")
+                            post = self.member(sub.cls, "__post_init__")
                             if post is not None:
                                 cs.append((post.key, (), True))
             direct_w[key], direct_r[key], calls[key] = w, r, cs
@@ -296,7 +366,7 @@ class Program:
             if fty is None:
                 continue
             for suffix, _ in components(fty):
-                out.append(f"@{c}.{f}" + (f".{suffix}" if suffix else ""))
+                out.append(f"@{decl.field_owner(f)}.{f}" + (f".{suffix}" if suffix else ""))
         return out
 
     def _definitional(self) -> None:
@@ -308,8 +378,8 @@ class Program:
             fn = ref.fn
             if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, (ir.TList, ir.TOption, ir.TDict)):
                 continue
-            if key in self.allocates or fn.name.endswith(".__init__"):
-                continue
+            if key in self.allocates or fn.name.endswith(".__init__") or key in self.dispatch:
+                continue  # an overridden method's body is not what every call runs
             if any(isinstance(sub, ir.Extern) for st in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st) for sub in ir.walk_expr(e)):
                 continue
             ok = True

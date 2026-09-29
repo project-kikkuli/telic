@@ -375,6 +375,8 @@ let () =
           cinvs = List.map Ir.clause_of (Json.to_list (Json.member "invariants" c));
           init = opt "init";
           post_init = opt "post_init";
+          cbases = (match Json.member "bases" c with Json.List l -> List.map Json.to_str l | _ -> []);
+          owner = (match Json.member "owner" c with Json.Assoc kvs -> List.map (fun (f, o) -> (f, Json.to_str o)) kvs | _ -> []);
         })
       (match Json.member "classes" req with Json.List l -> l | _ -> [])
   in

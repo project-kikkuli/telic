@@ -103,8 +103,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
                 tbl[name] = tgt.key
 
     def member(cname: str, meth: str) -> str | None:
-        home = program.class_module[cname]
-        tgt = program.resolve(home, f"{cname}.{meth}")
+        tgt = program.member(cname, meth)
         return tgt.key if tgt is not None else None
 
     classes = [
@@ -113,6 +112,8 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "module": program.class_module[cname].path,
             "fields": [[f, irjson.ty(t)] for f, t in decl.fields],
             "invariants": [irjson.clause(c) for c in decl.invariants],
+            "bases": list(decl.bases),
+            "owner": dict(decl.owner),
             "init": member(cname, "__init__"),
             "post_init": member(cname, "__post_init__"),
         }

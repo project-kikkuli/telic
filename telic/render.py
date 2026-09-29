@@ -169,6 +169,11 @@ def snippet(p: Paint, module: ir.Module, marks: list[tuple[ir.Loc, str, str]], c
     return out
 
 
+def _empty(f) -> bool:
+    """Proved, but vacuously: no obligation and no claim."""
+    return f.status == "proved" and not f.verdicts and not f.fn.has_contract and not f.open_deps
+
+
 def fn_loc(rep: FunctionReport) -> str:
     return f"{rep.ref.module.path}:{rep.fn.loc.line}"
 
@@ -238,7 +243,8 @@ class Renderer:
         r = self.r
         refuted = [f for f in r.functions if f.status == "refuted"] + [m for m in r.mirrors if m.status == "refuted"]
         open_ = [f for f in r.functions if f.status in ("open", "error")] + [m for m in r.mirrors if m.status == "open"]
-        proved = [f for f in r.functions if f.status == "proved"]
+        proved = [f for f in r.functions if f.status == "proved" and not _empty(f)]
+        empty = [f for f in r.functions if _empty(f)]
         problems = sum(len(m.problems) for m in r.modules)
         parts = []
         if refuted:
@@ -248,6 +254,8 @@ class Renderer:
         if problems:
             parts.append(p.byellow(f"{problems} problem{'s' * (problems != 1)}"))
         parts.append(p.bgreen(f"{len(proved)} proved"))
+        if empty:
+            parts.append(p.gray(f"{len(empty)} with nothing to check"))
         unsup = [f for f in r.functions if f.status == "unsupported"]
         if unsup:
             parts.append(p.gray(f"{len(unsup)} unsupported"))
@@ -505,10 +513,19 @@ class Renderer:
         if not fs:
             return []
         out = [self.rule("functions", f"{len(fs)}"), ""]
-        nw = max(len(f.fn.name) for f in fs) + 2
-        lw = max(len(fn_loc(f)) for f in fs) + 2
+        # functions with nothing to check make no claim: listed only with --verbose
+        empty = [f for f in fs if _empty(f)]
+        if not self.verbose and len(empty) > 3:
+            fs = [f for f in fs if not _empty(f)]
+        if not fs:
+            fs = empty[:0]
+        nw = max([len(f.fn.name) for f in fs] + [8]) + 2
+        lw = max([len(fn_loc(f)) for f in fs] + [8]) + 2
         for f in fs:
             n = len(f.verdicts)
+            if _empty(f):
+                out.append(f"  {p.dim('·')} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{p.dim('nothing to check')}")
+                continue
             if f.status == "proved":
                 desc = p.dim(f"{n} obligation{'s' * (n != 1)}")
             elif f.status == "refuted":
@@ -542,6 +559,8 @@ class Renderer:
                 extras.append(p.yellow(f"assumes unproved {deps}"))
             ex = p.dim("  ·  " + "  ·  ".join(extras)) if extras else ""
             out.append(f"  {mark(p, f.status)} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{desc}{ex}")
+        if len(fs) < len(self.r.functions) and empty and not self.verbose:
+            out.append(p.dim(f"  · {len(empty)} more with nothing to check: no contract and no operation that can fail (add '@ensures' to make a claim; --verbose lists them)"))
         out.append("")
         return out
 
@@ -565,19 +584,29 @@ class Renderer:
             else:
                 out.append(f"  {p.blue('◇')} {p.dim('@assume')} {text} {p.dim(f'{f.ref.module.path}:{loc.line}')}")
 
+        brief = not self.verbose
+
         def where(locs: list[tuple[str, int]]) -> str:
             by: dict[str, list[int]] = {}
             for path, line in locs:
                 by.setdefault(path, [])
                 if line not in by[path]:
                     by[path].append(line)
-            return "  ".join(f"{path}:{','.join(str(x) for x in sorted(ls))}" for path, ls in by.items())
+            items = [f"{path}:{','.join(str(x) for x in sorted(ls))}" for path, ls in by.items()]
+            if brief and len(items) > 3:
+                n = sum(len(ls) for ls in by.values())
+                return "  ".join(items[:3]) + f"  … {n} places in {len(items)} files"
+            return "  ".join(items)
 
         if calls:
-            names = ", ".join(sorted(calls))
-            out.append(f"  {p.blue('◇')} unchecked calls do not raise: {names}  {p.dim(where([x for v in calls.values() for x in v]))}")
+            names = sorted(calls, key=lambda k: (-len(calls[k]), k))
+            shown = ", ".join(names[:8] if brief else sorted(names))
+            more = f", … {len(names) - 8} more" if brief and len(names) > 8 else ""
+            out.append(f"  {p.blue('◇')} unchecked calls do not raise: {shown}{more}  {p.dim(where([x for v in calls.values() for x in v]))}")
         for text, locs in groups.items():
             out.append(f"  {p.blue('◇')} {text}  {p.dim(where(locs))}")
+        if brief and (calls or groups) and sum(len(v) for v in calls.values()) + sum(len(v) for v in groups.values()) > 12:
+            out.append(p.dim("  (--verbose lists every assumption and where it is made)"))
         if self.verbose:
             for lang in langs:
                 mod = next(m for m in self.r.modules if m.language == lang)

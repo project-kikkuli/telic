@@ -400,7 +400,8 @@ class VCGen:
         fty = decl.field_type(fname)
         if fty is None:
             raise VCError(f"{cls} has no field '{fname}'")
-        return [(f"@{cls}.{fname}" + (f".{suffix}" if suffix else ""), L.ARRAY(srt)) for suffix, srt in components(fty)]
+        owner = decl.field_owner(fname)
+        return [(f"@{owner}.{fname}" + (f".{suffix}" if suffix else ""), L.ARRAY(srt)) for suffix, srt in components(fty)]
 
     def heap_init(self, env: dict[str, Val]) -> None:
         for cname, decl in self.program.classes.items():
@@ -422,14 +423,14 @@ class VCGen:
         return {k: v for k, v in env.items() if k.startswith("@")}
 
     def class_invariants(self, cls: str, ref: L.Term, env: dict[str, Val], ctx_base: list[L.Term]) -> list[tuple[ir.Clause, L.Term]]:
-        decl = self.program.classes.get(cls)
-        if decl is None or not decl.invariants:
-            return []
-        mod = self.program.class_module[cls]
         e = dict(self.heap_env(env))
         e["self"] = ref
-        ctx = Ctx(base=ctx_base, env=e, module=mod, spec=True, quiet=True)
-        return [(inv, self.ev(inv.expr, ctx)) for inv in decl.invariants]
+        out = []
+        for c in self.program.mro(cls):  # a subclass keeps its bases' invariants
+            decl = self.program.classes[c]
+            ctx = Ctx(base=ctx_base, env=e, module=self.program.class_module[c], spec=True, quiet=True)
+            out += [(inv, self.ev(inv.expr, ctx)) for inv in decl.invariants]
+        return out
 
     # -- obligations ------------------------------------------------------
 
@@ -743,8 +744,9 @@ class VCGen:
                 ectx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ectx) for r in self.fn.raises])
                 self.oblige("raise", ctx, cond, s.loc, f"raise {s.what} outside '@raises {self.fn.raises[0].text}'")
-            else:
+            elif self.fn.requires or self.fn.ensures:
                 self.oblige("raise", ctx, L.FALSE, s.loc, f"raise {s.what} is reachable (add '@raises <condition>' if intended)")
+            # (without a contract, an explicit raise is what the function does, not a failure)
             st.alive = False
             return st
         if isinstance(s, ir.ExprStmt):
@@ -810,7 +812,7 @@ class VCGen:
                         if decl is not None and self._init_key(sub.cls) is None:
                             for f, _ in decl.fields:
                                 names.update(k for k, _ in self.heap_keys(sub.cls, f))
-                            post = self.program.resolve(self.program.class_module[sub.cls], f"{sub.cls}.__post_init__")
+                            post = self.program.member(sub.cls, "__post_init__")
                             for cls_field in self.program.heap_writes.get(post.key if post else "", {}):
                                 c, f = cls_field.split(".", 1)
                                 names.update(k for k, _ in self.heap_keys(c, f))
@@ -839,8 +841,7 @@ class VCGen:
         return names, appends
 
     def _init_key(self, cls: str) -> str | None:
-        mod = self.program.class_module.get(cls)
-        ref = self.program.resolve(mod, f"{cls}.__init__") if mod is not None else None
+        ref = self.program.member(cls, "__init__") if cls in self.program.classes else None
         return ref.key if ref is not None else None
 
     def havoc(self, st: State, names: set[str], appends: set[str]) -> State:
@@ -1361,6 +1362,17 @@ class VCGen:
             ctx.assume(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, ln)), L.eq(L.select(vals, j), L.select(d.vals, L.select(keys, j)))), patterns=((L.select(vals, j),),)))
             return ListVal(vals, L.ZERO, ln, ir.TList(d.ty.val))
 
+        if name == "list_concat":
+            xs, ys = args
+            assert isinstance(xs, ListVal) and isinstance(ys, ListVal)
+            n = next(self.counter)
+            arr = L.Const(f"cat@{n}.arr", sort_of(xs.ty))
+            ln = L.add(xs.len, ys.len)
+            i = L.Const(f"i!{n}", L.INT)
+            k = L.Const(f"k!{n}", L.INT)
+            ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(arr, i), xs.at(i))), patterns=((L.select(arr, i),),)))
+            ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(xs.len, k), L.lt(k, ln)), L.eq(L.select(arr, k), ys.at(L.sub(k, xs.len)))), patterns=((L.select(arr, k),),)))
+            return ListVal(arr, L.ZERO, ln, xs.ty)
         if name == "dict_copy":
             return args[0]  # dicts are values in the model; aliasing is excluded
         if name == "list_append":
@@ -1574,7 +1586,9 @@ class VCGen:
         # Other tasks are checked code too: they leave objects satisfying
         # their class invariants whenever they yield.
         for cname, decl in self.program.classes.items():
-            if not decl.invariants:
+            # (only where the field maps are the class's alone: the assumption
+            # ranges over every object, and subclasses share their bases' maps)
+            if not decl.invariants or self.program.in_hierarchy(cname):
                 continue
             r = L.Const(f"r!{next(self.counter)}", L.INT)
             for inv, t in self.class_invariants(cname, r, env, ctx.base):
@@ -1663,19 +1677,26 @@ class VCGen:
         env["@alloc"] = L.store(alloc, r, L.TRUE)  # type: ignore[arg-type]
         if init is not None:
             self.call(self.program.ref(init), [r] + args, [None] + list(e.args), ctx, e.loc, new_self=True)
+            if not init.endswith(f"::{e.cls}.__init__"):
+                # an inherited constructor establishes its own class's
+                # invariants; this class's must be shown here
+                self.new_invariants(e.cls, r, env, ctx, e.loc)
             return r
         # Generated constructor (dataclass-style): fields in declaration order,
         # then __post_init__ if there is one.
         for (fname, _), v in zip(decl.fields, args):
             self.heap_write(env, e.cls, fname, r, v)
-        post = self.program.resolve(self.program.class_module[e.cls], f"{e.cls}.__post_init__")
+        post = self.program.member(e.cls, "__post_init__")
         if post is not None:
             self.call(post, [r], [None], ctx, e.loc, new_self=True)
             return r
-        for inv, t in self.class_invariants(e.cls, r, env, ctx.base):
-            self.oblige("class.inv", ctx, t, inv.loc, f"new {e.cls} satisfies its invariant '{inv.text}'", site=e.loc, clause=inv)
-            ctx.assume(t)
+        self.new_invariants(e.cls, r, env, ctx, e.loc)
         return r
+
+    def new_invariants(self, cls: str, r: L.Term, env: dict[str, Val], ctx: Ctx, loc: ir.Loc) -> None:
+        for inv, t in self.class_invariants(cls, r, env, ctx.base):
+            self.oblige("class.inv", ctx, t, inv.loc, f"new {cls} satisfies its invariant '{inv.text}'", site=loc, clause=inv)
+            ctx.assume(t)
 
     def call(self, callee: FuncRef, args: list[Val], arg_exprs: list[ir.Expr | None], ctx: Ctx, loc: ir.Loc, new_self: bool = False) -> Val:
         fn = callee.fn

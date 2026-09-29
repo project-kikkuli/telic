@@ -167,8 +167,10 @@ type classinfo = {
   cmod : string;  (** the module the class lives in (its invariants resolve there) *)
   cfields : (string * Ir.ty) list;
   cinvs : Ir.clause list;
-  init : string option;  (** key of Cls.__init__ *)
+  init : string option;  (** key of Cls.__init__, its own or inherited *)
   post_init : string option;
+  cbases : string list;  (** checked base classes *)
+  owner : (string * string) list;  (** field -> the class that introduced it *)
 }
 
 type program = {
@@ -302,8 +304,20 @@ let field_type g cls fname =
   | None -> raise (Vc_error ("unknown class '" ^ cls ^ "'", Ir.noloc))
   | Some c -> ( match List.assoc_opt fname c.cfields with Some t -> t | None -> raise (Vc_error (Printf.sprintf "%s has no field '%s'" cls fname, Ir.noloc)))
 
+(* subclasses keep inherited fields where the base class does *)
+let field_owner g cls fname = match class_of g cls with Some c -> (match List.assoc_opt fname c.owner with Some o -> o | None -> cls) | None -> cls
+
 let heap_keys g cls fname =
-  List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" cls fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) (components (field_type g cls fname))
+  let owner = field_owner g cls fname in
+  List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" owner fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) (components (field_type g cls fname))
+
+let mro g cls =
+  let out = ref [] in
+  let rec walk c = if not (List.mem c !out) then match class_of g c with Some ci -> out := !out @ [ c ]; List.iter walk ci.cbases | None -> () in
+  walk cls;
+  !out
+
+let in_hierarchy g cls = (match class_of g cls with Some c -> c.cbases <> [] | None -> false) || List.exists (fun c -> List.mem cls c.cbases) g.prog.classes
 
 let heap_read g env cls fname r =
   pack (field_type g cls fname) (List.map (fun (k, _) -> match SM.find_opt k env with Some (T m) -> select m r | _ -> raise (Vc_error ("heap map " ^ k ^ " missing", Ir.noloc))) (heap_keys g cls fname))
@@ -526,12 +540,15 @@ and equal g a b =
   | _ -> raise (Vc_error ("comparing values of different shapes", Ir.noloc))
 
 and class_invariants g cls r env base =
-  match class_of g cls with
-  | Some c when c.cinvs <> [] ->
-    let e = SM.add "self" (T r) (heap_env env) in
-    let ctx = spec_ctx g ~modpath:c.cmod ~base ~env:e () in
-    List.map (fun (inv : Ir.clause) -> (inv, term_of inv.cloc (ev g ctx inv.cexpr))) c.cinvs
-  | _ -> []
+  let e = SM.add "self" (T r) (heap_env env) in
+  List.concat_map
+    (fun cn ->
+      match class_of g cn with
+      | Some c when c.cinvs <> [] ->
+        let ctx = spec_ctx g ~modpath:c.cmod ~base ~env:e () in
+        List.map (fun (inv : Ir.clause) -> (inv, term_of inv.cloc (ev g ctx inv.cexpr))) c.cinvs
+      | _ -> [])
+    (mro g cls)
 
 and builtin g ctx (e : Ir.expr) name args =
   let loc = e.loc in
@@ -625,6 +642,15 @@ and builtin g ctx (e : Ir.expr) name args =
         assume_ (quant "forall" [ j ] (implies (and_ [ le zero j; lt j ln ]) (eq (select vs j) (select d.vals (select keys j)))) [ [| select vs j |] ]);
         L { arr = vs; off = zero; len = ln; lty = TList (dval d) }
       end
+    | "list_concat", [ xs; ys ] ->
+      let a = lst xs and b = lst ys in
+      let n = next g in
+      let arr = const (Printf.sprintf "cat@%d.arr" n) a.arr.sort in
+      let ln = add a.len b.len in
+      let i = const (Printf.sprintf "i!%d" n) Int and k = const (Printf.sprintf "k!%d" n) Int in
+      assume_ (quant "forall" [ i ] (implies (and_ [ le zero i; lt i a.len ]) (eq (select arr i) (at (a.arr, a.off) i))) [ [| select arr i |] ]);
+      assume_ (quant "forall" [ k ] (implies (and_ [ le a.len k; lt k ln ]) (eq (select arr k) (at (b.arr, b.off) (sub k a.len)))) [ [| select arr k |] ]);
+      L { arr; off = zero; len = ln; lty = a.lty }
     | "dict_copy", [ d ] -> d
     | "dict_set", [ d; k; v ] ->
       let d = dct d in
@@ -779,7 +805,7 @@ and await_havoc g ctx (loc : Ir.loc) =
         st.env;
       List.iter
         (fun c ->
-          if c.cinvs <> [] then begin
+          if c.cinvs <> [] && not (in_hierarchy g c.cname) then begin
             let r = const (Printf.sprintf "r!%d" (next g)) Int in
             List.iter
               (fun (_, t) ->
@@ -863,9 +889,19 @@ and new_object g ctx loc cls args =
   let r = const (Printf.sprintf "%s@new%d" cls (next g)) Int in
   assume ctx (not_ (select alloc r));
   st.env <- SM.add "@alloc" (T (store alloc r tt)) st.env;
+  let check_invariants () =
+    List.iter
+      (fun ((inv : Ir.clause), t) ->
+        oblige g ~site:loc ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "new %s satisfies its invariant '%s'" cls inv.text);
+        assume ctx t)
+      (class_invariants g cls r st.env ctx.base)
+  in
   match c.init with
   | Some k ->
     ignore (call g ~new_self:true (finfo_of g k) (T r :: vals) (None :: List.map Option.some args) ctx loc);
+    (* an inherited constructor establishes its own class's invariants; this class's are shown here *)
+    let own = "::" ^ cls ^ ".__init__" in
+    if not (String.length k >= String.length own && String.sub k (String.length k - String.length own) (String.length own) = own) then check_invariants ();
     T r
   | None -> (
     List.iter (fun ((f, _), v) -> st.env <- heap_write g st.env cls f r v) (zip c.cfields vals);
@@ -874,11 +910,7 @@ and new_object g ctx loc cls args =
       ignore (call g ~new_self:true (finfo_of g k) [ T r ] [ None ] ctx loc);
       T r
     | None ->
-      List.iter
-        (fun ((inv : Ir.clause), t) ->
-          oblige g ~site:loc ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "new %s satisfies its invariant '%s'" cls inv.text);
-          assume ctx t)
-        (class_invariants g cls r st.env ctx.base);
+      check_invariants ();
       T r)
 
 and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs : Ir.expr option list) ctx loc : value =
@@ -1156,7 +1188,9 @@ and stmt g (s : Ir.stmt) (st : state) : state =
          let cond = or_ (List.map (fun (r : Ir.clause) -> term_of loc (ev g ectx r.cexpr)) g.info.fn.raises) in
          oblige g "raise" ctx cond loc (Printf.sprintf "raise %s outside '@raises %s'" what (List.hd g.info.fn.raises).text)
        end
-       else oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable (add '@raises <condition>' if intended)" what));
+       else if g.info.fn.requires <> [] || g.info.fn.ensures <> [] then
+         oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable (add '@raises <condition>' if intended)" what)
+       (* without a contract, an explicit raise is what the function does, not a failure *));
       st.alive <- false;
       st
     end

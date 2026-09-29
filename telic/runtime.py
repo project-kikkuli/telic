@@ -343,6 +343,14 @@ class FunctionInstrumenter:
         return prelude + [s]
 
 
+def _with_inherited_contracts(module: ir.Module) -> ir.Module:
+    """Overrides without a contract of their own run under their base method's."""
+    from .program import Program
+
+    Program.build([module])
+    return module
+
+
 def instrument_source(source: str, module: ir.Module, filename: str = "<telic>") -> ast.Module:
     tree = ast.parse(source, filename=filename)
     targets: list[tuple[ast.FunctionDef, str]] = []
@@ -385,7 +393,7 @@ def load_instrumented(path: str, name: str | None = None, root: str | None = Non
     from .frontend.python import _dotted, lower_python
 
     src = Path(path).read_text()
-    mod_ir = lower_python(path, src)
+    mod_ir = _with_inherited_contracts(lower_python(path, src))
     tree = instrument_source(src, mod_ir, path)
     package = None
     if root is not None:
@@ -439,7 +447,7 @@ class _ContractLoader(importlib.abc.Loader):
     def exec_module(self, module):
         from .frontend.python import lower_python
 
-        mod_ir = lower_python(self.origin, self.source)
+        mod_ir = _with_inherited_contracts(lower_python(self.origin, self.source))
         tree = instrument_source(self.source, mod_ir, self.origin)
         exec(compile(tree, self.origin, "exec"), module.__dict__)
 

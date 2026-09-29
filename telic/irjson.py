@@ -163,7 +163,7 @@ def module(m: ir.Module) -> dict[str, Any]:
         "language": m.language,
         "functions": [function(f) for f in m.functions.values()],
         "records": {n: ty(t) for n, t in m.records.items()},
-        "classes": {n: {"fields": [[f, ty(t)] for f, t in c.fields], "invariants": [clause(x) for x in c.invariants], "loc": loc(c.loc)} for n, c in m.classes.items()},
+        "classes": {n: {"fields": [[f, ty(t)] for f, t in c.fields], "invariants": [clause(x) for x in c.invariants], "loc": loc(c.loc), "bases": list(c.bases), "owner": dict(c.owner)} for n, c in m.classes.items()},
         "imports": {k: list(v) for k, v in m.imports.items()},
         "context": m.context,
     }

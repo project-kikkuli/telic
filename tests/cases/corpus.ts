@@ -149,8 +149,16 @@ export function evens(n: int): int[] {
   return out;
 }
 
-// expect: refuted
+// expect: proved
+// (no contract: throwing is what it does, e.g. an HTTP handler rejecting a request)
 export function throwsAlways(x: number): number {
+  if (x > 3) throw new Error("too big");
+  return x;
+}
+
+// expect: refuted
+export function throwsUndeclared(x: number): number {
+  //@ ensures result <= 3
   if (x > 3) throw new Error("too big");
   return x;
 }
