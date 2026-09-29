@@ -43,6 +43,7 @@ TRUE_HELPERS = {
     "t24.py": {"is_neg", "fine", "Counter.__init__"},
     "t25.ts": {"fine"},
     "t26.rs": {"fine"},
+    "t27.py": {"Box.__init__", "Box.get"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))

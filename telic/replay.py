@@ -35,7 +35,7 @@ def _encode_any(v: Any) -> Any:
         return {"__record__": v["__record__"], "fields": {k: _encode_any(x) for k, x in v["fields"].items()}}
     if isinstance(v, dict) and "__class__" in v:
         fields = None if v.get("__stub__") else {k: _encode_any(x) for k, x in v.items() if not k.startswith("__")}
-        return {"__object__": v["__class__"], "ref": v.get("__ref__"), "fields": fields}
+        return {"__object__": ir.source_name(v["__class__"]), "ref": v.get("__ref__"), "fields": fields}
     if isinstance(v, Fraction):
         return {"__real__": [v.numerator, v.denominator]}
     if isinstance(v, list):
@@ -61,7 +61,7 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(ty, ir.TClass):
         if isinstance(v, dict) and "__class__" in v:
             return _encode_any(v)
-        return {"__object__": ty.name, "ref": v, "fields": None}
+        return {"__object__": ir.source_name(ty.name), "ref": v, "fields": None}
     if isinstance(ty, ir.TDict):
         return {"__dict__": [[encode_value(k, ty.key), encode_value(x, ty.val)] for k, x in (v or {}).items()]}
     if isinstance(ty, ir.TList):
@@ -166,7 +166,7 @@ def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth
     if isinstance(ty, ir.TClass):
         decl = (classes or {}).get(ty.name)
         fields = [[f, type_desc(t, classes, depth + 1)] for f, t in decl.fields] if decl is not None and depth < 3 else None
-        return {"k": "class", "name": ty.name, "fields": fields}
+        return {"k": "class", "name": ir.source_name(ty.name), "fields": fields}
     if isinstance(ty, ir.TList):
         return {"k": "list", "elem": type_desc(ty.elem, classes, depth + 1)}
     if isinstance(ty, ir.TRecord):
@@ -179,7 +179,7 @@ REPLAY_ROOT: list[str] = []  # the project root, so package-relative imports res
 
 def run_python(path: str, func: str, args: list[Any], timeout: float = TIMEOUT_S, extra: dict | None = None) -> dict[str, Any]:
     root = _package_root(os.path.abspath(path))
-    req = json.dumps({"path": os.path.abspath(path), "func": func, "args": args, **({"root": root} if root else {}), **(extra or {})})
+    req = json.dumps({"path": os.path.abspath(path), "func": ir.source_name(func), "args": args, **({"root": root} if root else {}), **(extra or {})})
     env = dict(os.environ)
     env["PYTHONPATH"] = PKG_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     try:
@@ -213,7 +213,7 @@ def _package_root(path: str) -> str | None:
 def run_typescript(path: str, func: str, args: list[Any], timeout: float = TIMEOUT_S, extra: dict | None = None) -> dict[str, Any]:
     from .frontend.typescript import run_ts
 
-    return run_ts(path, func, args, timeout, extra)
+    return run_ts(path, ir.source_name(func), args, timeout, extra)
 
 
 FUZZ_INPUTS = 400
@@ -224,7 +224,7 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
     if module is None:
         return out
     for f in module.functions.values():
-        out[f.name] = {
+        out[ir.source_name(f.name)] = {
             "params": [p.name for p in f.params],
             "lists": [i for i, p in enumerate(f.params) if isinstance(p.ty, ir.TList)],
             "requires": [c.text for c in f.requires],
@@ -265,9 +265,9 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
     k = ob.kind
     v, crash = out.get("violation"), out.get("crash")
     if k == "ensures":
-        return v == "ensures" and out.get("func") == fn.name and _same(out.get("text", ""), ob.clause)
+        return v == "ensures" and out.get("func") == ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
     if k == "call":
-        return v == "requires" and out.get("func") != fn.name and _same(out.get("text", ""), ob.clause)
+        return v == "requires" and out.get("func") != ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
     if k in ("inv.entry", "inv.step"):
         return v == "invariant" and _same(out.get("text", ""), ob.clause)
     if k == "assert":
@@ -290,7 +290,7 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
     if k == "key":
         return crash == "KeyError" or bool(out.get("missing_key"))
     if k == "class.inv":
-        return v == "class.inv" and out.get("func") == fn.name and _same(out.get("text", ""), ob.clause)
+        return v == "class.inv" and out.get("func") == ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
     if k == "raise":
         return crash is not None and crash not in ("RecursionError",)
     if k == "raises":
@@ -332,7 +332,7 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
         return False, f"{runtime}: timed out after {TIMEOUT_S:.0f}s", None
     if "harness_error" in out:
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
-    if out.get("violation") == "requires" and out.get("func") == fn.name and ob.kind != "call":
+    if out.get("violation") == "requires" and out.get("func") == ir.source_name(fn.name) and ob.kind != "call":
         return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
     summary = describe(out, runtime)
     if matches(ob, out, fn, lang):

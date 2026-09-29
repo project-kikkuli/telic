@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from telic.checker import CheckOptions, check
 from telic.ledger import affected_files
 
@@ -34,3 +36,31 @@ def test_imported_modules_are_context_not_rechecked():
 def test_importers_are_affected():
     scope = affected_files(str(ROOT), {"app/models.py"}, None)
     assert {"app/models.py", "app/services.py"} <= scope
+
+
+DUP = Path(__file__).parent / "cases" / "dupclass"
+
+
+@pytest.fixture(scope="module")
+def dup():
+    rep = check([str(DUP)], CheckOptions(cache_path=None, lean=False), root=str(DUP))
+    return {f.fn.name: f for f in rep.functions}
+
+
+@pytest.mark.parametrize(
+    "fn,status",
+    [
+        ("read_a", "proved"),
+        ("field_a", "proved"),
+        ("read_b", "refuted"),  # proved if b's Box were a's
+        ("field_b", "refuted"),
+        ("build_b", "refuted"),
+        ("via_signature", "unsupported"),  # Box only reaches it through a signature
+        ("Box@a_shapes.get", "proved"),
+        ("Box@b_shapes.get", "proved"),
+    ],
+)
+def test_same_named_classes_in_different_files_are_distinct(dup, fn, status):
+    assert dup[fn].status == status, dup[fn].problems
+    if status == "refuted":
+        assert all(v.replay.confirmed for v in dup[fn].verdicts if v.status == "refuted")

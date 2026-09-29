@@ -81,10 +81,10 @@ def test_inheritance():
     assert any("Leaky.withdraw" in d for d in tb.open_deps), tb.open_deps
 
 
-def test_same_class_name_in_two_files_is_never_checked_against_the_wrong_one(tmp_path):
+def test_same_class_name_in_two_files_is_checked_against_its_own(tmp_path):
     (tmp_path / "a.py").write_text("class Box:\n    def __init__(self, v: int):\n        self.v = v\n\n\ndef get(b: Box) -> int:\n    #@ ensures result == b.v\n    return b.v\n")
     (tmp_path / "b.py").write_text("class Box:\n    def __init__(self, w: str):\n        self.w = w\n\n\ndef name(b: Box) -> str:\n    return b.w\n\n\ndef plain(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
     rep = check([str(tmp_path / "a.py"), str(tmp_path / "b.py")], CheckOptions(cache_path=None, lean=False, replay=False), root=str(tmp_path))
     by = {(f.ref.module.path, f.fn.name): f for f in rep.functions}
-    assert by[("a.py", "get")].status == "unsupported" and by[("b.py", "name")].status == "unsupported"
-    assert by[("b.py", "plain")].status == "proved"
+    assert all(by[k].status == "proved" for k in [("a.py", "get"), ("b.py", "name"), ("b.py", "plain")])
+    assert {f.fn.params[0].ty.name for k, f in by.items() if k[1] in ("get", "name")} == {"Box@a", "Box@b"}

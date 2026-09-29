@@ -134,7 +134,7 @@ class ModuleLowerer {
     this.sf = sf;
     this.src = sf.text;
     this.lines = sf.text.split(/\r?\n/);
-    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
+    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
     this.aliases = {};
     this.sigs = {}; // name -> {params, ret, node}
     this.classes = {}; // name -> {node, fields: [[n, ty]], props, setters, statics, home: ModuleLowerer}
@@ -2639,7 +2639,10 @@ function link(mls, byFile, stage) {
         }
         if (other.enums[d.name]) ml.enums[d.local] = other.enums[d.name];
         else if (other.module.records[d.name]) ml.module.records[d.local] = other.module.records[d.name];
-        else if (other.classes[d.name] && d.local === d.name) ml.classes[d.name] = other.classes[d.name];
+        else if (other.classes[d.name] && d.local === d.name) {
+          ml.classes[d.name] = other.classes[d.name];
+          ml.module.class_origin[d.name] = other.rel;
+        }
         else if (d.name in other.constants) ml.constants[d.local] = other.constants[d.name];
         else if (other.aliases[d.name]) ml.aliases[d.local] = other.aliases[d.name];
         else ml.imported[d.local] = { mod: other, name: d.name };
@@ -2689,7 +2692,7 @@ function main() {
         }
       } catch (e) {
         ml.stage = "done";
-        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
+        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
       }
     }
   };

@@ -4,6 +4,7 @@ which list parameters a function mutates."""
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass, field
 
@@ -38,24 +39,22 @@ class Program:
     heap_writes: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     heap_reads: dict[str, set[str]] = field(default_factory=dict)
     allocates: set[str] = field(default_factory=set)
-    # class name defined in more than one checked file -> why functions that use it are not checked
-    ambiguous: dict[str, str] = field(default_factory=dict)
+    # module path -> class name it uses that telic cannot attribute to one definition -> why
+    ambiguous: dict[str, dict[str, str]] = field(default_factory=dict)
     # method key -> keys of every override (a call through the base may run any of them)
     dispatch: dict[str, set[str]] = field(default_factory=dict)
 
     @classmethod
     def build(cls, modules: list[ir.Module]) -> "Program":
         p = cls(modules)
+        qualify_classes(modules)
+        p.ambiguous = {m.path: dict(m.ambiguous_classes) for m in modules if m.ambiguous_classes}
         for m in modules:
             for f in m.functions.values():
                 ref = FuncRef(m, f)
                 p.funcs[ref.key] = ref
         for m in modules:
             for cname, decl in m.classes.items():
-                if cname in p.classes and p.class_module[cname] is not m:
-                    m.problems.append((f"class {cname} is also defined in {p.class_module[cname].path}; telic needs class names to be unique across checked files", decl.loc))
-                    p.ambiguous[cname] = f"class {cname} is defined in both {p.class_module[cname].path} and {m.path}; telic cannot tell them apart yet (rename one, or check the files separately)"
-                    continue
                 p.classes[cname] = decl
                 p.class_module[cname] = m
         p._overrides()
@@ -149,13 +148,15 @@ class Program:
         return None
 
     def ambiguity(self, ref: FuncRef) -> str | None:
-        """Why ``ref`` cannot be checked soundly: it mentions a class name two
-        checked files define (conservatively, by any mention in its IR)."""
-        if not self.ambiguous:
+        """Why ``ref`` cannot be checked soundly: it mentions a class name that
+        several checked files define and telic cannot tell which one is
+        meant (conservatively, by any mention in its IR)."""
+        names = self.ambiguous.get(ref.module.path)
+        if not names:
             return None
         text = repr(ref.fn)
-        for cname, why in self.ambiguous.items():
-            if f"'{cname}'" in text or ref.fn.name.startswith(cname + "."):
+        for cname, why in names.items():
+            if f"'{cname}'" in text or f"'{cname}." in text or ref.fn.name.startswith(cname + "."):
                 return why
         return None
 
@@ -432,3 +433,152 @@ class Program:
                     cand = f"{base}_{k}"
                 used.add(cand)
                 self.logic_names[key] = cand
+
+
+# ---------------------------------------------------------------------------
+# Classes with the same name in several checked files
+
+
+def qualify_classes(modules: list[ir.Module]) -> None:
+    """Give each class that several checked files define a module-qualified
+    name (``Lowerer@rust``) everywhere it is meant: in the module defining
+    it and in modules importing it. Functions are renamed with their class
+    (``Lowerer@rust.run``). Names a module uses that cannot be attributed
+    to one definition (it neither defines nor imports them, or a
+    declaration it borrows from another file means a different one) are
+    recorded in its ``ambiguous_classes``."""
+    defs: dict[str, list[ir.Module]] = {}
+    for m in modules:
+        for cname in m.classes:
+            defs.setdefault(cname, []).append(m)
+    dup = {c: ms for c, ms in defs.items() if len(ms) > 1}
+    if not dup:
+        return
+    qual: dict[tuple[int, str], str] = {}
+    for cname, ms in dup.items():
+        for m, tag in zip(ms, _tags([m.path for m in ms])):
+            qual[(id(m), cname)] = f"{cname}@{tag}"
+    by_path = {m.path: m for m in modules}
+    views: dict[int, dict[str, str]] = {}
+    for m in modules:
+        v: dict[str, str] = {}
+        for cname in dup:
+            if cname in m.classes:
+                v[cname] = qual[(id(m), cname)]
+            elif cname in m.class_origin and m.class_origin[cname] in by_path:
+                q = qual.get((id(by_path[m.class_origin[cname]]), cname))
+                if q is not None:
+                    v[cname] = q
+        views[id(m)] = v
+    fn_home = {(m.path, name): m for m in modules for name in m.functions}
+    in_records = {n for m in modules for r in m.records.values() for n in _class_names(r) if n in dup}
+    out: dict[str, dict[str, str]] = {}
+    for m in modules:
+        v = views[id(m)]
+        bad: dict[str, str] = {}
+        for cname in dup:
+            if cname not in v:
+                bad[cname] = f"class {cname} is defined in {' and '.join(x.path for x in dup[cname])}, and {m.path} neither defines nor imports it, so telic cannot tell which one is meant (import it explicitly)"
+            elif cname in in_records:
+                bad[cname] = f"a record type mentions class {cname}, which several checked files define; telic cannot tell which one is meant"
+        # Declarations lowered into this module from elsewhere keep their
+        # home's meaning of a name; where that differs from this module's,
+        # the name is ambiguous here.
+        borrowed: list[tuple[ir.Module, object]] = []
+        for cname, path in m.class_origin.items():
+            src = by_path.get(path)
+            if src is not None and cname in src.classes:
+                borrowed.append((src, src.classes[cname].fields))
+        used = set(re.findall(r"TClass\(name='([^']+)'\)", repr(list(m.functions.values())) + repr(list(m.classes.values()))))
+        for src in modules:
+            if src is not m:
+                borrowed += [(src, d.fields) for c, d in src.classes.items() if c not in dup and c in used]
+        for _, (path, remote) in m.imports.items():
+            src = fn_home.get((path, remote))
+            if src is not None and src is not m:
+                f = src.functions[remote]
+                borrowed.append((src, (f.params, f.ret)))
+        for src, what in borrowed:
+            for n in _class_names(what):
+                if n in dup and n not in bad and views[id(src)].get(n) != v.get(n):
+                    bad[n] = f"class {n} is defined in {' and '.join(x.path for x in dup[n])}, and a declaration {m.path} uses from {src.path} means a different one than {m.path} does; telic cannot tell them apart here"
+        if bad:
+            out[m.path] = bad
+    for m in modules:
+        v = {c: q for c, q in views[id(m)].items() if c not in out.get(m.path, {})}
+        if v:
+            _rename(m, v)
+        m.ambiguous_classes.update(out.get(m.path, {}))
+
+
+def _tags(paths: list[str]) -> list[str]:
+    """Shortest distinguishing path suffixes: a/x.py, b/x.py -> a_x, b_x."""
+    parts = [re.sub(r"\.\w+$", "", p).split("/") for p in paths]
+    for k in range(1, max(len(x) for x in parts) + 1):
+        tags = [re.sub(r"\W", "_", "_".join(x[-k:])) for x in parts]
+        if len(set(tags)) == len(tags):
+            return tags
+    return [f"{t}_{i + 1}" for i, t in enumerate(tags)]
+
+
+def _class_names(x: object) -> set[str]:
+    out: set[str] = set()
+
+    def walk(y: object) -> None:
+        if isinstance(y, ir.TClass):
+            out.add(y.name)
+        elif isinstance(y, (list, tuple)):
+            for z in y:
+                walk(z)
+        elif isinstance(y, (ir.TList, ir.TOption, ir.TDict, ir.TRecord, ir.Param)):
+            for f in dataclasses.fields(y):
+                walk(getattr(y, f.name))
+
+    walk(x)
+    return out
+
+
+def _rename(m: ir.Module, view: dict[str, str]) -> None:
+    def name(n: str) -> str:
+        head, dot, rest = n.partition(".")
+        return view[head] + dot + rest if head in view else n
+
+    def rw(x):
+        if isinstance(x, ir.TClass):
+            return ir.TClass(view[x.name]) if x.name in view else x
+        if isinstance(x, list):
+            return [rw(y) for y in x]
+        if isinstance(x, tuple):
+            ys = tuple(rw(y) for y in x)
+            return x if all(a is b for a, b in zip(x, ys)) else ys
+        if isinstance(x, (ir.Loc, ir.TRecord, str)) or not dataclasses.is_dataclass(x):
+            return x
+        changes = {}
+        for f in dataclasses.fields(x):
+            old = getattr(x, f.name)
+            new = name(old) if f.name in ("cls", "func") and isinstance(old, str) and isinstance(x, (ir.New, ir.FieldAssign, ir.Call)) else rw(old)
+            if new is not old:
+                changes[f.name] = new
+        return dataclasses.replace(x, **changes) if changes else x
+
+    fns = {}
+    for key, fn in m.functions.items():
+        fn.name = name(fn.name)
+        fn.params = rw(fn.params)
+        fn.ret = rw(fn.ret)
+        fn.requires, fn.ensures, fn.raises = rw(fn.requires), rw(fn.ensures), rw(fn.raises)
+        fn.decreases = rw(fn.decreases)
+        fn.body = rw(fn.body)
+        fn.locals = {k: rw(t) for k, t in fn.locals.items()}
+        fns[name(key)] = fn
+    m.functions = fns
+    classes = {}
+    for cname, decl in m.classes.items():
+        decl.name = name(decl.name)
+        decl.fields = [(f, rw(t)) for f, t in decl.fields]
+        decl.invariants = rw(decl.invariants)
+        decl.bases = [name(b) for b in decl.bases]
+        decl.owner = {f: name(o) for f, o in decl.owner.items()}
+        classes[name(cname)] = decl
+    m.classes = classes
+    m.class_origin = {name(c): p for c, p in m.class_origin.items()}

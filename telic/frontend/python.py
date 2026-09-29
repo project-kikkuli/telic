@@ -2813,6 +2813,11 @@ def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
         for local, (other, name) in fe.linked_functions.items():
             if name in other.signatures and local == name:
                 fe.import_function(other, name)
+    home = {id(decl): fe.module.path for fe in fes for decl in fe.module.classes.values()}
+    for fe in fes:
+        for cname, decl in fe.foreign_classes.items():
+            if id(decl) in home:
+                fe.module.class_origin[cname] = home[id(decl)]
     owners: dict[str, PythonFrontend | None] = {}
     for fe in fes:
         for cname in fe.module.classes:

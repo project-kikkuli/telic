@@ -128,7 +128,7 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
     source = open(path).read()
     fe = RustFrontend(path, source)
     fe.run()
-    info = fe.fns.get(fn.name)
+    info = fe.fns.get(ir.source_name(fn.name))
     if info is None:
         return None
     node = info.node
@@ -210,7 +210,7 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
         for line in r.stdout.splitlines():
             if line.startswith("TELIC_VIOLATION ensures "):
                 c = fn.ensures[int(line.split()[-1])]
-                return {"violation": "ensures", "func": fn.name, "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip()}
+                return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip()}
         return out
     first = next((l for l in err.splitlines() if l.startswith("error")), "compile error")
     return {"harness_error": f"rustc could not build the counterexample: {first}"}

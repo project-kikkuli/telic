@@ -15,6 +15,7 @@ through shared names. Constructs a frontend cannot lower faithfully become
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Union
@@ -569,6 +570,17 @@ class Module:
     notes: list[tuple[str, Loc]] = field(default_factory=list)
     # Assumptions the language model makes, listed verbatim in reports.
     assumptions: list[str] = field(default_factory=list)
+    # class name used here -> path of the checked module that defines it (imports)
+    class_origin: dict[str, str] = field(default_factory=dict)
+    # class name used here that several checked files define, and telic cannot tell which -> why
+    ambiguous_classes: dict[str, str] = field(default_factory=dict)
+
+
+def source_name(name: str) -> str:
+    """A class or function name as the source spells it: ``Lowerer@rust.run``
+    (a class qualified because another checked file has one of the same
+    name) -> ``Lowerer.run``."""
+    return re.sub(r"@\w+", "", name) if "@" in name else name
 
 
 def walk_stmts(stmts: Any):

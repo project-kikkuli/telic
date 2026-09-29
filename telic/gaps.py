@@ -12,6 +12,7 @@ diff plus that input, which is usually all it takes to see the missing
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import shutil
@@ -223,12 +224,14 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None) ->
                     fg.killed += 1
                     continue
                 # Survived verification. Is it actually different?
-                program = Program.build(modules + [mmod])
+                # a copy: the build qualifies the class names both define, in place
+                orig = copy.deepcopy(mod)
+                afn, bfn = orig.functions[fn.name], mmod.functions[fn.name]
+                program = Program.build(others + [orig, mmod])
                 program.root = root  # type: ignore[attr-defined]
                 theory, _ = build_theory(program, {})
-                a = program.resolve(mod, fn.name)
-                b = program.resolve(mmod, fn.name)
-                assert a is not None and b is not None
+                a = next(r for r in program.funcs.values() if r.fn is afn)
+                b = next(r for r in program.funcs.values() if r.fn is bfn)
                 pr = check_pair(program, theory, a, b, root, fn.loc, opts.timeout_ms, n_tests=200)
                 if pr.status == "refuted" and pr.witness:
                     w = pr.witness

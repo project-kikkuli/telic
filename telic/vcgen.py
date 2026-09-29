@@ -402,13 +402,21 @@ class VCGen:
     # references to the same object read and write the same map entries, so
     # aliasing needs no special treatment (Burstall-Bornat).
 
-    def heap_keys(self, cls: str, fname: str) -> list[tuple[str, L.Sort]]:
+    def heap_keys(self, cls: str, fname: str, strict: bool = False) -> list[tuple[str, L.Sort]]:
+        """The maps holding ``cls.fname``. A field telic cannot model has
+        none: only functions that read or write it (``strict``) fail."""
         decl = self.program.classes[cls]
         fty = decl.field_type(fname)
         if fty is None:
             raise VCError(f"{cls} has no field '{fname}'")
         owner = decl.field_owner(fname)
-        return [(f"@{owner}.{fname}" + (f".{suffix}" if suffix else ""), L.ARRAY(srt)) for suffix, srt in components(fty)]
+        try:
+            comps = components(fty)
+        except VCError:
+            if strict:
+                raise
+            return []
+        return [(f"@{owner}.{fname}" + (f".{suffix}" if suffix else ""), L.ARRAY(srt)) for suffix, srt in comps]
 
     def heap_init(self, env: dict[str, Val]) -> None:
         for cname, decl in self.program.classes.items():
@@ -420,10 +428,10 @@ class VCGen:
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
         fty = self.program.classes[cls].field_type(fname)
         assert fty is not None
-        return pack(fty, [L.select(env[k], ref) for k, _ in self.heap_keys(cls, fname)])  # type: ignore[arg-type]
+        return pack(fty, [L.select(env[k], ref) for k, _ in self.heap_keys(cls, fname, strict=True)])  # type: ignore[arg-type]
 
     def heap_write(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term, v: Val) -> None:
-        for (k, _), comp in zip(self.heap_keys(cls, fname), flatten(v)):
+        for (k, _), comp in zip(self.heap_keys(cls, fname, strict=True), flatten(v)):
             env[k] = L.store(env[k], ref, comp)  # type: ignore[arg-type]
 
     def heap_env(self, env: dict[str, Val]) -> dict[str, Val]:
@@ -2046,12 +2054,29 @@ def build_axioms(program: Program, ref: FuncRef, fundef: L.FunDef) -> list[L.Axi
     call = L.Fn(fundef.name, fundef.params, fundef.sort)
     base: list[L.Term] = []
     ctx = Ctx(base=base, env=env, module=ref.module, spec=True, quiet=True)
-    hyps = [g.ev(r.expr, ctx) for r in ref.fn.requires]
+    # The body was proved assuming the invariants of the objects passed in,
+    # so the lemma assumes them too (over any heap maps they read beyond the
+    # definition's own, quantified as well).
+    extra: list[L.Const] = []
+    hyps = []
+    for p in ref.fn.params:
+        if isinstance(p.ty, ir.TClass) and not (g.is_init and p.name == "self"):
+            for c in program.mro(p.ty.name):
+                for f, _ in program.classes[c].fields:
+                    for key, srt in g.heap_keys(c, f):
+                        if key not in env:
+                            env[key] = L.Const(f"{key[1:]}!lemma", srt)
+                            extra.append(env[key])  # type: ignore[arg-type]
+            try:
+                hyps += [t for _, t in g.class_invariants(p.ty.name, env[p.name], env, base)]  # type: ignore[arg-type]
+            except (VCError, KeyError):
+                return []  # without its invariant hypotheses the lemma could be false
+    hyps += [g.ev(r.expr, ctx) for r in ref.fn.requires]
     for p in ref.fn.params:
         v = env[p.name]
         if isinstance(v, ListVal):
             hyps.append(L.le(L.ZERO, v.len))
     ectx = Ctx(base=base, env=env, module=ref.module, old_env=env, result=call, spec=True, quiet=True)
     goals = [g.ev(en.expr, ectx) for en in ref.fn.ensures]
-    formula = L.forall(fundef.params, L.implies(L.and_(*hyps), L.and_(*goals)))
+    formula = L.forall(tuple(fundef.params) + tuple(extra), L.implies(L.and_(*base, *hyps), L.and_(*goals)))
     return [L.Axiom(f"{fundef.name}_spec", formula, about=ref.key, doc=f"@ensures of {ref.fn.name}")]
