@@ -273,7 +273,7 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
                 hyps=[reader.terms[i] for i in o["hyps"]],
                 goal=reader.terms[o["goal"]],
                 clause=clause,
-                intents=tuple(o["intents"]),
+                aims=tuple(o["aims"]),
                 inputs=list(inputs),
                 deps=set(o["deps"]),
                 exclude_axioms=set(o["exclude"]),

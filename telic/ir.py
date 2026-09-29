@@ -385,7 +385,7 @@ class Clause:
     expr: Expr
     loc: Loc
     text: str
-    intents: tuple[str, ...] = ()
+    aims: tuple[str, ...] = ()
     inferred: bool = False
 
 
@@ -505,7 +505,7 @@ class Function:
     decreases: Clause | None = None
     raises: list[Clause] = field(default_factory=list)  # "@raises cond"
     body: list[Stmt] = field(default_factory=list)
-    intents: list[str] = field(default_factory=list)
+    aims: list[str] = field(default_factory=list)
     mirrors: list[tuple[str, Loc]] = field(default_factory=list)
     unsupported: list[tuple[str, Loc]] = field(default_factory=list)
     trusted: bool = False  # "@trusted": contract assumed, body not verified
@@ -521,7 +521,7 @@ class Function:
 
 
 @dataclass(frozen=True)
-class IntentDecl:
+class AimDecl:
     id: str
     text: str
     loc: Loc
@@ -558,7 +558,7 @@ class Module:
     language: str  # "python" | "typescript"
     source: str
     functions: dict[str, Function] = field(default_factory=dict)
-    intents: list[IntentDecl] = field(default_factory=list)
+    aims: list[AimDecl] = field(default_factory=list)
     records: dict[str, TRecord] = field(default_factory=dict)
     classes: dict[str, "ClassDecl"] = field(default_factory=dict)
     # local name -> (module path, name there): calls into other checked modules

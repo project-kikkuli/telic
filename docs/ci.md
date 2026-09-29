@@ -26,21 +26,21 @@ hash-identical after a clean rebase. A commit-keyed cache re-runs all of them.
 `telic ci --since origin/main` checks only what the change can affect. For telic
 this is computed, not guessed: a proof depends on its own body and the
 contracts it calls, so the affected files are the changed files, the files
-that import them, their `@mirrors` partners, and files sharing an intent with
+that import them, their `@mirrors` partners, and files sharing an aim with
 them. Importers of importers are unaffected. No coverage map is involved.
 (One known hole: a caller that reaches a changed override only through its
 base class in another file; see [handoff.md](handoff.md).)
 
 ## 3. The ledger ratchets
 
-`telic.ledger.json` is committed. It records every intent (status, linked
+`telic.ledger.json` is committed. It records every aim (status, linked
 functions, the clauses it rests on), every function's status, and every
 mirror. `telic ci` compares the change against it:
 
 | change | result |
 |---|---|
-| intent / function / mirror gets worse | **fails** |
-| a clause is dropped from an intent, or an intent is removed | **fails**: weakening a promise is a decision |
+| aim / function / mirror gets worse | **fails** |
+| a clause is dropped from an aim, or an aim is removed | **fails**: weakening a promise is a decision |
 | the same, with `Telic-accept: <id> <reason>` in a commit message | passes, and the reason is shown for review |
 | something gets better, or is new | passes. `--update` or the pre-push hook records it |
 

@@ -22,7 +22,7 @@ for the known gaps.
 | `telic/equiv.py`, `telic/gaps.py` | `@mirrors` and spec-gap mutation |
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
-| `telic/intent.py` | intents: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
+| `telic/aim.py` | aims: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
 | `telic/propose.py`, `telic/phrase.py` | `telic propose`: proved facts, crash-free preconditions, facts rendered as EARS drafts |
 | `telic/oracle.py` | the only place a judgment is delegated to a model: typed questions, pluggable backends (builtin, Jev, HTTP, command, Python, LLM), cache. Answers are labelled, never proof |
 | `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving, `--engine ox` / `TELIC_ENGINE=ox`; covers everything the Python core models (heap, optionals, dicts, opaque values, try, async); a function it cannot handle falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |

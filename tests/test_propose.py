@@ -1,4 +1,4 @@
-"""telic propose: proved facts, crash-free preconditions, drafted intents."""
+"""telic propose: proved facts, crash-free preconditions, drafted aims."""
 
 import json
 import os
@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from telic.checker import CheckOptions, check
-from telic.propose import draft_intents, propose, write_back
+from telic.propose import draft_aims, propose, write_back
 
 SHOP = '''
 def average(xs: list[int]) -> float:
@@ -68,7 +68,7 @@ def test_written_facts_are_proved(tmp_path):
         assert by[name].status == "proved", (name, by[name].status, [(v.ob.id, v.status) for v in by[name].verdicts])
 
 
-def test_drafted_intents_only_cite_proved_facts(tmp_path):
+def test_drafted_aims_only_cite_proved_facts(tmp_path):
     (tmp_path / "shop.py").write_text(SHOP)
     props = propose([str(tmp_path / "shop.py")], str(tmp_path), opts())
     # a generative oracle: classifies, rephrases (once badly), and names a gap
@@ -87,22 +87,22 @@ def test_drafted_intents_only_cite_proved_facts(tmp_path):
         "        out[k] = {'text': json.dumps(['The shop shall be fast.'])}\n"
         "print(json.dumps({'answers': out}))\n"
     )
-    d = draft_intents(props, str(tmp_path), oracle=f"cmd:{sys.executable} {fake}")
-    for it in d["intents"]:
+    d = draft_aims(props, str(tmp_path), oracle=f"cmd:{sys.executable} {fake}")
+    for it in d["aims"]:
         assert it["facts"] and all(f in d["facts"] for f in it["facts"])  # backed drafts cite proved facts only
         assert not it["lint"]  # a rephrasing that is not EARS is dropped for the literal one
-    assert "averages are fine" not in [i["text"] for i in d["intents"]]
+    assert "averages are fine" not in [i["text"] for i in d["aims"]]
     assert [i["text"] for i in d["unbacked"]] == ["The shop shall be fast."]
     assert d["suspicious"] and all("evens" in d["facts"][s["fact"]]["func"] for s in d["suspicious"])
     assert d["oracle"].startswith("cmd:")
 
 
-def test_drafted_intents_with_builtin_oracle(tmp_path, monkeypatch):
+def test_drafted_aims_with_builtin_oracle(tmp_path, monkeypatch):
     for v in ("TELIC_ORACLE", "JEV_API_KEY", "TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "TELIC_JUDGE_CMD"):
         monkeypatch.delenv(v, raising=False)
     (tmp_path / "shop.py").write_text(SHOP)
     props = propose([str(tmp_path / "shop.py")], str(tmp_path), opts())
-    d = draft_intents(props, str(tmp_path))
-    assert d["oracle"] == "builtin" and d["intents"] and not d["unbacked"]
-    assert all(not i["lint"] for i in d["intents"])
-    assert not any("old(self.owner)" in d["facts"][i["facts"][0]]["clause"] for i in d["intents"])  # frame facts are details
+    d = draft_aims(props, str(tmp_path))
+    assert d["oracle"] == "builtin" and d["aims"] and not d["unbacked"]
+    assert all(not i["lint"] for i in d["aims"])
+    assert not any("old(self.owner)" in d["facts"][i["facts"][0]]["clause"] for i in d["aims"])  # frame facts are details

@@ -1,4 +1,4 @@
-"""Proposing contracts and intents for code that has none.
+"""Proposing contracts and aims for code that has none.
 
 Three things, in increasing order of judgment:
 
@@ -11,7 +11,7 @@ Three things, in increasing order of judgment:
    can crash (division by zero, an index, a missing key, None, overflow),
    candidate ``requires`` are tried one at a time; the ones that remove every
    crash are reported. Adopting one moves the obligation to the callers.
-3. **Draft intents** (``--intents``). Each proved fact is rendered as an
+3. **Draft aims** (``--aims``). Each proved fact is rendered as an
    EARS sentence, and an oracle (a classifier such as Jev, the builtin
    rules, or an LLM; see ``oracle.py``) sorts them into requirements,
    details and likely bugs. A generative oracle may also rephrase them and
@@ -19,7 +19,7 @@ Three things, in increasing order of judgment:
    decision.
 
 Nothing is written to the source unless ``--write`` is given, and then only
-the facts and preconditions (never a model's intent draft).
+the facts and preconditions (never a model's aim draft).
 """
 
 from __future__ import annotations
@@ -413,7 +413,7 @@ def write_back(root: str, props: list[Proposal], with_fixes: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Drafting intents (an oracle's classification of proved facts, never a proof)
+# Drafting aims (an oracle's classification of proved facts, never a proof)
 
 KIND_CRITERIA = {
     "requirement": "a behaviour a product owner would state as a requirement of the system",
@@ -422,14 +422,14 @@ KIND_CRITERIA = {
 }
 
 
-def draft_intents(props: list[Proposal], root: str, oracle: str | None = None, k: int = 6) -> dict[str, Any]:
-    """Draft EARS intents from the proved facts. Every draft starts as a
+def draft_aims(props: list[Proposal], root: str, oracle: str | None = None, k: int = 6) -> dict[str, Any]:
+    """Draft EARS aims from the proved facts. Every draft starts as a
     literal rendering of one proved clause (``phrase.requirement``); the
     oracle classifies each as a requirement, a detail or a likely bug, and a
     generative oracle may rephrase it and name requirements nothing proves
     yet. Drafts that cite facts only ever cite facts telic proved."""
     from . import oracle as oracles
-    from .intent import ears_problems
+    from .aim import ears_problems
     from .phrase import requirement
 
     facts: dict[str, tuple[Proposal, str]] = {}
@@ -442,7 +442,7 @@ def draft_intents(props: list[Proposal], root: str, oracle: str | None = None, k
         for c in clauses:
             facts[f"F{len(facts) + 1}"] = (p, c)
     if not facts:
-        return {"intents": [], "unbacked": [], "suspicious": [], "details": [], "facts": {}, "oracle": None, "notes": []}
+        return {"aims": [], "unbacked": [], "suspicious": [], "details": [], "facts": {}, "oracle": None, "notes": []}
     literal = {fid: requirement(p.func, c) for fid, (p, c) in facts.items()}
     state = {
         "functions": sources,
@@ -489,23 +489,23 @@ def draft_intents(props: list[Proposal], root: str, oracle: str | None = None, k
             text = " ".join(phrased.split())
         ranked.append((-(conf if isinstance(conf, (int, float)) else 0.5), fid, text, a.get("by", got.oracle)))
     ranked.sort()
-    intents = []
+    aims = []
     seen: set[str] = set()
     for _, fid, text, by in ranked[:k]:
         p = facts[fid][0]
-        base = re.sub(r"[^A-Z0-9]+", "-", p.func.split(".")[-1].upper()).strip("-") or "INTENT"
+        base = re.sub(r"[^A-Z0-9]+", "-", p.func.split(".")[-1].upper()).strip("-") or "AIM"
         iid, n = base, 2
         while iid in seen:
             iid, n = f"{base}-{n}", n + 1
         seen.add(iid)
-        intents.append({"id": iid, "text": text, "facts": [fid], "lint": ears_problems(text), "by": by})
+        aims.append({"id": iid, "text": text, "facts": [fid], "lint": ears_problems(text), "by": by})
     unbacked = []
     gaps = (ans.get("gaps") or {}).get("text")
     for sentence in _sentences(gaps):
         wid = "-".join(w.upper() for w in re.findall(r"[A-Za-z]+", sentence) if w.lower() not in ("when", "the", "shall", "a", "an", "if", "then", "while", "where", "system"))[:40].strip("-")
-        unbacked.append({"id": wid or "INTENT", "text": sentence, "facts": [], "lint": ears_problems(sentence), "by": ans["gaps"].get("by", got.oracle)})
+        unbacked.append({"id": wid or "AIM", "text": sentence, "facts": [], "lint": ears_problems(sentence), "by": ans["gaps"].get("by", got.oracle)})
     return {
-        "intents": intents,
+        "aims": aims,
         "unbacked": unbacked,
         "suspicious": suspicious,
         "details": details,
@@ -551,15 +551,15 @@ def cmd_propose(args: Any, options: Any) -> int:
     say = (lambda msg: print(p.dim(f"  … {msg}"), flush=True)) if not args.json else None
     props = propose(args.paths, root, opts, only=only, progress=say)
     drafted = None
-    if args.intents:
+    if args.aims:
         try:
-            drafted = draft_intents(props, root, oracle=args.oracle)
+            drafted = draft_aims(props, root, oracle=args.oracle)
         except Exception as e:  # noqa: BLE001 - reported, the facts still stand
             drafted = {"error": str(e)}
     if args.json:
         print(json.dumps({
             "functions": [{"module": x.module, "function": x.func, "facts": x.facts, "crashes": x.crashes, "fixes": [{"requires": r, "removes": c} for r, c in x.fixes], "skipped": x.skipped} for x in props],
-            "intents": drafted,
+            "aims": drafted,
         }, indent=2))
     else:
         print(render_proposals(props, drafted, p))
@@ -597,14 +597,14 @@ def render_proposals(props: list[Proposal], drafted: dict[str, Any] | None, p: A
         out.append("")
     if drafted is not None:
         if "error" in drafted:
-            out.append(p.yellow(f"intents: could not draft ({drafted['error']})"))
+            out.append(p.yellow(f"aims: could not draft ({drafted['error']})"))
         else:
-            out.append(p.bold("Draft intents") + p.dim(f"  (proved facts in words, sorted by {drafted.get('oracle') or 'an oracle'}: requirements are yours to decide)"))
+            out.append(p.bold("Draft aims") + p.dim(f"  (proved facts in words, sorted by {drafted.get('oracle') or 'an oracle'}: requirements are yours to decide)"))
             out.append("")
             facts = drafted.get("facts", {})
-            for it in drafted.get("intents", []):
+            for it in drafted.get("aims", []):
                 by = sorted({facts[f]["func"] for f in it["facts"]})
-                out.append(f"  #@ intent {it['id']}: {it['text']}")
+                out.append(f"  #@ aim {it['id']}: {it['text']}")
                 out.append(f"  #@   by: {', '.join(by)}")
                 out.append(p.dim("    backed by these lemmas, cited in their functions:"))
                 for f in it["facts"]:
@@ -613,10 +613,10 @@ def render_proposals(props: list[Proposal], drafted: dict[str, Any] | None, p: A
                     out.append(p.yellow(f"      EARS: {lint}"))
                 out.append("")
             if drafted.get("unbacked"):
-                out.append(p.bold("Draft intents nothing proves yet") + p.dim("  (decide whether each is a requirement; then write the lemmas that back it)"))
+                out.append(p.bold("Draft aims nothing proves yet") + p.dim("  (decide whether each is a requirement; then write the lemmas that back it)"))
                 out.append("")
                 for it in drafted["unbacked"]:
-                    out.append(f"  #@ intent {it['id']}: {it['text']}")
+                    out.append(f"  #@ aim {it['id']}: {it['text']}")
                     for lint in it["lint"]:
                         out.append(p.yellow(f"      EARS: {lint}"))
                 out.append("")
@@ -632,10 +632,10 @@ def render_proposals(props: list[Proposal], drafted: dict[str, Any] | None, p: A
 
 
 def add_command(sub: Any, common: Any, options: Any) -> None:
-    c = sub.add_parser("propose", help="propose contracts (proved facts, crash-free preconditions) and draft intents for code without them")
+    c = sub.add_parser("propose", help="propose contracts (proved facts, crash-free preconditions) and draft aims for code without them")
     common(c)
     c.add_argument("--color", choices=["auto", "always", "never"], default="auto")
-    c.add_argument("--intents", action="store_true", help="also draft EARS intents from the proved facts (classified by the oracle)")
+    c.add_argument("--aims", action="store_true", help="also draft EARS aims from the proved facts (classified by the oracle)")
     c.add_argument("--oracle", default=None, help="oracle spec (builtin, jev, anthropic, cmd:..., http:..., py:...; default TELIC_ORACLE)")
     c.add_argument("--write", action="store_true", help="insert the proved facts into the source")
     c.add_argument("--with-fixes", action="store_true", help="with --write, also insert the first crash-free precondition")

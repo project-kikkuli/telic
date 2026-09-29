@@ -69,34 +69,34 @@ contract, a function is only checked for crashes; most glue code turns out to
 have nothing to check, and telic says so. See [field notes](docs/field-notes.md)
 for runs on real apps.
 
-## Intents: requirements above proofs
+## Aims: requirements above proofs
 
-An intent is a requirement a reviewer can read: one sentence, in
+An aim is a requirement a reviewer can read: one sentence, in
 [EARS](https://alistairmavin.com/ears/) form. The contracts that back it can sit
 anywhere in the project, in either language.
 
 ```python
-#@ intent REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
+#@ aim REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
 #@   what the customer paid, net of earlier refunds.
 #@   by: refund_amount, web/checkout.ts::refundButton
 
 def refund_amount(paid: int, refunded: int, requested: int) -> int:
-    #@ intent REFUND-CAP
+    #@ aim REFUND-CAP
     #@ ensures 0 <= result <= paid - refunded
     ...
 ```
 
 `by:` points down from the requirement to its lemmas, and each lemma cites the
-intent back. telic checks both directions. An intent is **backed** when every
+aim back. telic checks both directions. An aim is **backed** when every
 lemma is proved, and **broken** when one is refuted. It is never "proved": whether
 the lemmas cover the requirement is a separate verdict, recorded by a person
-(`telic intents --accept ID`) or by an oracle (`--judge`). Both are pinned to
+(`telic aims --accept ID`) or by an oracle (`--judge`). Both are pinned to
 the exact sentence and lemma set.
 
 **Starting from code with no contracts,** `telic propose src/` lists facts it
 has proved about the code as it is (a proposed contract is only shown once it
 is proved) and the preconditions that would make each crashing function
-crash-free. With `--intents`, each proved fact is written as an EARS
+crash-free. With `--aims`, each proved fact is written as an EARS
 requirement and an oracle sorts them into requirements, details and likely
 bugs. A fact can faithfully describe a bug, and a requirement is a decision, so
 you (or your agent) choose what to keep; `--write` inserts the facts.
@@ -120,8 +120,8 @@ proof is saved next to the code and reused until the code it's about changes.
 ```
 telic demo                 a 20-second walkthrough
 telic check [PATHS]        verify (-j N workers, --json for agents and CI, --engine ox)
-telic intents              requirements, their lemmas, and whether the links hold
-telic propose [PATHS]      proved facts and crash-free preconditions to adopt; --intents drafts requirements
+telic aims              requirements, their lemmas, and whether the links hold
+telic propose [PATHS]      proved facts and crash-free preconditions to adopt; --aims drafts requirements
 telic gaps [PATHS]         mutants the contracts fail to reject
 telic explain NAME         every obligation of a function, with formulas
 telic lean ID / prove      Lean escalation
@@ -143,7 +143,7 @@ telic run script.py        run with every contract checked at runtime
   telic keeps it honest (`tests/cases/soundness/`).
 - **Anything listed under trusted base,** plus anything you mark `@assume` or
   `@trusted`.
-- **Not the oracles.** Coverage judgments and drafted intents are labelled
+- **Not the oracles.** Coverage judgments and drafted aims are labelled
   opinions; no verdict depends on them.
 
 Counterexamples need no trust: each one is executed before it's reported.

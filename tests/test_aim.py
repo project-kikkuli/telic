@@ -1,4 +1,4 @@
-"""Intents are requirements above lemmas: EARS shape, two-sided links,
+"""Aims are requirements above lemmas: EARS shape, two-sided links,
 statuses that never say 'proved', reviews and judgments pinned by digest."""
 
 import json
@@ -8,14 +8,14 @@ import sys
 from pathlib import Path
 
 from telic.checker import CheckOptions, check
-from telic.intent import accept, ears_problems, judge, split_by
+from telic.aim import accept, ears_problems, judge, split_by
 
-CASES = Path(__file__).parent / "cases" / "intents"
+CASES = Path(__file__).parent / "cases" / "aims"
 
 
-def intents(root: Path):
+def aims(root: Path):
     rep = check([str(root / "app.py")], CheckOptions(cache_path=None, lean=False, replay=False), root=str(root))
-    return rep, {i.id: i for i in rep.intents}
+    return rep, {i.id: i for i in rep.aims}
 
 
 def test_ears_lint():
@@ -34,7 +34,7 @@ def test_by_list_parsing():
 
 def test_statuses_and_two_sided_links(tmp_path):
     shutil.copy(CASES / "app.py", tmp_path / "app.py")
-    _, got = intents(tmp_path)
+    _, got = aims(tmp_path)
     cap = got["CAP"]
     assert cap.status == "backed" and cap.proved == 2  # refund's ensures and stray's tagged clause
     msgs = " | ".join(cap.pointers)
@@ -48,13 +48,13 @@ def test_statuses_and_two_sided_links(tmp_path):
 
 def test_review_goes_stale_when_lemmas_change(tmp_path):
     shutil.copy(CASES / "app.py", tmp_path / "app.py")
-    _, got = intents(tmp_path)
+    _, got = aims(tmp_path)
     accept(str(tmp_path), got["CAP"], "ana")
-    _, got = intents(tmp_path)
+    _, got = aims(tmp_path)
     assert got["CAP"].coverage == {"kind": "reviewed", "by": "ana", "fresh": True}
     src = (tmp_path / "app.py").read_text().replace("#@ ensures result <= paid", "#@ ensures result <= paid + 1")
     (tmp_path / "app.py").write_text(src)
-    _, got = intents(tmp_path)
+    _, got = aims(tmp_path)
     assert got["CAP"].coverage["fresh"] is False
 
 
@@ -71,12 +71,12 @@ def test_judge_is_cached_and_labelled(tmp_path):
         "print(json.dumps({'answers': {k: {'noul': 0.1} for k in req['questions']}}))\n"
     )
     spec = f"cmd:{sys.executable} {script}"
-    _, got = intents(tmp_path)
+    _, got = aims(tmp_path)
     judge(str(tmp_path), [got["CAP"]], oracle=spec)
     cov = got["CAP"].coverage
     assert cov["kind"] == "judged" and cov["verdict"] == "insufficient"
     assert cov["model"].startswith("cmd:") and cov["missing"]  # labelled with the oracle, and says which part is missing
-    _, got = intents(tmp_path)  # a fresh run shows the cached judgment
+    _, got = aims(tmp_path)  # a fresh run shows the cached judgment
     assert got["CAP"].coverage["kind"] == "judged"
     judge(str(tmp_path), [got["CAP"]], oracle=spec)
     assert counter.read_text() == "x"  # asked once

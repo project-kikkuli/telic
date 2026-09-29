@@ -35,7 +35,7 @@ be modelling gaps. *Next:*
    frontend fixes with a corpus case.
 2. Reduce the unsupported count: list the top reasons
    (`telic check telic/ --json`) and fix the most common idioms.
-3. Put contracts and intents on the pure helpers (`telic/phrase.py`,
+3. Put contracts and aims on the pure helpers (`telic/phrase.py`,
    `ears_problems`, `ears_conditions`, `split_by`, `oracle._one`), then add a
    CI job that ratchets `telic.ledger.json` for telic itself.
 
@@ -72,7 +72,7 @@ be modelling gaps. *Next:*
   handles. Function-level receipts are still reused. *Done:* obligation keys
   are sent to the engine and cached obligations are skipped.
 
-## Oracles and intents
+## Oracles and aims
 
 - **Only Jev has been tested live** (coverage and fact classification). The
   `anthropic` backend has not been run against the real API since it moved to
@@ -82,7 +82,7 @@ be modelling gaps. *Next:*
   each EARS condition against proved facts. That is fine as a free default,
   but it can call unrelated facts "sufficient" when they share words. Its
   answers are capped at p=0.7, so it never sounds confident.
-- **Intent redesign (task 11) is still open.** Remaining: `telic intents
+- **Aim redesign (task 11) is still open.** Remaining: `telic aims
   --json` should carry the per-part judge answers, and the HTML report should
   show judgments with the oracle and probability, as the terminal does.
 

@@ -1,12 +1,12 @@
-#@ intent CAP: WHEN a refund is requested, the shop shall refund at most what was paid.
+#@ aim CAP: WHEN a refund is requested, the shop shall refund at most what was paid.
 #@   by: refund, audit
-#@ intent LOOSE: refunds are small and also fast. They never fail.
-#@ intent LONELY: The shop shall log every refund.
+#@ aim LOOSE: refunds are small and also fast. They never fail.
+#@ aim LONELY: The shop shall log every refund.
 
 
 def refund(paid: int, requested: int) -> int:
     #@ requires paid >= 0 and requested >= 0
-    #@ intent CAP
+    #@ aim CAP
     #@ ensures result <= paid
     return min(paid, requested)
 

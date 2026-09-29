@@ -2,13 +2,13 @@ from .models import FEE_CENTS, Invoice, Status, fee
 from . import models
 
 
-#@ intent NO-OVERPAY: IF a payment exceeds what is owed THEN the system shall
+#@ aim NO-OVERPAY: IF a payment exceeds what is owed THEN the system shall
 #@   reject it without changing the invoice.
 #@   by: settle, models.py::Invoice.pay
 
 
 def settle(inv: Invoice, cents: int) -> bool:
-    #@ intent NO-OVERPAY
+    #@ aim NO-OVERPAY
     #@ ensures implies(not result, inv.paid == old(inv.paid))
     if cents <= 0 or cents > inv.amount - inv.paid:
         return False

@@ -207,7 +207,7 @@ type obligation = {
   hyps : term list;
   goal : term;
   clause : Ir.clause option;
-  intents : string list;
+  aims : string list;
   inputs : (string * value) list;
   deps : string list;
   exclude : string list;
@@ -342,10 +342,10 @@ let oblige g ?site ?clause ?(inferred = false) kind ctx goal (loc : Ir.loc) mess
     Hashtbl.replace g.ids base (k + 1);
     let oid = Printf.sprintf "%s/%s%s" g.info.fn.name base (if k > 0 then Printf.sprintf "#%d" (k + 1) else "") in
     let excl = g.info.key :: g.info.scc in
-    let intents = match clause with Some (c : Ir.clause) -> c.intents | None -> [] in
+    let aims = match clause with Some (c : Ir.clause) -> c.aims | None -> [] in
     let inferred = inferred || match clause with Some c -> c.inferred | None -> false in
     g.obligations <-
-      { oid; func = g.info.key; kind; oloc = loc; site; message; hyps = hyps ctx; goal; clause; intents; inputs = List.rev g.inputs; deps = g.deps; exclude = excl; inferred }
+      { oid; func = g.info.key; kind; oloc = loc; site; message; hyps = hyps ctx; goal; clause; aims; inputs = List.rev g.inputs; deps = g.deps; exclude = excl; inferred }
       :: g.obligations
   end
 

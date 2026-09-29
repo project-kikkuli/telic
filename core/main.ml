@@ -555,7 +555,7 @@ let () =
                     ("site", match ob.site with Some s -> loc_json s | None -> Json.Null);
                     ("message", Json.String ob.message);
                     ("clause", clause_json ob.clause);
-                    ("intents", Json.List (List.map (fun s -> Json.String s) ob.intents));
+                    ("aims", Json.List (List.map (fun s -> Json.String s) ob.aims));
                     ("inferred", Json.Bool ob.inferred);
                     ("deps", Json.List (List.map (fun s -> Json.String s) ob.deps));
                     ("exclude", Json.List (List.map (fun s -> Json.String s) ob.exclude));

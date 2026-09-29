@@ -5,8 +5,8 @@
     telic lean ID                  print the Lean 4 goal for an obligation
     telic prove [PATH...]          discharge open obligations in Lean (auto tactics / --agent)
     telic gaps [PATH...]           attack the specs: find wrong code the contracts still accept
-    telic propose [PATH...]        propose contracts (proved facts) and draft intents for code without them
-    telic intents [PATH...]        requirements, the lemmas backing them, --judge coverage with an oracle
+    telic propose [PATH...]        propose contracts (proved facts) and draft aims for code without them
+    telic aims [PATH...]        requirements, the lemmas backing them, --judge coverage with an oracle
     telic oracle [--probe]         which classifier or model answers the judgment tasks
     telic run SCRIPT [ARGS...]     run a Python program with every contract enforced
 """
@@ -67,7 +67,7 @@ def report_json(rep: Report) -> dict[str, Any]:
                 "file": f.ref.module.path,
                 "line": v.ob.loc.line,
                 "site_line": v.ob.site.line if v.ob.site else None,
-                "intents": list(v.ob.intents),
+                "aims": list(v.ob.aims),
             }
             if v.status != "proved":
                 if v.model:
@@ -84,7 +84,7 @@ def report_json(rep: Report) -> dict[str, Any]:
                 "line": f.fn.loc.line,
                 "status": f.status,
                 "problems": [{"message": m, "line": loc.line} for m, loc in f.problems],
-                "intents": f.fn.intents,
+                "aims": f.fn.aims,
                 "obligations": obs,
                 "assumes_unproved": sorted(f.open_deps),
                 "inferred": {
@@ -100,9 +100,9 @@ def report_json(rep: Report) -> dict[str, Any]:
         "seconds": round(rep.seconds, 3),
         "cache_hits": rep.cache_hits,
         "problems": [{"file": m.path, "line": loc.line, "message": msg} for m in rep.modules for msg, loc in m.problems],
-        "intents": [
+        "aims": [
             {"id": i.id, "status": i.status, "text": i.text, "at": f"{i.loc[0]}:{i.loc[1]}" if i.loc else None, "scope": i.scope, "functions": i.functions, "proved": i.proved, "refuted": i.refuted, "open": i.open, "links": i.pointers, "advice": i.advice}
-            for i in rep.intents
+            for i in rep.aims
         ],
         "functions": fns,
         "mirrors": [m.to_json() for m in rep.mirrors],
@@ -190,9 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     from .html import add_commands as add_report
 
     add_report(sub, _common, _options)
-    from .intent import add_commands as add_intents
+    from .aim import add_commands as add_aims
 
-    add_intents(sub, _common, _options)
+    add_aims(sub, _common, _options)
     from .propose import add_command as add_propose
 
     add_propose(sub, _common, _options)

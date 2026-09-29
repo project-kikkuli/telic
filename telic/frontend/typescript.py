@@ -139,7 +139,7 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
 def _clause(d: dict[str, Any] | None) -> ir.Clause | None:
     if d is None:
         return None
-    return ir.Clause(d["kind"], _expr(d["expr"]), _loc(d["loc"]), d["text"], tuple(d.get("intents") or ()))
+    return ir.Clause(d["kind"], _expr(d["expr"]), _loc(d["loc"]), d["text"], tuple(d.get("aims") or ()))
 
 
 def _stmts(xs: list[dict[str, Any]]) -> tuple[ir.Stmt, ...]:
@@ -200,7 +200,7 @@ def _function(d: dict[str, Any]) -> ir.Function:
         decreases=_clause(d.get("decreases")),
         raises=[_clause(c) for c in d["raises"]],  # type: ignore[misc]
         body=list(_stmts(d["body"])),
-        intents=list(d.get("intents") or []),
+        aims=list(d.get("aims") or []),
         mirrors=[(m, ir.Loc(int(line))) for m, line in d.get("mirrors") or []],
         unsupported=[(m, ir.Loc(int(line))) for m, line in d.get("unsupported") or []],
         trusted=bool(d.get("trusted")),
@@ -221,7 +221,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
         m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")))  # type: ignore[misc]
     m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.class_origin = dict(d.get("class_origin") or {})
-    m.intents = [ir.IntentDecl(i["id"], i["text"], ir.Loc(int(i["line"]), int(i.get("col", 0)))) for i in d.get("intents", [])]
+    m.aims = [ir.AimDecl(i["id"], i["text"], ir.Loc(int(i["line"]), int(i.get("col", 0)))) for i in d.get("aims", [])]
     m.problems = [(msg, ir.Loc(int(line))) for msg, line in d.get("problems", [])]
     m.notes = [(msg, ir.Loc(int(line))) for msg, line in d.get("notes", [])]
     m.assumptions = list(d.get("assumptions", []))

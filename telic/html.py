@@ -1,6 +1,6 @@
 """`telic report`: the proof ledger as one self-contained HTML page.
 
-Intents first (the summary a reader wants), then every function with its
+Aims first (the summary a reader wants), then every function with its
 source and a proof gutter: each line that carries an obligation shows what was
 proved there, how, or what broke.
 """
@@ -35,7 +35,7 @@ STATUS_WORD = {
 MARK = {"proved": "✓", "refuted": "✗", "vacuous": "∅", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "unbacked": "○"}
 
 CSS = """
-/* Layout: a ledger. Intents summary on top, then one panel per function:
+/* Layout: a ledger. Aims summary on top, then one panel per function:
    source with a proof gutter, evidence table beneath. */
 :root {
   --ground: #f4f6f5;
@@ -91,17 +91,17 @@ header.top { display: grid; gap: 10px; }
 .pill.backed { color: var(--proved); background: var(--proved-bg); }
 .pill.broken, .pill.vacuous { color: var(--refuted); background: var(--refuted-bg); }
 .pill.partial, .pill.unbacked { color: var(--open); background: var(--open-bg); }
-.intent ul { margin: 6px 0 0; padding-left: 1.1rem; list-style: none; }
+.aim ul { margin: 6px 0 0; padding-left: 1.1rem; list-style: none; }
 .pill.unsupported, .pill.trusted, .pill.unformalized, .pill.error { color: var(--quiet); background: var(--quiet-bg); }
 section { display: grid; gap: 14px; }
-.intents { display: grid; gap: 0; border-top: 1px solid var(--rule); }
-.intent { display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr) auto; gap: 6px 18px; padding: 14px 2px; border-bottom: 1px solid var(--rule); align-items: baseline; }
-.intent .id { font: 600 0.9rem var(--font-mono); color: var(--accent); overflow-wrap: anywhere; }
-.intent .text { min-width: 0; }
-.intent .evidence { grid-column: 2 / 4; color: var(--muted); font-size: 0.86rem; }
+.aims { display: grid; gap: 0; border-top: 1px solid var(--rule); }
+.aim { display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr) auto; gap: 6px 18px; padding: 14px 2px; border-bottom: 1px solid var(--rule); align-items: baseline; }
+.aim .id { font: 600 0.9rem var(--font-mono); color: var(--accent); overflow-wrap: anywhere; }
+.aim .text { min-width: 0; }
+.aim .evidence { grid-column: 2 / 4; color: var(--muted); font-size: 0.86rem; }
 @media (max-width: 640px) {
-  .intent { grid-template-columns: minmax(0, 1fr) auto; }
-  .intent .text, .intent .evidence { grid-column: 1 / 3; }
+  .aim { grid-template-columns: minmax(0, 1fr) auto; }
+  .aim .text, .aim .evidence { grid-column: 1 / 3; }
 }
 .fn { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
 .fn > header { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--rule); }
@@ -216,7 +216,7 @@ def function_panel(f: FunctionReport) -> str:
             body = f'<span class="contract">{body}</span>'
         rows.append(f'<tr class="{st}"><td class="n">{n}</td><td class="g">{g}</td><td class="c">{body}</td></tr>')
     tags = []
-    for i in f.fn.intents:
+    for i in f.fn.aims:
         tags.append(f'<span class="tag">{e(i)}</span>')
     if f.inferred:
         for line, cs in sorted(f.inferred.invariants.items()):
@@ -295,7 +295,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
     nob = sum(len(f.verdicts) for f in fs)
     lean = sum(1 for f in fs for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
     inferred = sum(sum(len(c) for c in f.inferred.invariants.values()) for f in fs if f.inferred)
-    nfiles = sum(1 for m in rep.modules if m.language != "intents")
+    nfiles = sum(1 for m in rep.modules if m.language != "aims")
     tally = [
         f"<span><b>{nfiles}</b> file{'s' * (nfiles != 1)}</span>",
         f"<span><b>{len(fs)}</b> function{'s' * (len(fs) != 1)}</span>",
@@ -312,10 +312,10 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         tally.append(f"<span><b>{lean}</b> by Lean</span>")
     if inferred:
         tally.append(f"<span><b>{inferred}</b> inferred invariant{'s' * (inferred != 1)}</span>")
-    intents = []
-    for i in rep.intents:
+    aims = []
+    for i in rep.aims:
         ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
-        ev = [f"{ok}/{len(i.lemmas)} lemmas proved"] if i.lemmas else ["no lemma cites this intent yet"]
+        ev = [f"{ok}/{len(i.lemmas)} lemmas proved"] if i.lemmas else ["no lemma cites this aim yet"]
         cov = i.coverage or {}
         if cov.get("kind") == "reviewed":
             ev.append(f"reviewed by {cov.get('by') or 'a person'}" if cov.get("fresh") else "review stale")
@@ -327,8 +327,8 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         if i.loc:
             ev.append(f"declared in {i.loc[0]}:{i.loc[1]}")
         issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
-        intents.append(
-            f'<div class="intent"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
+        aims.append(
+            f'<div class="aim"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
             f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}<ul>{lemmas}{issues}</ul></span></div>"
         )
     trust = []
@@ -349,7 +349,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
     <h1>{e(title)}</h1>
     <div class="tally">{"".join(tally)}</div>
   </header>
-  {"<section><h2>Intents</h2><div class='intents'>" + "".join(intents) + "</div></section>" if intents else ""}
+  {"<section><h2>Aims</h2><div class='aims'>" + "".join(aims) + "</div></section>" if aims else ""}
   {"<section><h2>Mirrors</h2>" + "".join(mirror_card(m) for m in rep.mirrors) + "</section>" if rep.mirrors else ""}
   <section>
     <h2>Functions</h2>

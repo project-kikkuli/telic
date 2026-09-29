@@ -1,11 +1,11 @@
 ---
 name: telic
-description: Verify Python/TypeScript/Rust functions against intents and contracts written as #@ / //@ comments. Use when writing or changing business logic, when a function has #@/ //@ contracts, or before committing code that carries intents.
+description: Verify Python/TypeScript/Rust functions against aims and contracts written as #@ / //@ comments. Use when writing or changing business logic, when a function has #@/ //@ contracts, or before committing code that carries aims.
 ---
 
 # telic: prove it, don't vibe it
 
-This project states intent and contracts in comments and verifies them with
+This project states aims and contracts in comments and verifies them with
 `telic`. Follow this loop for any function you write or change:
 
 0. On code that has no contracts yet, run `telic propose --json <files>` first:
@@ -15,9 +15,9 @@ This project states intent and contracts in comments and verifies them with
 
 1. If the change serves a requirement, declare or link it. Declare it anywhere,
    as one EARS sentence, and list the functions that back it:
-   `#@ intent ID: WHEN <trigger>, the <system> shall <response>.` followed by
-   `#@   by: fn_a, Class.method, web/x.ts::fnB`. Then write `#@ intent ID` in
-   each of those functions. `telic intents` checks both directions.
+   `#@ aim ID: WHEN <trigger>, the <system> shall <response>.` followed by
+   `#@   by: fn_a, Class.method, web/x.ts::fnB`. Then write `#@ aim ID` in
+   each of those functions. `telic aims` checks both directions.
 2. Write `#@ requires` (what callers must guarantee) and `#@ ensures` (what the
    function promises; `result` is the return value, `old(e)` is an entry value).
    Use `//@` in TypeScript and Rust.

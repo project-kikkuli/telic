@@ -34,7 +34,7 @@ class MirrorReport:
     a: FuncRef
     b: FuncRef
     loc: ir.Loc
-    intents: list[str]
+    aims: list[str]
     status: str  # proved | refuted | open
     method: str = ""  # smt | testing
     witness: dict[str, Any] | None = None
@@ -51,7 +51,7 @@ class MirrorReport:
             "witness": self.witness,
             "reason": self.reason,
             "explanation": self.explanation,
-            "intents": self.intents,
+            "aims": self.aims,
         }
 
 
@@ -229,7 +229,7 @@ def explain_difference(a: ir.Function, b: ir.Function, notes: list[str]) -> str:
 
 
 def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300) -> MirrorReport:
-    rep = MirrorReport(a, b, loc, sorted(set(a.fn.intents) | set(b.fn.intents)), "open", verdicts=["mirror"])
+    rep = MirrorReport(a, b, loc, sorted(set(a.fn.aims) | set(b.fn.aims)), "open", verdicts=["mirror"])
     try:
         ina, inb, shown, notes = _shared_inputs(a.fn, b.fn)
     except Incomparable as e:
@@ -353,7 +353,7 @@ def check_mirrors(program: Program, theory: Theory, opts, root: str | None = Non
                 owner = FuncRef(m, f)
                 target = resolve_mirror(program, owner, spec)
                 if target is None:
-                    rep = MirrorReport(owner, owner, loc, list(f.intents), "open", verdicts=["mirror"])
+                    rep = MirrorReport(owner, owner, loc, list(f.aims), "open", verdicts=["mirror"])
                     rep.reason = f"cannot find '{spec}' (path is relative to {m.path}; the file must be checkable)"
                     out.append(rep)
                     continue

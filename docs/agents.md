@@ -10,14 +10,14 @@ invariant, or a Lean goal.
 0. **On existing code, start with `telic propose --json`.** It returns facts
    telic has proved about the code as it is, and preconditions that would make
    crashing functions crash-free. Adopt a fact only if it is what the code
-   *should* do; a fact that looks wrong is a bug report. `--intents` adds
+   *should* do; a fact that looks wrong is a bug report. `--aims` adds
    drafted requirements (the user decides which are real).
-1. **State the intent** where the code lives, one EARS sentence per
+1. **State the aim** where the code lives, one EARS sentence per
    requirement, listing the functions that back it:
-   `#@ intent SPLIT-EXACT: WHEN a bill is split, the app shall assign every cent to exactly one person.`
+   `#@ aim SPLIT-EXACT: WHEN a bill is split, the app shall assign every cent to exactly one person.`
    `#@   by: split_bill`
 2. **Write the lemmas** with the functions: `@requires` for what callers must
-   guarantee, `@ensures` tagged with the intent (`#@ [SPLIT-EXACT] ensures ...`)
+   guarantee, `@ensures` tagged with the aim (`#@ [SPLIT-EXACT] ensures ...`)
    for what each function promises towards it.
 3. **Run `telic check --json`** and handle each non-`proved` obligation:
    - `refuted` with `replay.confirmed: true`: the code violates the contract on
@@ -33,10 +33,10 @@ invariant, or a Lean goal.
 4. **Run `telic gaps`** on what you proved. Each surviving mutant is a wrong
    implementation your contract accepts. Strengthen `@ensures` until none survive,
    or until you decide the remaining freedom is intended.
-5. **Check the intents with `telic intents`.** Each should be `backed` (every
+5. **Check the aims with `telic aims`.** Each should be `backed` (every
    lemma proved) with its links intact. Whether the lemmas cover the sentence is
    the user's review (`--accept`), or at most an oracle's labelled judgment
-   (`--judge`); never claim an intent is proved.
+   (`--judge`); never claim an aim is proved.
 6. **Commit when `telic check --strict` passes.**
 
 ## Rules worth giving an agent

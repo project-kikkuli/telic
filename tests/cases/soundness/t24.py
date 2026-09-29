@@ -1,7 +1,7 @@
 # Vacuity: preconditions or invariants that can never hold make every claim
 # trivially true. None of these may be reported proved.
 
-#@ intent NEVER: The system shall return 42 for every input.
+#@ aim NEVER: The system shall return 42 for every input.
 
 
 def is_neg(x: int) -> bool:
@@ -11,7 +11,7 @@ def is_neg(x: int) -> bool:
 
 def contradictory(x: int) -> int:
     #@ requires x > 0 and x < 0
-    #@ intent NEVER
+    #@ aim NEVER
     #@ ensures result == 42
     return x
 

@@ -198,7 +198,7 @@ class Renderer:
         self.p = paint or Paint()
         self.verbose = verbose
         self.width = width or min(100, max(72, _term_width()))
-        self.intent_text = {i.id: i.text for i in report.intents}
+        self.aim_text = {i.id: i.text for i in report.aims}
 
     def rule(self, title: str, right: str = "", color: str = "bold") -> str:
         p = self.p
@@ -221,7 +221,7 @@ class Renderer:
         for mr in self.r.mirrors:
             if mr.status != "proved" or self.verbose:
                 out += self.mirror_detail(mr)
-        out += self.intent_table()
+        out += self.aim_table()
         out += self.function_table()
         out += self.trust_section()
         out.append(self.footer())
@@ -232,7 +232,7 @@ class Renderer:
         r = self.r
         nfun = len(r.functions)
         nob = sum(len(f.verdicts) for f in r.functions) + sum(len(m.verdicts) for m in r.mirrors)
-        files = sum(1 for m in r.modules if m.language != "intents")
+        files = sum(1 for m in r.modules if m.language != "aims")
         stats = f"{files} file{'s' * (files != 1)} · {nfun} function{'s' * (nfun != 1)} · {nob} obligation{'s' * (nob != 1)}"
         if r.cache_hits:
             stats += f" · {r.cache_hits} cached"
@@ -330,9 +330,9 @@ class Renderer:
             head = f"{KIND_NOUN.get(ob.kind, ob.kind)} not proved"
         where = f"{mod.path}:{(ob.site or ob.loc).line}"
         out = [self.rule(f"{tag} {p.bold(f.fn.name)} {p.dim('·')} {head}", where)]
-        for iid in ob.intents:
-            txt = self.intent_text.get(iid)
-            out.append(f"   {p.cyan(iid)}  {txt or p.dim('(undeclared intent)')}")
+        for iid in ob.aims:
+            txt = self.aim_text.get(iid)
+            out.append(f"   {p.cyan(iid)}  {txt or p.dim('(undeclared aim)')}")
         marks: list[tuple[ir.Loc, str, str]] = []
         color = "red" if v.status == "refuted" else "yellow"
         if ob.kind == "ensures":
@@ -434,8 +434,8 @@ class Renderer:
         else:
             tag = p.byellow("? UNKNOWN")
         out.append(self.rule(f"{tag} {p.bold(a.fn.name)} {p.dim('≡')} {p.bold(b.fn.name)}", f"{a.module.path} ⇄ {b.module.path}"))
-        for iid in mr.intents:
-            out.append(f"   {p.cyan(iid)}  {self.intent_text.get(iid) or ''}")
+        for iid in mr.aims:
+            out.append(f"   {p.cyan(iid)}  {self.aim_text.get(iid) or ''}")
         if mr.status == "refuted" and mr.witness is not None:
             out.append("")
             w = mr.witness
@@ -460,13 +460,13 @@ class Renderer:
 
     # -- tables --------------------------------------------------------------
 
-    def intent_table(self) -> list[str]:
-        """Requirements first: each intent, what backs it, and whether its
+    def aim_table(self) -> list[str]:
+        """Requirements first: each aim, what backs it, and whether its
         links and wording hold up. Lemmas are listed under it."""
         p = self.p
-        if not self.r.intents:
+        if not self.r.aims:
             return []
-        out = [self.rule("intents", f"{len(self.r.intents)}"), ""]
+        out = [self.rule("aims", f"{len(self.r.aims)}"), ""]
         label = {
             "backed": p.green("backed"),
             "broken": p.red("broken"),
@@ -476,7 +476,7 @@ class Renderer:
             "undeclared": p.yellow("undeclared"),
         }
         glyph = {"backed": p.green("●"), "broken": p.red("✗"), "vacuous": p.red("∅"), "partial": p.yellow("◐"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
-        for i in self.r.intents:
+        for i in self.r.aims:
             n = len(i.lemmas)
             ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
             summary = [label[i.status]]
@@ -495,7 +495,7 @@ class Renderer:
                 summary.append(p.dim("coverage not reviewed"))
             where = f"{i.loc[0]}:{i.loc[1]}" if i.loc else ""
             out.append(f"  {glyph[i.status]} {p.bold(p.cyan(i.id))}  {'  ·  '.join(summary)}  {p.dim(where)}")
-            text = i.text or p.dim("cited, but never declared with '@intent ID: sentence'")
+            text = i.text or p.dim("cited, but never declared with '@aim ID: sentence'")
             for line in _wrap(text, self.width - 6):
                 out.append(f"    {line}")
             nw = max((len(x.name) for x in i.lemmas), default=0) + 2
@@ -515,7 +515,7 @@ class Renderer:
             for msg in i.advice:
                 out.append(f"    {p.dim('note')}   {p.dim(msg)}")
             if i.status == "unbacked" and i.scope is not None:
-                out.append(f"    {p.yellow('orphan')} {p.dim('declared in an intents/ file and nothing backs it: cite it from the code, or remove it')}")
+                out.append(f"    {p.yellow('orphan')} {p.dim('declared in an aims/ file and nothing backs it: cite it from the code, or remove it')}")
             out.append("")
         return out
 

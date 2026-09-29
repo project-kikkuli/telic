@@ -108,8 +108,8 @@ def test_unsatisfiable_entry_is_vacuous(vacuity_reports, name, fn):
     assert status[fn] == "vacuous"
 
 
-def test_intent_backed_only_by_a_vacuous_lemma_is_not_backed(vacuity_reports):
-    (never,) = [i for i in vacuity_reports["t24.py"].intents if i.id == "NEVER"]
+def test_aim_backed_only_by_a_vacuous_lemma_is_not_backed(vacuity_reports):
+    (never,) = [i for i in vacuity_reports["t24.py"].aims if i.id == "NEVER"]
     assert never.status == "vacuous"
 
 

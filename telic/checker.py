@@ -32,7 +32,7 @@ def language_of(path: str) -> str | None:
 
 
 def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
-    from .frontend.intent_file import is_intent_file
+    from .frontend.aim_file import is_aim_file
 
     files: list[str] = []
     for p in paths:
@@ -41,13 +41,13 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build", "target")]
                 for f in sorted(filenames):
                     full = os.path.join(dirpath, f)
-                    if language_of(full) or is_intent_file(full):
+                    if language_of(full) or is_aim_file(full):
                         files.append(full)
         else:
             files.append(p)
     root = root or os.getcwd()
-    intents_files = [f for f in files if is_intent_file(f)]
-    files = [f for f in files if not is_intent_file(f)]
+    aims_files = [f for f in files if is_aim_file(f)]
+    files = [f for f in files if not is_aim_file(f)]
     # Files named by '@mirrors' come along automatically.
     seen = {os.path.normpath(os.path.abspath(f)) for f in files}
     pending = list(files)
@@ -106,31 +106,31 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
             from .frontend.rust import lower_rust
 
             mods.append(lower_rust(os.path.relpath(f, root), Path(f).read_text()))
-    return mods + intents_modules(paths, intents_files, root)
+    return mods + aims_modules(paths, aims_files, root)
 
 
-def intents_modules(paths: list[str], named: list[str], root: str) -> list[ir.Module]:
-    """The intents/<ID>.md files named or walked, plus those in the intents/
+def aims_modules(paths: list[str], named: list[str], root: str) -> list[ir.Module]:
+    """The aims/<ID>.md files named or walked, plus those in the aims/
     directories of ancestors up to the root. Ancestors come as context: their
-    intents are reported only where the checked code cites them."""
-    from .frontend.intent_file import DIR, is_intent_file, lower_intent_file
+    aims are reported only where the checked code cites them."""
+    from .frontend.aim_file import DIR, is_aim_file, lower_aim_file
 
     own = {os.path.normpath(os.path.abspath(f)) for f in named}
     top = os.path.normpath(os.path.abspath(root))
     ancestors: set[str] = set()
     for p in paths:
         full = os.path.normpath(os.path.abspath(p))
-        d = os.path.dirname(full)  # a walked directory's own intents/ is already named
+        d = os.path.dirname(full)  # a walked directory's own aims/ is already named
         while d == top or d.startswith(top + os.sep):
             above = os.path.join(d, DIR)
             if os.path.isdir(above):
-                ancestors.update(f for f in (os.path.join(above, n) for n in os.listdir(above)) if is_intent_file(f))
+                ancestors.update(f for f in (os.path.join(above, n) for n in os.listdir(above)) if is_aim_file(f))
             if d == top:
                 break
             d = os.path.dirname(d)
     out = []
     for f in sorted(own | ancestors):
-        m = lower_intent_file(os.path.relpath(f, root), Path(f).read_text())
+        m = lower_aim_file(os.path.relpath(f, root), Path(f).read_text())
         m.context = f not in own
         out.append(m)
     return out
@@ -190,7 +190,7 @@ class FunctionReport:
         return sum(1 for v in self.verdicts if v.status == status)
 
 
-from .intent import IntentReport  # noqa: E402  (re-exported)
+from .aim import AimReport  # noqa: E402  (re-exported)
 
 
 @dataclass
@@ -198,7 +198,7 @@ class Report:
     modules: list[ir.Module]
     program: Program
     functions: list[FunctionReport]
-    intents: list[IntentReport]
+    aims: list[AimReport]
     mirrors: list[Any] = field(default_factory=list)  # EquivReport
     seconds: float = 0.0
     cache_hits: int = 0
@@ -273,7 +273,7 @@ def make_receipt(rep: "FunctionReport") -> dict[str, Any]:
                 "loc": [v.ob.loc.line, v.ob.loc.col, v.ob.loc.end_col],
                 "site": [v.ob.site.line, v.ob.site.col, v.ob.site.end_col] if v.ob.site else None,
                 "message": v.ob.message,
-                "intents": list(v.ob.intents),
+                "aims": list(v.ob.aims),
                 "method": v.reason if v.method == "cache" else v.method,
                 "inferred": v.ob.inferred,
             }
@@ -298,7 +298,7 @@ def restore_receipt(rep: "FunctionReport", r: dict[str, Any]) -> None:
             message=o["message"],
             hyps=[],
             goal=L.TRUE,
-            intents=tuple(o.get("intents", ())),
+            aims=tuple(o.get("aims", ())),
             inferred=o.get("inferred", False),
         )
         rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=o.get("method", "")))
@@ -577,7 +577,7 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
 
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None) -> Report:
     t0 = t0 or time.perf_counter()
-    program = Program.build([m for m in modules if m.language != "intents"])
+    program = Program.build([m for m in modules if m.language != "aims"])
     _sidecars.clear()
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)
@@ -843,16 +843,16 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     cache.save()
     rep = Report(modules, program, reports, [], mirrors, time.perf_counter() - t0, hits, solved)
     rep.root = program.root  # type: ignore[attr-defined]
-    rep.intents = intent_reports(rep)
+    rep.aims = aim_reports(rep)
     return rep
 
 
 # ---------------------------------------------------------------------------
 
 
-def intent_reports(rep: Report) -> list[IntentReport]:
-    from . import intent
+def aim_reports(rep: Report) -> list[AimReport]:
+    from . import aim
 
-    out = intent.build(rep)
-    intent.attach_cached_judgments(getattr(rep, "root", None) or ".", out)
+    out = aim.build(rep)
+    aim.attach_cached_judgments(getattr(rep, "root", None) or ".", out)
     return out

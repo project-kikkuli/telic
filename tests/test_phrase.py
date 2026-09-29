@@ -1,8 +1,8 @@
-"""Proved clauses in words: the literal first draft of an intent."""
+"""Proved clauses in words: the literal first draft of an aim."""
 
 import pytest
 
-from telic.intent import ears_conditions, ears_problems
+from telic.aim import ears_conditions, ears_problems
 from telic.phrase import requirement
 
 CASES = [

@@ -1,6 +1,6 @@
 """Contract clauses in words.
 
-Drafted intents start as a deterministic rendering of a proved clause:
+Drafted aims start as a deterministic rendering of a proved clause:
 ``ensures result <= a`` on ``saturating`` reads "WHEN saturating returns,
 the result shall be at most a." The rendering is plain and literal; a
 generative oracle may rephrase it, and a person always edits it."""

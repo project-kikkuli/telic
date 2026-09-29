@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 
-#@ intent STOCK-NONNEG: Stock levels never go negative.
-#@ intent RESERVE-BOUNDED: WHEN an order is reserved the system shall reserve no more than is in stock.
-#@ intent RESTOCK-ALERT: IF stock falls below the reorder point THEN the item shall be flagged for restock.
+#@ aim STOCK-NONNEG: Stock levels never go negative.
+#@ aim RESERVE-BOUNDED: WHEN an order is reserved the system shall reserve no more than is in stock.
+#@ aim RESTOCK-ALERT: IF stock falls below the reorder point THEN the item shall be flagged for restock.
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ def available(s: Sku) -> int:
 
 def reserve(s: Sku, qty: int) -> Sku:
     #@ requires 0 <= s.reserved <= s.on_hand and qty >= 0
-    #@ intent RESERVE-BOUNDED
+    #@ aim RESERVE-BOUNDED
     #@ ensures result.reserved <= result.on_hand
     #@ ensures result.on_hand == s.on_hand
     #@ ensures result.reserved - s.reserved == min(qty, s.on_hand - s.reserved)
@@ -32,14 +32,14 @@ def reserve(s: Sku, qty: int) -> Sku:
 
 def needs_restock(s: Sku) -> bool:
     #@ requires 0 <= s.reserved <= s.on_hand
-    #@ intent RESTOCK-ALERT
+    #@ aim RESTOCK-ALERT
     #@ ensures result == (s.on_hand - s.reserved < s.reorder_point)
     return available(s) < s.reorder_point
 
 
 def restock_list(skus: list[Sku]) -> list[int]:
     #@ requires all(0 <= s.reserved <= s.on_hand for s in skus)
-    #@ intent RESTOCK-ALERT
+    #@ aim RESTOCK-ALERT
     #@ ensures all(0 <= i < len(skus) for i in result)
     #@ ensures all(needs_restock(skus[i]) for i in result)
     out: list[int] = []
@@ -55,7 +55,7 @@ def ship(levels: list[int], idx: int, qty: int) -> None:
     #@ requires 0 <= idx < len(levels)
     #@ requires all(x >= 0 for x in levels)
     #@ requires 0 <= qty <= levels[idx]
-    #@ intent STOCK-NONNEG
+    #@ aim STOCK-NONNEG
     #@ ensures all(x >= 0 for x in levels)
     #@ ensures len(levels) == len(old(levels))
     #@ ensures levels[idx] == old(levels[idx]) - qty

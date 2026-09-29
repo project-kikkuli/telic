@@ -47,14 +47,14 @@ class LowerError extends Error {
 // Contract comments (mirrors telic/contracts.py)
 
 const CLAUSE_KW = new Set(["requires", "ensures", "invariant", "decreases", "assert", "assume", "raises"]);
-const DIRECTIVE_KW = new Set(["intent", "index", "mirrors", "trusted", "pure"]);
-const FUNCTION_KW = new Set(["requires", "ensures", "decreases", "raises", "intent", "mirrors", "trusted", "pure"]);
+const DIRECTIVE_KW = new Set(["aim", "index", "mirrors", "trusted", "pure"]);
+const FUNCTION_KW = new Set(["requires", "ensures", "decreases", "raises", "aim", "mirrors", "trusted", "pure"]);
 const LOOP_KW = new Set(["invariant", "decreases", "index"]);
 const STMT_KW = new Set(["assert", "assume"]);
-const INTENT_ID = "[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*";
-const TAG_RE = new RegExp(`^\\[\\s*(${INTENT_ID}(?:\\s*,\\s*${INTENT_ID})*)\\s*\\]\\s*`);
-const INTENT_DECL_RE = new RegExp(`^(${INTENT_ID})\\s*(?::\\s*(.*))?$`);
-const INTENT_LIST_RE = new RegExp(`^${INTENT_ID}(?:\\s*,\\s*${INTENT_ID})*$`);
+const AIM_ID = "[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*";
+const TAG_RE = new RegExp(`^\\[\\s*(${AIM_ID}(?:\\s*,\\s*${AIM_ID})*)\\s*\\]\\s*`);
+const AIM_DECL_RE = new RegExp(`^(${AIM_ID})\\s*(?::\\s*(.*))?$`);
+const AIM_LIST_RE = new RegExp(`^${AIM_ID}(?:\\s*,\\s*${AIM_ID})*$`);
 
 // Every comment in the file, via the compiler's own trivia ranges (a raw
 // scanner can mistake `//` inside a template literal or regex for a comment).
@@ -110,12 +110,12 @@ function parseContractLines(comments) {
   return out;
 }
 
-function parseIntent(cl) {
+function parseAim(cl) {
   const payload = cl.payload.split(/\s+/).join(" ");
-  const m = INTENT_DECL_RE.exec(payload);
+  const m = AIM_DECL_RE.exec(payload);
   if (m && m[2] !== undefined) return { ids: [m[1]], text: m[2].trim() };
-  if (INTENT_LIST_RE.test(payload)) return { ids: payload.split(",").map((s) => s.trim()), text: null };
-  throw new LowerError("malformed intent: write '@intent ID: sentence' to declare or '@intent ID' to link", cl.line);
+  if (AIM_LIST_RE.test(payload)) return { ids: payload.split(",").map((s) => s.trim()), text: null };
+  throw new LowerError("malformed aim: write '@aim ID: sentence' to declare or '@aim ID' to link", cl.line);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class ModuleLowerer {
     this.sf = sf;
     this.src = sf.text;
     this.lines = sf.text.split(/\r?\n/);
-    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], intents: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
+    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
     this.aliases = {};
     this.sigs = {}; // name -> {params, ret, node}
     this.classes = {}; // name -> {node, fields: [[n, ty]], props, setters, statics, home: ModuleLowerer}
@@ -281,12 +281,12 @@ class ModuleLowerer {
     }
     for (const cl of this.contracts) {
       if (cl.consumed) continue;
-      if (cl.keyword === "intent") {
+      if (cl.keyword === "aim") {
         cl.consumed = true;
         try {
-          const { ids, text } = parseIntent(cl);
-          if (text === null) this.module.problems.push(["'@intent ID' outside a function links nothing; declare with '@intent ID: sentence'", cl.line]);
-          else this.module.intents.push({ id: ids[0], text, line: cl.line, col: cl.col });
+          const { ids, text } = parseAim(cl);
+          if (text === null) this.module.problems.push(["'@aim ID' outside a function links nothing; declare with '@aim ID: sentence'", cl.line]);
+          else this.module.aims.push({ id: ids[0], text, line: cl.line, col: cl.col });
         } catch (e) {
           this.module.problems.push([e.message, cl.line]);
         }
@@ -637,8 +637,8 @@ class FunctionLowerer {
     };
     if (f.node && f.node.body) collect(f.node.body);
     this.unsupported = [];
-    this.intents = [];
-    this.currentIntents = [];
+    this.aims = [];
+    this.currentAims = [];
     const anchor = f.stmt || f.node;
     if (anchor) {
       const start = anchor.getStart(ml.sf), end = f.node.getEnd();
@@ -745,7 +745,7 @@ class FunctionLowerer {
       decreases: null,
       raises: [],
       body: [],
-      intents: [],
+      aims: [],
       mirrors: [],
       unsupported: this.unsupported,
       trusted: false,
@@ -767,7 +767,7 @@ class FunctionLowerer {
     if (this.f.ctor) {
       fn.body = this.constructorBody();
       fn.locals = { ...this.env };
-      fn.intents = this.intents;
+      fn.aims = this.aims;
       return fn;
     }
     this.scanClosures(node);
@@ -798,7 +798,7 @@ class FunctionLowerer {
     }
     fn.locals = { ...this.env };
     fn.escaped = Object.keys(this.env).filter((n) => this.escaped.has(n.split("$")[0]) && n !== "self");
-    fn.intents = this.intents;
+    fn.aims = this.aims;
     return fn;
   }
 
@@ -899,11 +899,11 @@ class FunctionLowerer {
 
   functionContract(cl) {
     const kw = cl.keyword;
-    if (kw === "intent") {
-      const { ids, text } = parseIntent(cl);
-      if (text !== null) this.ml.module.intents.push({ id: ids[0], text, line: cl.line, col: cl.col });
-      for (const i of ids) if (!this.intents.includes(i)) this.intents.push(i);
-      this.currentIntents = ids;
+    if (kw === "aim") {
+      const { ids, text } = parseAim(cl);
+      if (text !== null) this.ml.module.aims.push({ id: ids[0], text, line: cl.line, col: cl.col });
+      for (const i of ids) if (!this.aims.includes(i)) this.aims.push(i);
+      this.currentAims = ids;
       return;
     }
     if (kw === "mirrors") {
@@ -915,8 +915,8 @@ class FunctionLowerer {
       return;
     }
     if (kw === "pure") return;
-    const tags = cl.tags.length ? cl.tags : this.currentIntents;
-    for (const t of tags) if (!this.intents.includes(t)) this.intents.push(t);
+    const tags = cl.tags.length ? cl.tags : this.currentAims;
+    for (const t of tags) if (!this.aims.includes(t)) this.aims.push(t);
     if (kw === "requires") this.fn.requires.push(this.clause(cl, "requires", tags));
     else if (kw === "ensures") this.fn.ensures.push(this.clause(cl, "ensures", tags, this.sig.ret));
     else if (kw === "decreases") this.fn.decreases = this.clause(cl, "decreases", tags, null, INT);
@@ -940,7 +940,7 @@ class FunctionLowerer {
       if (expect.k === "bool") e = this.truthy(e, st.expression);
       else if (e.ty.k !== "int") throw this.err(`'@${kind}' must be an int expression`, cl.line);
       const loc = [cl.line, cl.payloadCol, text.includes("\n") ? 0 : cl.payloadCol + text.length];
-      return { kind, expr: e, loc, text: text.split(/\s+/).join(" "), intents: tags };
+      return { kind, expr: e, loc, text: text.split(/\s+/).join(" "), aims: tags };
     } finally {
       Object.assign(this, { spec: saved.spec, resultTy: saved.result, specSf: saved.specSf, specLine: saved.specLine, specCol: saved.specCol });
     }
@@ -2692,7 +2692,7 @@ function main() {
         }
       } catch (e) {
         ml.stage = "done";
-        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], intents: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
+        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
       }
     }
   };

@@ -33,7 +33,7 @@ ACTS: list[Step] = [
         title="telic",
         say="""
         A small shop, vibecoded overnight: billing rules in Python, the checkout
-        page in TypeScript, zero tests. What it does have is intent, written down
+        page in TypeScript, zero tests. What it does have is its aims, written down
         where the code lives, and contracts in comments. The runtime never
         executes a comment, so they cost nothing in production.
         """,
@@ -90,10 +90,10 @@ ACTS: list[Step] = [
         say="""
         The checkout page re-implements the discount in TypeScript. That
         requirement spans the server and the page, so it is declared in the
-        intents/ directory at the top of the shop, whose scope is everything
+        aims/ directory at the top of the shop, whose scope is everything
         below it. The filename is the ID.
         """,
-        show=("intents/PRICE-AGREE.md", 1, 3),
+        show=("aims/PRICE-AGREE.md", 1, 3),
     ),
     Step(
         say="""
@@ -157,7 +157,7 @@ ACTS: list[Step] = [
     Step(
         title="the whole shop",
         say="""
-        Put the proof back and check everything. Every intent: proved, with the
+        Put the proof back and check everything. Every aim: proved, with the
         evidence one command away.
         """,
         edits=[("server/referrals.py", "return level_bonus(b + a) == level_bonus(a) * level_bonus(b)", "return level_bonus(a + b) == level_bonus(a) * level_bonus(b)")],

@@ -7,7 +7,7 @@ The usual answer is tests, but a test checks one input, and an agent that writes
 both the code and the tests tends to write tests that agree with the code.
 Requirement-tracking systems help with the other half: they record *what* the code
 is for and *which* code implements it, so a change to one side is noticed on the
-other. But they can't tell you whether the intent is actually met. The link from
+other. But they can't tell you whether the aim is actually met. The link from
 an English sentence to the code is traceability, not truth.
 
 telic's aim is to close that loop mechanically, with good *locality* (evidence
@@ -16,10 +16,10 @@ changes) and good *legibility* (every claim and every failure points at source
 lines a person can read in ten seconds).
 
 ```
-intent  ──formalize──▶  contract  ──verify──▶  evidence
+aim  ──formalize──▶  contract  ──verify──▶  evidence
   ▲                        ▲                      │
   │                        └──── telic gaps ──────┤  (is the contract strong enough?)
-  └──────────── intent status is computed from ───┘
+  └──────────── aim status is computed from ───┘
 ```
 
 ## Principles
@@ -74,7 +74,7 @@ compiled with `rustc` and run.
 weak spec certifies wrong code. `telic gaps` mutates proved code and re-verifies
 it. A surviving mutant that demonstrably differs from the original, shown as a
 diff plus an input, is exactly the missing `@ensures`. This is how telic narrows
-the gap between the English intent and its formalization, which no verifier can
+the gap between the English aim and its formalization, which no verifier can
 close alone.
 
 **6. Strict where it counts, silent where nothing is claimed.** Following
@@ -88,9 +88,9 @@ intentional `raise HTTPException` or a `while (true)` reader is not a bug.
 Every finding comes with a line number and, where possible, a real failing
 input.
 
-**7. Requirements are words, and are never proved.** An intent is one EARS
+**7. Requirements are words, and are never proved.** An aim is one EARS
 sentence. The contract clauses that cite it are its lemmas, and those are
-proved; the intent is only "backed". Whether the lemmas cover the sentence is
+proved; the aim is only "backed". Whether the lemmas cover the sentence is
 recorded by a person (`--accept`) or judged by an oracle (`--judge`), both
 pinned to a digest of the sentence and the lemma set. telic never pretends
 facts fully specify a system.
@@ -119,7 +119,7 @@ facts fully specify a system.
                                  ▼
           checker.py: verdicts, receipts ─▶ render.py / html.py / --json
                                  │
-          intent.py (EARS, links, status) · propose.py + phrase.py (facts, drafts)
+          aim.py (EARS, links, status) · propose.py + phrase.py (facts, drafts)
           ledger.py (CI ratchet) · oracle.py (judgments, never proof)
 ```
 
@@ -158,7 +158,7 @@ falls back to differential testing, labelled as such.
   and modular verification. telic applies it as a *postprocessor* on languages
   people already vibecode in, rather than asking them to adopt a verification
   language.
-* **Requirement-tracing tools** and the EARS templates gave the intent layer:
+* **Requirement-tracing tools** and the EARS templates gave the aim layer:
   requirements as sentences, with links in both directions to what implements
   them. telic adds proof status to the links.
 * **CrossHair** (Python) and bounded symbolic execution find counterexamples

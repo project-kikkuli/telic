@@ -24,17 +24,17 @@ CLAUSE_KEYWORDS = {
     "assume",
     "raises",
 }
-DIRECTIVE_KEYWORDS = {"intent", "index", "mirrors", "trusted", "pure"}
+DIRECTIVE_KEYWORDS = {"aim", "index", "mirrors", "trusted", "pure"}
 KEYWORDS = CLAUSE_KEYWORDS | DIRECTIVE_KEYWORDS
 
-FUNCTION_KEYWORDS = {"requires", "ensures", "decreases", "raises", "intent", "mirrors", "trusted", "pure"}
+FUNCTION_KEYWORDS = {"requires", "ensures", "decreases", "raises", "aim", "mirrors", "trusted", "pure"}
 LOOP_KEYWORDS = {"invariant", "decreases", "index"}
 STATEMENT_KEYWORDS = {"assert", "assume"}
 
-INTENT_ID = r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*"
-_TAG = re.compile(rf"^\[\s*({INTENT_ID}(?:\s*,\s*{INTENT_ID})*)\s*\]\s*")
-_INTENT_DECL = re.compile(rf"^({INTENT_ID})\s*(?::\s*(.*))?$")
-_INTENT_LIST = re.compile(rf"^{INTENT_ID}(?:\s*,\s*{INTENT_ID})*$")
+AIM_ID = r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*"
+_TAG = re.compile(rf"^\[\s*({AIM_ID}(?:\s*,\s*{AIM_ID})*)\s*\]\s*")
+_AIM_DECL = re.compile(rf"^({AIM_ID})\s*(?::\s*(.*))?$")
+_AIM_LIST = re.compile(rf"^{AIM_ID}(?:\s*,\s*{AIM_ID})*$")
 
 
 @dataclass
@@ -116,16 +116,16 @@ def parse_comment_lines(comments: list[tuple[int, int, str]], marker: str) -> li
     return out
 
 
-def parse_intent_directive(cl: ContractLine) -> tuple[list[str], str | None]:
-    """``intent ID: sentence`` declares; ``intent A, B`` links."""
+def parse_aim_directive(cl: ContractLine) -> tuple[list[str], str | None]:
+    """``aim ID: sentence`` declares; ``aim A, B`` links."""
     payload = " ".join(cl.payload.split())
-    m = _INTENT_DECL.match(payload)
+    m = _AIM_DECL.match(payload)
     if m and m.group(2) is not None:
         return [m.group(1)], m.group(2).strip()
-    if _INTENT_LIST.match(payload):
+    if _AIM_LIST.match(payload):
         return [p.strip() for p in payload.split(",")], None
     raise ContractSyntaxError(
-        "malformed intent: write '@intent ID: sentence' to declare or '@intent ID' to link",
+        "malformed aim: write '@aim ID: sentence' to declare or '@aim ID' to link",
         cl.line,
         cl.col,
     )

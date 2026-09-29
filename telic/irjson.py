@@ -94,7 +94,7 @@ def expr(e: ir.Expr) -> dict[str, Any]:
 def clause(c: ir.Clause | None) -> dict[str, Any] | None:
     if c is None:
         return None
-    return {"kind": c.kind, "expr": expr(c.expr), "loc": loc(c.loc), "text": c.text, "intents": list(c.intents), "inferred": bool(getattr(c, "inferred", False))}
+    return {"kind": c.kind, "expr": expr(c.expr), "loc": loc(c.loc), "text": c.text, "aims": list(c.aims), "inferred": bool(getattr(c, "inferred", False))}
 
 
 def stmts(xs) -> list[dict[str, Any]]:
@@ -149,7 +149,7 @@ def function(f: ir.Function) -> dict[str, Any]:
         "decreases": clause(f.decreases),
         "raises": [clause(c) for c in f.raises],
         "body": stmts(f.body),
-        "intents": list(f.intents),
+        "aims": list(f.aims),
         "unsupported": [[m, l.line] for m, l in f.unsupported],
         "trusted": f.trusted,
         "locals": {n: ty(t) for n, t in f.locals.items()},

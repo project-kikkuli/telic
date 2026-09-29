@@ -47,11 +47,11 @@ def test_demo_runs_green():
     assert "✗ DIVERGES discounted_total ≡ displayTotal" in text
     assert "is stale" in text
     tail = text.rsplit("the whole shop", 1)[1]
-    assert "6 proved" in tail and "refuted" not in tail.split("intents", 1)[1]
+    assert "6 proved" in tail and "refuted" not in tail.split("aims", 1)[1]
 
 
 def test_html_report(tmp_path):
-    (tmp_path / "m.py").write_text("#@ intent POS: Results are positive.\n\ndef f(x: int) -> int:\n    #@ requires x > 0\n    #@ intent POS\n    #@ ensures result > 0\n    return x\n")
+    (tmp_path / "m.py").write_text("#@ aim POS: Results are positive.\n\ndef f(x: int) -> int:\n    #@ requires x > 0\n    #@ aim POS\n    #@ ensures result > 0\n    return x\n")
     out = telic("report", "m.py", "--no-cache", "-o", "r.html", cwd=tmp_path)
     assert out.returncode == 0, out.stderr
     page = (tmp_path / "r.html").read_text()

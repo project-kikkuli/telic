@@ -32,14 +32,14 @@ def test_list_alias_is_rejected():
     assert any("alias" in msg for msg, _ in f.unsupported)
 
 
-def test_intents_declared_linked_and_statused(tmp_path):
+def test_aims_declared_linked_and_statused(tmp_path):
     src = """
-#@ intent CAP: Results never exceed the cap.
-#@ intent LATER: Something nobody formalized yet.
+#@ aim CAP: Results never exceed the cap.
+#@ aim LATER: Something nobody formalized yet.
 
 def capped(x: int, cap: int) -> int:
     #@ requires cap >= 0
-    #@ intent CAP
+    #@ aim CAP
     #@ ensures result <= cap
     return min(x, cap)
 
@@ -49,7 +49,7 @@ def tagged(x: int) -> int:
     return x
 """
     rep = run_check(tmp_path, {"i.py": src})
-    st = {i.id: i.status for i in rep.intents}
+    st = {i.id: i.status for i in rep.aims}
     assert st == {"CAP": "backed", "LATER": "unbacked", "GHOST": "undeclared"}
 
 

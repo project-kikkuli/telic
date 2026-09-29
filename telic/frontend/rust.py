@@ -35,7 +35,7 @@ from ..contracts import (
     ContractLine,
     ContractSyntaxError,
     parse_comment_lines,
-    parse_intent_directive,
+    parse_aim_directive,
 )
 
 RUST_ASSUMPTIONS = [
@@ -183,16 +183,16 @@ class RustFrontend:
         for cl in self.contract_lines:
             if cl.consumed:
                 continue
-            if cl.keyword == "intent":
+            if cl.keyword == "aim":
                 try:
-                    ids, text = parse_intent_directive(cl)
+                    ids, text = parse_aim_directive(cl)
                 except ContractSyntaxError as e:
                     self.module.problems.append((str(e), ir.Loc(e.line, e.col)))
                     continue
                 if text is not None:
-                    self.module.intents.append(ir.IntentDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
+                    self.module.aims.append(ir.AimDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
                 else:
-                    self.module.problems.append((f"'@intent {', '.join(ids)}' outside a function links nothing", ir.Loc(cl.line, cl.col)))
+                    self.module.problems.append((f"'@aim {', '.join(ids)}' outside a function links nothing", ir.Loc(cl.line, cl.col)))
                 continue
             self.module.problems.append((f"'@{cl.keyword}' is not attached to anything telic checks", ir.Loc(cl.line, cl.col)))
         return self.module
@@ -429,7 +429,7 @@ class FunctionLowerer:
         self.scopes: list[dict[str, str]] = [{p.name: p.name for p in info.params}]  # source name -> IR name
         self.used: set[str] = {p.name for p in info.params}
         self.tmp = 0
-        self.intents: list[str] = []
+        self.aims: list[str] = []
         lo, hi = self.node.start_point[0] + 1, self.node.end_point[0] + 1
         self.local_contracts = [cl for cl in fe.contract_lines if lo <= cl.line <= hi]
         self.loop_value: list[str | None] = []  # target of 'break value' per enclosing loop
@@ -473,7 +473,7 @@ class FunctionLowerer:
         self.fn.body = stmts
         self.fn.locals = dict(self.env)
         self.fn.escaped = set(self.escaped)
-        self.fn.intents = self.intents + [i for i in self.fn.intents if i not in self.intents]
+        self.fn.aims = self.aims + [i for i in self.fn.aims if i not in self.aims]
         return self.fn
 
     def err(self, msg: str, node: Any) -> LowerError:
@@ -513,14 +513,14 @@ class FunctionLowerer:
 
     def _function_contract(self, cl: ContractLine) -> None:
         kw = cl.keyword
-        if kw == "intent":
-            ids, text = parse_intent_directive(cl)
+        if kw == "aim":
+            ids, text = parse_aim_directive(cl)
             if text is not None:
-                self.fe.module.intents.append(ir.IntentDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
+                self.fe.module.aims.append(ir.AimDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
             for i in ids:
-                if i not in self.intents:
-                    self.intents.append(i)
-            self.current_intents = ids
+                if i not in self.aims:
+                    self.aims.append(i)
+            self.current_aims = ids
             return
         if kw == "mirrors":
             self.fn.mirrors.append((cl.payload.strip(), ir.Loc(cl.line, cl.col)))
@@ -530,10 +530,10 @@ class FunctionLowerer:
             return
         if kw == "pure":
             return
-        tags = tuple(cl.tags) or tuple(getattr(self, "current_intents", ()))
+        tags = tuple(cl.tags) or tuple(getattr(self, "current_aims", ()))
         for t in tags:
-            if t not in self.intents:
-                self.intents.append(t)
+            if t not in self.aims:
+                self.aims.append(t)
         if kw == "requires":
             self.fn.requires.append(self.clause(cl, "requires", tags))
         elif kw == "ensures":

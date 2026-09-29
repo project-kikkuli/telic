@@ -1,7 +1,7 @@
 """Oracles: the one place telic delegates a judgment to a model.
 
 telic proves things; a few steps need judgment that no proof gives: whether
-an intent's lemmas cover its words, and which proved facts read like
+an aim's lemmas cover its words, and which proved facts read like
 requirements (or like bugs). Those steps go through this module and nowhere
 else, and their answers are always labelled with the oracle that gave them
 and never count as proof.

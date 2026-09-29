@@ -40,7 +40,7 @@ and enode =
   | New of string * expr list
   | Extern of string * expr list
 
-type clause = { ckind : string; cexpr : expr; cloc : loc; text : string; intents : string list; inferred : bool }
+type clause = { ckind : string; cexpr : expr; cloc : loc; text : string; aims : string list; inferred : bool }
 
 type stmt =
   | Assign of loc * string * expr
@@ -73,7 +73,7 @@ type func = {
   decreases : clause option;
   raises : clause list;
   body : stmt list;
-  fintents : string list;
+  faims : string list;
   unsupported : (string * int) list;
   trusted : bool;
   locals : (string, ty) Hashtbl.t;
@@ -171,7 +171,7 @@ let clause_of j =
     cexpr = expr_of (member "expr" j);
     cloc = loc_of (member "loc" j);
     text = to_str (member "text" j);
-    intents = List.map to_str (to_list (member "intents" j));
+    aims = List.map to_str (to_list (member "aims" j));
     inferred = to_bool (member "inferred" j);
   }
 
@@ -218,7 +218,7 @@ let func_of j =
     decreases = clause_opt (member "decreases" j);
     raises = List.map clause_of (to_list (member "raises" j));
     body = stmts_of (member "body" j);
-    fintents = List.map to_str (to_list (member "intents" j));
+    faims = List.map to_str (to_list (member "aims" j));
     unsupported = List.map (function List [ String m; l ] -> (m, to_int l) | _ -> ("?", 0)) (to_list (member "unsupported" j));
     trusted = to_bool (member "trusted" j);
     locals;

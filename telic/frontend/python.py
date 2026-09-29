@@ -27,7 +27,7 @@ from ..contracts import (
     ContractLine,
     ContractSyntaxError,
     parse_comment_lines,
-    parse_intent_directive,
+    parse_aim_directive,
 )
 
 PY_ASSUMPTIONS = [
@@ -293,23 +293,23 @@ class PythonFrontend:
             fn = self._lower_safely(node, cname, key)
             self.module.functions[fn.name] = fn
 
-        # Module-level intent declarations (anything not consumed by a function).
+        # Module-level aim declarations (anything not consumed by a function).
         for cl in self.contract_lines:
             if cl.consumed:
                 continue
-            if cl.keyword == "intent":
+            if cl.keyword == "aim":
                 try:
-                    ids, text = parse_intent_directive(cl)
+                    ids, text = parse_aim_directive(cl)
                 except ContractSyntaxError as e:
                     self.module.problems.append((str(e), ir.Loc(e.line, e.col)))
                     cl.consumed = True
                     continue
                 if text is None:
                     self.module.problems.append(
-                        ("'@intent ID' outside a function links nothing; declare with '@intent ID: sentence'", ir.Loc(cl.line, cl.col))
+                        ("'@aim ID' outside a function links nothing; declare with '@aim ID: sentence'", ir.Loc(cl.line, cl.col))
                     )
                 else:
-                    self.module.intents.append(ir.IntentDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
+                    self.module.aims.append(ir.AimDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
                 cl.consumed = True
         spans: list[tuple[int, int, str]] = []
         for node in ast.walk(tree):
@@ -687,7 +687,7 @@ class FunctionLowerer:
         self.local_contracts = [
             cl for cl in fe.contract_lines if node.lineno <= cl.line <= (node.end_lineno or node.lineno)
         ]
-        self.current_intents: list[str] = []
+        self.current_aims: list[str] = []
         self.try_depth = 0
         self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args + node.args.kwonlyargs}
 
@@ -782,14 +782,14 @@ class FunctionLowerer:
 
     def _function_contract(self, cl: ContractLine) -> None:
         kw = cl.keyword
-        if kw == "intent":
-            ids, text = parse_intent_directive(cl)
+        if kw == "aim":
+            ids, text = parse_aim_directive(cl)
             if text is not None:
-                self.fe.module.intents.append(ir.IntentDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
+                self.fe.module.aims.append(ir.AimDecl(ids[0], text, ir.Loc(cl.line, cl.col)))
             for i in ids:
-                if i not in self.fn.intents:
-                    self.fn.intents.append(i)
-            self.current_intents = ids
+                if i not in self.fn.aims:
+                    self.fn.aims.append(i)
+            self.current_aims = ids
             return
         if kw == "mirrors":
             self.fn.mirrors.append((cl.payload.strip(), ir.Loc(cl.line, cl.col)))
@@ -799,10 +799,10 @@ class FunctionLowerer:
             return
         if kw == "pure":
             return
-        tags = tuple(cl.tags) or tuple(self.current_intents)
+        tags = tuple(cl.tags) or tuple(self.current_aims)
         for t in tags:
-            if t not in self.fn.intents:
-                self.fn.intents.append(t)
+            if t not in self.fn.aims:
+                self.fn.aims.append(t)
         if kw == "requires":
             self.fn.requires.append(self.clause(cl, "requires", tags))
         elif kw == "ensures":
@@ -1513,7 +1513,7 @@ class _ClassScope(FunctionLowerer):
         self.key = cls
         self.env = {"self": ir.TClass(cls)}
         self.tmp = 0
-        self.current_intents = []
+        self.current_aims = []
         self.local_contracts = []
         self.stored_names = set()
         self.try_depth = 0

@@ -124,7 +124,7 @@ def main() -> None:
         res["pr-many"], _ = timed(d, "ci", "--since", "main")
         ledger = json.loads((d / "telic.ledger.json").read_text())
         report = {
-            "repository": {"python_modules": a.py, "typescript_modules": a.ts, "functions": len(ledger["functions"]), "intents": len(ledger["intents"])},
+            "repository": {"python_modules": a.py, "typescript_modules": a.ts, "functions": len(ledger["functions"]), "aims": len(ledger["aims"])},
             "seconds": res,
             "machine": {"python": platform.python_version(), "cpus": os.cpu_count(), "platform": platform.platform()},
             "warm_header": head,

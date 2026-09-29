@@ -16,11 +16,11 @@ telic never ignores a contract silently.
 
 | keyword | attaches to | placement |
 |---|---|---|
-| `requires`, `ensures`, `decreases`, `raises`, `intent`, `mirrors`, `trusted` | a function | contiguous comment lines directly above the `def`/`function`, or the first lines of its body |
+| `requires`, `ensures`, `decreases`, `raises`, `aim`, `mirrors`, `trusted` | a function | contiguous comment lines directly above the `def`/`function`, or the first lines of its body |
 | `invariant`, `decreases`, `index` | a loop | directly above the loop header, or the first lines of its body |
 | `assert`, `assume` | a statement position | anywhere inside a block |
-| `intent ID: sentence` | the module | anywhere outside a function |
-| sentence | a directory | an `intents/<ID>.md` file (see [Cross-file intents](#cross-file-intents)) |
+| `aim ID: sentence` | the module | anywhere outside a function |
+| sentence | a directory | an `aims/<ID>.md` file (see [Cross-file aims](#cross-file-aims)) |
 
 ## Clauses
 
@@ -66,40 +66,40 @@ every report under *trusted base*.
 **`trusted`**: the function's contract is assumed and its body not verified
 (FFI, performance hacks). Also listed under *trusted base*.
 
-## Intents
+## Aims
 
-An intent is a top-level requirement, written for a reviewer as one EARS
+An aim is a top-level requirement, written for a reviewer as one EARS
 sentence. It is not a formula, and telic never reports one as "proved".
 
 ```python
-#@ intent REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
+#@ aim REFUND-CAP: WHEN a refund is requested, the shop shall refund at most
 #@   what the customer paid, net of earlier refunds.
 #@   by: refund_amount, Ledger.apply, web/checkout.ts::refundButton
 ```
 
-Declare an intent anywhere in the project; IDs are `UPPER-KEBAB` and unique
+Declare an aim anywhere in the project; IDs are `UPPER-KEBAB` and unique
 project-wide. What telic proves are **lemmas** one layer below: contract clauses
-that cite the intent. `#@ intent ID` inside a function tags every following
-clause, and `#@ [ID] ensures …` tags one clause. An intent's lemmas can be spread
+that cite the aim. `#@ aim ID` inside a function tags every following
+clause, and `#@ [ID] ensures …` tags one clause. An aim's lemmas can be spread
 over many functions, files and both languages, and an `@mirrors` equivalence
 counts as a lemma too.
 
-**Two-sided links.** `by:` points down from the intent to the functions that
+**Two-sided links.** `by:` points down from the aim to the functions that
 back it, and citations point back up. telic checks both directions: a `by:` entry
-that does not cite the intent, or a function that cites it without being listed,
-is reported, and `telic intents` fails on it. `by:` accepts `name`,
+that does not cite the aim, or a function that cites it without being listed,
+is reported, and `telic aims` fails on it. `by:` accepts `name`,
 `Class.method` or `path::name`.
 
-### Cross-file intents
+### Cross-file aims
 
-Cross-file intents live in `intents/<ID>.md`, one file per intent, in the
-lowest directory that contains all the code the intent constrains. Its scope is
-the directory holding `intents/` and everything below it; `intents/` at the
-root is repo-scoped. An intent that concerns one file stays a comment in that
+Cross-file aims live in `aims/<ID>.md`, one file per aim, in the
+lowest directory that contains all the code the aim constrains. Its scope is
+the directory holding `aims/` and everything below it; `aims/` at the
+root is repo-scoped. An aim that concerns one file stays a comment in that
 file.
 
 ```markdown
-<!-- intents/PRICE-AGREE.md -->
+<!-- aims/PRICE-AGREE.md -->
 WHEN a customer checks out, the checkout page shall show exactly the amount the
 server charges.
 by: discounted_total, web/checkout.ts::displayTotal
@@ -107,23 +107,23 @@ by: discounted_total, web/checkout.ts::displayTotal
 
 The filename is the ID, under the same rules as a comment ID; a file named
 otherwise is reported. The contents are one EARS sentence, then an optional
-`by:` line, with no heading. Code cites the intent exactly as it cites a
+`by:` line, with no heading. Code cites the aim exactly as it cites a
 comment-declared one.
 
-- **One ID space.** Comments and intent files share IDs. Declaring a sentence
+- **One ID space.** Comments and aim files share IDs. Declaring a sentence
   for the same ID twice, in either place, is reported.
-- **Scope.** Every lemma and `by:` target of a file-declared intent must live
+- **Scope.** Every lemma and `by:` target of a file-declared aim must live
   under its scope, judged by real path through symlinks.
-- **Orphans.** A file-declared intent nothing backs makes `telic intents` and
+- **Orphans.** A file-declared aim nothing backs makes `telic aims` and
   `telic ci` fail.
-- **Sprawl.** A file-declared intent whose lemmas all sit in one code file gets
+- **Sprawl.** A file-declared aim whose lemmas all sit in one code file gets
   a note to declare it there as a comment instead.
-- **Partial checks.** Checking a file or directory also reads every `intents/`
-  directory above it, and reports their intents where the checked code cites
+- **Partial checks.** Checking a file or directory also reads every `aims/`
+  directory above it, and reports their aims where the checked code cites
   them.
 
-`telic intents --for PATH` lists what governs a file or directory: intents
-declared in `intents/` directories above or inside it, declared or cited in its
+`telic aims --for PATH` lists what governs a file or directory: aims
+declared in `aims/` directories above or inside it, declared or cited in its
 code, or naming its functions in `by:`. It only parses; nothing is proved.
 
 **EARS.** The sentence is linted against the EARS patterns:
@@ -140,17 +140,17 @@ declared).
 prover can't answer it, so telic records an answer instead:
 
 ```
-telic intents --accept REFUND-CAP      # you reviewed it: pinned to a digest of
+telic aims --accept REFUND-CAP      # you reviewed it: pinned to a digest of
                                        # the sentence and the lemma set
-telic intents --judge                  # an oracle's opinion, cached by the same
+telic aims --judge                  # an oracle's opinion, cached by the same
                                        # digest, labelled "judged" with who and p
 ```
 
-**How the layers line up.** An intent says *what* the system must do, in
+**How the layers line up.** An aim says *what* the system must do, in
 words. A contract clause says one precise, checkable thing about one function.
-Each clause that cites an intent is one lemma for it, and an intent usually
+Each clause that cites an aim is one lemma for it, and an aim usually
 needs several, in different functions and files, each checked on its own. The
-clause is proved; the intent is only ever "backed", because nothing proves that
+clause is proved; the aim is only ever "backed", because nothing proves that
 the lemmas add up to the sentence. That is what the review records.
 
 **Proposals.** `telic propose PATHS` works bottom-up from existing code:
@@ -161,7 +161,7 @@ the lemmas add up to the sentence. That is what the review records.
   written down.
 - *crash-free preconditions*: for each function that can crash, the weakest
   simple `requires` that removes every crash (callers then owe it).
-- *draft intents* (`--intents`): each proved fact written as an EARS
+- *draft aims* (`--aims`): each proved fact written as an EARS
   sentence ("WHEN saturating returns, the result shall be at most a"), then
   sorted by an oracle into requirements, implementation details and likely
   bugs (shown as *suspicious*). A generative oracle may rephrase a draft
@@ -175,7 +175,7 @@ A review goes stale when either the sentence or the lemma set changes.
 
 ## Oracles
 
-Two steps need judgment no proof gives: whether an intent's lemmas cover it,
+Two steps need judgment no proof gives: whether an aim's lemmas cover it,
 and which proved facts read as requirements. Both go through one protocol:
 typed questions about a state, the shape of a System One classifier.
 

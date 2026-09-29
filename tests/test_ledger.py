@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = """#@ intent CAP: A result never exceeds the cap.
+SRC = """#@ aim CAP: A result never exceeds the cap.
 
 def capped(x: int, cap: int) -> int:
     #@ requires cap >= 0
-    #@ intent CAP
+    #@ aim CAP
     #@ ensures result <= cap
     return min(x, cap)
 
@@ -50,20 +50,20 @@ def commit(repo, msg):
     sh(repo, "git", "commit", "-qam", msg)
 
 
-CITES_OTHER = "def f(x: int) -> int:\n    #@ intent {iid}\n    #@ ensures result == x\n    return x\n"
+CITES_OTHER = "def f(x: int) -> int:\n    #@ aim {iid}\n    #@ ensures result == x\n    return x\n"
 
 
 @pytest.mark.parametrize(
     "files, problem",
     [
         ({"lib/cap.py": SRC.replace("the cap.", "the cap. by: capped, gone")}, "'gone' is listed in by:"),
-        ({"lib/unrelated.py": "#@ intent CAP: A result never exceeds the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
-        ({"lib/intents/ORPH.md": "The shop shall log.\n"}, "nothing backs it"),
-        ({"lib/sub/intents/SUBX.md": "The shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
-        ({"lib/intents/Overview.md": "prose\n"}, "not an intent ID"),
+        ({"lib/unrelated.py": "#@ aim CAP: A result never exceeds the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
+        ({"lib/aims/ORPH.md": "The shop shall log.\n"}, "nothing backs it"),
+        ({"lib/sub/aims/SUBX.md": "The shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
+        ({"lib/aims/Overview.md": "prose\n"}, "not an aim ID"),
     ],
 )
-def test_intent_link_problems_fail_ci_and_cannot_be_accepted(repo, files, problem):
+def test_aim_link_problems_fail_ci_and_cannot_be_accepted(repo, files, problem):
     for rel, text in files.items():
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(text)
@@ -75,10 +75,10 @@ def test_intent_link_problems_fail_ci_and_cannot_be_accepted(repo, files, proble
     assert "updated telic.ledger.json" not in out.stdout
 
 
-def test_ledger_records_intents_and_clauses(repo):
+def test_ledger_records_aims_and_clauses(repo):
     data = json.loads((repo / "telic.ledger.json").read_text())
-    assert data["intents"]["CAP"]["status"] == "backed"
-    assert data["intents"]["CAP"]["clauses"] == ["capped: ensures result <= cap"]
+    assert data["aims"]["CAP"]["status"] == "backed"
+    assert data["aims"]["CAP"]["clauses"] == ["capped: ensures result <= cap"]
     assert data["functions"]["lib/cap.py::capped"]["status"] == "proved"
 
 
@@ -93,13 +93,13 @@ def test_regression_fails_and_scope_is_exact(repo):
     commit(repo, "oops")
     out = telic(repo, "ci", "--since", "main", "--color", "never")
     assert out.returncode == 1
-    assert "intent CAP: backed → broken" in out.stdout
+    assert "aim CAP: backed → broken" in out.stdout
     assert "1 affected file" in out.stdout  # unrelated.py is not re-checked
 
 
 def test_dropping_a_clause_needs_acceptance(repo):
     p = repo / "lib" / "cap.py"
-    p.write_text(SRC.replace("    #@ intent CAP\n    #@ ensures result <= cap\n", ""))  # a cite left without its clause is a link problem
+    p.write_text(SRC.replace("    #@ aim CAP\n    #@ ensures result <= cap\n", ""))  # a cite left without its clause is a link problem
     commit(repo, "weaken")
     out = telic(repo, "ci", "--since", "main", "--color", "never")
     assert out.returncode == 1 and "lost a clause" in out.stdout
@@ -110,12 +110,12 @@ def test_dropping_a_clause_needs_acceptance(repo):
 
 def test_improvement_updates_ledger(repo):
     p = repo / "lib" / "unrelated.py"
-    p.write_text("#@ intent SAME: f is the identity.\n\ndef f(x: int) -> int:\n    #@ intent SAME\n    #@ ensures result == x\n    return x\n")
+    p.write_text("#@ aim SAME: f is the identity.\n\ndef f(x: int) -> int:\n    #@ aim SAME\n    #@ ensures result == x\n    return x\n")
     commit(repo, "formalize")
     out = telic(repo, "ci", "--since", "main", "--update", "--color", "never")
-    assert out.returncode == 0 and "intent SAME (backed)" in out.stdout
+    assert out.returncode == 0 and "aim SAME (backed)" in out.stdout
     data = json.loads((repo / "telic.ledger.json").read_text())
-    assert data["intents"]["SAME"]["status"] == "backed" and "CAP" in data["intents"]
+    assert data["aims"]["SAME"]["status"] == "backed" and "CAP" in data["aims"]
 
 
 def test_github_annotations(repo):
@@ -137,7 +137,7 @@ def test_receipts_are_bound_to_the_toolchain(repo, monkeypatch):
 BASE = "class Shape:\n    def area(self) -> int:\n        #@ ensures result >= 0\n        return 0\n"
 MID = "from base import Shape\n\n\nclass Poly(Shape):\n    pass\n"
 SUB = "from {parent} import {cls}\n\n\nclass Square({cls}):\n    def area(self) -> int:\n        return {body}\n"
-CALLER = "#@ intent POS: Every area is non-negative.\n\nfrom base import Shape\n\n\ndef total(s: Shape) -> int:\n    #@ intent POS\n    #@ ensures result >= 0\n    return s.area()\n"
+CALLER = "#@ aim POS: Every area is non-negative.\n\nfrom base import Shape\n\n\ndef total(s: Shape) -> int:\n    #@ aim POS\n    #@ ensures result >= 0\n    return s.area()\n"
 
 
 @pytest.mark.parametrize("parent,cls", [("base", "Shape"), ("mid", "Poly")])
@@ -156,4 +156,4 @@ def test_changed_override_rechecks_callers_through_the_base(tmp_path, parent, cl
     commit(tmp_path, "negative area")
     out = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never")
     assert out.returncode == 1, out.stdout
-    assert "intent POS: backed →" in out.stdout
+    assert "aim POS: backed →" in out.stdout

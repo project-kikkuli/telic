@@ -49,5 +49,5 @@ Silence is the right default for code that makes no claims:
 - an intentional `raise HTTPException` is not a bug;
 - neither is a `while (true)` stream reader.
 
-telic becomes useful once intents and contracts state what the app must do.
+telic becomes useful once aims and contracts state what the app must do.
 The proofs are only as strong as the claims they prove.

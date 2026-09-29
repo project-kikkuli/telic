@@ -249,7 +249,7 @@ class Obligation:
     hyps: list[L.Term]
     goal: L.Term
     clause: ir.Clause | None = None
-    intents: tuple[str, ...] = ()
+    aims: tuple[str, ...] = ()
     inputs: list[tuple[str, Val]] = field(default_factory=list)
     deps: set[str] = field(default_factory=set)  # callee contracts assumed
     exclude_axioms: set[str] = field(default_factory=set)
@@ -480,7 +480,7 @@ class VCGen:
                 hyps=ctx.hyps(),
                 goal=goal,
                 clause=clause,
-                intents=clause.intents if clause else (),
+                aims=clause.aims if clause else (),
                 inputs=list(self.inputs),
                 deps=set(self.deps),
                 exclude_axioms=excl,
