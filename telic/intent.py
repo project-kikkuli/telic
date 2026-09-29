@@ -139,7 +139,7 @@ def build(rep: Any) -> list[IntentReport]:
 
     decls: dict[str, tuple[str, tuple[str, int], list[str], str | None, bool]] = {}
     twice: dict[str, list[str]] = {}
-    for m in rep.modules:
+    for m in sorted(rep.modules, key=lambda m: m.language == LANGUAGE and m.context):
         scope = scope_of(m.path) if m.language == LANGUAGE else None
         for d in m.intents:
             text, by = split_by(d.text)
@@ -189,7 +189,7 @@ def build(rep: Any) -> list[IntentReport]:
                 if not any(_match(item, f.ref.key, f.fn.name) for item in by):
                     r.pointers.append(f"{f.fn.name} cites {iid} but is not in its by: list")
         if scope is not None:
-            _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context)
+            _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context, root=getattr(rep, "root", None) or ".")
         if text is not None:
             r.ears = ears_problems(text)
         # Status: what the lemmas establish (never "proved").
@@ -218,13 +218,19 @@ def _within(path: str, scope: str) -> bool:
     return not scope or path.replace(os.sep, "/").startswith(scope + "/")
 
 
-def _check_scope(r: IntentReport, targets: list[str], partial: bool) -> None:
+def _inside(root: str, path: str, scope: str) -> bool:
+    """Whether the file really lives under scope, through any symlinks."""
+    real = os.path.realpath(os.path.join(root, scope))
+    return os.path.realpath(os.path.join(root, path)).startswith(real + os.sep)
+
+
+def _check_scope(r: IntentReport, targets: list[str], partial: bool, root: str) -> None:
     """A file-declared intent may only rest on code under its directory, and
     one whose lemmas all sit in one file belongs in that file (judged only
     when the check saw all of its code)."""
     scope = r.scope or ""
     home = f"{scope}/intents.md" if scope else "intents.md"
-    outside = sorted({x.path for x in r.lemmas if not _within(x.path, scope)} | {p for p in targets if not _within(p, scope)})
+    outside = sorted({p for p in {x.path for x in r.lemmas} | set(targets) if not _inside(root, p, scope)})
     for path in outside:
         r.pointers.append(f"{path} is outside {scope or '.'}/, the scope of {home}: declare {r.id} in the intents.md of a directory containing both")
     files = {x.path for x in r.lemmas}

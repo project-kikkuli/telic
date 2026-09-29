@@ -17,6 +17,7 @@ import re
 
 from .. import ir
 from ..contracts import INTENT_ID
+from ..intent import split_by
 
 NAME = "intents.md"
 LANGUAGE = "intents"
@@ -45,7 +46,7 @@ def lower_intents_md(path: str, source: str) -> ir.Module:
             return
         iid, line = current
         text = " ".join(" ".join(body).split())
-        if not text:
+        if not split_by(text)[0]:
             m.problems.append((f"intent {iid} has no sentence: write one EARS sentence under its heading", ir.Loc(line)))
         else:
             m.intents.append(ir.IntentDecl(iid, text, ir.Loc(line)))

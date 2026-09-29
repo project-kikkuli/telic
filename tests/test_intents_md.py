@@ -50,6 +50,7 @@ def run(root: Path, *args: str, capsys=None) -> tuple[int, str]:
         ("## CAP\n\n## NEXT\nThe shop shall log.\n", [("NEXT", "The shop shall log.", 3)], ["no sentence"]),
         ("## Overview\ntext\n", [], ["not an intent ID"]),
         ("```\n## CAP\n```\n### CAP\nprose\n", [], []),
+        ("## CAP\nby: charge\n", [], ["no sentence"]),
     ],
 )
 def test_parse(source, decls, problems):
@@ -94,6 +95,22 @@ def test_scope_duplicates_and_sprawl(tmp_path, files, pointer, advice):
 def test_intents_exit_code(tmp_path, capsys, files, code):
     tree(tmp_path, files)
     assert run(tmp_path, capsys=capsys)[0] == code
+
+
+def test_symlinked_code_is_judged_where_it_lives(tmp_path):
+    tree(tmp_path, {"a/intents.md": md(("PAY", SAME, "charge, refund")), "a/x.py": fn("charge", "PAY"), "b/y.py": fn("refund", "PAY")})
+    (tmp_path / "a/ld").symlink_to("../b")
+    _, got = report(tmp_path, ["a", "a/ld/y.py"])
+    assert any("a/ld/y.py is outside a/" in p for p in got["PAY"].pointers)
+
+
+@pytest.mark.parametrize("cited", [True, False])
+def test_partial_check_reports_its_own_intents_md_over_an_ancestor(tmp_path, cited):
+    tree(tmp_path, {"intents.md": md(("PAY", SAME, "")), "s/intents.md": md(("PAY", SAME, "")), "s/y.py": fn("refund", "PAY" if cited else None)})
+    _, got = report(tmp_path, ["s"])
+    pay = got["PAY"]
+    assert (pay.loc, pay.scope, pay.status) == (("s/intents.md", 5), "s", "backed" if cited else "unbacked")
+    assert any("declared more than once" in p for p in pay.pointers)
 
 
 def test_checking_one_file_reads_ancestor_intents(tmp_path):
