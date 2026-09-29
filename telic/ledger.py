@@ -38,7 +38,7 @@ from typing import Any
 from .checker import Report, check, language_of
 
 LEDGER = "telic.ledger.json"
-RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
+RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "vacuous": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +289,7 @@ def cmd_ci(args) -> int:
     regressions = [c for c in changes if c.kind == "regression"]
     unaccepted = [c for c in regressions if c.id not in accepted]
     # The full report for anything that is not fine.
-    if any(f.status in ("refuted", "open", "error") for f in rep.functions) or any(m.status != "proved" for m in rep.mirrors):
+    if any(f.status in ("refuted", "vacuous", "open", "error") for f in rep.functions) or any(m.status != "proved" for m in rep.mirrors):
         print(Renderer(rep, p).render())
         print()
     scope_txt = f"{len(paths)} affected file{'s' * (len(paths) != 1)} (since {args.since})" if scope is not None else f"{len(rep.modules)} files"

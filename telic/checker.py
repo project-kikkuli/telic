@@ -142,7 +142,7 @@ class Verdict:
 @dataclass
 class FunctionReport:
     ref: FuncRef
-    status: str  # proved | refuted | open | unsupported | trusted | error
+    status: str  # proved | refuted | vacuous | open | unsupported | trusted | error
     verdicts: list[Verdict] = field(default_factory=list)
     inferred: Inferred | None = None
     problems: list[tuple[str, ir.Loc]] = field(default_factory=list)
@@ -437,6 +437,73 @@ def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, jobs: int 
         return list(tp.map(lambda ob: solve(ob, theory, timeout_ms), obs))
 
 
+class Vacuity:
+    """Is each function's entry state (the invariants of the objects passed
+    in, then the preconditions) satisfiable? Where it is not, every
+    obligation holds trivially and the function is reported ``vacuous``.
+    An undecided check leaves the verdict alone."""
+
+    def __init__(self) -> None:
+        self.todo: list[tuple[tuple[FunctionReport, VCGen], Obligation, str]] = []
+        self.unsat: list[tuple[FunctionReport, VCGen]] = []
+
+    def record(self, results: list[SmtResult], cache: "ProofCache") -> None:
+        for (item, _, key), res in zip(self.todo, results):
+            if res.status == "proved":
+                self.unsat.append(item)
+                cache.put(key, {"method": "unsat"})
+            elif res.status == "refuted":
+                cache.put(key, {"method": "sat"})
+
+    def explain(self, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> dict[str, str]:
+        out: dict[str, str] = {}
+        for rep, gen in self.unsat:
+            fn = rep.fn
+            classes = sorted({p.ty.name for p in fn.params if isinstance(p.ty, ir.TClass)})
+            inv_unsat = False
+            if gen.invariant_facts and fn.requires:
+                ob = _unsat_probe(gen, gen.invariant_facts)
+                key = "sat:" + obligation_key(ob, theory)
+                hit = cache.get(key)
+                if hit is None:
+                    res = solve(ob, theory, opts.timeout_ms)
+                    hit = {"method": {"proved": "unsat", "refuted": "sat"}.get(res.status, "unknown")}
+                    if hit["method"] != "unknown":
+                        cache.put(key, hit)
+                inv_unsat = hit.get("method") == "unsat"
+            elif gen.invariant_facts:
+                inv_unsat = True
+            if inv_unsat:
+                why = f"the invariants of {', '.join(classes)} can never hold, so every claim about '{fn.name}' is vacuous; fix the invariant"
+            elif gen.invariant_facts:
+                why = f"its @requires can never hold together with the invariants of {', '.join(classes)}, so every claim about '{fn.name}' is vacuous; weaken the preconditions"
+            else:
+                why = f"its @requires can never hold, so every claim about '{fn.name}' is vacuous; weaken the preconditions"
+            out[rep.ref.key] = why
+        return out
+
+
+def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
+    """``facts ⊢ false``: proved exactly when ``facts`` are unsatisfiable."""
+    excl = {k for k in gen.program.funcs if gen.program.same_scc(gen.ref.key, k)}
+    return Obligation(id=f"{gen.fn.name}/vacuity", func=gen.ref.key, kind="vacuity", loc=gen.fn.loc, site=None, message="the entry state is satisfiable", hyps=list(facts), goal=L.FALSE, exclude_axioms=excl)
+
+
+def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache") -> Vacuity:
+    v = Vacuity()
+    for rep, gen in entries:
+        if not (gen.fn.requires or gen.invariant_facts):
+            continue
+        ob = _unsat_probe(gen, gen.entry_facts)
+        key = "sat:" + obligation_key(ob, theory)
+        hit = cache.get(key)
+        if hit is None:
+            v.todo.append(((rep, gen), ob, key))
+        elif hit.get("method") == "unsat":
+            v.unsat.append((rep, gen))
+    return v
+
+
 def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory, list[tuple[str, str]]]:
     theory = Theory()
     problems: list[tuple[str, str]] = []
@@ -528,6 +595,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     pending: list[tuple[Verdict, str]] = []
     staged: list[tuple[FunctionReport, str | None, float]] = []
     engine_tasks: list[tuple[FunctionReport, FuncRef, Inferred, str | None, float]] = []
+    entry_checks: list[tuple[FunctionReport, VCGen]] = []
 
     def python_gather(rep: FunctionReport, ref: FuncRef, inf: Inferred) -> bool:
         """Generate and triage one function's obligations with the Python core.
@@ -553,6 +621,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             return False
         rep.assumptions = gen.assumptions
         rep.deps = set(gen.deps)
+        entry_checks.append((rep, gen))
         for line, note in gen.loop_notes:
             if note == "no-variant" and ref.fn.has_contract:
                 # (a claim about what a function returns needs it to return;
@@ -640,6 +709,12 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 continue
             rep.assumptions = a["assumptions"]
             rep.deps = a["deps"]
+            gen = VCGen(program, ref, inf.options)
+            try:
+                gen.enter()
+                entry_checks.append((rep, gen))
+            except VCError:
+                pass  # the engine already reported whatever makes the entry state ill-formed
             for line, note in a["loop_notes"]:
                 if note == "no-variant" and ref.fn.has_contract:
                     rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
@@ -655,8 +730,11 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     # Solve everything pending at once: each obligation gets its own Z3
     # context, and Z3 releases the GIL while it works, so threads use every
     # core.
-    if pending:
-        results = solve_all([v.ob for v, _ in pending], theory, opts.timeout_ms, opts.jobs)
+    vacuity = vacuity_checks(entry_checks, theory, cache)
+    if pending or vacuity.todo:
+        results = solve_all([v.ob for v, _ in pending] + [ob for _, ob, _ in vacuity.todo], theory, opts.timeout_ms, opts.jobs)
+        vacuity.record(results[len(pending) :], cache)
+        results = results[: len(pending)]
         for (v, key_), res in zip(pending, results):
             v.status, v.seconds, v.model, v.state, v.reason = res.status, res.seconds, res.model, res.state, res.reason
             if res.status == "proved":
@@ -675,6 +753,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if to_replay:
             with ThreadPoolExecutor(max_workers=min(len(to_replay), opts.jobs or os.cpu_count() or 4)) as ex:
                 list(ex.map(lambda r: replay_verdicts(program, r), to_replay))
+    vacuous = vacuity.explain(theory, opts, cache)
     for rep, fkey, ft in staged:
         ref = rep.ref
         if opts.lean and any(v.status == "unknown" for v in rep.verdicts):
@@ -683,6 +762,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             escalate(program, theory, rep, cache, obligation_key, root=root)
         if any(v.status == "refuted" for v in rep.verdicts):
             rep.status = "refuted"
+        elif ref.key in vacuous:
+            rep.status = "vacuous"
+            rep.problems.append((vacuous[ref.key], ref.fn.loc))
         elif any(v.status != "proved" for v in rep.verdicts) or any("termination" in p for p, _ in rep.problems):
             rep.status = "open"
         rep.seconds = time.perf_counter() - ft

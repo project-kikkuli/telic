@@ -80,6 +80,7 @@ STATUS_MARK = {
     "proved": ("✓", "green"),
     "trusted": ("◇", "blue"),
     "refuted": ("✗", "red"),
+    "vacuous": ("∅", "red"),
     "open": ("?", "yellow"),
     "unsupported": ("⊘", "gray"),
     "error": ("!", "red"),
@@ -215,7 +216,7 @@ class Renderer:
         for m, msg, loc in problems:
             out += self.problem(m, msg, loc)
         for f in self.r.functions:
-            if f.status in ("refuted", "open", "error") or (self.verbose and f.status != "proved"):
+            if f.status in ("refuted", "vacuous", "open", "error") or (self.verbose and f.status != "proved"):
                 out += self.function_detail(f)
         for mr in self.r.mirrors:
             if mr.status != "proved" or self.verbose:
@@ -242,6 +243,7 @@ class Renderer:
         p = self.p
         r = self.r
         refuted = [f for f in r.functions if f.status == "refuted"] + [m for m in r.mirrors if m.status == "refuted"]
+        vacuous = [f for f in r.functions if f.status == "vacuous"]
         open_ = [f for f in r.functions if f.status in ("open", "error")] + [m for m in r.mirrors if m.status == "open"]
         proved = [f for f in r.functions if f.status == "proved" and not _empty(f)]
         empty = [f for f in r.functions if _empty(f)]
@@ -249,6 +251,8 @@ class Renderer:
         parts = []
         if refuted:
             parts.append(p.bred(f"{len(refuted)} refuted"))
+        if vacuous:
+            parts.append(p.bred(f"{len(vacuous)} vacuous"))
         if open_:
             parts.append(p.byellow(f"{len(open_)} open"))
         if problems:
@@ -300,8 +304,9 @@ class Renderer:
         if rest > 0:
             out.append(p.dim(f"   … and {rest} more for {f.fn.name} (telic explain {f.fn.name})"))
             out.append("")
+        tag = p.bred("∅ VACUOUS") if f.status == "vacuous" else p.byellow("? OPEN")
         for msg, loc in f.problems:
-            out.append(self.rule(p.byellow("? OPEN") + " " + p.bold(f.fn.name), f"{f.ref.module.path}:{loc.line}"))
+            out.append(self.rule(tag + " " + p.bold(f.fn.name), f"{f.ref.module.path}:{loc.line}"))
             out.append("   " + msg)
             out += ["   " + x for x in snippet(p, f.ref.module, [(loc, "", "yellow")])]
             out.append("")
@@ -466,11 +471,12 @@ class Renderer:
         label = {
             "backed": p.green("backed"),
             "broken": p.red("broken"),
+            "vacuous": p.red("vacuous"),
             "partial": p.yellow("partial"),
             "unbacked": p.gray("unbacked"),
             "undeclared": p.yellow("undeclared"),
         }
-        glyph = {"backed": p.green("●"), "broken": p.red("✗"), "partial": p.yellow("◐"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
+        glyph = {"backed": p.green("●"), "broken": p.red("✗"), "vacuous": p.red("∅"), "partial": p.yellow("◐"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
         for i in self.r.intents:
             n = len(i.lemmas)
             ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
@@ -495,7 +501,7 @@ class Renderer:
                 out.append(f"    {line}")
             nw = max((len(x.name) for x in i.lemmas), default=0) + 2
             for x in i.lemmas:
-                m = {"proved": p.green("✓"), "trusted": p.blue("◇"), "refuted": p.red("✗")}.get(x.status, p.yellow("?"))
+                m = {"proved": p.green("✓"), "trusted": p.blue("◇"), "refuted": p.red("✗"), "vacuous": p.red("∅")}.get(x.status, p.yellow("?"))
                 body = x.text if x.kind == "mirror" else f"{x.kind} {x.text}"
                 room = self.width - nw - 12
                 if visible_len(body) > room:
@@ -540,6 +546,8 @@ class Renderer:
             elif f.status == "unsupported":
                 msg, loc = f.problems[0] if f.problems else ("", f.fn.loc)
                 desc = p.gray(f"line {loc.line}: {msg}")
+            elif f.status == "vacuous":
+                desc = p.red("vacuous") + p.dim(" · what it assumes on entry can never hold")
             elif f.status == "trusted":
                 desc = p.blue("trusted") + p.dim(" · contract assumed, body not checked")
             else:

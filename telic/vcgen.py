@@ -484,6 +484,26 @@ class VCGen:
 
     def run(self) -> list[Obligation]:
         fn = self.fn
+        st = self.enter()
+        st = self.block(fn.body, st)
+        if st.alive and fn.ret != ir.NONE:
+            self.oblige(
+                "return",
+                self.ctx(st),
+                L.FALSE,
+                ir.Loc(fn.end_line),
+                f"'{fn.name}' can reach its end without returning a value",
+            )
+        if st.alive:
+            self.exits.append(Exit(list(st.facts), None, dict(st.env), ir.Loc(fn.end_line)))
+        self.check_exits()
+        return self.obligations
+
+    def enter(self) -> State:
+        """The entry state: inputs, the invariants of objects passed in, and
+        the preconditions. ``invariant_facts`` (empty when no invariant is
+        assumed) and ``entry_facts`` record what was assumed at each step."""
+        fn = self.fn
         env: dict[str, Val] = {}
         facts: list[L.Term] = []
         self.heap_init(env)
@@ -498,28 +518,19 @@ class VCGen:
         st = State(env, facts)
         # Callers establish the invariants of the objects they pass in (a
         # constructor's own 'self' is still being built).
+        n0 = len(st.facts)
         for p in fn.params:
             if isinstance(p.ty, ir.TClass) and not (self.is_init and p.name == "self"):
                 for _, t in self.class_invariants(p.ty.name, env[p.name], env, st.facts):  # type: ignore[arg-type]
                     st.facts.append(t)
+        self.invariant_facts = list(st.facts) if len(st.facts) > n0 else []
         ctx = self.ctx(st, spec=True)
         for r in fn.requires:
             # Preconditions must be well-defined given the earlier ones.
             t = self.ev(r.expr, ctx.sub(label="requires"))
             st.facts.append(t)
-        st = self.block(fn.body, st)
-        if st.alive and fn.ret != ir.NONE:
-            self.oblige(
-                "return",
-                self.ctx(st),
-                L.FALSE,
-                ir.Loc(fn.end_line),
-                f"'{fn.name}' can reach its end without returning a value",
-            )
-        if st.alive:
-            self.exits.append(Exit(list(st.facts), None, dict(st.env), ir.Loc(fn.end_line)))
-        self.check_exits()
-        return self.obligations
+        self.entry_facts = list(st.facts)
+        return st
 
     def entry_inputs(self) -> list[tuple[str, Val]]:
         """The inputs as counterexamples show them (what ``run`` records)."""

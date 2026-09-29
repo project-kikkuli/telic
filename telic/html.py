@@ -20,6 +20,7 @@ ORDER = {"refuted": 0, "unconfirmed": 1, "unknown": 2, "proved": 3}
 STATUS_WORD = {
     "proved": "proved",
     "refuted": "refuted",
+    "vacuous": "vacuous",
     "open": "open",
     "unsupported": "unsupported",
     "trusted": "trusted",
@@ -31,7 +32,7 @@ STATUS_WORD = {
     "partial": "partial",
     "unbacked": "unbacked",
 }
-MARK = {"proved": "✓", "refuted": "✗", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "unbacked": "○"}
+MARK = {"proved": "✓", "refuted": "✗", "vacuous": "∅", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "unbacked": "○"}
 
 CSS = """
 /* Layout: a ledger. Intents summary on top, then one panel per function:
@@ -88,7 +89,7 @@ header.top { display: grid; gap: 10px; }
 .pill.refuted { color: var(--refuted); background: var(--refuted-bg); }
 .pill.open, .pill.unknown, .pill.unconfirmed, .pill.undeclared { color: var(--open); background: var(--open-bg); }
 .pill.backed { color: var(--proved); background: var(--proved-bg); }
-.pill.broken { color: var(--refuted); background: var(--refuted-bg); }
+.pill.broken, .pill.vacuous { color: var(--refuted); background: var(--refuted-bg); }
 .pill.partial, .pill.unbacked { color: var(--open); background: var(--open-bg); }
 .intent ul { margin: 6px 0 0; padding-left: 1.1rem; list-style: none; }
 .pill.unsupported, .pill.trusted, .pill.unformalized, .pill.error { color: var(--quiet); background: var(--quiet-bg); }
@@ -290,7 +291,7 @@ def mirror_card(m) -> str:
 
 def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = True) -> str:
     fs = rep.functions
-    counts = {s: sum(1 for f in fs if f.status == s) for s in ("proved", "refuted", "open", "unsupported", "trusted", "error")}
+    counts = {s: sum(1 for f in fs if f.status == s) for s in ("proved", "refuted", "vacuous", "open", "unsupported", "trusted", "error")}
     nob = sum(len(f.verdicts) for f in fs)
     lean = sum(1 for f in fs for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
     inferred = sum(sum(len(c) for c in f.inferred.invariants.values()) for f in fs if f.inferred)
@@ -302,6 +303,8 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
     ]
     if counts["refuted"]:
         tally.append(f"<span><b>{counts['refuted']}</b> refuted</span>")
+    if counts["vacuous"]:
+        tally.append(f"<span><b>{counts['vacuous']}</b> vacuous</span>")
     if counts["open"] + counts["error"]:
         tally.append(f"<span><b>{counts['open'] + counts['error']}</b> open</span>")
     if lean:

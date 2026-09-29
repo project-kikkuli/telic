@@ -189,6 +189,8 @@ def build(rep: Any) -> list[IntentReport]:
             r.status = "unbacked"
         elif "refuted" in fstat or any(x.status == "refuted" for x in r.lemmas):
             r.status = "broken"
+        elif any(x.status == "vacuous" for x in r.lemmas):
+            r.status = "vacuous"
         elif all(s in ("proved", "trusted") for s in fstat) and all(x.status in ("proved", "trusted") for x in r.lemmas) and not any(f.open_deps for f in fns):
             r.status = "backed"
         else:
@@ -212,8 +214,8 @@ def _loop_invariants(fn: Any):
 def _clause_status(f: Any, c: Any) -> str:
     if f.status in ("unsupported", "error"):
         return "unsupported"
-    if f.status == "trusted":
-        return "trusted"
+    if f.status in ("trusted", "vacuous"):
+        return f.status
     vs = [v for v in f.verdicts if v.ob.clause is c or (v.ob.clause is not None and v.ob.clause.loc == c.loc and v.ob.clause.text == c.text)]
     if not vs:
         return "proved" if f.status == "proved" else "open"
@@ -399,7 +401,7 @@ def cmd_intents(args: Any, options: Any) -> int:
         print("\n".join(Renderer(rep, paint).intent_table()))
         for n in notes:
             print(paint.dim("  " + n))
-    bad = [r for r in rep.intents if r.status in ("broken", "undeclared") or r.pointers]
+    bad = [r for r in rep.intents if r.status in ("broken", "vacuous", "undeclared") or r.pointers]
     return 1 if bad else 0
 
 
