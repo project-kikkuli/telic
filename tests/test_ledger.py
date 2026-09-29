@@ -1,7 +1,6 @@
 """The CI ratchet: regressions fail, acceptances and improvements pass."""
 
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -108,3 +107,28 @@ def test_receipts_are_bound_to_the_toolchain(repo, monkeypatch):
     first = C.toolchain_id()
     monkeypatch.setattr(C, "_TOOLCHAIN", None)
     assert C.toolchain_id() == first  # stable across processes for the same sources
+
+
+BASE = "class Shape:\n    def area(self) -> int:\n        #@ ensures result >= 0\n        return 0\n"
+MID = "from base import Shape\n\n\nclass Poly(Shape):\n    pass\n"
+SUB = "from {parent} import {cls}\n\n\nclass Square({cls}):\n    def area(self) -> int:\n        return {body}\n"
+CALLER = "#@ intent POS: Every area is non-negative.\n\nfrom base import Shape\n\n\ndef total(s: Shape) -> int:\n    #@ intent POS\n    #@ ensures result >= 0\n    return s.area()\n"
+
+
+@pytest.mark.parametrize("parent,cls", [("base", "Shape"), ("mid", "Poly")])
+def test_changed_override_rechecks_callers_through_the_base(tmp_path, parent, cls):
+    (tmp_path / "base.py").write_text(BASE)
+    (tmp_path / "mid.py").write_text(MID)
+    (tmp_path / "square.py").write_text(SUB.format(parent=parent, cls=cls, body="1"))
+    (tmp_path / "caller.py").write_text(CALLER)
+    sh(tmp_path, "git", "init", "-q", "-b", "main")
+    sh(tmp_path, "git", "config", "user.email", "t@example.com")
+    sh(tmp_path, "git", "config", "user.name", "t")
+    assert telic(tmp_path, "init", "--no-hook").returncode == 0
+    sh(tmp_path, "git", "add", "-A")
+    sh(tmp_path, "git", "commit", "-qm", "init")
+    (tmp_path / "square.py").write_text(SUB.format(parent=parent, cls=cls, body="-1"))
+    commit(tmp_path, "negative area")
+    out = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never")
+    assert out.returncode == 1, out.stdout
+    assert "intent POS: backed →" in out.stdout

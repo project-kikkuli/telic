@@ -2693,6 +2693,36 @@ def project_imports(path: str, root: str) -> list[str]:
     return sorted(set(out))
 
 
+def ancestor_files(path: str, root: str) -> list[str]:
+    """Python files under ``root``, other than ``path``, that define an
+    ancestor of a class ``path`` defines (best effort, by name through imports)."""
+    out: list[str] = []
+    todo = [os.path.abspath(path)]
+    seen: set[str] = set(todo)
+    while todo:
+        cur = todo.pop()
+        try:
+            tree = ast.parse(Path(cur).read_text())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        bases = {b.id if isinstance(b, ast.Name) else b.attr for n in ast.walk(tree) if isinstance(n, ast.ClassDef) for b in n.bases if isinstance(b, (ast.Name, ast.Attribute))}
+        if not bases:
+            continue
+        for imp in project_imports(cur, root):
+            imp = os.path.abspath(imp)
+            if imp in seen:
+                continue
+            try:
+                defined = {n.name for n in ast.walk(ast.parse(Path(imp).read_text())) if isinstance(n, ast.ClassDef)}
+            except (OSError, SyntaxError, ValueError):
+                continue
+            if defined & bases:
+                seen.add(imp)
+                out.append(imp)
+                todo.append(imp)
+    return sorted(out)
+
+
 def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
     """Lower several modules so that ``from .models import Order`` or
     ``import billing`` between them resolve to the checked definitions:

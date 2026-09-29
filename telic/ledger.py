@@ -19,8 +19,10 @@ Because it only ratchets, telic can be adopted on a codebase with known
 failures: snapshot today's state, and from then on nothing may get worse.
 
 What a change can affect is computed exactly: calls resolve within a module
-so the affected files are the changed ones, the files importing them, their
-mirror partners, and the files sharing an intent with them.
+so the affected files are the changed ones, the files importing them, the
+files defining the bases of changed classes (a call through a base may run an
+override) and their importers, mirror partners, and the files sharing an
+intent with them.
 """
 
 from __future__ import annotations
@@ -29,11 +31,11 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .checker import CheckOptions, Report, check, language_of
+from .checker import Report, check, language_of
 
 LEDGER = "telic.ledger.json"
 RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
@@ -190,14 +192,20 @@ def acceptances(root: str, base: str | None) -> dict[str, str]:
 def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) -> set[str]:
     """Changed checkable files, the files that import them (their proofs use
     the changed contracts), their @mirrors partners, and files that share an
-    intent with them. Importers of importers are unaffected: a proof depends
-    on its callees' contracts, not on what those rest on."""
+    intent with them. A changed subclass also affects the files defining its
+    ancestors and their importers: a call through a base may run any
+    override. Importers of importers are unaffected: a proof depends on its
+    callees' contracts, not on what those rest on."""
     files = {f for f in changed if language_of(f) and os.path.exists(os.path.join(root, f))}
     deleted = {f for f in changed if language_of(f) and not os.path.exists(os.path.join(root, f))}
     if any(f.endswith(".py") for f in files | deleted):
-        from .frontend.python import project_imports
+        from .frontend.python import ancestor_files, project_imports
 
         touched = {os.path.normpath(os.path.join(root, f)) for f in files | deleted if f.endswith(".py")}
+        for f in [f for f in files if f.endswith(".py")]:
+            for a in ancestor_files(os.path.join(root, f), root):
+                touched.add(os.path.normpath(a))
+                files.add(os.path.relpath(a, root))
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build")]
             for fn in filenames:
