@@ -7,10 +7,18 @@ invariant, or a Lean goal.
 
 ## The loop
 
-1. **State the intent** where the code lives, one sentence per requirement:
-   `#@ intent SPLIT-EXACT: Splitting a bill never loses or invents a cent.`
-2. **Write the contract** with the function: `@requires` for what callers must
-   guarantee, `@ensures` tagged with the intent for what the function promises.
+0. **On existing code, start with `telic propose --json`.** It returns facts
+   telic has proved about the code as it is, and preconditions that would make
+   crashing functions crash-free. Adopt a fact only if it is what the code
+   *should* do; a fact that looks wrong is a bug report. `--intents` adds
+   drafted requirements (the user decides which are real).
+1. **State the intent** where the code lives, one EARS sentence per
+   requirement, listing the functions that back it:
+   `#@ intent SPLIT-EXACT: WHEN a bill is split, the app shall assign every cent to exactly one person.`
+   `#@   by: split_bill`
+2. **Write the lemmas** with the functions: `@requires` for what callers must
+   guarantee, `@ensures` tagged with the intent (`#@ [SPLIT-EXACT] ensures ...`)
+   for what each function promises towards it.
 3. **Run `telic check --json`** and handle each non-`proved` obligation:
    - `refuted` with `replay.confirmed: true`: the code violates the contract on
      real inputs. Fix the code, or fix the contract if the contract is wrong.
@@ -25,8 +33,11 @@ invariant, or a Lean goal.
 4. **Run `telic gaps`** on what you proved. Each surviving mutant is a wrong
    implementation your contract accepts. Strengthen `@ensures` until none survive,
    or until you decide the remaining freedom is intended.
-5. **Commit when `telic check --strict` passes.** Intents are `proved` or
-   explicitly `open`, with the reason visible in the report.
+5. **Check the intents with `telic intents`.** Each should be `backed` (every
+   lemma proved) with its links intact. Whether the lemmas cover the sentence is
+   the user's review (`--accept`), or at most a model's labelled judgment
+   (`--judge`); never claim an intent is proved.
+6. **Commit when `telic check --strict` passes.**
 
 ## Rules worth giving an agent
 

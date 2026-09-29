@@ -333,7 +333,7 @@ def attach_cached_judgments(root: str, reports: list[IntentReport]) -> None:
                 break
 
 
-def _ask(prompt: str, model: str, command: str | None) -> str:
+def _ask(prompt: str, model: str, command: str | None, max_tokens: int = 200) -> str:
     if command:
         p = subprocess.run(command, shell=True, input=prompt, capture_output=True, text=True, timeout=120)
         if p.returncode != 0:
@@ -344,7 +344,7 @@ def _ask(prompt: str, model: str, command: str | None) -> str:
         raise RuntimeError("set ANTHROPIC_API_KEY, or TELIC_JUDGE_CMD to a command that reads the prompt on stdin")
     import urllib.request
 
-    body = json.dumps({"model": model, "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]}).encode()
+    body = json.dumps({"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=body,

@@ -5,6 +5,7 @@
     telic lean ID                  print the Lean 4 goal for an obligation
     telic prove [PATH...]          discharge open obligations in Lean (auto tactics / --agent)
     telic gaps [PATH...]           attack the specs: find wrong code the contracts still accept
+    telic propose [PATH...]        propose contracts (proved facts) and draft intents for code without them
     telic run SCRIPT [ARGS...]     run a Python program with every contract enforced
 """
 
@@ -190,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     from .intent import add_commands as add_intents
 
     add_intents(sub, _common, _options)
+    from .propose import add_command as add_propose
+
+    add_propose(sub, _common, _options)
     from .ledger import add_commands as add_ledger
 
     add_ledger(sub, _common, _options)

@@ -91,6 +91,13 @@ the lemmas cover the requirement is a separate verdict, recorded by a person
 (`telic intents --accept ID`) or by a cheap model (`--judge`). Both are pinned to
 the exact sentence and lemma set.
 
+**Starting from code with no contracts,** `telic propose src/` lists facts it
+has proved about the code as it is (a proposed contract is only shown once it
+is proved) and the preconditions that would make each crashing function
+crash-free. With `--intents`, the cheap model drafts EARS requirements from
+them. A fact can faithfully describe a bug, and a requirement is a decision, so
+you (or your agent) choose what to keep; `--write` inserts the facts.
+
 ## When the solver can't decide
 
 Z3 can't do induction. telic turns the stuck obligation into a Lean 4 theorem, and
@@ -103,6 +110,7 @@ proof is saved next to the code and reused until the code it's about changes.
 ```
 telic check [PATHS]        verify (-j N workers, --json for agents and CI)
 telic intents              requirements, their lemmas, and whether the links hold
+telic propose [PATHS]      proved facts and crash-free preconditions to adopt; --intents drafts requirements
 telic gaps [PATHS]         mutants the contracts fail to reject
 telic explain NAME         every obligation of a function, with formulas
 telic lean ID / prove      Lean escalation

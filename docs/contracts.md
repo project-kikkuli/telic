@@ -107,6 +107,29 @@ telic intents --judge                  # a cheap model's opinion, cached by the 
                                        # digest, always labelled "judged"
 ```
 
+**How the layers line up.** An intent says *what* the system must do, in
+words. A contract clause says one precise, checkable thing about one function.
+Each clause that cites an intent is one lemma for it, and an intent usually
+needs several, in different functions and files, each checked on its own. The
+clause is proved; the intent is only ever "backed", because nothing proves that
+the lemmas add up to the sentence. That is what the review records.
+
+**Proposals.** `telic propose PATHS` works bottom-up from existing code:
+
+- *facts*: candidate postconditions (bounds, relations to parameters, lengths,
+  what a method leaves unchanged), each kept only if telic proves it about the
+  code as it is. It describes behaviour, not intent, so a fact can be a bug
+  written down.
+- *crash-free preconditions*: for each function that can crash, the weakest
+  simple `requires` that removes every crash (callers then owe it).
+- *draft intents* (`--intents`): EARS sentences a model drafts from the
+  functions and the proved facts. A draft lists the facts that would back it
+  (each already proved), or is shown as unbacked when nothing does yet.
+  Drafts are EARS-linted and never written to your code.
+
+`--write` inserts the facts (and, with `--with-fixes`, the first precondition);
+`--json` is for agents.
+
 A review goes stale when either the sentence or the lemma set changes. The
 judge reads `ANTHROPIC_API_KEY` (model: `TELIC_JUDGE_MODEL`, default a Haiku
 model), or `TELIC_JUDGE_CMD`, any command that reads the prompt on stdin.
