@@ -50,6 +50,31 @@ def commit(repo, msg):
     sh(repo, "git", "commit", "-qam", msg)
 
 
+CITES_OTHER = "def f(x: int) -> int:\n    #@ intent {iid}\n    #@ ensures result == x\n    return x\n"
+
+
+@pytest.mark.parametrize(
+    "files, problem",
+    [
+        ({"lib/cap.py": SRC.replace("the cap.", "the cap. by: capped, gone")}, "'gone' is listed in by:"),
+        ({"lib/unrelated.py": "#@ intent CAP: A result never exceeds the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
+        ({"lib/intents.md": "## ORPH\nThe shop shall log.\n"}, "nothing backs it"),
+        ({"lib/sub/intents.md": "## SUBX\nThe shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
+        ({"lib/intents.md": "## Overview\nprose\n"}, "not an intent ID"),
+    ],
+)
+def test_intent_link_problems_fail_ci_and_cannot_be_accepted(repo, files, problem):
+    for rel, text in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+    sh(repo, "git", "add", "-A")
+    iids = " ".join(["CAP", "ORPH", "SUBX"])
+    commit(repo, f"rot\n\nTelic-accept: {iids} trying to wave it through")
+    out = telic(repo, "ci", "--since", "main", "--update", "--color", "never")
+    assert out.returncode == 1 and problem in out.stdout, out.stdout
+    assert "updated telic.ledger.json" not in out.stdout
+
+
 def test_ledger_records_intents_and_clauses(repo):
     data = json.loads((repo / "telic.ledger.json").read_text())
     assert data["intents"]["CAP"]["status"] == "backed"
@@ -74,7 +99,7 @@ def test_regression_fails_and_scope_is_exact(repo):
 
 def test_dropping_a_clause_needs_acceptance(repo):
     p = repo / "lib" / "cap.py"
-    p.write_text(SRC.replace("    #@ ensures result <= cap\n", ""))
+    p.write_text(SRC.replace("    #@ intent CAP\n    #@ ensures result <= cap\n", ""))  # a cite left without its clause is a link problem
     commit(repo, "weaken")
     out = telic(repo, "ci", "--since", "main", "--color", "never")
     assert out.returncode == 1 and "lost a clause" in out.stdout

@@ -507,6 +507,21 @@ def cmd_intents(args: Any, options: Any) -> int:
     return 1 if bad or _file_problems(rep) else 0
 
 
+def link_problems(rep: Any) -> list[tuple[str, str]]:
+    """(message, file) for every broken link, scope breach, duplicate
+    declaration, intents.md orphan and malformed intents.md in the report."""
+    from .frontend.intents_md import LANGUAGE
+
+    out = []
+    for r in rep.intents:
+        home = r.loc[0] if r.loc else next((x.path for x in r.lemmas), "")
+        out += [(f"intent {r.id}: {msg}", home) for msg in r.pointers]
+        if r.status == "unbacked" and r.scope is not None:
+            out.append((f"intent {r.id} is declared in {home} and nothing backs it: cite it from the code, or remove it", home))
+    out += [(f"{m.path}:{loc.line}: {msg}", m.path) for m in rep.modules if m.language == LANGUAGE for msg, loc in m.problems]
+    return out
+
+
 def _file_problems(rep: Any) -> list[str]:
     from .frontend.intents_md import LANGUAGE
 

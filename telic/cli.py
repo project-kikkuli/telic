@@ -210,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or (argv[0] not in sub.choices and argv[0] not in ("-h", "--help", "--version")):
         argv = ["check"] + argv
     args = ap.parse_args(argv)
+    for path in getattr(args, "paths", []) + [getattr(args, "for_path", None) or "."]:
+        if not os.path.exists(path):
+            print(f"telic: {path}: no such file or directory", file=sys.stderr)
+            return 2
     return args.func(args)
 
 

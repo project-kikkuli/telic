@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .checker import Report, check, language_of
+from .contracts import INTENT_ID
 
 LEDGER = "telic.ledger.json"
 RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "vacuous": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
@@ -61,7 +62,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
             "functions": sorted(i.functions),
             "clauses": sorted(set(clauses)),
             **({"links": sorted(i.pointers)} if i.pointers else {}),
-            **({"declared": i.loc[0]} if i.scope is not None and i.loc else {}),
+            **({"declared": i.loc[0]} if i.loc else {}),
         }
     functions = {}
     for f in rep.functions:
@@ -232,6 +233,7 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
                     if touched & {os.path.normpath(x) for x in project_imports(full, root)}:
                         files.add(os.path.relpath(full, root))
     grow = True
+    named: set[str] = set()  # intent ids the affected code declares or cites
     while grow:
         grow = False
         # mirror partners, both directions (from source and from the ledger)
@@ -240,6 +242,8 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
                 continue
             for line in Path(root, f).read_text().splitlines():
                 t = line.strip()
+                if t.startswith(("#@", "//@")):
+                    named.update(re.findall(rf"\bintent\s+({INTENT_ID})", t))
                 if t.startswith(("#@", "//@")) and " mirrors " in t + " " and "::" in t:
                     rel = t.split("mirrors", 1)[1].strip().rsplit("::", 1)[0]
                     tgt = os.path.normpath(os.path.join(os.path.dirname(f), rel))
@@ -254,9 +258,9 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
                         if p not in files and os.path.exists(os.path.join(root, p)):
                             files.add(p)
                             grow = True
-            for v in ledger.get("intents", {}).values():
-                fs = {k.split("::")[0] for k in v.get("functions", [])}
-                if fs & (files | deleted):
+            for iid, v in ledger.get("intents", {}).items():
+                fs = {k.split("::")[0] for k in v.get("functions", [])} | ({v["declared"]} if v.get("declared") else set())
+                if fs & (files | deleted) or iid in named:
                     for p in fs:
                         if p not in files and os.path.exists(os.path.join(root, p)):
                             files.add(p)
@@ -328,7 +332,14 @@ def cmd_ci(args) -> int:
             print(f"  {p.green('+')} {c.what}")
         else:
             print(f"  {p.dim('−')} {c.what}")
+    from .intent import link_problems
+
+    links = link_problems(rep)
+    for what, _ in links:
+        print(f"  {p.red('✗')} {what}")
     if args.format == "github":
+        for what, f in links:
+            print(f"::error file={f},title=telic intent link::{what}")
         for c in unaccepted:
             f = c.file or ""
             print(f"::error file={f},title=telic regression::{c.what} (accept with a 'Telic-accept: {c.id} <reason>' commit line)")
@@ -338,14 +349,17 @@ def cmd_ci(args) -> int:
                     line = (v.ob.site or v.ob.loc).line
                     print(f"::error file={fr.ref.module.path},line={line},title=telic: {v.ob.kind} refuted::{v.ob.message}")
     stale = any(c.kind in ("improvement", "new", "removed") for c in changes) or bool(regressions)
-    if args.update and (not unaccepted):
+    if args.update and not unaccepted and not links:
         write_ledger(path, merge(old or {}, new, scope) if old else new)
         print(p.dim(f"  updated {LEDGER}"))
-    elif stale and not unaccepted:
+    elif stale and not unaccepted and not links:
         print(p.dim(f"  {LEDGER} is behind; 'telic ci --update' (or the pre-push hook) records this"))
-    if unaccepted:
+    if unaccepted or links:
         print()
-        print(p.bred(f"{len(unaccepted)} regression{'s' * (len(unaccepted) != 1)}") + p.dim("  (accept one with a 'Telic-accept: <id> <reason>' line in a commit message)"))
+        if unaccepted:
+            print(p.bred(f"{len(unaccepted)} regression{'s' * (len(unaccepted) != 1)}") + p.dim("  (accept one with a 'Telic-accept: <id> <reason>' line in a commit message)"))
+        if links:
+            print(p.bred(f"{len(links)} intent link problem{'s' * (len(links) != 1)}") + p.dim("  (fix the declaration or the code; these cannot be accepted)"))
         return 1
     print(p.bgreen("no regressions"))
     return 0

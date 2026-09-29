@@ -153,3 +153,10 @@ def test_json_and_ledger_carry_the_declaring_file(tmp_path, capsys):
     ledger = snapshot(rep)
     assert ledger["intents"]["PAY"]["declared"] == "intents.md"
     assert affected_files(str(tmp_path), {"intents.md"}, ledger) == {"intents.md", "a/x.py", "b/y.py"}
+
+
+@pytest.mark.parametrize("args", [["check", "{root}/nope.py"], ["intents", "--for", "{root}/deep/nope.py"], ["{root}/nope"]])
+def test_missing_path_is_one_line_error(tmp_path, capsys, args):
+    assert main([a.format(root=tmp_path) for a in args]) == 2
+    err = capsys.readouterr().err.strip()
+    assert "nope" in err and "no such file" in err and "\n" not in err
