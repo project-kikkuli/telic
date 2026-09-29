@@ -27,7 +27,7 @@ def test_json_output_is_actionable(tmp_path):
 def test_exit_codes(tmp_path):
     (tmp_path / "ok.py").write_text("def f(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
     assert telic("check", "ok.py", "--no-cache", cwd=tmp_path).returncode == 0
-    (tmp_path / "open.py").write_text("def g(n: int) -> int:\n    while n != 1:\n        n = n // 2 if n % 2 == 0 else 3 * n + 1\n    return n\n")
+    (tmp_path / "open.py").write_text("def g(n: int) -> int:\n    #@ ensures result == 1\n    while n != 1:\n        n = n // 2 if n % 2 == 0 else 3 * n + 1\n    return n\n")
     assert telic("check", "open.py", "--no-cache", cwd=tmp_path).returncode == 0
     assert telic("check", "open.py", "--no-cache", "--strict", cwd=tmp_path).returncode == 1
 

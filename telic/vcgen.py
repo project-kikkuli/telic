@@ -1371,6 +1371,10 @@ class VCGen:
             ctx.assume(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, ln)), L.eq(L.select(vals, j), L.select(d.vals, L.select(keys, j)))), patterns=((L.select(vals, j),),)))
             return ListVal(vals, L.ZERO, ln, ir.TList(d.ty.val))
 
+        if name == "same_len":  # r's elements, xs's length (Array.map with an unchecked callback)
+            xs, r = args
+            assert isinstance(xs, ListVal) and isinstance(r, ListVal)
+            return ListVal(r.arr, r.off, xs.len, r.ty)
         if name == "list_concat":
             xs, ys = args
             assert isinstance(xs, ListVal) and isinstance(ys, ListVal)

@@ -209,3 +209,40 @@ export function missingKey(x: number): number {
   m.set("a", x);
   return m.get("b")!;
 }
+
+// expect: proved
+export function pushAll(a: number[], b: number[]): number {
+  //@ ensures result == a.length + b.length
+  const out: number[] = a.slice();
+  out.push(...b);
+  return out.length;
+}
+
+// expect: proved
+export function mapKeepsLength(xs: string[]): number {
+  //@ ensures result == xs.length
+  const ys = xs.map((s) => {
+    console.log(s);
+    return s.toUpperCase();
+  });
+  return ys.length;
+}
+
+// expect: refuted
+export function unshiftLength(): number {
+  //@ ensures result == 2
+  const ys: number[] = [5];
+  ys.unshift(1);
+  return ys.length + ys[0] - ys[1];
+}
+
+interface Holder {
+  items: number[];
+  label: string;
+}
+
+// expect: proved
+// (destructured props, as React components take them)
+export function labelLength({ label }: Holder): number {
+  return label.length;
+}

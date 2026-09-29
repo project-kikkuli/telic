@@ -546,9 +546,14 @@ class ModuleLowerer {
     const defaults = {};
     let rest = null;
     if (f.cls && !f.isStatic) params.push({ name: "self", ty: classOf(f.cls) });
+    const destructs = [];
     for (const p of node ? node.parameters : []) {
-      if (!ts.isIdentifier(p.name)) throw new LowerError("destructured parameters are not supported", this.line(p));
-      const pname = p.name.text;
+      let pname;
+      if (!ts.isIdentifier(p.name)) {
+        // ({ a, b }: Props) => ...: a parameter of the declared type, destructured on entry
+        pname = `arg$${destructs.length}`;
+        destructs.push([pname, p.name]);
+      } else pname = p.name.text;
       if (p.dotDotDotToken) {
         params.push({ name: pname, ty: opaque("...rest") });
         rest = pname;
@@ -578,7 +583,7 @@ class ModuleLowerer {
       if (node.body) visit(node.body);
       if (valued) ret = opaque("unannotated return");
     }
-    return { params, ret, node, contracts: cls, intsFromContract: ints, defaults, rest, cls: f.cls, isStatic: !!f.isStatic };
+    return { params, ret, node, contracts: cls, intsFromContract: ints, defaults, rest, cls: f.cls, isStatic: !!f.isStatic, destructs };
   }
 
   // Greatest fixpoint: a number-typed function result is an int if every
@@ -767,16 +772,29 @@ class FunctionLowerer {
     }
     this.scanClosures(node);
     const body = node.body;
-    if (ts.isBlock(body)) fn.body = this.block(body.statements, body);
+    const entry = [];
+    for (const [pname, pat] of sig.destructs || []) {
+      try {
+        this.destructureFrom(pat, { e: "Var", ty: this.env[pname], loc: ml.loc(pat), name: pname }, pat, ml.loc(pat), false, entry);
+      } catch (e) {
+        if (!(e instanceof LowerError)) throw e;
+        this.unsupported.push([e.message, e.line || ml.line(pat)]);
+      }
+    }
+    if (ts.isBlock(body)) fn.body = entry.concat(this.block(body.statements, body));
     else {
       try {
         const v = this.coerce(this.expr(body, sig.ret), sig.ret);
-        fn.body = [{ s: "Return", loc: ml.loc(body), value: v }];
+        fn.body = entry.concat([{ s: "Return", loc: ml.loc(body), value: v }]);
       } catch (e) {
         if (!(e instanceof LowerError)) throw e;
         this.unsupported.push([e.message, e.line || ml.line(body)]);
         fn.body = [{ s: "Unsupported", loc: ml.loc(body), reason: e.message }];
       }
+    }
+    if (sig.ret.k === "opaque" && sig.ret.why === "unannotated return" && ts.isBlock(body)) {
+      // without an annotation the function's type includes undefined: falling off the end returns it
+      fn.body.push({ s: "Return", loc: [fn.end_line, 0, 0], value: this.coerce({ e: "Lit", ty: NONE, loc: [fn.end_line, 0, 0], value: null }, sig.ret) });
     }
     fn.locals = { ...this.env };
     fn.escaped = Object.keys(this.env).filter((n) => this.escaped.has(n.split("$")[0]) && n !== "self");
@@ -1071,7 +1089,9 @@ class FunctionLowerer {
   freshList(e) {
     if (e.e === "Extern" && /^Array\.(sort|reverse|fill|copyWithin)$/.test(e.name)) return false;
     if (e.e === "ListLit" || e.e === "Call" || e.e === "Extern" || e.e === "New") return true;
-    if (e.e === "Builtin" && ["slice", "comp", "dict_lit", "dict_copy", "from_opaque", "dict_keys", "dict_values", "list_append"].includes(e.name)) return true;
+    if (e.e === "Builtin" && ["slice", "comp", "dict_lit", "dict_copy", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat"].includes(e.name)) return true;
+    if (e.e === "Builtin" && e.name === "same_len") return this.freshList(e.args[1]);
+    if (e.e === "Builtin" && e.name === "await") return this.freshList(e.args[0]);
     if (e.e === "Ite") return this.freshList(e.then) && this.freshList(e.orelse);
     return false;
   }
@@ -1227,11 +1247,37 @@ class FunctionLowerer {
           return [{ s: "FieldAssign", loc, obj: fld.obj, cls: fld.obj.ty.name, field: fld.name, value: { e: "Builtin", ty: fld.ty, loc, name: "list_append", args: [fld, v] } }];
         }
       }
+      if (ts.isPropertyAccessExpression(c) && c.name.text === "unshift" && ts.isIdentifier(c.expression) && e.arguments.length === 1 && !ts.isSpreadElement(e.arguments[0])) {
+        // xs.unshift(v): xs = [v] + xs
+        const name = this.varOf(c.expression.text, node);
+        let t = this.env[name];
+        if (t && t.k === "list") {
+          const v0 = this.expr(e.arguments[0], t.elem.k === "none" ? null : t.elem);
+          if (t.elem.k === "none") {
+            t = listOf(v0.ty);
+            this.env[name] = t;
+          }
+          const v = this.coerce(v0, t.elem);
+          return [{ s: "Assign", loc, name, value: { e: "Builtin", ty: t, loc, name: "list_concat", args: [{ e: "ListLit", ty: t, loc, elems: [v] }, { e: "Var", ty: t, loc, name }] } }];
+        }
+      }
       if (ts.isPropertyAccessExpression(c) && c.name.text === "push" && ts.isIdentifier(c.expression)) {
         const name = this.varOf(c.expression.text, node);
         let t = this.env[name];
         if (t && t.k === "opaque") return [{ s: "ExprStmt", loc, expr: this.extern(`${c.expression.text}.push`, [{ e: "Var", ty: t, loc, name }, ...e.arguments.map((a) => this.coerce(this.expr(a), opaque("")))], NONE, loc) }];
         if (!t || t.k !== "list") throw this.err(`'${c.expression.text}.push' needs an array`, node);
+        if (e.arguments.length === 1 && ts.isSpreadElement(e.arguments[0])) {
+          // xs.push(...ys): xs = xs + ys
+          let ys = this.expr(e.arguments[0].expression, t.elem.k === "none" ? null : t);
+          if (ys.ty.k === "opaque") ys = this.coerce(ys, t.elem.k === "none" ? listOf(opaque("")) : t);
+          if (ys.ty.k !== "list") throw this.err("push(...xs) needs an array", node);
+          if (t.elem.k === "none") {
+            t = ys.ty;
+            this.env[name] = t;
+          }
+          if (!tyEq(ys.ty, t)) throw this.err(`cannot push ${tyStr(ys.ty)} onto ${tyStr(t)}`, node);
+          return [{ s: "Assign", loc, name, value: { e: "Builtin", ty: t, loc, name: "list_concat", args: [{ e: "Var", ty: t, loc, name }, ys] } }];
+        }
         if (e.arguments.length !== 1) throw this.err("push takes one argument here", node);
         const v0 = this.expr(e.arguments[0], t.elem.k === "none" ? null : t.elem);
         if (t.elem.k === "none") {
@@ -1599,8 +1645,21 @@ class FunctionLowerer {
       const { invs } = this.loopClauses(cls);
       return [{ s: "ForEach", loc, elem: kname, idx, seq: keys, invariants: invs, body, idx_visible: false }];
     }
-    if (!ts.isIdentifier(pat)) throw this.err("use 'for (const x of xs)'", s);
     if (seq.ty.k === "dict") throw this.err("iterate a Map with 'for (const [k, v] of m)'", s);
+    if (!ts.isIdentifier(pat)) {
+      // for (const [a, b] of xs) / for (const { a } of xs): each element destructured
+      if (seq.ty.k === "opaque") seq = this.coerce(seq, listOf(opaque("")));
+      if (seq.ty.k !== "list") throw this.err("for-of needs an array", s);
+      const idx = `i$${++this.tmp}`;
+      this.env[idx] = INT;
+      const elem = `elem$${++this.tmp}`;
+      this.env[elem] = seq.ty.elem;
+      const pre = [];
+      this.destructureFrom(pat, { e: "Var", ty: seq.ty.elem, loc, name: elem }, s, loc, true, pre);
+      const body = pre.concat(this.inner(s.statement));
+      const { invs } = this.loopClauses(cls);
+      return [{ s: "ForEach", loc, elem, idx, seq, invariants: invs, body, idx_visible: false }];
+    }
     if (seq.ty.k === "opaque") seq = this.coerce(seq, listOf(opaque("")));
     if (seq.ty.k === "str") throw this.err("iterating over a string's characters is not supported", s);
     if (seq.ty.k !== "list") throw this.err("for-of needs an array", s);
@@ -1632,7 +1691,8 @@ class FunctionLowerer {
       const lo = isInc ? this.expr(init.declarations[0].initializer) : null;
       if (isInc && lo.ty.k === "int") {
         const irv = this.bindLocal(v, INT, s);
-        const hi = this.expr(cond.right);
+        let hi = this.expr(cond.right);
+        if (hi.ty.k === "opaque") hi = this.coerce(hi, INT);  // xs.length of an untyped value: a count
         if (hi.ty.k === "int") {
           const body = this.inner(s.statement);
           if (!assigned(body).has(irv)) {
@@ -1877,6 +1937,25 @@ class FunctionLowerer {
       if (n.questionDotToken && obj.ty.k === "option") return this.optionalChain(obj, (x) => this.propertyOf(x, name, n, loc), loc);
       return this.propertyOf(this.unwrap(obj), name, n, loc);
     }
+    if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+      // a React element: built by the runtime; the expressions embedded in it are evaluated (and checked)
+      if (this.spec) throw this.err("JSX is not supported in specifications", this.nline(n));
+      const parts = [];
+      const visit = (x) => {
+        if (ts.isJsxExpression(x)) {
+          if (x.expression) parts.push(this.expr(x.expression));
+          return;
+        }
+        if (ts.isJsxSpreadAttribute(x)) {
+          parts.push(this.expr(x.expression));
+          return;
+        }
+        ts.forEachChild(x, visit);
+      };
+      ts.forEachChild(n, visit);
+      return this.opaqueOp("jsx", parts.map((x) => (x.ty.k === "opaque" ? x : this.coerce(x, opaque("")))), opaque("React element"), loc);
+    }
+    if (n.kind === ts.SyntaxKind.RegularExpressionLiteral) return this.opaqueOp("regexp", [{ e: "Lit", ty: STR, loc, value: n.text }], opaque("RegExp"), loc);
     if (ts.isArrayLiteralExpression(n) && n.elements.some((e) => ts.isSpreadElement(e))) {
       if (this.spec) throw this.err("spread is not supported in specifications", this.nline(n));
       const parts = n.elements.map((e) => this.expr(ts.isSpreadElement(e) ? e.expression : e));
@@ -2407,7 +2486,14 @@ class FunctionLowerer {
     if (this.spec) throw this.err(`array method .${m}() is not supported in specifications`, this.nline(n));
     const res = { find: optionOf(t.elem), pop: optionOf(t.elem), shift: optionOf(t.elem), indexOf: INT, findIndex: INT, lastIndexOf: INT, join: STR, concat: t, map: listOf(opaque("")), filter: t, flatMap: listOf(opaque("")), push: REAL, unshift: REAL, toString: STR }[m];
     if (["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && xs.e !== "Var") throw this.err(`'.${m}()' on an array that is not a variable is not tracked`, this.nline(n));
-    return this.extern(`Array.${m}`, [xs, ...args.map((a) => this.argValue(a))], res || expect, loc);
+    // a non-mutating method leaves the array alone unless a callback mentions it
+    const mentions = (a) => xs.e === "Var" && (() => { let hit = false; const v = (x) => { if (ts.isIdentifier(x) && this.resolve(x.text) === xs.name) hit = true; ts.forEachChild(x, v); }; v(a); return hit; })();
+    const pure = !["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && !args.some(mentions);
+    const recv = pure && xs.e === "Var" ? this.coerce(xs, opaque("")) : xs;
+    const call = this.extern(`Array.${m}`, [recv, ...args.map((a) => this.argValue(a))], res || expect, loc);
+    // whatever the callback does, map returns one element per element
+    if (m === "map" && call.ty.k === "list") return { e: "Builtin", ty: call.ty, loc, name: "same_len", args: [xs, call] };
+    return call;
   }
 }
 

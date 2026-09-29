@@ -537,7 +537,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         rep.assumptions = gen.assumptions
         rep.deps = set(gen.deps)
         for line, note in gen.loop_notes:
-            if note == "no-variant":
+            if note == "no-variant" and ref.fn.has_contract:
+                # (a claim about what a function returns needs it to return;
+                # without a contract telic only looks for crashes)
                 rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
         for ob in obs:
             key_ = obligation_key(ob, theory)
@@ -622,7 +624,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             rep.assumptions = a["assumptions"]
             rep.deps = a["deps"]
             for line, note in a["loop_notes"]:
-                if note == "no-variant":
+                if note == "no-variant" and ref.fn.has_contract:
                     rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
             for o in a["obligations"]:
                 ob = o["ob"]

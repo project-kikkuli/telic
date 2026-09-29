@@ -650,6 +650,7 @@ and builtin g ctx (e : Ir.expr) name args =
         assume_ (quant "forall" [ j ] (implies (and_ [ le zero j; lt j ln ]) (eq (select vs j) (select d.vals (select keys j)))) [ [| select vs j |] ]);
         L { arr = vs; off = zero; len = ln; lty = TList (dval d) }
       end
+    | "same_len", [ xs; r ] -> let a = lst xs and b = lst r in L { b with len = a.len }
     | "list_concat", [ xs; ys ] ->
       let a = lst xs and b = lst ys in
       let n = next g in
