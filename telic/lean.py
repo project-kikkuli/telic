@@ -635,9 +635,8 @@ def _phash(proof: str) -> str:
 
 
 def _first_error(errors: list[str]) -> str:
-    if not errors:
-        return "unknown error"
-    return errors[0].strip().splitlines()[0][:160]
+    lines = errors[0].strip().splitlines() if errors else []
+    return lines[0][:160] if lines else "unknown error"
 
 
 def _def_tactics(theory: Theory, ob: Obligation) -> list[str]:

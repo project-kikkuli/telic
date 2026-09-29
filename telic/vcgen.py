@@ -405,7 +405,9 @@ class VCGen:
     def heap_keys(self, cls: str, fname: str, strict: bool = False) -> list[tuple[str, L.Sort]]:
         """The maps holding ``cls.fname``. A field telic cannot model has
         none: only functions that read or write it (``strict``) fail."""
-        decl = self.program.classes[cls]
+        decl = self.program.classes.get(cls)
+        if decl is None:
+            raise VCError(f"class {cls} is not modelled")
         fty = decl.field_type(fname)
         if fty is None:
             raise VCError(f"{cls} has no field '{fname}'")
@@ -426,9 +428,10 @@ class VCGen:
         env.setdefault("@alloc", L.Const("alloc", L.ARRAY(L.BOOL)))
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
+        keys = self.heap_keys(cls, fname, strict=True)
         fty = self.program.classes[cls].field_type(fname)
         assert fty is not None
-        return pack(fty, [L.select(env[k], ref) for k, _ in self.heap_keys(cls, fname, strict=True)])  # type: ignore[arg-type]
+        return pack(fty, [L.select(env[k], ref) for k, _ in keys])  # type: ignore[arg-type]
 
     def heap_write(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term, v: Val) -> None:
         for (k, _), comp in zip(self.heap_keys(cls, fname, strict=True), flatten(v)):
@@ -561,7 +564,7 @@ class VCGen:
             return ObjVal(v, ty.name, None)  # type: ignore[arg-type]
         if isinstance(ty, ir.TClass) and not (self.is_init and not self.inputs):
             decl = self.program.classes[ty.name]
-            fs = tuple((f, self.input_view(self.heap_read(env, ty.name, f, v), fty, env, depth - 1)) for f, fty in decl.fields)  # type: ignore[arg-type]
+            fs = tuple((f, self.input_view(self.heap_read(env, ty.name, f, v), fty, env, depth - 1)) for f, fty in decl.fields if self.heap_keys(ty.name, f))  # type: ignore[arg-type]
             return ObjVal(v, ty.name, fs)  # type: ignore[arg-type]
         if isinstance(ty, ir.TOption) and isinstance(ty.inner, (ir.TClass, ir.TEnum)) and isinstance(v, OptVal):
             return OptVal(v.some, self.input_view(v.val, ty.inner, env, depth), ty)  # type: ignore[arg-type]
@@ -574,6 +577,7 @@ class VCGen:
         return self.fn.name.endswith(".__init__")
 
     def alloc_facts(self, v: Val, ty: ir.Type, env: dict[str, Val]) -> list[L.Term]:
+        #@ requires "@alloc" in env
         """Objects handed to a function already exist."""
         if isinstance(ty, ir.TEnum) and isinstance(v, L.Term):
             return [L.le(L.ZERO, v), L.lt(v, L.IntV(len(ty.members)))]
@@ -1856,6 +1860,7 @@ class VCGen:
             env["@alloc"] = new_alloc
 
     def apply_def(self, callee: FuncRef, args: list[Val], heap: dict[str, Val] | None = None) -> L.Term:
+        #@ requires callee.key in self.program.logic_names
         flat: list[L.Term] = []
         for a in args:
             flat.extend(flatten(a))

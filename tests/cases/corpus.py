@@ -370,3 +370,23 @@ def overloaded_format(x: float, n: int) -> int:
     #@ ensures result >= 0
     # the same formatting operation applied to a float and to an int
     return len(f"{x:>5}" + f"{n:>5}")
+
+
+# expect: proved
+def count_pairs(pairs: list[tuple[int, int]]) -> int:
+    #@ ensures result == len(pairs)
+    n = 0
+    for a, b in pairs:
+        #@ index i
+        #@ invariant n == i
+        n = n + 1
+    return n
+
+
+# expect: open
+def first_of_last_pair(pairs: list[tuple[int, int]]) -> int:
+    #@ ensures result >= 0
+    t = 0
+    for a, b in pairs:
+        t = a
+    return t

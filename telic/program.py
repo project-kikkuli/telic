@@ -161,6 +161,7 @@ class Program:
         return None
 
     def ref(self, key: str) -> FuncRef:
+        #@ requires key in self.funcs
         return self.funcs[key]
 
     # ------------------------------------------------------------------

@@ -58,7 +58,10 @@ class Proposal:
 
 
 class Syntax:
+    #@ invariant self.lang == "python" or self.lang == "typescript" or self.lang == "rust"
+
     def __init__(self, lang: str):
+        #@ requires lang == "python" or lang == "typescript" or lang == "rust"
         self.lang = lang
         self.marker = "#@" if lang == "python" else "//@"
 
@@ -85,6 +88,7 @@ class Syntax:
 
 
 def ensures_candidates(fn: ir.Function, program: Any, lang: str) -> list[str]:
+    #@ requires lang == "python" or lang == "typescript" or lang == "rust"
     s = Syntax(lang)
     out: list[str] = []
     ret = fn.ret
@@ -132,6 +136,7 @@ def ensures_candidates(fn: ir.Function, program: Any, lang: str) -> list[str]:
 
 
 def requires_candidates(fn: ir.Function, lang: str) -> list[str]:
+    #@ requires lang == "python" or lang == "typescript" or lang == "rust"
     s = Syntax(lang)
     out: list[str] = []
     params = [p for p in fn.params if p.name != "self"]

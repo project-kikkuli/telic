@@ -549,6 +549,7 @@ class PythonFrontend:
                 self.module.problems.append((f"class {node.name}: invariant: {e}", ir.Loc(cl.line, cl.col)))
 
     def _lower_safely(self, node: ast.FunctionDef, cname: str | None, key: str) -> ir.Function:
+        #@ requires key in self.signatures
         """Lower one function; a bug in telic on one function leaves that
         function unchecked (with the reason) instead of stopping the run."""
         try:
@@ -843,6 +844,7 @@ class FunctionLowerer:
     # -- statements ------------------------------------------------------
 
     def _block_end(self, stmts: list[ast.stmt]) -> int:
+        #@ requires len(stmts) > 0
         """Last line (inclusive) that belongs to this block, including trailing comments."""
         last = stmts[-1].end_lineno or stmts[-1].lineno
         col = stmts[0].col_offset
@@ -1472,9 +1474,10 @@ class FunctionLowerer:
                 d = self.expr(it.func.value)
                 if isinstance(d.ty, ir.TDict):
                     items_of = d
-            if items_of is None and not isinstance(s.target, ast.Name):
+            unpack = items_of is None and isinstance(s.target, ast.Tuple) and all(isinstance(t, ast.Name) for t in s.target.elts)
+            if items_of is None and not (isinstance(s.target, ast.Name) or unpack):
                 raise LowerError("for-loop target must be a name", s)
-            elem = s.target.elts[0].id if items_of is not None else s.target.id  # type: ignore[attr-defined]
+            elem = s.target.elts[0].id if items_of is not None else self.fresh("tuple") if unpack else s.target.id  # type: ignore[attr-defined]
             idx = index_name or self.fresh("i")
             seq_node = it.func.value if items_of is not None else it  # type: ignore[attr-defined]
         seq = self.expr(seq_node)
@@ -1491,6 +1494,18 @@ class FunctionLowerer:
         self.declare(idx, ir.INT, s)
         self.declare(elem, seq.ty.elem, s)
         prefix: tuple[ir.Stmt, ...] = ()
+        if isinstance(s.target, ast.Tuple) and value_name is None and not idx_visible:
+            # for a, b in pairs: the elements are tuples, which are opaque, and so are their items
+            if not isinstance(seq.ty.elem, ir.TOpaque):
+                raise LowerError(f"unpacking a {seq.ty.elem} is not supported", s)
+            items = []
+            for k, tgt in enumerate(s.target.elts):
+                item = ir.Builtin(ir.TOpaque(""), loc, "opaque_op", (ir.Lit(ir.STR, loc, f"item{k}"), ir.Var(seq.ty.elem, loc, elem)))
+                known = self.env.get(tgt.id)  # type: ignore[attr-defined]
+                val = self.coerce(item, known) if known is not None else item
+                self.declare(tgt.id, val.ty, s)  # type: ignore[attr-defined]
+                items.append(ir.Assign(loc, tgt.id, val))  # type: ignore[attr-defined]
+            prefix = tuple(items)
         if value_name is not None:
             d_expr = seq.args[0]  # type: ignore[attr-defined]
             self.declare(value_name, d_expr.ty.val, s)
@@ -2464,6 +2479,7 @@ class ExprLowerer:
     # -- gradual fallbacks ------------------------------------------------
 
     def value_boolop(self, op: str, vals: list[ir.Expr], n: ast.AST, loc: ir.Loc) -> ir.Expr:
+        #@ requires len(vals) > 0
         """``a or b`` is ``a`` if ``a`` is truthy, else ``b`` (``and`` the
         reverse): the usual defaulting idiom."""
         out = vals[-1]

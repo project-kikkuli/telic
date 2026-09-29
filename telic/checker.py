@@ -285,6 +285,7 @@ def make_receipt(rep: "FunctionReport") -> dict[str, Any]:
 
 
 def restore_receipt(rep: "FunctionReport", r: dict[str, Any]) -> None:
+    #@ requires "status" in r and "obs" in r
     """Rebuild a proved function's report from its receipt (no formulas are
     kept; `telic explain` recomputes them)."""
     rep.status = r["status"]

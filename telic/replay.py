@@ -426,7 +426,8 @@ def replay_verdicts(program: Program, rep) -> None:
         else:
             for v in pending:
                 v.replay.fuzz_summary = f"{out.get('tried', 0)} random inputs found no failure"  # type: ignore[attr-defined]
-    # A model the real program cannot reproduce is not a refutation.
+    # A model the real program cannot reproduce is not a refutation; nor is
+    # one for termination, which no finite run can witness.
     for v in rep.verdicts:
-        if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed:
+        if v.status == "refuted" and (v.ob.kind == "variant" or v.replay is not None and v.replay.ran and not v.replay.confirmed):
             v.status = "unconfirmed"
