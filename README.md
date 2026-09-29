@@ -64,8 +64,10 @@ It works on ordinary code: classes, optionals, dicts/Maps, enums, pydantic
 models, async, try/except, comprehensions, imports between your files. Anything
 it can't model (a library call, an untyped value) becomes opaque: nothing is
 assumed about its result, and what telic does assume (for example "`requests.get`
-does not raise") is listed under **trusted base** in every report. On real
-libraries it models 87–92% of functions.
+does not raise") is listed under **trusted base** in every report. Without a
+contract, a function is only checked for crashes; most glue code turns out to
+have nothing to check, and telic says so. See [field notes](docs/field-notes.md)
+for runs on real apps.
 
 ## Intents: requirements above proofs
 
@@ -116,7 +118,8 @@ proof is saved next to the code and reused until the code it's about changes.
 ## Commands
 
 ```
-telic check [PATHS]        verify (-j N workers, --json for agents and CI)
+telic demo                 a 20-second walkthrough
+telic check [PATHS]        verify (-j N workers, --json for agents and CI, --engine ox)
 telic intents              requirements, their lemmas, and whether the links hold
 telic propose [PATHS]      proved facts and crash-free preconditions to adopt; --intents drafts requirements
 telic gaps [PATHS]         mutants the contracts fail to reject
@@ -124,12 +127,13 @@ telic explain NAME         every obligation of a function, with formulas
 telic lean ID / prove      Lean escalation
 telic init / ci / ledger   the CI ratchet (telic.ledger.json)
 telic report -o out.html   the proof ledger as a page
+telic oracle [--probe]     which classifier or model answers the judgment steps
 telic run script.py        run with every contract checked at runtime
 ```
 
 ## What you are trusting
 
-- **Language models.** Python ints are exact; Rust integers are their fixed
+- **Language semantics.** Python ints are exact; Rust integers are their fixed
   width, and overflow is a panic (debug semantics). Floats and JavaScript
   numbers are exact rationals: no rounding, NaN or Infinity.
 - **Z3 and the Lean kernel.**
@@ -139,7 +143,9 @@ telic run script.py        run with every contract checked at runtime
   telic keeps it honest (`tests/cases/soundness/`).
 - **Anything listed under trusted base,** plus anything you mark `@assume` or
   `@trusted`.
+- **Not the oracles.** Coverage judgments and drafted intents are labelled
+  opinions; no verdict depends on them.
 
 Counterexamples need no trust: each one is executed before it's reported.
 
-**Docs:** [contracts](docs/contracts.md) · [how it works](docs/design.md) · [CI](docs/ci.md) · [agents](docs/agents.md) · MIT
+**Docs:** [contracts](docs/contracts.md) · [how it works](docs/design.md) · [CI](docs/ci.md) · [agents](docs/agents.md) · [known gaps](docs/handoff.md) · MIT

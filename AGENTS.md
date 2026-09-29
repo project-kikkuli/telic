@@ -1,9 +1,11 @@
 # Working on telic
 
-telic is a static verifier: frontends lower Python/TypeScript plus `@`-comment
-contracts into one IR; `vcgen.py` turns each function into proof obligations;
-Z3 and Lean discharge them; counterexamples are replayed in the real runtime.
-Read [docs/design.md](docs/design.md) first.
+telic is a static verifier: frontends lower Python/TypeScript/Rust plus
+`@`-comment contracts into one IR; `vcgen.py` (or the OxCaml engine in
+`core/`) turns each function into proof obligations; Z3 and Lean discharge
+them; counterexamples are replayed in the real runtime. Read
+[docs/design.md](docs/design.md) first, and [docs/handoff.md](docs/handoff.md)
+for the known gaps.
 
 ## Map
 

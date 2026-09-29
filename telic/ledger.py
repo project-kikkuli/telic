@@ -19,9 +19,8 @@ Because it only ratchets, telic can be adopted on a codebase with known
 failures: snapshot today's state, and from then on nothing may get worse.
 
 What a change can affect is computed exactly: calls resolve within a module
-and cross-file coupling is only ever an explicit `@mirrors`, so the affected
-files are the changed ones, their mirror partners, and the files sharing an
-intent with them.
+so the affected files are the changed ones, the files importing them, their
+mirror partners, and the files sharing an intent with them.
 """
 
 from __future__ import annotations

@@ -55,7 +55,9 @@ an error; without any contract, raising is simply what the function does (a
 handler rejecting a request). A Rust `panic!` is always a crash to rule out.
 
 **`assert P`** is proved statically, then assumed. Native `assert` statements are
-treated the same way.
+treated the same way, except an `assert` about values from unchecked code (a
+library result, an untyped input): that is a runtime check of the
+environment, so it is treated like a `raise`.
 
 **`assume P`** is assumed without proof. It's an escape hatch and is listed in
 every report under *trusted base*.
@@ -260,7 +262,8 @@ otherwise copy it with `xs[:]` / `.slice()`. The same goes for storing one in a
 field. A loop may not change the collection it iterates over.
 
 **Strictness.** Falling off the end of a function that returns a value is an
-error. In TypeScript, `var` is rejected and a declaration may not shadow an
+error. A class name defined in two checked files is ambiguous: functions that
+use it are reported unsupported until one is renamed. In TypeScript, `var` is rejected and a declaration may not shadow an
 outer one. `x or default` / `x || default` are modelled with the language's
 truthiness. Without a contract, telic only looks for crashes: termination and
 intended raises are claims a contract makes.
@@ -277,4 +280,6 @@ is unknown afterwards. `match`, `if let`, `while let`, `?` on `Option` (and on a
 unchecked `Result`), shadowing, iterator chains (`map`, `filter`, `sum`,
 `count`, `all`, `any`, `collect`) and C-like enums are modelled. Refutations are
 replayed by compiling the file with `rustc` (overflow checks on) and calling the
-function on the counterexample.
+function on the counterexample. Not yet modelled: data-carrying enums, tuple
+structs, traits and generics (their values are opaque), and modules in other
+files.
