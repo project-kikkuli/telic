@@ -8,7 +8,7 @@ from typing import Any
 
 from . import ir
 from . import logic as L
-from .checker import FunctionReport, IntentReport, Report, Verdict
+from .checker import FunctionReport, Report, Verdict
 from .replay import call_text
 
 # ---------------------------------------------------------------------------
@@ -439,7 +439,6 @@ class Renderer:
         if mr.status == "refuted" and mr.witness is not None:
             out.append("")
             w = mr.witness
-            la, lb = a.module.language, b.module.language
             col = max(16, len(a.module.path) + 2, len(b.module.path) + 2)
             out.append(f"   {p.bold(pad('input', col))}{w['args_text']}")
             out.append(f"   {p.bold(pad(a.module.path, col))}{w['a_text']}")
