@@ -161,6 +161,7 @@ type finfo = {
   key : string;
   fn : Ir.func;
   modpath : string;
+  language : string;
   mutated : string list;
   appends : string list;
   definitional : bool;
@@ -496,6 +497,21 @@ let rec alloc_facts g v (ty : Ir.ty) env =
 let rec reaches_objects (t : Ir.ty) = match t with TClass _ | TOpaque -> true | TList e -> reaches_objects e | TDict (_, v) -> reaches_objects v | TOption i -> reaches_objects i | _ -> false
 let extern_touches_heap g (args : Ir.expr list) = g.prog.classes <> [] && List.exists (fun (a : Ir.expr) -> reaches_objects a.ty) args
 
+(* [xs += ys] and the like: Python changes a list, set or dict in place *)
+let in_place n (v : Ir.expr) =
+  let first = match v.e with
+    | Builtin ("list_concat", a :: _) -> Some a
+    | Builtin ("opaque_op", { e = Lit (LStr ("add" | "mult" | "sub" | "bitor" | "bitand" | "bitxor")); _ } :: a :: _) -> Some a
+    | _ -> None in
+  match first with Some { e = Var m; _ } -> m = n | _ -> false
+
+let representable ty = match components ty with _ -> true | exception Vc_error _ -> false
+
+let literal_parts (e : Ir.expr) = match e.e with ListLit xs | Builtin ("dict_lit", xs) -> Some xs | _ -> None
+
+(* a literal telic cannot represent (only unchecked code receives it) *)
+let handed (e : Ir.expr) = literal_parts e <> None && not (representable e.ty)
+
 let fresh_expr (e : Ir.expr option) = match e with Some { e = ListLit _ | Call _ | New _; _ } -> true | Some { e = Builtin (("slice" | "dict_lit"), _); _ } -> true | _ -> false
 
 (* the objects of a class a function has written a field of (a ghost set, not
@@ -677,18 +693,21 @@ let rec ev g ctx (e : Ir.expr) : value =
        match (ev g ctx s, q.elem) with
        | D d, Some el ->
          let k = const (Printf.sprintf "%s!%d" el n) (sort_of kty) in
-         run_each g ctx loc (Some s) (select d.has k) [ (el, T k) ] q.body None
+         let key _ c = match ev g c s with D d -> (select d.has k, [ (el, T k) ]) | _ -> raise (Vc_error ("quantifier over a non-dict", loc)) in
+         run_each g ctx loc (Some s) (select d.has k) [ (el, T k) ] q.body None ~reread:key
        | _ -> raise (Vc_error ("quantifier over a non-dict", loc)))
      | _ ->
        let lo = tm (ev g ctx q.lo) and hi = tm (ev g ctx q.hi) in
        let base = match String.index_opt q.idx '$' with Some k -> String.sub q.idx 0 k | None -> q.idx in
        let i = const (Printf.sprintf "%s!%d" base n) Int in
+       let at_ l = match q.elem with Some el -> [ (el, T (at (l.arr, l.off) i)) ] | None -> [] in
        let binds =
          match (q.seq, q.elem) with
-         | Some s, Some el -> ( match ev g ctx s with L l -> [ (el, T (at (l.arr, l.off) i)) ] | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
+         | Some s, Some _ -> ( match ev g ctx s with L l -> at_ l | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
          | _ -> []
        in
-       run_each g ctx loc q.seq (and_ [ le lo i; lt i hi ]) ((q.idx, T i) :: binds) q.body None);
+       let live read c = let l = read c in (and_ [ le lo i; lt i l.len ], (q.idx, T i) :: at_ l) in
+       run_each g ctx loc q.seq (and_ [ le lo i; lt i hi ]) ((q.idx, T i) :: binds) q.body None ~reread:live);
     T (const (Printf.sprintf "%s@%d" q.kind n) Bool)
   | Quant q when (match q.seq with Some { ty = TDict _; _ } -> true | _ -> false) -> (
     (* over a dict's keys: every k it holds *)
@@ -814,9 +833,11 @@ and builtin g ctx (e : Ir.expr) name args =
     assume ctx (quant "forall" [ i ] (implies (and_ [ le zero i; lt i ln ]) (eq (select arr i) (at (xs.arr, xs.off) (emod i (int_ width))))) [ [| select arr i |] ]);
     L { arr; off = zero; len = ln; lty = xs.lty }
   | "threw" -> threw g ctx (List.hd args)
+  | "to_opaque" when (match args with [ a ] -> handed a | _ -> false) -> handed_over g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
     D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
   | "dict_lit" ->
+    ignore (components e.ty);
     let kt, vt = match e.ty with TDict (k, v) -> (k, v) | _ -> raise (Vc_error ("dict literal of a non-dict type", loc)) in
     let ks = sort_of kt and vs = sort_of vt in
     let vals = ref (const_array (Array (ks, vs)) (default_term vs)) and has = ref (const_array (Array (ks, Bool)) ff) in
@@ -833,7 +854,7 @@ and builtin g ctx (e : Ir.expr) name args =
     D { vals = !vals; has = !has; dty = e.ty }
   | _ -> (
     (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the await" | _ -> ());
-    let vals = List.map (ev g ctx) args in
+    let vals = List.map (fun a -> if name = "opaque_op" && handed a then handed_over g ctx a else ev g ctx a) args in
     let lst = function L l -> l | _ -> raise (Vc_error ("builtin on a non-list: " ^ name, loc)) in
     let dct = function D d -> d | _ -> raise (Vc_error ("builtin on a non-dict: " ^ name, loc)) in
     let dval d = match d.dty with TDict (_, v) -> v | _ -> assert false in
@@ -1021,6 +1042,37 @@ and builtin g ctx (e : Ir.expr) name args =
     | "is_int", [ x ] -> T (is_int (tm x))
     | _ -> raise (Fallback ("builtin " ^ name)))
 
+(* a literal telic cannot represent, handed straight to unchecked code: its
+   parts' obligations and effects, and an unknown value *)
+and handed_over g ctx (e : Ir.expr) =
+  List.iter
+    (fun (x : Ir.expr) -> if handed x then ignore (handed_over g ctx x) else ignore (ev g ctx x))
+    (Option.value (literal_parts e) ~default:[]);
+  T (const (Printf.sprintf "handed@%d" (next g)) Opaque)
+
+(* Python and JavaScript iterate a list as it is at each step, so a loop or
+   comprehension whose body may change what it iterates over reads the
+   sequence afresh from each state it may be in *)
+and live_seq g (seq : Ir.expr) changed body loc : ctx -> lv =
+  let direct_names, direct_appends = modified ~unchecked:false ~rebinds:false g body in
+  let direct = List.filter (fun n -> List.mem n direct_names) changed in
+  let tys n = match List.assoc_opt n g.info.fn.params with Some t -> Some t | None -> Hashtbl.find_opt g.info.fn.locals n in
+  let dicts = List.filter (fun n -> match tys n with Some (Ir.TDict _) -> true | _ -> false) changed in
+  if dicts <> [] && g.info.language = "python" then begin
+    if List.exists (fun n -> List.mem n direct) dicts then
+      raise (Vc_error (Printf.sprintf "the loop changes the dict %s while iterating over it (Python raises RuntimeError when its size changes)" (String.concat ", " dicts), loc));
+    note_assumed g loc (Printf.sprintf "unchecked code called here does not add keys to or remove keys from %s" (String.concat ", " dicts))
+  end;
+  let indirect = List.filter (fun n -> not (List.mem n direct)) changed in
+  if indirect <> [] then note_assumed g loc (Printf.sprintf "unchecked code called here does not keep adding to %s" (String.concat ", " indirect));
+  let grows = List.filter (fun n -> List.mem n direct_appends) changed in
+  let note = (loc.line, "grows:" ^ String.concat ", " grows) in
+  if grows <> [] && not (List.mem note g.loop_notes) then g.loop_notes <- note :: g.loop_notes;
+  let rec inner (x : Ir.expr) = match x.e with Builtin (("dict_keys" | "from_opaque"), [ a ]) -> inner a | _ -> x in
+  match ((inner seq).e, seq.ty) with
+  | Var _, TList _ -> fun ctx -> (match ev g ctx seq with L l -> l | _ -> raise (Vc_error ("for-each over a non-list", loc)))
+  | _ -> fun ctx -> (match fresh g "iterated" seq.ty () with L l -> assume ctx (le zero l.len); l | _ -> raise (Vc_error ("for-each over a non-list", loc)))
+
 and pure g (e : Ir.expr) =
   let ok = ref true in
   Ir.walk_expr
@@ -1042,22 +1094,32 @@ and each_element g ctx (e : Ir.expr) seq =
   in
   (* "x" or "x,i": the element and its index *)
   let elem, idx = match String.index_opt names ',' with Some k -> (String.sub names 0 k, Some (String.sub names (k + 1) (String.length names - k - 1))) | None -> (names, None) in
-  let i = const (Printf.sprintf "%s!%d" elem (next g)) Int in
-  let binds = (elem, T (at (seq.arr, seq.off) i)) :: (match idx with Some x -> [ (x, T i) ] | None -> []) in
-  run_each g ctx e.loc (Some src) (and_ [ le zero i; lt i seq.len ]) binds body cond
+  let element (seq : lv) =
+    let i = const (Printf.sprintf "%s!%d" elem (next g)) Int in
+    (and_ [ le zero i; lt i seq.len ], (elem, T (at (seq.arr, seq.off) i)) :: (match idx with Some x -> [ (x, T i) ] | None -> []))
+  in
+  let rng, binds = element seq in
+  run_each g ctx e.loc (Some src) rng binds body cond ~reread:(fun read c -> element (read c))
 
 (* A comprehension's body run on an arbitrary element (binds, within rng),
    from any state the earlier elements may have left: its obligations hold
    for every element, and what it may change is unknown afterwards. *)
-and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
+(* When the body may change the source, [reread] picks the element from the
+   source as it is in the state the earlier elements left. *)
+and run_each ?reread g ctx loc (src : Ir.expr option) rng binds body cond =
   let parts = match cond with Some c -> [ c; body ] | None -> [ body ] in
-  let names, appends = modified g (List.map (fun x -> Ir.ExprStmt (loc, x)) parts) in
+  let stmts = List.map (fun x -> Ir.ExprStmt (loc, x)) parts in
+  let names, appends = modified g stmts in
+  let changed = fst (modified ~rebinds:false g stmts) in
   let calls_out = List.exists (fun x -> let hit = ref false in Ir.walk_expr (fun (y : Ir.expr) -> match y.e with Extern _ -> hit := true | _ -> ()) x; !hit) parts in
-  let names = if calls_out then names @ List.filter (fun v -> Hashtbl.mem g.info.fn.locals v && not (List.mem v names)) g.info.fn.escaped else names in
+  let escaped = if calls_out then List.filter (fun v -> Hashtbl.mem g.info.fn.locals v) g.info.fn.escaped else [] in
+  let names = names @ List.filter (fun v -> not (List.mem v names)) escaped in
+  let changed = changed @ escaped in
   let rec container (x : Ir.expr) = match x.e with Builtin (("dict_keys" | "from_opaque"), [ a ]) -> container a | _ -> x in
-  (match Option.map container src with
-   | Some { e = Var n; ty = TList _ | TDict _; _ } when List.mem n names -> raise (Vc_error (Printf.sprintf "the comprehension changes '%s' while iterating over it" n, loc))
-   | _ -> ());
+  let live = match (Option.map container src, src, reread) with
+    | Some { e = Var n; ty = TList _ | TDict _; _ }, Some s, Some rr when List.mem n changed -> Some (fun c -> rr (live_seq g s [ n ] stmts loc) c)
+    | _ -> None
+  in
   let havoc_here () =
     match ctx.state with
     | Some st ->
@@ -1068,17 +1130,30 @@ and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
     | None -> ()
   in
   havoc_here ();
+  let rng, binds = match live with Some f -> f ctx | None -> (rng, binds) in
   let sub = sub_ctx ~cond:rng ctx in
   let sub = { sub with bound = List.fold_left (fun m (k, v) -> SM.add k v m) sub.bound binds } in
   let sub = match cond with Some c -> sub_ctx ~cond:(term_of loc (ev g sub c)) sub | None -> sub in
   ignore (ev g sub body);
   havoc_here ()
 
-and modified g body =
+(* ~unchecked:false leaves out what unchecked code may change, and
+   ~rebinds:false names that are only rebound, not changed in place *)
+and modified ?(unchecked = true) ?(rebinds = true) g body =
   (* sets kept as lists (their order names the havocked constants) plus a
      table for membership: a program with many classes has thousands of heap
      keys, and list membership made this quadratic *)
-  let names = ref (Ir.assigned_names body) and appends = ref [] in
+  let in_place_names () =
+    let out = ref [] in
+    Ir.walk_stmts
+      (function
+        | Ir.IndexAssign (_, n, _, _, _) | Append (_, n, _) | DictDel (_, n, _, _) -> if not (List.mem n !out) then out := n :: !out
+        | Assign (_, n, v) when in_place n v -> if not (List.mem n !out) then out := n :: !out
+        | _ -> ())
+      body;
+    !out
+  in
+  let names = ref (if rebinds then Ir.assigned_names body else in_place_names ()) and appends = ref [] in
   let seen_n = Hashtbl.create 64 and seen_a = Hashtbl.create 16 in
   List.iter (fun n -> Hashtbl.replace seen_n n ()) !names;
   let addn n = if not (Hashtbl.mem seen_n n) then (Hashtbl.add seen_n n (); names := n :: !names) in
@@ -1094,7 +1169,7 @@ and modified g body =
     (fun s ->
       (match s with
        | Append (_, n, _) -> adda n
-       | Assign (_, n, _) -> ( match Hashtbl.find_opt g.info.fn.locals n with Some (TList _) -> adda n | _ -> ())
+       | Assign (_, n, v) when rebinds || in_place n v -> ( match Hashtbl.find_opt g.info.fn.locals n with Some (TList _) -> adda n | _ -> ())
        | FieldAssign (_, _, cls, f, _) ->
          List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f);
          if has_invariants g cls then addn (written_key cls)
@@ -1119,7 +1194,7 @@ and modified g body =
                     Option.iter add_writes c.post_init)
                 | None -> ())
               | Extern (_, args) ->
-                List.iter (fun (a : Ir.expr) -> match (a.e, a.ty) with Var n, (TList _ | TDict _) -> addn n; adda n | _ -> ()) args;
+                if unchecked then List.iter (fun (a : Ir.expr) -> match (a.e, a.ty) with Var n, (TList _ | TDict _) -> addn n; adda n | _ -> ()) args;
                 if extern_touches_heap g args then begin
                   addn "@alloc";
                   List.iter addn (all_heap_keys g)
@@ -1388,7 +1463,7 @@ and havoc_heap g ctx =
 
 and extern g ctx (e : Ir.expr) name args =
   let loc = e.loc in
-  let vals = List.map (ev g ctx) args in
+  let vals = List.map (fun a -> if handed a then handed_over g ctx a else ev g ctx a) args in
   if ctx.spec then raise (Vc_error (Printf.sprintf "specifications cannot call unchecked code ('%s')" name, loc));
   (* '@wrapper f' runs checked f with these arguments (a generator, a library decorator) *)
   (match if starts_with "@" name then resolve g ctx.modpath name else None with
@@ -1560,6 +1635,11 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
   List.iter
     (fun ((p, pty), a_e) ->
       match a_e with
+      | _ when List.mem p muts && (match a_e with Some { Ir.e = Var _; _ } -> false | _ -> true) ->
+        (* a new object: only its value after the call is unknown *)
+        let nv = fresh g p pty () in
+        (match nv with L l -> assume ctx (le zero l.len) | _ -> ());
+        post := SM.add p nv !post
       | Some { Ir.e = Var n; _ } when List.mem p muts -> (
         match SM.find_opt n st.env with
         | Some (D _) ->
@@ -2063,7 +2143,8 @@ and loop_while g (w : Ir.stmt) (st : state) : state =
   Dynarray.add_last out.facts (not_ c);
   merge g (out :: List.rev frame.breaks)
 
-and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bind : state -> term -> unit) : state =
+(* [live]: the bound is read afresh from each loop head (a sequence the body changes) *)
+and counted_loop ?live g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bind : state -> term -> unit) : state =
   let invs = invariants_for g loc.line invariants in
   let counter = idx ^ "$k" in
   let entry = copy_state st in
@@ -2079,7 +2160,7 @@ and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bi
   cut g names head loc ~at_head:true;
   let k = match SM.find_opt counter head.env with Some (T k) -> k | _ -> assert false in
   Dynarray.add_last head.facts (le lo_v k);
-  Dynarray.add_last head.facts (le k (max_ lo_v hi_v));
+  let hi_v = match live with Some read -> read head | None -> Dynarray.add_last head.facts (le k (max_ lo_v hi_v)); hi_v in
   assume_invs g invs head [ (idx, T k) ];
   assume_written g wrote head;
   let c = lt k hi_v in
@@ -2145,14 +2226,17 @@ and loop_each g (r : Ir.stmt) (st : state) : state =
   let loc, elem, idx, seq, invariants, body = match r with Ir.ForEach r -> (r.loc, r.elem, r.idx, r.seq, r.invariants, r.body) | _ -> assert false in
   let ctx = state_ctx g st in
   let l = match ev g ctx seq with L l -> l | _ -> raise (Vc_error ("for-each over a non-list", loc)) in
-  let names, _ = modified g body in
   let seq_vars = ref [] in
   Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Var n -> seq_vars := n :: !seq_vars | _ -> ()) seq;
-  let clash = List.sort_uniq compare (List.filter (fun n -> List.mem n !seq_vars) names) in
-  if clash <> [] then raise (Vc_error (Printf.sprintf "the loop body changes %s while iterating over it" (String.concat ", " clash), loc));
+  let changed = List.sort_uniq compare (List.filter (fun n -> List.mem n !seq_vars) (fst (modified ~rebinds:false g body))) in
+  let now = ref l in
+  let live = if changed = [] then None else
+      let read = live_seq g seq changed body loc in
+      Some (fun head -> now := read (state_ctx g head); !now.len) in
   let before = st.env in
   let out =
-    counted_loop g loc invariants body st zero l.len idx (fun bst k ->
+    counted_loop ?live g loc invariants body st zero l.len idx (fun bst k ->
+        let l = !now in
         bst.env <- SM.add elem (T (at (l.arr, l.off) k)) bst.env;
         bst.env <- SM.add idx (T k) bst.env;
         assume_held g (state_ctx g bst) (T (at (l.arr, l.off) k)) (match seq.ty with TList t -> t | t -> t))

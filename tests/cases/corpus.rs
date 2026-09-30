@@ -639,3 +639,10 @@ pub fn clamped(x: u32) -> u32 {
     //@ ensures result <= 10
     units::clamp(x, 10)
 }
+
+// expect: unsupported
+pub fn zero_all(v: &mut Vec<u32>) {
+    for x in v.iter_mut() {
+        *x = 0;
+    }
+}

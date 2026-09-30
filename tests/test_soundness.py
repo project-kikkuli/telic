@@ -34,6 +34,7 @@ TRUE_HELPERS = {
     "t23.rs": {"Counter.bump", "set_through"},
     "t21.py": {"B.__init__", "B.value", "C.value", "B.shrink", "other_task"},
     "t2.py": {"bump", "grow", "abs", "two"},
+    "t44.py": {"grow"},
     "t6.py": {"inc"},
     "t7.py": {"setz", "first", "arith", "chained"},
     "t9.py": {"seqsum"},

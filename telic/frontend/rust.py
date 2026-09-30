@@ -1525,7 +1525,9 @@ class FunctionLowerer:
             f = it.child_by_field_name("function")
             meth = _text(f.child_by_field_name("field"))
             recv = f.child_by_field_name("value")
-            if meth in ("iter", "into_iter", "iter_mut") and not it.child_by_field_name("arguments").named_children:
+            if meth == "iter_mut" or (meth == "enumerate" and _text(recv).endswith(".iter_mut()")):
+                raise self.err("a for loop over 'iter_mut()' (changing elements through the loop variable) is not modelled", it)
+            if meth in ("iter", "into_iter") and not it.child_by_field_name("arguments").named_children:
                 seq_node = recv
             elif meth == "enumerate":
                 inner = recv

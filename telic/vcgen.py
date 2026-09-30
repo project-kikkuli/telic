@@ -31,7 +31,7 @@ import itertools
 import json
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Union
+from typing import Callable, Union
 
 from . import ir, irjson
 from . import logic as L
@@ -110,16 +110,16 @@ def suspends(e: ir.Expr) -> bool:
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     """How a value of ``ty`` is represented in logic, as named components."""
     if isinstance(ty, ir.TList):
-        return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT)]
+        return [("arr", L.ARRAY(slot_sort(ty.elem))), ("off", L.INT), ("len", L.INT)]
     if isinstance(ty, ir.TOption):
         if isinstance(ty.inner, (ir.TList, ir.TDict, ir.TOption)):
-            raise VCError(f"optional {ty.inner} is not supported yet")
+            raise Unsupported(f"optional {ty.inner} is not supported yet")
         return [("some", L.BOOL), ("val", sort_of(ty.inner))]
     if isinstance(ty, ir.TDict):
         if isinstance(ty.val, (ir.TList, ir.TDict, ir.TOption)):
-            raise VCError(f"dict values of type {ty.val} are not supported yet")
-        k = sort_of(ty.key)
-        return [("vals", L.ARRAY(sort_of(ty.val), k)), ("has", L.ARRAY(L.BOOL, k))]
+            raise Unsupported(f"dict values of type {ty.val} are not supported yet")
+        k = slot_sort(ty.key)
+        return [("vals", L.ARRAY(slot_sort(ty.val), k)), ("has", L.ARRAY(L.BOOL, k))]
     return [("", sort_of(ty))]
 
 
@@ -159,14 +159,20 @@ def sort_of(ty: ir.Type) -> L.Sort:
     if isinstance(ty, ir.TRecord):
         return L.REC(ty.name, tuple((n, field_sort(t)) for n, t in ty.fields))
     if isinstance(ty, ir.TList):
-        return L.ARRAY(sort_of(ty.elem))
+        return L.ARRAY(slot_sort(ty.elem))
     if isinstance(ty, ir.TClass):
         return L.INT  # an object reference
     if isinstance(ty, ir.TOpaque):
         return L.OPAQUE
     if isinstance(ty, ir.TEnum):
         return L.INT  # member index
-    raise VCError(f"no single logical sort for {ty}")
+    raise Unsupported(f"values of type {ty} inside a list, dict or record are not modelled")
+
+
+def slot_sort(ty: ir.Type) -> L.Sort:
+    """The sort of a container's element, key or value slot. An empty
+    literal's slots have type none until it is stored; they hold ints."""
+    return L.INT if ty == ir.NONE else sort_of(ty)
 
 
 def field_sort(ty: ir.Type) -> L.Sort:
@@ -257,6 +263,11 @@ class VCError(Exception):
     def __init__(self, msg: str, loc: ir.Loc | None = None):
         super().__init__(msg)
         self.loc = loc
+
+
+class Unsupported(VCError):
+    """A construct telic does not model: the function is reported
+    unsupported, with this reason."""
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +482,7 @@ class VCGen:
         none: only functions that read or write it (``strict``) fail."""
         decl = self.program.classes.get(cls)
         if decl is None:
-            raise VCError(f"class {cls} is not modelled")
+            raise Unsupported(f"class {cls} is not modelled")
         fty = decl.field_type(fname)
         if fty is None:
             raise VCError(f"{cls} has no field '{fname}'")
@@ -1078,8 +1089,8 @@ class VCGen:
             self.ev(s.expr, self.ctx(st))
             return st
         if isinstance(s, ir.Unsupported):
-            raise VCError(s.reason, s.loc)
-        raise VCError(f"unhandled statement {type(s).__name__}", s.loc)
+            raise Unsupported(s.reason, s.loc)
+        raise Unsupported(f"unhandled statement {type(s).__name__}", s.loc)
 
     # -- merging ----------------------------------------------------------
 
@@ -1115,14 +1126,20 @@ class VCGen:
 
     # -- loops ------------------------------------------------------------
 
-    def modified(self, stmts) -> tuple[set[str], set[str]]:
-        """(names possibly reassigned/mutated, list names possibly appended)."""
-        names = ir.assigned_names(stmts)
+    def modified(self, stmts, unchecked: bool = True, rebinds: bool = True) -> tuple[set[str], set[str]]:
+        """(names possibly reassigned/mutated, list names possibly appended).
+        ``unchecked=False`` leaves out what unchecked code may change, and
+        ``rebinds=False`` names that are only rebound, not changed in place."""
+        shared = self.shared if unchecked else set()
+        if rebinds:
+            names = ir.assigned_names(stmts)
+        else:
+            names = {t.name for t in ir.walk_stmts(stmts) if isinstance(t, (ir.IndexAssign, ir.Append, ir.DictDel)) or (isinstance(t, ir.Assign) and in_place(t))}
         appends: set[str] = set()
         for s in ir.walk_stmts(stmts):
             if isinstance(s, ir.Append):
                 appends.add(s.name)
-            elif isinstance(s, ir.Assign) and isinstance(self.fn.locals.get(s.name), ir.TList):
+            elif isinstance(s, ir.Assign) and isinstance(self.fn.locals.get(s.name), ir.TList) and (rebinds or in_place(s)):
                 appends.add(s.name)
             elif isinstance(s, ir.FieldAssign):
                 names.update(k for k, _ in self.heap_keys(s.cls, s.field))
@@ -1148,12 +1165,12 @@ class VCGen:
                         names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Extern):
                         for a in sub.args:
-                            if isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
+                            if unchecked and isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
                                 names.add(a.name)
                                 appends.add(a.name)
                         if self.program.extern_writes_unchecked(sub, self.fn, self.views):
-                            names.update(self.shared)
-                            appends.update(self.shared)
+                            names.update(shared)
+                            appends.update(shared)
                         if self.program.extern_touches_heap(sub):
                             names.add("@alloc")
                             names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
@@ -1172,14 +1189,14 @@ class VCGen:
                                 if p.name in self.program.appends.get(tgt.key, ()):
                                     appends.add(a.name)
                                 if a.name in self.views:
-                                    names.update(self.shared)
-                                    appends.update(self.shared)
+                                    names.update(shared)
+                                    appends.update(shared)
                         if tgt.key in self.program.unchecked_writers:
-                            names.update(self.shared)
-                            appends.update(self.shared)
+                            names.update(shared)
+                            appends.update(shared)
             if (isinstance(s, (ir.IndexAssign, ir.Append, ir.DictDel)) and s.name in self.views) or (isinstance(s, ir.Assign) and self.writes_in_place(s)):
-                names.update(self.shared)
-                appends.update(self.shared)
+                names.update(shared)
+                appends.update(shared)
         return names, appends
 
     def _init_key(self, cls: str) -> str | None:
@@ -1321,12 +1338,13 @@ class VCGen:
         out.facts.append(L.not_(c))
         return self.merge([out] + frame.breaks)
 
-    def _counted_loop(self, s, st: State, lo_v: L.Term, hi_v: L.Term, idx: str, bind) -> State:
+    def _counted_loop(self, s, st: State, lo_v: L.Term, hi_v, idx: str, bind) -> State:
         """Shared shape of ``for i in range`` and ``for x in xs``.
 
         The hidden counter ``k`` runs over ``[lo, hi)``; invariants see the
         index name bound to ``k`` (the *next* iteration), so after the last
-        iteration it equals ``hi``.
+        iteration it equals ``hi``. A callable ``hi_v`` is read afresh from
+        each loop head (a sequence the body changes).
         """
         invs = self.invariants_for(s.loc.line, s.invariants)
         counter = f"{idx}$k"
@@ -1346,7 +1364,10 @@ class VCGen:
         assert not isinstance(k, ListVal)
         # By construction the counter stays within [lo, max(lo, hi)].
         head.facts.append(L.le(lo_v, k))
-        head.facts.append(L.le(k, L.max_(lo_v, hi_v)))
+        if callable(hi_v):
+            hi_v = hi_v(head)
+        else:
+            head.facts.append(L.le(k, L.max_(lo_v, hi_v)))
         view = {idx: k}
         self.assume_invs(invs, head, view)
         self.assume_written(wrote, head)
@@ -1408,24 +1429,32 @@ class VCGen:
 
         bad = changed(hi)
         if bad:
-            raise VCError(f"the loop bound depends on {', '.join(sorted(bad))}, which the loop body changes", loc)
+            raise Unsupported(f"the loop bound depends on {', '.join(sorted(bad))}, which the loop body changes", loc)
 
     def loop_each(self, s: ir.ForEach, st: State) -> State:
         ctx = self.ctx(st)
         seq = self.ev(s.seq, ctx)
         assert isinstance(seq, ListVal)
-        names, _ = self.modified(s.body)
         seq_vars = {x.name for x in ir.walk_expr(s.seq) if isinstance(x, ir.Var)}
-        if names & seq_vars:
-            raise VCError(f"the loop body changes {', '.join(sorted(names & seq_vars))} while iterating over it", s.loc)
+        changed = self.modified(s.body, rebinds=False)[0] & seq_vars
+        now = [seq]
+        hi: L.Term | Callable[[State], L.Term] = seq.len
+        if changed:
+            read = self.live_seq(s.seq, changed, s.body, s.loc)
+
+            def live_hi(head: State) -> L.Term:
+                now[0] = read(self.ctx(head))
+                return now[0].len
+
+            hi = live_hi
         before = set(st.env)
 
         def bind(body_st: State, k: L.Term) -> None:
-            body_st.env[s.elem] = seq.at(k)
+            body_st.env[s.elem] = now[0].at(k)
             body_st.env[s.idx] = k
             self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
 
-        out = self._counted_loop(s, st, L.ZERO, seq.len, s.idx, bind)
+        out = self._counted_loop(s, st, L.ZERO, hi, s.idx, bind)
         out.env.pop(f"{s.idx}$k", None)
         for name in (s.elem, s.idx):
             if name in before and name in self.fn.locals:
@@ -1433,6 +1462,45 @@ class VCGen:
             else:
                 out.env.pop(name, None)
         return out
+
+    def live_seq(self, seq_e: ir.Expr, changed: set[str], body, loc: ir.Loc) -> Callable[[Ctx], ListVal]:
+        """Python and JavaScript iterate a list as it is at each step, so a
+        loop or comprehension whose body may change what it iterates over
+        reads the sequence afresh from each state it may be in. Returns that
+        read."""
+        direct_names, direct_appends = self.modified(body, unchecked=False, rebinds=False)
+        direct = direct_names & changed
+        tys = {**{p.name: p.ty for p in self.fn.params}, **self.fn.locals}
+        dicts = sorted(v for v in changed if isinstance(tys.get(v), ir.TDict))
+        if dicts and self.module.language == "python":
+            if direct & set(dicts):
+                raise Unsupported(f"the loop changes the dict {', '.join(dicts)} while iterating over it (Python raises RuntimeError when its size changes)", loc)
+            self.note(loc, f"unchecked code called here does not add keys to or remove keys from {', '.join(dicts)}")
+        if changed - direct:
+            self.note(loc, f"unchecked code called here does not keep adding to {', '.join(sorted(changed - direct))}")
+        grows = (loc.line, "grows:" + ", ".join(sorted(direct_appends & changed)))
+        if direct_appends & changed and grows not in self.loop_notes:
+            self.loop_notes.append(grows)
+        inner = seq_e
+        while isinstance(inner, ir.Builtin) and inner.name in ("dict_keys", "from_opaque"):
+            inner = inner.args[0]
+        if isinstance(inner, ir.Var) and isinstance(seq_e.ty, ir.TList):
+
+            def read(ctx: Ctx) -> ListVal:
+                v = self.ev(seq_e, ctx)
+                assert isinstance(v, ListVal)
+                return v
+
+            return read
+
+        def unknown(ctx: Ctx) -> ListVal:
+            assert isinstance(seq_e.ty, ir.TList)
+            v = self.fresh("iterated", seq_e.ty)
+            assert isinstance(v, ListVal)
+            ctx.assume(L.le(L.ZERO, v.len))
+            return v
+
+        return unknown
 
     # -- expressions ------------------------------------------------------
 
@@ -1565,7 +1633,7 @@ class VCGen:
                 return L.and_(L.eq(a.some, b.some), L.implies(a.some, L.eq(a.val, b.val)))
             return L.and_(a.some, L.eq(a.val, b))  # type: ignore[arg-type]
         if isinstance(a, DictVal) or isinstance(b, DictVal):
-            raise VCError("comparing whole dicts with == is not supported")
+            raise Unsupported("comparing whole dicts with == is not supported")
         return rec_equal(a, b)  # type: ignore[arg-type]
 
     def ev_Ite(self, e: ir.Ite, ctx: Ctx) -> Val:
@@ -1675,10 +1743,13 @@ class VCGen:
             return self.ev_threw(e, ctx)
         if name == "await" and ctx.state is not None and not ctx.spec:
             self.check_objects(ctx.state, e.loc, "at the await", ctx.guard)
+        if name == "to_opaque" and _handed(e.args[0]):
+            return self.ev_handed_over(e.args[0], ctx)
         if name == "dict_lit" and e.ty.key == ir.NONE:  # type: ignore[union-attr]
             return DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), e.ty)  # type: ignore[arg-type]
         if name == "dict_lit":
             assert isinstance(e.ty, ir.TDict)
+            components(e.ty)
             ks = sort_of(e.ty.key)
             vals: L.Term = L.const_array(L.ARRAY(sort_of(e.ty.val), ks), default_term(sort_of(e.ty.val)))
             has: L.Term = L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE)
@@ -1688,7 +1759,7 @@ class VCGen:
                 vals = L.store(vals, k, v)  # type: ignore[arg-type]
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
             return DictVal(vals, has, e.ty)
-        args = [self.ev(a, ctx) for a in e.args]
+        args = [self.ev_handed_over(a, ctx) if name == "opaque_op" and _handed(a) else self.ev(a, ctx) for a in e.args]
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
@@ -2154,28 +2225,40 @@ class VCGen:
         elem_lit = e.args[1]
         assert isinstance(elem_lit, ir.Lit)
         elem, _, idx = str(elem_lit.value).partition(",")  # "x" or "x,i": the element and its index
-        i = L.Const(f"{elem}!{next(self.counter)}", L.INT)
-        rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
-        binds: dict[str, Val] = {elem: seq.at(i)}
-        if idx:
-            binds[idx] = i
-        self.run_each(e.loc, e.args[0], rng, binds, e.args[2], e.args[3] if len(e.args) > 3 else None, ctx)
 
-    def run_each(self, loc: ir.Loc, src: ir.Expr | None, rng: L.Term, binds: dict[str, Val], body: ir.Expr, cond: ir.Expr | None, ctx: Ctx) -> None:
+        def element(seq: ListVal) -> tuple[L.Term, dict[str, Val]]:
+            i = L.Const(f"{elem}!{next(self.counter)}", L.INT)
+            binds: dict[str, Val] = {elem: seq.at(i)}
+            if idx:
+                binds[idx] = i
+            return L.and_(L.le(L.ZERO, i), L.lt(i, seq.len)), binds
+
+        rng, binds = element(seq)
+        self.run_each(e.loc, e.args[0], rng, binds, e.args[2], e.args[3] if len(e.args) > 3 else None, ctx, lambda read, c: element(read(c)))
+
+    def run_each(self, loc: ir.Loc, src: ir.Expr | None, rng: L.Term, binds: dict[str, Val], body: ir.Expr, cond: ir.Expr | None, ctx: Ctx, reread=None) -> None:
         """A comprehension's body run on an arbitrary element (``binds``,
         within ``rng``), from any state the earlier elements may have left:
         its obligations hold for every element, and what it may change is
-        unknown afterwards."""
+        unknown afterwards. When the body may change the source, ``reread``
+        picks the element from the source as it is in that state."""
         parts = [x for x in (cond, body) if x is not None]
-        names, appends = self.modified([ir.ExprStmt(loc, x) for x in parts])
+        stmts = [ir.ExprStmt(loc, x) for x in parts]
+        names, appends = self.modified(stmts)
+        changed = self.modified(stmts, rebinds=False)[0]
         if any(isinstance(sub, ir.Extern) for x in parts for sub in ir.walk_expr(x)):
-            names |= {v for v in self.fn.escaped if v in self.fn.locals}
-        while isinstance(src, ir.Builtin) and src.name in ("dict_keys", "from_opaque"):
-            src = src.args[0]
-        if isinstance(src, ir.Var) and isinstance(src.ty, (ir.TList, ir.TDict)) and src.name in names:
-            raise VCError(f"the comprehension changes '{src.name}' while iterating over it", loc)
+            escaped = {v for v in self.fn.escaped if v in self.fn.locals}
+            names |= escaped
+            changed |= escaped
+        var = src
+        while isinstance(var, ir.Builtin) and var.name in ("dict_keys", "from_opaque"):
+            var = var.args[0]
+        live = isinstance(var, ir.Var) and isinstance(var.ty, (ir.TList, ir.TDict)) and var.name in changed
         if ctx.state is not None:
             self.havoc_here(ctx, names, appends)
+        if live:
+            assert src is not None and isinstance(var, ir.Var) and reread is not None
+            rng, binds = reread(self.live_seq(src, {var.name}, stmts, loc), ctx)
         sub = ctx.sub(rng)
         sub.bound.update(binds)
         if cond is not None:
@@ -2200,16 +2283,30 @@ class VCGen:
             d = self.ev(e.seq, ctx)
             assert isinstance(d, DictVal) and e.elem is not None
             k = L.Const(f"{e.elem}!{n}", sort_of(e.seq.ty.key))
-            self.run_each(e.loc, e.seq, L.select(d.has, k), {e.elem: k}, e.body, None, ctx)
+
+            def key(_, c: Ctx) -> tuple[L.Term, dict[str, Val]]:
+                d = self.ev(e.seq, c)  # type: ignore[arg-type]
+                assert isinstance(d, DictVal)
+                return L.select(d.has, k), {e.elem: k}  # type: ignore[dict-item]
+
+            self.run_each(e.loc, e.seq, L.select(d.has, k), {e.elem: k}, e.body, None, ctx, key)
         else:
             lo, hi = self.ev(e.lo, ctx), self.ev(e.hi, ctx)
             i = L.Const(f"{e.idx.split('$')[0]}!{n}", L.INT)
-            binds: dict[str, Val] = {e.idx: i}
-            if e.seq is not None and e.elem is not None:
-                seq = self.ev(e.seq, ctx)
-                assert isinstance(seq, ListVal)
-                binds[e.elem] = seq.at(i)
-            self.run_each(e.loc, e.seq, L.and_(L.le(lo, i), L.lt(i, hi)), binds, e.body, None, ctx)  # type: ignore[arg-type]
+            elem = e.elem
+
+            def at(seq: Val | None, end: L.Term) -> tuple[L.Term, dict[str, Val]]:
+                binds: dict[str, Val] = {e.idx: i}
+                if isinstance(seq, ListVal) and elem is not None:
+                    binds[elem] = seq.at(i)
+                return L.and_(L.le(lo, i), L.lt(i, end)), binds  # type: ignore[arg-type]
+
+            def live(read, c: Ctx) -> tuple[L.Term, dict[str, Val]]:
+                seq = read(c)
+                return at(seq, seq.len)
+
+            rng, binds = at(self.ev(e.seq, ctx) if e.seq is not None and elem is not None else None, hi)  # type: ignore[arg-type]
+            self.run_each(e.loc, e.seq, rng, binds, e.body, None, ctx, live)
         return L.Const(f"{e.kind}@{n}", L.BOOL)
 
     def ev_each(self, e: ir.Builtin, ctx: Ctx) -> Val:
@@ -2288,7 +2385,7 @@ class VCGen:
             self.assumptions.append((loc, text))
 
     def ev_Extern(self, e: ir.Extern, ctx: Ctx) -> Val:
-        args = [self.ev(a, ctx) for a in e.args]
+        args = [self.ev_handed_over(a, ctx) if _handed(a) else self.ev(a, ctx) for a in e.args]
         if ctx.spec:
             raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
         callee = self.program.through_wrapper(self.module, e.name)
@@ -2411,10 +2508,11 @@ class VCGen:
         muts = self.program.mutated.get(callee.key, set())
         list_vars = [a_e.name for a_e, p in zip(arg_exprs, fn.params) if isinstance(a_e, ir.Var) and isinstance(p.ty, (ir.TList, ir.TDict))]
         if muts and len(list_vars) != len(set(list_vars)):
-            raise VCError(f"the same list is passed twice to '{fn.name}', which mutates a list parameter; the two parameters would alias", loc)
+            raise Unsupported(f"the same list is passed twice to '{fn.name}', which mutates a list parameter; the two parameters would alias", loc)
         for p, a_e in zip(fn.params, arg_exprs):
-            if p.name in muts and not isinstance(a_e, ir.Var) and not _fresh_expr(a_e):
-                raise VCError(f"'{fn.name}' mutates its list parameter '{p.name}'; pass a variable (or a copy) so the change is tracked", loc)
+            if p.name in muts and not isinstance(a_e, ir.Var) and not _fresh_expr(a_e) and not _unchecked_object(a_e):
+                where = "an element of the sequence being iterated" if a_e is None else "not a variable"
+                raise Unsupported(f"'{fn.name}' changes its parameter '{p.name}' in place, and the argument is {where}; pass a variable (or a copy) so telic can track the change", loc)
         pmap: dict[str, Val] = {p.name: a for p, a in zip(fn.params, args)}
         heap_pre = self.heap_env(ctx.env) if ctx.state is None else self.heap_env(ctx.state.env)
         predicate = callee.key in self.program.predicates
@@ -2477,6 +2575,13 @@ class VCGen:
         env = ctx.state.env
         heap_pre = self.heap_env(env)
         for p, a_expr in zip(fn.params, arg_exprs):
+            if p.name in muts and not isinstance(a_expr, ir.Var):
+                # a new object, or one unchecked code holds: only its value after the call is unknown
+                nv = self.fresh(p.name, p.ty)
+                if isinstance(nv, ListVal):
+                    ctx.assume(L.le(L.ZERO, nv.len))
+                post[p.name] = nv
+                continue
             if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
                 nd = self.fresh(a_expr.name, p.ty)
                 env[a_expr.name] = nd
@@ -2495,7 +2600,8 @@ class VCGen:
                 env[a_expr.name] = nv
                 post[p.name] = nv
         views = [a.name for p, a in zip(fn.params, arg_exprs) if p.name in muts and isinstance(a, ir.Var) and a.name in self.views]
-        if callee.key in self.program.unchecked_writers or views:
+        handed = any(p.name in muts and _unchecked_object(a) for p, a in zip(fn.params, arg_exprs))
+        if callee.key in self.program.unchecked_writers or views or handed:
             self.havoc_unchecked(ctx, keep=frozenset(views))
             for p, a_expr in zip(fn.params, arg_exprs):
                 if reaches_unchecked(p.ty) and p.name not in post:
@@ -2598,6 +2704,16 @@ class VCGen:
                     changed = True
         pairs = [fact for fact, need in self.pair_facts if need <= heads or need <= present]
         return [self.lemma_info[i][0] for i in sorted(chosen)] + pairs
+
+    def ev_handed_over(self, e: ir.Expr, ctx: Ctx) -> Val:
+        """A literal telic cannot represent, handed straight to unchecked
+        code: its parts' obligations and effects, and an unknown value."""
+        for x in _literal_parts(e) or ():
+            if _handed(x):
+                self.ev_handed_over(x, ctx)
+            else:
+                self.ev(x, ctx)
+        return L.Const(f"handed@{next(self.counter)}", L.OPAQUE)
 
     def box_facts(self, b: L.Term, v: Val, ty: ir.Type, ctx: Ctx, known: bool) -> None:
         """How a checked value ``v`` of type ``ty`` looks through the
@@ -2871,6 +2987,32 @@ def _children(e: ir.Expr) -> list[ir.Expr]:
     if isinstance(e, ir.RecordLit):
         direct.extend(v for _, v in e.fields)
     return direct
+
+
+def representable(ty: ir.Type) -> bool:
+    try:
+        components(ty)
+    except Unsupported:
+        return False
+    return True
+
+
+def _handed(e: ir.Expr) -> bool:
+    """A literal telic cannot represent (only unchecked code receives it)."""
+    return _literal_parts(e) is not None and not representable(e.ty)
+
+
+def _literal_parts(e: ir.Expr) -> tuple[ir.Expr, ...] | None:
+    if isinstance(e, ir.ListLit):
+        return tuple(e.elems)
+    if isinstance(e, ir.Builtin) and e.name == "dict_lit":
+        return tuple(e.args)
+    return None
+
+
+def _unchecked_object(e: ir.Expr | None) -> bool:
+    """An object unchecked code returned or holds."""
+    return isinstance(e, ir.Extern) or (isinstance(e, ir.Builtin) and e.name == "from_opaque")
 
 
 def _fresh_expr(e: ir.Expr | None) -> bool:

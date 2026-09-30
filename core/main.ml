@@ -416,6 +416,7 @@ let () =
               Vc.key;
               fn = f;
               modpath = m.path;
+              language = m.language;
               mutated = strs "mutated";
               appends = strs "appends";
               definitional = Json.to_bool (Json.member "definitional" pj);

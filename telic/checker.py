@@ -18,7 +18,7 @@ from .jobs import take as take_jobs
 from .program import ANY, FuncRef, Program
 from .render_expr import render
 from .smt import RLIMIT, SmtResult, Theory, solve
-from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
+from .vcgen import Obligation, Unsupported, VCError, VCGen, build_axioms, build_fundef
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -705,6 +705,19 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
     return rep
 
 
+def loop_problems(notes, fn: ir.Function) -> list[tuple[str, ir.Loc]]:
+    """Loops whose termination a function's claims need but telic cannot show."""
+    if not fn.has_contract:
+        return []
+    out = []
+    for line, note in notes:
+        if note == "no-variant":
+            out.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
+        elif note.startswith("grows:"):
+            out.append((f"termination not proved: the loop may add to {note[6:]} while iterating over it", ir.Loc(line)))
+    return out
+
+
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None, ui: Any = None) -> Report:
     t0 = t0 or time.perf_counter()
     program = Program.build([m for m in modules if m.language != "aims"])
@@ -810,7 +823,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             gen = VCGen(program, ref, inf.options)
             obs = gen.run()
         except VCError as e:
-            rep.status = "error"
+            rep.status = "unsupported" if isinstance(e, Unsupported) else "error"
             rep.problems.append((str(e), e.loc or ref.fn.loc))
             return False
         except Exception as e:  # noqa: BLE001 - a bug in telic must not block the other functions
@@ -823,11 +836,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         rep.deps = set(gen.deps)
         code_value_calls(program, rep)
         entry_checks.append((rep, gen))
-        for line, note in gen.loop_notes:
-            if note == "no-variant" and ref.fn.has_contract:
-                # (a claim about what a function returns needs it to return;
-                # without a contract telic only looks for crashes)
-                rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
+        # (a claim about what a function returns needs it to return;
+        # without a contract telic only looks for crashes)
+        rep.problems.extend(loop_problems(gen.loop_notes, ref.fn))
         for ob in obs:
             key_ = obligation_key(ob, theory, opts.rlimit)
             hit = cache.get(key_)
@@ -923,9 +934,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 entry_checks.append((rep, gen))
             except VCError:
                 pass  # the engine already reported whatever makes the entry state ill-formed
-            for line, note in a["loop_notes"]:
-                if note == "no-variant" and ref.fn.has_contract:
-                    rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
+            rep.problems.extend(loop_problems(a["loop_notes"], ref.fn))
             for o in a["obligations"]:
                 ob = o["ob"]
                 if o["status"] == "proved" and o["reason"] == "cache":

@@ -958,7 +958,7 @@ class FunctionLowerer:
         for name, fnode in nested.items():
             if any(isinstance(x, (ast.Nonlocal, ast.Global)) for x in ast.walk(fnode)):
                 self.fn.unsupported.append((f"nested function '{name}' rebinds outer variables (nonlocal/global); not modelled", ir.Loc(fnode.lineno)))
-            self.closures[name] = sorted({x.id for x in ast.walk(fnode) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)} & self.stored_names)
+            self.closures[name] = sorted(_free_names(fnode) & self.stored_names)
         for n in _own_nodes(node):
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.closures and id(n) not in called:
                 self.escaped.update(self.closures[n.id])
@@ -1786,6 +1786,22 @@ def _about_unchecked(e: ir.Expr) -> bool:
 
 def _is_generator(fn: ast.AST) -> bool:
     return any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in _own_nodes(fn))
+
+
+def _free_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> set[str]:
+    """Names a nested function reads from enclosing scopes: its own
+    parameters and assignments shadow them."""
+    a = fn.args
+    bound = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [v for v in (a.vararg, a.kwarg) if v is not None]}
+    loads: set[str] = set()
+    for n in _own_nodes(fn):
+        if isinstance(n, ast.Name):
+            (loads if isinstance(n.ctx, ast.Load) else bound).add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            loads |= _free_names(n)
+            if not isinstance(n, ast.Lambda):
+                bound.add(n.name)
+    return loads - bound
 
 
 def _own_nodes(fn: ast.AST):
