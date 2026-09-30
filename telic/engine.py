@@ -180,12 +180,15 @@ def _call(req: dict[str, Any]) -> dict[str, Any]:
     assert exe is not None
     with take_jobs(req["jobs"] or None) as workers:
         req["jobs"] = workers
-        p = subprocess.run([exe], input=json.dumps(req), capture_output=True, text=True)
+        # raw UTF-8, lone surrogates kept: a JavaScript string's code units and
+        # a Python string's code points stay apart (\u escapes would pair them)
+        p = subprocess.run([exe], input=json.dumps(req, ensure_ascii=False).encode("utf-8", "surrogatepass"), capture_output=True)
+    err = p.stderr.decode("utf-8", "replace")
     if p.returncode != 0:
-        raise RuntimeError(f"telic-core failed: {p.stderr.strip()[-800:]}")
-    if p.stderr and os.environ.get("TELIC_CORE_DEBUG"):
-        print(p.stderr, end="", file=sys.stderr)
-    return json.loads(p.stdout)
+        raise RuntimeError(f"telic-core failed: {err.strip()[-800:]}")
+    if err and os.environ.get("TELIC_CORE_DEBUG"):
+        print(err, end="", file=sys.stderr)
+    return json.loads(p.stdout.decode("utf-8", "surrogatepass"))
 
 
 def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, rlimit: int, jobs: int | None) -> dict[str, Any]:

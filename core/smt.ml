@@ -70,15 +70,30 @@ let rec sort_smt = function
   | Array (i, e) -> Printf.sprintf "(Array %s %s)" (sort_smt i) (sort_smt e)
   | Rec (n, _) -> q_rec n
 
+(* strings arrive as UTF-8 (surrogates as their own 3-byte sequences): one
+   SMT character per code point, not per byte *)
 let str_lit s =
   let b = Buffer.create (String.length s + 2) in
   Buffer.add_char b '"';
-  String.iter
-    (fun c ->
-      if c = '"' then Buffer.add_string b "\"\""
-      else if Char.code c < 32 || Char.code c > 126 || c = '\\' then Buffer.add_string b (Printf.sprintf "\\u{%x}" (Char.code c))
-      else Buffer.add_char b c)
-    s;
+  let n = String.length s in
+  let byte i = Char.code s.[i] in
+  let rec go i =
+    if i < n then begin
+      let c = byte i in
+      let len, cp =
+        if c < 0x80 then (1, c)
+        else if c < 0xE0 && i + 1 < n then (2, ((c land 0x1F) lsl 6) lor (byte (i + 1) land 0x3F))
+        else if c < 0xF0 && i + 2 < n then (3, ((c land 0x0F) lsl 12) lor ((byte (i + 1) land 0x3F) lsl 6) lor (byte (i + 2) land 0x3F))
+        else if i + 3 < n then (4, ((c land 0x07) lsl 18) lor ((byte (i + 1) land 0x3F) lsl 12) lor ((byte (i + 2) land 0x3F) lsl 6) lor (byte (i + 3) land 0x3F))
+        else (1, c)
+      in
+      if cp = Char.code '"' then Buffer.add_string b "\"\""
+      else if cp < 32 || cp > 126 || cp = Char.code '\\' then Buffer.add_string b (Printf.sprintf "\\u{%x}" cp)
+      else Buffer.add_char b (Char.chr cp);
+      go (i + len)
+    end
+  in
+  go 0;
   Buffer.add_char b '"';
   Buffer.contents b
 

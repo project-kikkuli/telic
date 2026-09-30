@@ -996,7 +996,7 @@ PURE_EXTERNS = frozenset(
     "isdigit isalpha isalnum isspace print log warn error str repr String Number Boolean len int float bool "
     "isinstance type id hash sorted list dict tuple set frozenset dumps stringify abs min max sum any all round "
     "isArray isInteger isNaN parseInt parseFloat slice concat indexOf lastIndexOf includes at toString "
-    "hasOwnProperty charAt charCodeAt substring padStart padEnd repeat getattr hasattr".split()
+    "hasOwnProperty charAt charCodeAt substring padStart padEnd repeat getattr hasattr chr ord from_bytes".split()
 )
 
 
@@ -1053,7 +1053,7 @@ def _is_view(e: ir.Expr) -> bool:
     """Does ``e`` denote an unchecked object seen at a checked container type?"""
     if isinstance(e, ir.Builtin) and e.name == "from_opaque":
         x = e.args[0]
-        new = isinstance(x, ir.Builtin) and x.name == "opaque_op" and isinstance(x.args[0], ir.Lit) and x.args[0].value in FRESH_OPS
+        new = isinstance(x, ir.Builtin) and (x.name == "each" or (x.name == "opaque_op" and isinstance(x.args[0], ir.Lit) and x.args[0].value in FRESH_OPS))
         return _mutable(e.ty) and not new
     if isinstance(e, ir.Builtin) and e.name in ("some", "await"):
         return _is_view(e.args[0])
