@@ -380,72 +380,91 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
     return second
 
 
+class _Deadline:
+    """Interrupts a Z3 context after ``ms``: Z3's rewriter unfolds a recursive
+    definition applied to literals while an assertion is added or a model
+    value is read, and the solver's own timeout covers neither."""
+
+    def __init__(self, ctx: z3.Context, ms: int):
+        self.fired = False
+        self.ctx = ctx
+        self.timer = threading.Timer(ms / 1000, self._fire)
+
+    def _fire(self) -> None:
+        self.fired = True
+        self.ctx.interrupt()
+
+    def __enter__(self) -> "_Deadline":
+        self.timer.start()
+        return self
+
+    def __exit__(self, kind: Any, exc: Any, tb: Any) -> bool:
+        self.timer.cancel()
+        self.timer.join()  # no thread may outlive the call: the checker forks workers
+        return self.fired and isinstance(exc, Exception)  # whatever the interrupt cut short
+
+
 def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
     terms = list(ob.hyps) + [ob.goal]
     defs, axioms = closure
     enc = Z3Encoder(defs)
-    # Z3's rewriter unfolds a recursive definition applied to literals while
-    # asserting, outside the solver's timeout; only an interrupt stops that.
-    deadline = threading.Timer(timeout_ms / 1000, enc.ctx.interrupt)
-    deadline.start()
-    try:
-        return _run(ob, enc, axioms, terms, timeout_ms, t0)
-    except z3.Z3Exception as e:
-        if deadline.finished.is_set():
-            return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
-        return SmtResult("unknown", time.perf_counter() - t0, reason=f"z3 error: {e}")  # pragma: no cover - defensive
-    finally:
-        deadline.cancel()
-        deadline.join()  # no thread may outlive the call: the checker forks workers
-
-
-def _run(ob: Obligation, enc: "Z3Encoder", axioms, terms, timeout_ms: int, t0: float) -> SmtResult:
-    start = time.perf_counter()
     s = z3.Solver(ctx=enc.ctx)
-    for ax in axioms:
-        s.add(enc.term(ax.formula))
-    for h in ob.hyps:
-        s.add(enc.term(h))
-    s.add(z3.Not(enc.term(ob.goal)))
-    left = timeout_ms - int((time.perf_counter() - start) * 1000)
-    if left <= 0:
-        return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
-    s.set("timeout", left)
-    r = s.check()
+    # Stating the problem has its own budget, so the solver keeps all of its own.
+    try:
+        with _Deadline(enc.ctx, timeout_ms) as d:
+            for ax in axioms:
+                s.add(enc.term(ax.formula))
+            for h in ob.hyps:
+                s.add(enc.term(h))
+            s.add(z3.Not(enc.term(ob.goal)))
+        if d.fired:
+            return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
+        s.set("timeout", timeout_ms)
+        r = s.check()
+    except z3.Z3Exception as e:
+        return SmtResult("unknown", time.perf_counter() - t0, reason=f"z3 error: {e}")
     dt = time.perf_counter() - t0
     if r == z3.unsat:
         return SmtResult("proved", dt)
     if r == z3.sat:
-        m = s.model()
-        enc.key_candidates = {}
-        for _, v in ob.inputs:
-            if isinstance(v, L.Term) and v.sort in (L.INT, L.STR, L.BOOL):
-                x = enc.value(m, v)
-                enc.key_candidates.setdefault(v.sort.name, []).append(x)
-        for sname, default in (("Str", ""), ("Int", 0)):
-            enc.key_candidates.setdefault(sname, []).append(default)
-        model = {name: decode(enc, m, v) for name, v in ob.inputs}
-        too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
-        state: dict[str, Any] = {}
-        input_consts = set()
-        for _, v in ob.inputs:
-            if isinstance(v, ListVal):
-                input_consts |= {v.arr, v.len}
-            elif isinstance(v, L.Term):
-                input_consts.add(v)
-            else:
-                input_consts |= set(getattr(v, "__dict__", {}).values()) if hasattr(v, "__dict__") else set()
-        for c in sorted(set().union(*(L.consts(t) for t in terms)), key=lambda c: c.name):
-            if c in input_consts or "!" in c.name or c.sort.name in ("Array", "Rec"):
-                continue
-            try:
-                state[c.name] = enc.value(m, c)
-            except Exception:  # pragma: no cover
-                pass
-        # A model is only trustworthy if quantifiers did not force an
-        # incomplete answer; Z3 reports that as 'unknown', not 'sat'.
-        res = SmtResult("refuted", dt, model=model, state=state)
-        if too_big:
-            res.reason = "the model's list input is too large to replay"
+        with _Deadline(enc.ctx, timeout_ms) as d:
+            res = _refutation(ob, enc, s, terms, dt)
+        if d.fired:
+            return SmtResult("unknown", time.perf_counter() - t0, reason="timeout reading the model")
         return res
     return SmtResult("unknown", dt, reason=s.reason_unknown() or "unknown")
+
+
+def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Term], dt: float) -> SmtResult:
+    m = s.model()
+    enc.key_candidates = {}
+    for _, v in ob.inputs:
+        if isinstance(v, L.Term) and v.sort in (L.INT, L.STR, L.BOOL):
+            x = enc.value(m, v)
+            enc.key_candidates.setdefault(v.sort.name, []).append(x)
+    for sname, default in (("Str", ""), ("Int", 0)):
+        enc.key_candidates.setdefault(sname, []).append(default)
+    model = {name: decode(enc, m, v) for name, v in ob.inputs}
+    too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
+    state: dict[str, Any] = {}
+    input_consts = set()
+    for _, v in ob.inputs:
+        if isinstance(v, ListVal):
+            input_consts |= {v.arr, v.len}
+        elif isinstance(v, L.Term):
+            input_consts.add(v)
+        else:
+            input_consts |= set(getattr(v, "__dict__", {}).values()) if hasattr(v, "__dict__") else set()
+    for c in sorted(set().union(*(L.consts(t) for t in terms)), key=lambda c: c.name):
+        if c in input_consts or "!" in c.name or c.sort.name in ("Array", "Rec"):
+            continue
+        try:
+            state[c.name] = enc.value(m, c)
+        except Exception:  # pragma: no cover
+            pass
+    # A model is only trustworthy if quantifiers did not force an
+    # incomplete answer; Z3 reports that as 'unknown', not 'sat'.
+    res = SmtResult("refuted", dt, model=model, state=state)
+    if too_big:
+        res.reason = "the model's list input is too large to replay"
+    return res

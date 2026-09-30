@@ -397,7 +397,9 @@ let rec input_line_by z deadline =
 let marker = "telic-sync-7f3a"
 
 let exchange z (cmds : string) : string list =
-  let deadline = Unix.gettimeofday () +. (float_of_int z.budget_ms /. 1000.) +. 0.5 in
+  (* stating the problem and solving it get [budget_ms] each, so a slow
+     statement never eats into the solver's own timeout *)
+  let deadline = Unix.gettimeofday () +. (2. *. float_of_int z.budget_ms /. 1000.) +. 0.5 in
   send z cmds;
   send z (Printf.sprintf "(echo \"%s\")" marker);
   let lines = ref [] in
