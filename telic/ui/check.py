@@ -343,6 +343,7 @@ def _change(n: Node) -> tuple[str, str | None, str] | None:
 
 
 def combine(outs: list[Outcome]) -> Outcome:
+    #@ requires len(outs) > 0
     """One verdict over every viewport: refuted anywhere is refuted; proved
     needs no open viewport and at least one that was not vacuous."""
     for st in ("refuted", "open"):

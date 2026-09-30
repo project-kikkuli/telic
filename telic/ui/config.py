@@ -132,6 +132,8 @@ def load(path: str, root: str) -> UiConfig:
     )
     if "viewports" in ui:
         cfg.viewports = [_size(v) for v in ui["viewports"]]
+        if not cfg.viewports:
+            raise ConfigError(f"{cfg.path}: viewports is empty; list at least one, e.g. [\"390x844\"]")
     if cfg.driver != "web":
         raise ConfigError(f"{cfg.path}: driver {cfg.driver!r} is not available (only 'web' so far)")
     return cfg

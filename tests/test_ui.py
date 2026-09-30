@@ -315,3 +315,15 @@ def test_a_banner_that_covers_the_menu_on_phones_only(tmp_path):
     r = got["menu-visible"]
     assert r.status == "refuted" and "at 390x844" in r.detail and 'div.banner "We use cookies"' in r.detail
     assert [v["status"] for v in r.viewports] == ["refuted", "proved"]
+
+
+@pytest.mark.parametrize("viewports, ok", [('["390x844"]', True), ("[]", False)])
+def test_viewports_must_name_at_least_one(tmp_path, viewports, ok):
+    from telic.ui.config import ConfigError, load
+
+    (tmp_path / "telic.toml").write_text(f'[ui]\nurl = "http://localhost:1"\nviewports = {viewports}\n')
+    if ok:
+        assert load(str(tmp_path / "telic.toml"), str(tmp_path)).viewports == [(390, 844)]
+    else:
+        with pytest.raises(ConfigError, match="viewports is empty"):
+            load(str(tmp_path / "telic.toml"), str(tmp_path))

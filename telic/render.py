@@ -705,6 +705,7 @@ def ui_label(status: str, method: str) -> str:
 
 
 def model_line(m: dict[str, Any], p: Paint) -> str:
+    #@ requires "states" in m and "transitions" in m and ("walks" not in m or "walk_length" in m and "agreed" in m)
     """One learned model: size, whether exploration finished, conformance."""
     bits = [f"{m['states']} states", f"{m['transitions']} transitions"]
     bits.append(p.green("complete") if m.get("complete") else p.yellow(f"incomplete: stopped at the {m.get('stop')}"))

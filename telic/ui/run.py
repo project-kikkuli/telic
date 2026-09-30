@@ -180,6 +180,7 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
 
 
 def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
+    #@ requires "status" in d
     return UiResult(lem, app, d["status"], d.get("method", ""), d.get("detail", ""), d.get("trace"), d.get("replay"), d.get("viewports", []))
 
 
