@@ -1,6 +1,9 @@
 """Proofs are cached by formula, so edits re-verify only what they touch."""
 
+import pytest
+
 from telic.checker import CheckOptions, check
+from telic.engine import binary
 
 SRC = """
 def a(x: int) -> int:
@@ -45,3 +48,37 @@ def test_editing_a_contract_rechecks_callers(tmp_path):
     r = run(tmp_path, SRC.replace("#@ ensures result >= x\n", "#@ ensures result >= x + 1\n"))
     solved = {v.ob.func.split("::")[1] for f in r.functions for v in f.verdicts if v.method == "z3"}
     assert solved == {"b", "c"}
+
+
+OUTSIDE = """
+LIMIT = 5
+
+
+class Box:
+    #@ invariant self.v >= 0
+
+    def __init__(self):
+        self.v: int = 0
+
+
+def read(b: Box) -> int:
+    #@ ensures result >= 0
+    return b.v
+
+
+def lim() -> int:
+    #@ ensures result <= 5
+    return LIMIT
+"""
+
+
+@pytest.mark.parametrize("engine", ["python", "ox"])
+@pytest.mark.parametrize("old,new,fn", [("self.v >= 0", "self.v >= -5", "read"), ("LIMIT = 5", "LIMIT = 10", "lim")])
+def test_an_edit_outside_a_function_rechecks_it(tmp_path, engine, old, new, fn):
+    if engine == "ox" and binary() is None:
+        pytest.skip("telic-core not built")
+    opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), lean=False, engine=engine)
+    for src, want in ((OUTSIDE, "proved"), (OUTSIDE.replace(old, new), "refuted")):
+        (tmp_path / "m.py").write_text(src)
+        rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+        assert {f.fn.name: f.status for f in rep.functions}[fn] == want

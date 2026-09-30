@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ir
+from . import ir, irjson
 from . import logic as L
 from .infer import Inferred, infer
 from .program import FuncRef, Program
@@ -375,10 +375,36 @@ def toolchain_id() -> str:
     return _TOOLCHAIN
 
 
+def _without_locs(x: Any) -> Any:
+    if isinstance(x, dict):
+        return {k: _without_locs(v) for k, v in x.items() if k not in ("loc", "end_line")}
+    if isinstance(x, list):
+        return [_without_locs(v) for v in x]
+    return x
+
+
+def _lowered(program: Program, key: str) -> str:
+    """A function as telic reads it, module constants inlined, without
+    positions: an edit outside the function that changes its meaning changes this."""
+    memo = program.__dict__.setdefault("_lowered", {})
+    if key not in memo:
+        memo[key] = json.dumps(_without_locs(irjson.function(program.ref(key).fn)), sort_keys=True, default=str)
+    return memo[key]
+
+
+def _classes(program: Program) -> str:
+    memo = program.__dict__.setdefault("_lowered", {})
+    if "" not in memo:
+        decls = {n: {"fields": [[f, irjson.ty(t)] for f, t in c.fields], "invariants": [i.text for i in c.invariants], "bases": c.bases, "owner": c.owner} for n, c in program.classes.items()}
+        memo[""] = json.dumps(decls, sort_keys=True, default=str)
+    return memo[""]
+
+
 def function_key(program: Program, key: str, root: str | None) -> str:
     """A function's verdict depends on its own source, everything it calls
     (contracts, and bodies of pure callees used as definitions), the records
-    it uses, its Lean sidecar proofs, and the toolchain. Nothing else."""
+    and class invariants it uses, the module constants it reads, its Lean
+    sidecar proofs, and the toolchain. Nothing else."""
     seen: set[str] = set()
     todo = [key]
     while todo:
@@ -388,9 +414,10 @@ def function_key(program: Program, key: str, root: str | None) -> str:
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
     h = hashlib.sha256(f"fn {toolchain_id()}".encode())
+    h.update(_classes(program).encode())
     for k in sorted(seen):
         ref = program.ref(k)
-        h.update(f"{k}\n{ref.module.language}\n{ref.fn.source}\n{sorted((n, str(t)) for n, t in ref.module.records.items())}".encode())
+        h.update(f"{k}\n{ref.module.language}\n{ref.fn.source}\n{sorted((n, str(t)) for n, t in ref.module.records.items())}\n{_lowered(program, k)}".encode())
     ref = program.ref(key)
     from .lean import sidecar_path
 
