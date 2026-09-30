@@ -332,6 +332,7 @@ EXPECTED = {
     "index": ("crash", "IndexError"),
     "none": ("crash", "TypeError"),
     "key": ("crash", "KeyError"),
+    "unbound": ("crash", "UnboundLocalError"),
     "class.inv": ("violation", "class.inv"),
     "lifecycle": ("violation", "lifecycle"),
 }
@@ -372,6 +373,8 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
         return crash in ("TypeError", "AttributeError") and ("NoneType" in msg or "None" in msg)
     if k == "key":
         return crash == "KeyError" or bool(out.get("missing_key"))
+    if k == "unbound":
+        return crash in ("UnboundLocalError", "NameError", "ReferenceError")
     if k == "class.inv":
         return v == "class.inv" and out.get("func") == ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
     if k == "lifecycle":

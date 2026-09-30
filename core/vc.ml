@@ -335,6 +335,9 @@ let fresh_self g = is_init g || (let n = g.info.fn.name in String.length n >= 14
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
 let ends_with x s = String.length s >= String.length x && String.sub s (String.length s - String.length x) (String.length x) = x
 let is_heap k = String.length k > 0 && k.[0] = '@'
+
+(* 'x$bound': on which paths local x has been assigned (absent: on all of them) *)
+let bound_key n = n ^ "$bound"
 let heap_env env = SM.filter (fun k _ -> is_heap k) env
 
 (* -- the heap: one map per class field (per component), keyed by reference *)
@@ -589,7 +592,14 @@ let rec ev g ctx (e : Ir.expr) : value =
   let tm x = term_of loc x in
   match e.e with
   | Lit _ -> lit_value e
-  | Var n -> lookup ctx n loc
+  | Var n ->
+    let v = lookup ctx n loc in
+    (match (SM.mem n ctx.bound, SM.find_opt (bound_key n) (cur_env ctx)) with
+     | false, Some (T b) when ctx.state <> None && not ctx.spec ->
+       oblige g "unbound" ctx b loc (Printf.sprintf "'%s' is assigned before it is read" n);
+       assume ctx b
+     | _ -> ());
+    v
   | Result -> ( match ctx.result with Some r -> r | None -> raise (Vc_error ("'result' is not available here", loc)))
   | Old x -> (
     match ctx.old_env with
@@ -1229,7 +1239,14 @@ and havoc g (st : state) names appends : state =
             | T o when is_segment k -> h.env <- SM.add k (T (const (Printf.sprintf "%s@%d" (String.sub k 1 (String.length k - 1)) (next g)) o.sort)) h.env
             | _ -> ())
           h.env
-      | None -> ()
+      | None -> (
+        (* first assigned in the loop: from the second iteration on it may be bound *)
+        match Hashtbl.find_opt g.info.fn.locals name with
+        | Some ty when name <> "" && name.[0] <> '@' && name.[0] <> '%' ->
+          let nv = fresh g name ty () in
+          (match nv with L l -> Dynarray.add_last h.facts (le zero l.len) | _ -> ());
+          h.env <- SM.add (bound_key name) (T (const (Printf.sprintf "%s@%d" (bound_key name) (next g)) Bool)) (SM.add name nv h.env)
+        | _ -> ())
       | Some (T o) when is_written_key name -> h.env <- SM.add name (T (const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort)) h.env
       | Some old when is_heap name -> (
         match old with
@@ -1863,7 +1880,7 @@ and stmt g (s : Ir.stmt) (st : state) : state =
   match s with
   | Assign (_, name, v) ->
     let x = coerce (ev g (state_ctx g st) v) (Hashtbl.find_opt g.info.fn.locals name) in
-    st.env <- SM.add name x st.env;
+    st.env <- SM.remove (bound_key name) (SM.add name x st.env);
     st
   | FieldAssign (loc, obj, cls, f, v) ->
     let ctx = state_ctx g st in
@@ -1997,7 +2014,7 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     st
   | Unsupported (loc, reason) -> raise (Vc_error (reason, loc))
 
-and merge _g (states : state list) : state =
+and merge g (states : state list) : state =
   let live = List.filter (fun s -> s.alive) states in
   match live with
   | [] ->
@@ -2019,9 +2036,17 @@ and merge _g (states : state list) : state =
       List.fold_left
         (fun env name ->
           let vals = List.map (fun (s : state) -> SM.find_opt name s.env) live in
-          if List.exists Option.is_none vals then env
+          let flags = List.map2 (fun (s : state) v -> match v with None -> ff | Some _ -> (match SM.find_opt (bound_key name) s.env with Some (T b) -> b | _ -> tt)) live vals in
+          if String.ends_with ~suffix:"$bound" name || (List.exists Option.is_none vals && not (Hashtbl.mem g.info.fn.locals name)) then env
           else
-            let vals = List.map Option.get vals in
+            let fill = List.find_map Fun.id vals |> Option.get in
+            let vals = List.map (function Some v -> v | None -> fill) vals in
+            let env =
+              if List.for_all (fun f -> f == tt || f = tt) flags then env
+              else
+                let rf = List.rev flags and rg = List.rev guards in
+                SM.add (bound_key name) (T (List.fold_left2 (fun out gd f -> ite gd f out) (List.hd rf) (List.tl rg) (List.tl rf))) env
+            in
             let v0 = List.hd vals in
             if List.for_all (value_equal v0) vals then SM.add name v0 env
             else begin
@@ -2188,12 +2213,12 @@ and loop_range g (r : Ir.stmt) (st : state) : state =
   let lo_v = term_of loc (ev g ctx lo) and hi_v = term_of loc (ev g ctx hi) in
   let prior = SM.find_opt var st.env in
   if reeval then bound_fixed g hi body loc;
-  let out = counted_loop g loc invariants body st lo_v hi_v var (fun bst k -> bst.env <- SM.add var (T k) bst.env) in
+  let out = counted_loop g loc invariants body st lo_v hi_v var (fun bst k -> bst.env <- SM.remove (bound_key var) (SM.add var (T k) bst.env)) in
   out.env <- SM.remove (var ^ "$k") out.env;
   let has_break = ref false in
   Ir.walk_stmts (function Ir.Break _ -> has_break := true | _ -> ()) body;
   (match prior with
-   | None -> out.env <- SM.remove var out.env
+   | None -> out.env <- SM.add (bound_key var) (T (lt lo_v hi_v)) (SM.add var (fresh g var TInt ()) out.env)  (* bound only if the loop ran *)
    | Some prior ->
      if !has_break || List.mem var (Ir.assigned_names body) then out.env <- SM.add var (fresh g var TInt ()) out.env
      else out.env <- SM.add var (T (ite (lt lo_v hi_v) (sub hi_v one) (term_of loc prior))) out.env);
@@ -2237,7 +2262,7 @@ and loop_each g (r : Ir.stmt) (st : state) : state =
   let out =
     counted_loop ?live g loc invariants body st zero l.len idx (fun bst k ->
         let l = !now in
-        bst.env <- SM.add elem (T (at (l.arr, l.off) k)) bst.env;
+        bst.env <- SM.remove (bound_key elem) (SM.add elem (T (at (l.arr, l.off) k)) bst.env);
         bst.env <- SM.add idx (T k) bst.env;
         assume_held g (state_ctx g bst) (T (at (l.arr, l.off) k)) (match seq.ty with TList t -> t | t -> t))
   in
@@ -2245,6 +2270,11 @@ and loop_each g (r : Ir.stmt) (st : state) : state =
   List.iter
     (fun name ->
       if SM.mem name before && Hashtbl.mem g.info.fn.locals name then out.env <- SM.add name (fresh g name (Hashtbl.find g.info.fn.locals name) ()) out.env
+      else if name = elem && Hashtbl.mem g.info.fn.locals name then begin
+        out.env <- SM.add name (fresh g name (Hashtbl.find g.info.fn.locals name) ()) out.env;
+        let b = if changed = [] then lt zero l.len else const (Printf.sprintf "%s@%d" (bound_key name) (next g)) Bool in
+        out.env <- SM.add (bound_key name) (T b) out.env
+      end
       else out.env <- SM.remove name out.env)
     [ elem; idx ];
   out

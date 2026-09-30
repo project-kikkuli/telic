@@ -96,6 +96,8 @@ NONE_V = L.Const("None", L.Sort("None"))
 # the objects of a class a function has written a field of (a ghost set, not heap:
 # callees and other tasks do not add to it)
 WRITTEN = "%written."
+# 'x$bound': on which paths local x has been assigned (absent: on all of them)
+BOUND = "$bound"
 NO_WRITES = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
 ANY_WRITES = L.const_array(L.ARRAY(L.BOOL), L.TRUE)
 # the heap when this run of the function last resumed (entry, or the latest
@@ -950,6 +952,7 @@ class VCGen:
         if isinstance(s, ir.Assign):
             ctx = self.ctx(st)
             st.env[s.name] = coerce(self.ev(s.value, ctx), self.fn.locals.get(s.name))
+            st.env.pop(s.name + BOUND, None)
             if self.writes_in_place(s):
                 self.havoc_unchecked(ctx, keep=frozenset({s.name}))
             return st
@@ -1111,9 +1114,20 @@ class VCGen:
         env: dict[str, Val] = {}
         names = set().union(*(s.env.keys() for s in live))
         for name in names:
+            if name.endswith(BOUND):
+                continue
             vals = [s.env.get(name) for s in live]
+            flags = [s.env.get(name + BOUND, L.TRUE) if v is not None else L.FALSE for s, v in zip(live, vals)]
             if any(v is None for v in vals):
-                continue  # possibly unbound: reading it later is an error, not a guess
+                if name not in self.fn.locals:
+                    continue
+                fill = next(v for v in vals if v is not None)
+                vals = [fill if v is None else v for v in vals]
+            if any(f != L.TRUE for f in flags):
+                bound = flags[-1]
+                for g, f in zip(reversed(guards[:-1]), reversed(flags[:-1])):
+                    bound = L.ite(g, f, bound)
+                env[name + BOUND] = bound
             if all(v == vals[0] for v in vals):
                 env[name] = vals[0]  # type: ignore[assignment]
                 continue
@@ -1211,6 +1225,13 @@ class VCGen:
                     h.env[k] = L.Const(f"{k[1:]}@{next(self.counter)}", h.env[k].sort)  # type: ignore[union-attr]
                 continue
             if name not in h.env:
+                if name in self.fn.locals and name[0] not in "@%":
+                    # first assigned in the loop: from the second iteration on it may be bound
+                    nv = self.fresh(name, self.fn.locals[name])
+                    if isinstance(nv, ListVal):
+                        h.facts.append(L.le(L.ZERO, nv.len))
+                    h.env[name] = nv
+                    h.env[name + BOUND] = L.Const(f"{name}{BOUND}@{next(self.counter)}", L.BOOL)
                 continue
             old = h.env[name]
             if name.startswith(WRITTEN):
@@ -1396,13 +1417,15 @@ class VCGen:
 
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.var] = k
+            body_st.env.pop(s.var + BOUND, None)
 
         if s.reeval:
             self._bound_fixed(s.hi, s.body, s.loc)
         out = self._counted_loop(s, st, lo_v, hi_v, s.var, bind)
         out.env.pop(f"{s.var}$k", None)
         if prior is None:
-            out.env.pop(s.var, None)  # bound only if the loop ran: reading it is an error
+            out.env[s.var] = self.fresh(s.var, ir.INT)
+            out.env[s.var + BOUND] = L.lt(lo_v, hi_v)  # bound only if the loop ran
         elif _has_break(s.body) or s.var in ir.assigned_names(s.body):
             out.env[s.var] = self.fresh(s.var, ir.INT)
         else:
@@ -1452,6 +1475,7 @@ class VCGen:
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.elem] = now[0].at(k)
             body_st.env[s.idx] = k
+            body_st.env.pop(s.elem + BOUND, None)
             self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
 
         out = self._counted_loop(s, st, L.ZERO, hi, s.idx, bind)
@@ -1459,6 +1483,9 @@ class VCGen:
         for name in (s.elem, s.idx):
             if name in before and name in self.fn.locals:
                 out.env[name] = self.fresh(name, self.fn.locals[name])
+            elif name == s.elem and name in self.fn.locals:
+                out.env[name] = self.fresh(name, self.fn.locals[name])
+                out.env[name + BOUND] = L.Const(f"{name}{BOUND}@{next(self.counter)}", L.BOOL) if changed else L.lt(L.ZERO, seq.len)
             else:
                 out.env.pop(name, None)
         return out
@@ -1508,6 +1535,10 @@ class VCGen:
         if name in ctx.bound:
             return ctx.bound[name]
         if name in ctx.env:
+            bound = ctx.env.get(name + BOUND)
+            if bound is not None and ctx.state is not None and not ctx.spec:
+                self.oblige("unbound", ctx, bound, loc, f"'{name}' is assigned before it is read")  # type: ignore[arg-type]
+                ctx.assume(bound)  # type: ignore[arg-type]
             return ctx.env[name]
         raise VCError(f"'{name}' may be used before it is assigned", loc)
 
@@ -2387,7 +2418,7 @@ class VCGen:
     def ev_Extern(self, e: ir.Extern, ctx: Ctx) -> Val:
         args = [self.ev_handed_over(a, ctx) if _handed(a) else self.ev(a, ctx) for a in e.args]
         if ctx.spec:
-            raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
+            raise Unsupported(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
         callee = self.program.through_wrapper(self.module, e.name)
         if callee is not None and self.program.same_scc(self.ref.key, callee.key) and self.program.needs_termination(self.ref.key):
             self.recursion_check(callee, {p.name: a for p, a in zip(callee.fn.params, args)}, ctx, e.loc)
@@ -2457,7 +2488,7 @@ class VCGen:
 
     def ev_New(self, e: ir.New, ctx: Ctx) -> Val:
         if ctx.spec:
-            raise VCError("specifications cannot create objects", e.loc)
+            raise Unsupported("specifications cannot create objects", e.loc)
         if ctx.state is None:
             raise VCError("objects can only be created in code", e.loc)
         decl = self.program.classes.get(e.cls)
@@ -2518,7 +2549,7 @@ class VCGen:
         predicate = callee.key in self.program.predicates
         definitional = callee.key in self.program.definitional or predicate
         if ctx.spec and not definitional:
-            raise VCError(f"specs may only call pure (loop-free, mutation-free) functions; '{fn.name}' is not", loc)
+            raise Unsupported(f"specs may only call pure (loop-free, mutation-free) functions; '{fn.name}' is not", loc)
         # Callee preconditions (which may read object fields).
         cctx = Ctx(base=ctx.base, env={**heap_pre, **pmap}, module=callee.module, guard=ctx.guard, spec=True, quiet=True)
         for rq in fn.requires:

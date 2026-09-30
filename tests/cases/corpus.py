@@ -887,3 +887,27 @@ def parse_float_digits(s: str) -> float:
     #@ requires s == "3"
     #@ ensures result == 3.0
     return float(s)
+
+
+# expect: refuted
+def assigned_on_one_branch(c: bool) -> int:
+    if c:
+        y = 1
+    return y
+
+
+# expect: proved
+def assigned_where_read(c: bool) -> int:
+    #@ ensures result >= 0
+    if c:
+        y = 1
+    if c:
+        return y
+    return 0
+
+
+# expect: refuted
+def loop_var_after_empty_loop(xs: list[int]) -> int:
+    for i in range(len(xs)):
+        pass
+    return i

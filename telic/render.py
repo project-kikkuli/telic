@@ -116,6 +116,7 @@ KIND_HEADLINE = {
     "raises": "returns normally where it should raise",
     "return": "can fall off the end without returning",
     "assert": "assertion can fail",
+    "unbound": "variable can be read before it is assigned",
 }
 
 KIND_NOUN = {
@@ -131,6 +132,7 @@ KIND_NOUN = {
     "return": "return",
     "assert": "assertion",
     "lifecycle": "lifecycle",
+    "unbound": "assignment",
 }
 
 
