@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from fractions import Fraction
@@ -55,7 +56,11 @@ func telicList(_ j: TelicJ) -> [TelicJ] { if case .list(let xs) = j { return xs 
 func telicAtom(_ j: TelicJ) -> String { if case .atom(let s) = j { return String(s.dropFirst()) }; fatalError("telic harness: a value was expected") }
 func telicNull(_ j: TelicJ) -> Bool { if case .atom(let s) = j { return s == "n" }; return false }
 func telicInt<T: FixedWidthInteger>(_ j: TelicJ) -> T { T(telicAtom(j))! }
-func telicDouble(_ j: TelicJ) -> Double { let p = telicAtom(j).split(separator: "/"); return Double(String(p[0]))! / Double(String(p[1]))! }
+func telicDouble(_ j: TelicJ) -> Double {
+    let a = telicAtom(j)
+    if a.hasPrefix("x") { return Double(bitPattern: UInt64(a.dropFirst(), radix: 16)!) }
+    let p = a.split(separator: "/"); return Double(String(p[0]))! / Double(String(p[1]))!
+}
 func telicBool(_ j: TelicJ) -> Bool { telicAtom(j) == "t" }
 func telicString(_ j: TelicJ) -> String {
     let h = Array(telicAtom(j).utf8)
@@ -494,6 +499,10 @@ def wire(v: Any, tn: Any, h: Harness, seen: set) -> str:
             v = 0
         return f"i{int(v)}"
     if cat == "real":
+        if isinstance(v, dict) and "__float__" in v:
+            v = float(v["__float__"])
+        if isinstance(v, float):
+            return "rx" + struct.pack(">d", v).hex()
         if isinstance(v, dict) and "__real__" in v:
             n, den = v["__real__"]
         elif isinstance(v, Fraction):

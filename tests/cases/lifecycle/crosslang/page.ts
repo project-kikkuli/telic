@@ -3,7 +3,7 @@ export class Order {
   constructor(public paid: number) {}
 
   pay(amount: number): void {
-    //@ requires amount >= 0
+    //@ requires amount >= 0 && Number.isFinite(amount)
     this.paid = this.paid + amount
   }
 }

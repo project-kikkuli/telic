@@ -168,6 +168,8 @@ class LeanPrinter:
             if v.denominator == 1:
                 return (f"({v.numerator} : Rat)", 100)
             return (f"(({v.numerator} : Rat) / {v.denominator})", 100)
+        if isinstance(x, L.FloatV):
+            raise LeanUnsupported("floating-point values have no Lean model here")
         if isinstance(x, L.BoolV):
             return ("True" if x.value else "False"), 100
         if isinstance(x, L.StrV):

@@ -7,7 +7,8 @@ interface Item {
 
 type int = number;
 
-// expect: proved
+// expect: refuted
+// (NaN is not >= 0)
 export function absVal(x: number): number {
   //@ ensures result >= 0
   if (x < 0) return -x;
@@ -21,7 +22,8 @@ export function absBad(x: number): number {
   return x;
 }
 
-// expect: proved
+// expect: open
+// (a NaN element makes both sides NaN, and NaN !== NaN; the float sum is not modelled beyond that)
 export function sumList(xs: number[]): number {
   //@ ensures result === sum(xs)
   let total = 0;
@@ -31,7 +33,8 @@ export function sumList(xs: number[]): number {
   return total;
 }
 
-// expect: proved
+// expect: open
+// (a NaN element makes both sides NaN, and NaN !== NaN; the float sum is not modelled beyond that)
 export function sumReduce(xs: number[]): number {
   //@ ensures result === sum(xs)
   return xs.reduce((a, b) => a + b, 0);
@@ -48,7 +51,8 @@ export function indexOf(xs: number[], target: number): number {
   return -1;
 }
 
-// expect: proved
+// expect: open
+// (Infinity * 0 is NaN; the float sum is not modelled beyond that)
 export function orderTotal(items: Item[]): number {
   //@ requires items.every(it => it.price >= 0 && it.qty >= 0)
   //@ ensures result >= 0
@@ -85,7 +89,8 @@ export function meanBad(xs: number[]): number {
   return xs.reduce((a, b) => a + b, 0) / xs.length;
 }
 
-// expect: proved
+// expect: open
+// (true, but the float sum is not modelled beyond being a function of the array)
 export function mean(xs: number[]): number {
   //@ requires xs.length > 0
   //@ requires xs.every(x => x >= 0)
@@ -108,7 +113,8 @@ export function jsModNeg(a: number, b: number): number {
   return a % b;
 }
 
-// expect: proved
+// expect: refuted
+// (Math.min(NaN, hi) is NaN)
 export function clamp(x: number, lo: number, hi: number): number {
   //@ requires lo <= hi
   //@ ensures lo <= result && result <= hi
@@ -170,7 +176,8 @@ export function throwsDeclared(x: number): number {
   return x;
 }
 
-// expect: proved
+// expect: open
+// (past 2^53, n-- leaves n unchanged: the loop does not terminate)
 export function countdown(n: int): number {
   //@ requires n >= 0
   //@ ensures result === 0
@@ -195,7 +202,8 @@ export function label(paid: boolean, shipped: boolean): string {
   return "open";
 }
 
-// expect: proved
+// expect: refuted
+// (NaN !== NaN)
 export function usesMap(x: number): number {
   //@ ensures result === x
   const m = new Map<string, number>();
@@ -276,7 +284,8 @@ export function isCard(p: Payment): boolean {
   return p.method === "card" && p.last4.length >= 0;
 }
 
-// expect: proved
+// expect: refuted
+// (NaN !== NaN)
 export function cash(amount: number): Payment {
   //@ ensures result.method === "cash" && result.amount === amount
   return { method: "cash", amount };
@@ -299,7 +308,8 @@ export function ageNext(p: Profile | undefined): number {
   return (p?.age ?? 0) + 1;
 }
 
-// expect: proved
+// expect: refuted
+// (NaN !== NaN)
 export function firstOf(xs: readonly number[]): number {
   //@ requires xs.length > 0
   //@ ensures result === xs[0]
@@ -339,13 +349,15 @@ interface Dog extends Named {
   good: boolean;
 }
 
-// expect: proved
+// expect: refuted
+// (NaN !== NaN)
 export function describeAged(a: Aged): number {
   //@ ensures result === a.name.length + a.age
   return a.name.length + a.age;
 }
 
-// expect: proved
+// expect: refuted
+// (Math.max(NaN, 0) is NaN)
 export function livesLeft(p: Pet): number {
   //@ ensures result >= 0
   if (p.species === "dog") return p.good ? 1 : 0;
@@ -378,7 +390,8 @@ export function newWallets(ws: Wallet[], out: Wallet[]): void {
 
 export type Nested = { n: number; inner: { m: number; tag?: string } };
 
-// expect: proved
+// expect: refuted
+// (NaN !== NaN)
 export function nestedField(r: Nested): number {
   //@ ensures result === r.n + r.inner.m
   return r.n + r.inner.m;
@@ -490,7 +503,8 @@ export function filterByIndex(xs: number[]): number {
   return 0;
 }
 
-// expect: proved
+// expect: refuted
+// (NaN <= 0 is false, so posNum(NaN) is called)
 export function mapStatementsGuarded(xs: number[]): number {
   //@ ensures result === 0
   const ys = xs.filter((x) => {
@@ -529,4 +543,49 @@ export function parseFloatWrong(s: string): number {
   //@ requires s === "5"
   //@ ensures result === 6
   return parseFloat(s)
+}
+
+// expect: proved
+export function absFinite(x: number): number {
+  //@ requires !Number.isNaN(x)
+  //@ ensures result >= 0
+  if (x < 0) return -x;
+  return x;
+}
+
+// expect: proved
+export function sameValue(x: number): number {
+  //@ ensures Object.is(result, x)
+  const m = new Map<string, number>();
+  m.set("a", x);
+  return m.get("a")!;
+}
+
+// expect: proved
+export function countdownSafe(n: int): number {
+  //@ requires n >= 0 && Number.isSafeInteger(n)
+  //@ ensures result === 0
+  while (n > 0) {
+    n--;
+  }
+  return n;
+}
+
+// expect: proved
+export function centsTotal(prices: int[]): number {
+  //@ requires prices.every(p => Number.isInteger(p) && p >= 0 && p <= 1000000)
+  //@ ensures result >= 0
+  let total = 0;
+  for (let i = 0; i < prices.length && i < 1000; i++) {
+    //@ invariant 0 <= total && total <= i * 1000000
+    total += prices[i];
+  }
+  return total;
+}
+
+// expect: refuted
+// (0.1 * 3 is 0.30000000000000004: money in floats does not add up)
+export function floatMoney(): boolean {
+  //@ ensures result
+  return 0.1 * 3 === 0.3;
 }

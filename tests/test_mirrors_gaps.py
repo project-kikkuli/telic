@@ -7,14 +7,14 @@ from conftest import needs_node, run_check
 
 SERVER = """
 def discounted(subtotal: int, percent: int) -> int:
-    #@ requires subtotal >= 0 and 0 <= percent <= 100
+    #@ requires 0 <= subtotal <= 1000000 and 0 <= percent <= 100
     #@ ensures 0 <= result <= subtotal
     return subtotal - round(subtotal * percent / 100)
 """
 
 WEB = """export function discounted(subtotal: number, percent: number): number {
   //@ requires Number.isInteger(subtotal) && Number.isInteger(percent)
-  //@ requires subtotal >= 0 && 0 <= percent && percent <= 100
+  //@ requires subtotal >= 0 && subtotal <= 1000000 && 0 <= percent && percent <= 100
   //@ mirrors ../server/pricing.py::discounted
   //@ ensures 0 <= result && result <= subtotal
   return subtotal - Math.round((subtotal * percent) / 100);
@@ -96,14 +96,14 @@ def split(amount: int, parts: int) -> list[int]:
 
 SPLIT_TS = """type int = number;
 function shareOf(amount: int, parts: int, i: int): int {
-  //@ requires amount >= 0 && parts >= 1 && 0 <= i && i < parts
+  //@ requires Number.isSafeInteger(amount) && amount >= 0 && parts >= 1 && 0 <= i && i < parts
   const base = Math.floor(amount / parts);
   return i < amount % parts ? base + 1 : base;
 }
 
 export function splitAll(amount: int, parts: int): int[] {
   //@ mirrors ../server/split.py::split
-  //@ requires amount >= 0 && parts >= 1
+  //@ requires Number.isSafeInteger(amount) && amount >= 0 && parts >= 1
   //@ ensures result.length === parts
   //@ ensures range(0, parts).every(i => result[i] === shareOf(amount, parts, i))
   const out: int[] = [];

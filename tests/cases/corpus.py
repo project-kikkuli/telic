@@ -187,7 +187,8 @@ def fib_iter(n: int) -> int:
     return a
 
 
-# expect: proved
+# expect: open
+# (true, but Python sums floats with compensation, which telic does not model)
 def mean_float(xs: list[float]) -> float:
     #@ requires len(xs) > 0
     #@ requires all(x >= 0 for x in xs)

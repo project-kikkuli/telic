@@ -36,7 +36,7 @@ from typing import Any
 
 from . import ir
 
-CRASH_KINDS = {"div", "index", "none", "key", "overflow"}
+CRASH_KINDS = {"div", "index", "none", "key", "overflow", "finite"}
 MAX_ROUNDS = 5
 
 
@@ -343,7 +343,7 @@ def _stated(fn: ir.Function, program: Any) -> set[str]:
 
 
 def _kind(k: str) -> str:
-    return {"div": "division by zero", "index": "index out of bounds", "none": "None used as a value", "key": "missing key", "overflow": "overflow"}.get(k, k)
+    return {"div": "division by zero", "index": "index out of bounds", "none": "None used as a value", "key": "missing key", "overflow": "overflow", "finite": "NaN or infinity rounded to an integer"}.get(k, k)
 
 
 def _prune(cs: list[str], stated: set[str] = frozenset()) -> list[str]:  # type: ignore[assignment]

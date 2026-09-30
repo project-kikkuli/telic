@@ -63,8 +63,14 @@ def expr(e: ir.Expr) -> dict[str, Any]:
     d: dict[str, Any] = {"e": type(e).__name__, "ty": ty(e.ty), "loc": loc(e.loc)}
     if isinstance(e, ir.Lit):
         v = e.value
+        if isinstance(e.ty, ir.TReal) and isinstance(v, (int, Fraction, float)) and not isinstance(v, bool):
+            f = L.fval(v) if isinstance(v, float) else L.fnear(Fraction(v))
+            d["bits"] = f"{f.bits:016x}"
         if isinstance(v, Fraction):
             d["frac"] = [v.numerator, v.denominator]
+            d["value"] = None
+        elif isinstance(v, float):
+            d["float"] = repr(v)
             d["value"] = None
         else:
             d["value"] = v
@@ -212,6 +218,8 @@ class TermWriter:
             enc = ["i", str(t.value)]
         elif isinstance(t, L.RealV):
             enc = ["r", str(t.value.numerator), str(t.value.denominator)]
+        elif isinstance(t, L.FloatV):
+            enc = ["x", f"{t.bits:016x}"]
         elif isinstance(t, L.BoolV):
             enc = ["b", t.value]
         elif isinstance(t, L.StrV):
@@ -255,6 +263,8 @@ class TermReader:
             return L.IntV(int(enc[1]))
         if tag == "r":
             return L.RealV(Fraction(int(enc[1]), int(enc[2])))
+        if tag == "x":
+            return L.FloatV(int(enc[1], 16))
         if tag == "b":
             return L.BoolV(bool(enc[1]))
         if tag == "s":

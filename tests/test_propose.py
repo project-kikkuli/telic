@@ -10,7 +10,7 @@ from telic.checker import CheckOptions, check
 from telic.propose import draft_aims, propose, write_back
 
 SHOP = '''
-def average(xs: list[int]) -> float:
+def average(xs: list[float]) -> float:
     return sum(xs) / len(xs)
 
 

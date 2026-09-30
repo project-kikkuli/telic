@@ -92,6 +92,10 @@ TRUE_HELPERS = {
     "t32.rs": {"set"},
     "t43.py": {"pos", "grow", "Counter.__init__", "Counter.bump"},
     "t43.ts": {"pos", "Counter.__init__", "Counter.bump"},
+    "float1.py": {"fine"},
+    "float1.ts": {"fine"},
+    "float1.rs": {"fine", "to_int"},
+    "float1.swift": {"fine"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.
@@ -135,6 +139,43 @@ def test_strings_are_not_compared_symbolically_across_languages():
     got = {m.b.fn.name: m for m in rep.mirrors}
     assert set(got) == {"size", "before"}
     assert all(m.status == "refuted" and m.witness["replay"]["confirmed"] for m in got.values())
+
+
+# Float claims a rational model proves; each is refuted by a run of the real program.
+FLOAT_REFUTED = [
+    ("float1.py", ["classic", "reflexive", "zero_sign", "grows", "neg_zero", "exact_compare", "big_int", "held"]),
+    ("float1.ts", ["classic", "reflexive", "inc", "unsafe", "backAndForth", "floorUp", "tax"]),
+    ("float1.rs", ["classic", "reflexive", "grows", "nan_cast", "neg_zero"]),
+    ("float1.swift", ["classic", "reflexive", "grows", "zeroSign"]),
+]
+
+
+@pytest.mark.parametrize("name,fns", FLOAT_REFUTED)
+def test_false_float_claims_are_refuted_by_the_runtime(name, fns):
+    if name.endswith(".ts"):
+        if shutil.which("node") is None:
+            pytest.skip("Node.js not available")
+    if name.endswith(".rs"):
+        pytest.importorskip("tree_sitter_rust")
+        if shutil.which("cargo") is None and shutil.which("rustc") is None:
+            pytest.skip("rustc not available")
+    if name.endswith(".swift"):
+        pytest.importorskip("tree_sitter_swift")
+        if shutil.which("swiftc") is None:
+            pytest.skip("swiftc not available")
+    rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False), root=str(DIR))
+    status = {f.fn.name: f.status for f in rep.functions}
+    wrong = {fn: status.get(fn) for fn in fns if status.get(fn) != "refuted"}
+    assert not wrong, f"{name}: not refuted by a replayed counterexample: {wrong}"
+
+
+@needs_node
+def test_float_mirrors_differ_across_summation_orders():
+    rep = check([str(DIR / "mirfloat")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mirfloat"))
+    got = {m.b.fn.name: m for m in rep.mirrors}
+    assert set(got) == {"total", "add3"}
+    assert all(m.status != "proved" for m in got.values())
+    assert got["add3"].status == "refuted" and got["add3"].witness["replay"]["confirmed"]
 
 
 @needs_node

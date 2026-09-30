@@ -1,6 +1,7 @@
 """Differential tests for TypeScript classes, unions and nullish idioms: for
 each expression and input, telic must prove the value Node computes and
-refute any other."""
+refute any other. The contracts compare numbers with Object.is, which a NaN
+satisfies too."""
 
 import json
 import subprocess
@@ -14,16 +15,16 @@ PRELUDE = """
 export class Base {
   tag = 1;
   constructor(public x: number) {
-    //@ ensures this.x === x && this.tag === 1
+    //@ ensures Object.is(this.x, x) && this.tag === 1
   }
 
   get(): number {
-    //@ ensures result === this.x + this.tag
+    //@ ensures Object.is(result, this.x + this.tag)
     return this.x + this.tag;
   }
 
   bump(d: number): void {
-    //@ ensures this.x === old(this.x) + d
+    //@ ensures Object.is(this.x, old(this.x) + d)
     this.x += d;
   }
 }
@@ -32,24 +33,24 @@ export class Mid extends Base {
   y = 10;
 
   constructor(x: number) {
-    //@ ensures this.x === x && this.tag === 1 && this.y === 10
+    //@ ensures Object.is(this.x, x) && this.tag === 1 && this.y === 10
     super(x);
   }
 
   get(): number {
-    //@ ensures result === this.x + this.tag
+    //@ ensures Object.is(result, this.x + this.tag)
     return this.x + this.tag;
   }
 
   both(): number {
-    //@ ensures result === this.x + this.tag + this.y
+    //@ ensures Object.is(result, this.x + this.tag + this.y)
     return super.get() + this.y;
   }
 }
 
 export class Leaf extends Mid {
   constructor(x: number, public z: number) {
-    //@ ensures this.x === 2 * x && this.tag === 1 && this.y === z
+    //@ ensures Object.is(this.x, 2 * x) && this.tag === 1 && Object.is(this.y, z)
     super(x * 2);
     this.y = z;
   }
@@ -62,8 +63,8 @@ export abstract class Sh {
 export type Shape = { kind: "sq"; side: number } | { kind: "rect"; w: number; h: number } | { kind: "dot" };
 
 export function area(s: Shape): number {
-  //@ ensures implies(s.kind === "sq", result === s.side * s.side)
-  //@ ensures implies(s.kind === "rect", result === s.w * s.h)
+  //@ ensures implies(s.kind === "sq", Object.is(result, s.side * s.side))
+  //@ ensures implies(s.kind === "rect", Object.is(result, s.w * s.h))
   //@ ensures implies(s.kind === "dot", result === 0)
   switch (s.kind) {
     case "sq":
@@ -81,7 +82,7 @@ export interface Opt {
 }
 
 export function pick(o: Opt | undefined, d: number): number {
-  //@ ensures result === (o === undefined ? d : o.v !== undefined ? o.v : o.w !== undefined ? o.w : d)
+  //@ ensures Object.is(result, o === undefined ? d : o.v !== undefined ? o.v : o.w !== undefined ? o.w : d)
   return o?.v ?? o?.w ?? d;
 }
 """

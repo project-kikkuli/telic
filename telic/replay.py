@@ -13,6 +13,7 @@ the actual runtime (CPython, Node) with contracts enforced, and reported as
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -43,6 +44,8 @@ def _encode_any(v: Any) -> Any:
         return {"__object__": ir.source_name(v["__class__"]), "ref": v.get("__ref__"), "fields": fields}
     if isinstance(v, Fraction):
         return {"__real__": [v.numerator, v.denominator]}
+    if isinstance(v, float):
+        return {"__float__": repr(v)}
     if isinstance(v, list):
         return [_encode_any(x) for x in v]
     if isinstance(v, dict):
@@ -94,6 +97,8 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(ty, ir.TEnum) and isinstance(v, int) and not isinstance(v, bool):
         return {"__enum__": ty.name, "member": ty.members[v] if 0 <= v < len(ty.members) else ty.members[0]}
     if isinstance(ty, ir.TReal):
+        if isinstance(v, float):
+            return {"__float__": repr(v)}
         if isinstance(v, Fraction):
             return {"__real__": [v.numerator, v.denominator]}
         return {"__real__": [int(v or 0), 1]}
@@ -138,6 +143,10 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return format_value(Fraction(n, d), ir.REAL, lang)
+    if isinstance(v, dict) and "__float__" in v:
+        return format_float(float(v["__float__"]), lang)
+    if isinstance(v, float):
+        return format_float(v, lang)
     if isinstance(ty, ir.TRecord) and isinstance(v, dict) and "__record__" not in v:
         v = {"__record__": ty.name, "fields": v}
     if isinstance(v, dict) and "__record__" in v and lang == "rust" and isinstance(ty, ir.TRecord):
@@ -166,6 +175,18 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, str):
         return json.dumps(v) if lang != "python" else repr(v)
     return str(v)
+
+
+def format_float(f: float, lang: str) -> str:
+    """A float literal as the language writes it, NaN, infinities and -0.0 included."""
+    if math.isnan(f):
+        return {"python": "float('nan')", "typescript": "NaN", "rust": "f64::NAN", "swift": "Double.nan"}.get(lang, "nan")
+    if math.isinf(f):
+        s = {"python": "float('inf')", "typescript": "Infinity", "rust": "f64::INFINITY", "swift": "Double.infinity"}.get(lang, "inf")
+        return s if f > 0 else "-" + s
+    if lang == "typescript":
+        return "-0" if f == 0 and math.copysign(1, f) < 0 else repr(f).removesuffix(".0")
+    return repr(f)
 
 
 def _rust_record(fields: dict[str, Any], ty: ir.TRecord) -> str:
@@ -356,7 +377,9 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
             return True  # a trap where a native assertion (bounds, precondition, fatalError) fails
         return (v in ("assert", "assume") and _same(out.get("text", ""), ob.clause)) or crash == "AssertionError" or (lang == "rust" and crash == "panic")
     if k == "overflow":
-        return crash == "overflow" or (lang == "swift" and crash == "trap")
+        return crash in ("overflow", "OverflowError") or (lang == "swift" and crash == "trap")
+    if k == "finite":
+        return crash in ("ValueError", "OverflowError", "overflow") or (lang == "swift" and crash == "trap") or bool(out.get("nonfinite"))
     if k == "div":
         return crash == "ZeroDivisionError" or (lang == "typescript" and bool(out.get("nonfinite")))
     if k == "index":

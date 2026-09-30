@@ -606,12 +606,42 @@ checked like one in code.
 
 ## Types and semantics
 
-**Numbers.** Python `int` is exact; `float` and JavaScript `number` are exact
-rationals. `/` is real division; Python `//` floors and `%` takes the divisor's
-sign; JavaScript `%` truncates; `round` rounds halves to even, `Math.round` rounds
-them up. In TypeScript a `number` is an integer when telic can show it
-(integer literals, `.length`, `Math.floor/…`, `Number.isInteger(p)` in a
-`@requires`, or a `type int = number` alias).
+**Numbers.** Python `int` is exact. Python `float`, TypeScript `number`, Rust
+`f64` and Swift `Double` are IEEE 754 doubles (Z3's floating-point theory,
+round to nearest even): `0.1 + 0.2 == 0.3` is false, `NaN == NaN` is false and
+every comparison with NaN is false, `-0.0 == 0.0`, and overflow gives
+±Infinity. A `float` parameter can be NaN or ±Infinity unless a `@requires`
+says otherwise (`math.isfinite(x)`, `Number.isFinite(x)`, `x.is_finite()`,
+`x.isFinite`). Rust `f32` and Swift `Float`/`Float80` are not modelled (opaque).
+
+- Rounding a float to an integer (`math.floor`, `int(x)`, `round`,
+  `Math.floor/ceil/trunc/round`, `Int(x)`) must see a finite number: it is an
+  obligation, because Python raises, Swift traps and JavaScript gives NaN. Rust
+  `x as i64` maps NaN to 0 and saturates.
+- Python compares an `int` with a `float` exactly (`2**53 + 1 != float(2**53)`).
+  Converting an `int` to a `float` rounds, and raises `OverflowError` past the
+  largest float, which is an obligation. `int / int` is the exact quotient
+  rounded once. A parameter annotated `float` is assumed to hold a float.
+- A TypeScript `number` is an integer when telic can show it (integer
+  literals, `.length`, `Math.floor/…`, `Number.isInteger(p)` in a `@requires`,
+  or a `type int = number` alias). Integer `+`, `-`, `*` are exact while the
+  result stays within 2^53 in magnitude; past that the result is a rounded
+  number telic does not know, so `n + 1 > n` needs
+  `Number.isSafeInteger(n) && n < Number.MAX_SAFE_INTEGER`. An array has at
+  most 2^32 − 1 elements, so counters and indices bounded by a length stay
+  exact. An integer used as a double may be `-0`.
+- `/` is double division (a divisor of zero is still an obligation); Python
+  `//` floors and `%` takes the divisor's sign; JavaScript `%` truncates;
+  `round` rounds halves to even, `Math.round` rounds them up. `//` and `%` on
+  floats, and `sum` of floats, are not modelled beyond being functions of their
+  arguments: Python sums floats with compensation, JavaScript left to right,
+  so a sum of floats is never equal across languages by proof.
+- `min`/`max` of floats agree across languages except with NaN or two zeros;
+  there the result is unknown. Lists and records holding floats compare
+  element by element with `==`, and in Python a NaN element may equal itself
+  (Python compares by identity first). Dicts keyed by floats are not modelled.
+- Money in floats does not prove: `price * 0.03 == price * 3 / 100` is refuted
+  with a counterexample the runtime confirms. Keep money in integer cents.
 
 **Objects.** Classes are references: two parameters may be the same object, and
 counterexamples show it (`f(a=<Box v=0>, b=a)`). A class invariant (`#@ invariant`

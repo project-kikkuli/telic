@@ -16,7 +16,7 @@ export type Rec = { kind: "a" | "b"; n: number; inner: Inner };
 HELPER
 
 export function caller(r: Rec): number {
-  //@ ensures result === r.n
+  //@ ensures Object.is(result, r.n)
   look(r);
   return r.n;
 }

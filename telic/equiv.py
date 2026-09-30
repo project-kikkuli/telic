@@ -261,6 +261,8 @@ def _model(fn: ir.Function, args: list[Any]) -> dict[str, Any]:
 def _decode_arg(a: Any) -> Any:
     if isinstance(a, dict) and "__real__" in a:
         return Fraction(*a["__real__"])
+    if isinstance(a, dict) and "__float__" in a:
+        return float(a["__float__"])
     if isinstance(a, list):
         return [_decode_arg(x) for x in a]
     return a

@@ -197,6 +197,8 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
         if d.get("frac"):
             n, den = d["frac"]
             return ir.Lit(ty, loc, Fraction(n, den))
+        if d.get("float"):
+            return ir.Lit(ty, loc, float(d["float"]))
         v = d["value"]
         if isinstance(ty, ir.TReal) and isinstance(v, (int, float)) and not isinstance(v, bool):
             return ir.Lit(ty, loc, Fraction(v))

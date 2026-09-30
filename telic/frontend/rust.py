@@ -23,6 +23,7 @@ arithmetic is mathematical (no overflow), ``result`` is the return value,
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -43,8 +44,10 @@ from ..lifecycle import LifecycleError
 from ..lifecycle import build as build_lifecycle
 from .rust_crate import ModPath, Res
 
+F64_CONSTS = {"EPSILON": Fraction(2) ** -52, "MAX": float.fromhex("0x1.fffffffffffffp+1023"), "MIN": -float.fromhex("0x1.fffffffffffffp+1023"), "MIN_POSITIVE": Fraction(2) ** -1022, "NAN": math.nan, "INFINITY": math.inf, "NEG_INFINITY": -math.inf}
+
 RUST_ASSUMPTIONS = [
-    "f32/f64 are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
+    "f32 values are not modelled (opaque); f64 is IEEE binary64",
     "integer overflow panics (debug build semantics); release builds wrap instead",
     "println!/eprintln!/dbg! and logging have no effect on program state",
 ]
@@ -599,8 +602,10 @@ class RustFrontend:
         if k == "primitive_type":
             if txt in INT_KINDS:
                 return ir.INT, txt
-            if txt in ("f32", "f64"):
+            if txt == "f64":
                 return ir.REAL, None
+            if txt == "f32":
+                return ir.TOpaque("f32: single precision is not modelled"), None
             if txt == "bool":
                 return ir.BOOL, None
             if txt in ("str", "char"):
@@ -1848,8 +1853,8 @@ class ExprLowerer:
         if len(parts) == 2 and parts[0] in INT_KINDS and parts[1] in ("MAX", "MIN"):
             lo, hi = int_range(parts[0])
             return self.kinded(ir.Lit(ir.INT, loc, hi if parts[1] == "MAX" else lo), parts[0])
-        if len(parts) >= 2 and parts[-2] in ("f32", "f64") and parts[-1] in ("EPSILON",):
-            return ir.Lit(ir.REAL, loc, Fraction(2) ** -52 if parts[-2] == "f64" else Fraction(2) ** -23)
+        if len(parts) >= 2 and parts[-2] == "f64" and parts[-1] in F64_CONSTS:
+            return ir.Lit(ir.REAL, loc, F64_CONSTS[parts[-1]])
         hit = self.fe.lookup(txt)
         if hit is not None:
             v = self._path_value(hit, txt, n, expect, loc)
@@ -1909,7 +1914,7 @@ class ExprLowerer:
                 return self.kinded(ir.Binary(ir.INT, loc, "sub", ir.Binary(ir.INT, loc, "fmod", ir.Binary(ir.INT, loc, "add", v, h), m), h), tt)
             if v.ty == ir.REAL:
                 lo, hi = int_range(tt)
-                t = ir.Builtin(ir.INT, loc, "trunc", (v,))
+                t = ir.Builtin(ir.INT, loc, "trunc_sat", (v,))  # NaN -> 0, infinities saturate
                 return self.kinded(ir.Builtin(ir.INT, loc, "min", (ir.Builtin(ir.INT, loc, "max", (t, ir.Lit(ir.INT, loc, lo))), ir.Lit(ir.INT, loc, hi))), tt)  # saturating
             if v.ty == ir.BOOL:
                 return self.kinded(ir.Ite(ir.INT, loc, v, ir.Lit(ir.INT, loc, 1), ir.Lit(ir.INT, loc, 0)), tt)
@@ -2928,6 +2933,11 @@ class ExprLowerer:
         k = self.kind_of(recv)
         if t == ir.INT:
             return self.int_method(recv, m, argn, n, k)
+        if t == ir.REAL and m in ("is_nan", "is_finite", "is_infinite") and not argn:
+            return ir.Builtin(ir.BOOL, loc, {"is_nan": "is_nan", "is_finite": "is_finite", "is_infinite": "is_inf"}[m], (recv,))
+        if t == ir.REAL and m in ("is_sign_negative", "is_sign_positive") and not argn:
+            neg = ir.Builtin(ir.BOOL, loc, "sign_bit", (recv,))
+            return neg if m == "is_sign_negative" else ir.Unary(ir.BOOL, loc, "not", neg)
         if t == ir.REAL:
             if m in ("abs", "floor", "ceil", "sqrt", "round", "trunc", "min", "max", "powi", "powf") and not self.spec:
                 args = [self.expr(a, ir.REAL) for a in argn]

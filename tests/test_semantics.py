@@ -3,6 +3,7 @@ with the real interpreter on random expressions. If these fail, a proof could
 be about a program that does not exist."""
 
 import json
+import math
 import os
 import random
 import subprocess
@@ -61,8 +62,6 @@ def py_expr(rnd, depth=0):
 
 
 def test_python_integer_semantics_match_cpython():
-    import math
-
     rnd = random.Random(1234)
     checked = 0
     for k in range(N_EXPR):
@@ -256,3 +255,92 @@ def test_python_built_lists_match_cpython(e):
             s.add(enc.term(f))
         s.add(z3.Not(enc.term(L.eq(ex.value, L.IntV(want)))))
         assert s.check() == z3.unsat, (e, a, b, want)
+
+
+FLOATS = [0.0, -0.0, 0.1, 0.2, 0.3, -1.5, 3.0, 1e308, -1e308, 5e-324, float("inf"), float("-inf"), float("nan"), 9007199254740993.0]
+
+
+def float_value(module, fname, a, b):
+    program = Program.build([module])
+    ref = program.resolve(module, fname)
+    g = VCGen(program, ref, inputs={"a": L.fval(a), "b": L.fval(b)})
+    g.definitional_mode = True
+    g.run()
+    (ex,) = [e for e in g.exits if e.value is not None]
+    return to_python(z3.simplify(Z3Encoder([]).term(ex.value)))
+
+
+def same_float(x, y) -> bool:
+    """The same double: NaN is NaN, -0.0 is not 0.0."""
+    if isinstance(x, float) and isinstance(y, float):
+        return (math.isnan(x) and math.isnan(y)) or (x == y and math.copysign(1, x) == math.copysign(1, y))
+    return x == y
+
+
+def float_expr(rnd, js=False, depth=0):
+    if depth > 2 or rnd.random() < 0.3:
+        return rnd.choice(["a", "b", "0.1", "0.5", "-0.0", "1e308", "3.0"])
+    x, y = float_expr(rnd, js, depth + 1), float_expr(rnd, js, depth + 1)
+    if js:
+        return rnd.choice([f"({x} + {y})", f"({x} - {y})", f"({x} * {y})", f"Math.abs({x})", f"(-({x}))", f"({x} < {y} ? {x} : {y})", f"({x} === {y} ? {x} : {y})"])
+    return rnd.choice([f"({x} + {y})", f"({x} - {y})", f"({x} * {y})", f"abs({x})", f"(-{x})", f"({x} if {x} < {y} else {y})", f"({x} if {x} == {y} else {y})"])
+
+
+def test_python_float_semantics_match_cpython():
+    rnd = random.Random(7)
+    checked = 0
+    for _ in range(60):
+        e = float_expr(rnd)
+        mod = lower_python("gen.py", f"def f(a: float, b: float) -> float:\n    return {e}\n")
+        assert not mod.functions["f"].unsupported, (e, mod.functions["f"].unsupported)
+        for a, b in [(rnd.choice(FLOATS), rnd.choice(FLOATS)) for _ in range(6)]:
+            expected = eval(e, {"a": a, "b": b})
+            got = float_value(mod, "f", a, b)
+            assert same_float(got, expected), f"{e} at a={a!r}, b={b!r}: model {got!r}, CPython {expected!r}"
+            checked += 1
+    assert checked >= 300
+
+
+@pytest.mark.parametrize("e", ["a == b", "a < b", "a <= b", "a != b", "a / b", "float(9007199254740993) == 9007199254740993", "9007199254740993 > b", "math.isnan(a)", "math.isinf(a) or math.isfinite(b)", "math.copysign(2.0, a)", "7 / 2 == 3.5"])
+def test_python_float_idioms_match_cpython(e):
+    ret = "float" if e in ("a / b", "math.copysign(2.0, a)") else "bool"
+    mod = lower_python("gen.py", f"import math\n\ndef f(a: float, b: float) -> {ret}:\n    return {e}\n")
+    assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+    for a in FLOATS:
+        for b in FLOATS:
+            try:
+                expected = eval(e, {"a": a, "b": b, "math": math})
+            except ZeroDivisionError:
+                continue
+            got = float_value(mod, "f", a, b)
+            if isinstance(got, str):
+                continue  # a NaN's sign: not modelled
+            assert same_float(got, expected), f"{e} at a={a!r}, b={b!r}: model {got!r}, CPython {expected!r}"
+
+
+@needs_node
+def test_javascript_float_semantics_match_node(tmp_path):
+    from telic.frontend.typescript import lower_typescript_files
+
+    rnd = random.Random(8)
+    exprs = [float_expr(rnd, js=True) for _ in range(40)]
+    files = []
+    for i, e in enumerate(exprs):
+        p = tmp_path / f"e{i}.ts"
+        p.write_text(f"export function f(a: number, b: number): number {{\n  return {e};\n}}\n")
+        files.append(str(p))
+    mods = lower_typescript_files(files, str(tmp_path))
+    cases = [(i, rnd.choice(FLOATS), rnd.choice(FLOATS)) for i in range(len(exprs)) for _ in range(6)]
+    lit = lambda x: "NaN" if math.isnan(x) else ("Infinity" if x > 0 else "-Infinity") if math.isinf(x) else repr(x)  # noqa: E731
+    js = "const out = [];\n" + "\n".join(f"out.push((function(a, b) {{ return {exprs[i]}; }})({lit(a)}, {lit(b)}));" for i, a, b in cases) + "\nconsole.log(JSON.stringify(out.map(x => Object.is(x, -0) ? '-0.0' : String(x))));"
+    real = json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+    checked = 0
+    for (i, a, b), s in zip(cases, real):
+        expected = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}.get(s, None)
+        expected = float(s) if expected is None else expected
+        got = float_value(mods[files[i]], "f", a, b)
+        if isinstance(got, str):
+            continue  # an integer zero's sign, which the model leaves open
+        checked += 1
+        assert same_float(got, expected), f"{exprs[i]} at a={a!r}, b={b!r}: model {got!r}, node {expected!r}"
+    assert checked >= 150

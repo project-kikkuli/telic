@@ -39,7 +39,7 @@ let term_of loc = function
 let rec sort_of (ty : Ir.ty) : sort =
   match ty with
   | TInt -> Int
-  | TReal -> Real
+  | TReal -> Float64
   | TBool -> Bool
   | TStr -> Str
   | TRecord (n, fs) -> Rec (n, List.map (fun (f, t) -> (f, field_sort t)) fs)
@@ -70,6 +70,7 @@ let components (ty : Ir.ty) : (string * sort) list =
     [ ("some", Bool); ("val", sort_of inner) ]
   | TDict (k, v) ->
     if complex v then raise (Vc_error ("dict values that are containers are not supported yet", Ir.noloc));
+    if k = TReal then raise (Vc_error ("dicts keyed by floats are not modelled (0.0 and -0.0 are one key, NaN keys are compared by identity)", Ir.noloc));
     let ks = sort_of k in
     [ ("vals", Array (ks, sort_of v)); ("has", Array (ks, Bool)) ]
   | t -> [ ("", sort_of t) ]
@@ -106,6 +107,7 @@ let rec default_term (s : sort) =
   match s with
   | Int -> zero
   | Real -> real (Q.of_int 0)
+  | Float64 -> mk (Big "0000000000000000") Float64
   | Bool -> ff
   | Str -> str ""
   | Array (_, e) -> const_array s (default_term e)
@@ -147,13 +149,16 @@ let round_even x =
   let half = real (Q.make 1 2) in
   ite (lt d half) f (ite (lt half d) (add f one) (ite (eq (emod f (int_ 2)) zero) f (add f one)))
 
-let rec rec_equal a b =
-  match a.sort with
-  | Rec (n, fields) when String.length n > 4 && String.sub n 0 4 = "Opt_" ->
-    let sa = field a "some" and sb = field b "some" in
-    and_ [ eq sa sb; implies sa (rec_equal (field a "val") (field b "val")) ]
-  | Rec (_, fields) -> and_ (List.map (fun (f, _) -> rec_equal (field a f) (field b f)) fields)
-  | _ -> eq a b
+(* equality as the language sees it; floats compare by [feq] *)
+let rec rec_equal ?(feq = feq) a b =
+  if a.sort = Float64 || b.sort = Float64 then feq a b
+  else
+    match a.sort with
+    | Rec (n, _) when String.length n > 4 && String.sub n 0 4 = "Opt_" ->
+      let sa = field a "some" and sb = field b "some" in
+      and_ [ eq sa sb; implies sa (rec_equal ~feq (field a "val") (field b "val")) ]
+    | Rec (_, fields) -> and_ (List.map (fun (f, _) -> rec_equal ~feq (field a f) (field b f)) fields)
+    | _ -> eq a b
 
 (* -- program information (computed by the Python side) ------------------ *)
 
@@ -170,6 +175,7 @@ type finfo = {
   termination : bool;  (** does its recursion group need a termination proof *)
   resolve : (string * string) list;  (** call name -> function key *)
   untrusted : (string * int) list;  (** (class, index) of invariants a call through a base does not establish on self *)
+  language : string;
 }
 
 type classinfo = {
@@ -296,6 +302,19 @@ type gen = {
 let next g =
   g.counter <- g.counter + 1;
   g.counter
+
+(* What a list length can be: a JavaScript array has at most 2^32-1
+   elements; elsewhere a length is a signed 64-bit size. *)
+let len_ok g n = and_ [ le zero n; le n (if g.info.language = "typescript" then int_ 4294967295 else mk (Big "9223372036854775807") Int) ]
+
+(* every integer up to this magnitude is a double *)
+let safe = int_ (1 lsl 53)
+
+(* 2^1024 - 2^970: an integer at least this large rounds past the largest float *)
+let float_max = "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792"
+
+(* 2^1100: beyond every integer type, where an infinity saturates *)
+let huge = "13582985290493858492773514283592667786034938469317445497485196697278130927542418487205392083207560592298578262953847383475038725543234929971155548342800628721885763499406390331782864144164680730766837160526223176512798435772129956553355286032203080380775759732320198985094884004069116123084147875437183658467465148948790552744165376"
 
 let tyname = function
   | Ir.TInt -> "int" | TReal -> "real" | TBool -> "bool" | TStr -> "str" | TNone -> "none"
@@ -456,6 +475,7 @@ let index_of g (arr, off, len) i wrap ctx loc what =
 
 let lit_value (e : Ir.expr) =
   match e.e with
+  | Lit (LFloat bits) -> T (mk (Big bits) Float64)
   | Lit (LInt s) -> (
     match int_of_string_opt s with
     | Some n -> ( match e.ty with TReal -> T (real (Q.of_int n)) | _ -> T (int_ n))
@@ -602,11 +622,12 @@ let rec ev g ctx (e : Ir.expr) : value =
       | "gt" -> T (gt x y)
       | "ge" -> T (ge x y)
       | "rdiv" | "floordiv" | "fmod" | "tmod" | "tdiv" ->
-        let z = lit_of_int 0 y.sort in
         let sym = match op with "rdiv" | "tdiv" -> "/" | "floordiv" -> "//" | _ -> "%" in
-        oblige g "div" ctx (ne y z) loc (Printf.sprintf "divisor of '%s' is non-zero" sym);
-        if not (ctx.quiet || ctx.spec) then assume ctx (ne y z);
+        let nonzero = if y.sort = Float64 then not_ (fpred "fp.isZero" y) else ne y (lit_of_int 0 y.sort) in
+        oblige g "div" ctx nonzero loc (Printf.sprintf "divisor of '%s' is non-zero" sym);
+        if not (ctx.quiet || ctx.spec) then assume ctx nonzero;
         if op = "rdiv" then T (rdiv x y)
+        else if x.sort = Float64 then T (fn (Printf.sprintf "float.%s.%s" op g.info.language) [| x; y |] Float64)
         else if x.sort = Real then begin
           let q = rdiv x y in
           let qi = if op = "fmod" || op = "floordiv" then floor q else ite (le (real (Q.of_int 0)) q) (floor q) (neg (floor (neg q))) in
@@ -728,17 +749,58 @@ let rec ev g ctx (e : Ir.expr) : value =
   | New (cls, args) -> new_object g ctx loc cls args
   | Extern (name, args) -> extern g ctx e name args
 
+(* A value the model does not determine. In a definition (loop-free, pure)
+   it is a function of the definition's inputs at this site. *)
+and unknown g name sort (loc : Ir.loc) =
+  if not g.definitional_mode then const (Printf.sprintf "%s!%d" name (next g)) sort
+  else fn (Printf.sprintf "%s@%d:%d" name loc.line loc.col) (Array.of_list (List.concat_map (fun (_, v) -> flatten v) (SM.bindings g.entry))) sort
+
+(* floats held in a list or record, compared with it: Python compares those by
+   identity first, so a NaN may equal itself (unknown then) *)
+and held_feq g ?(at = [||]) a b =
+  if g.info.language <> "python" then feq a b
+  else begin
+    if g.definitional_mode then raise (Vc_error ("== on lists or objects holding floats is not modelled here: Python compares a NaN inside them by identity", Ir.noloc));
+    let both = and_ [ fpred "fp.isNaN" a; fpred "fp.isNaN" b ] in
+    let n = next g in
+    let same = if Array.length at > 0 then fn (Printf.sprintf "same_nan!%d" n) at Bool else const (Printf.sprintf "same_nan!%d" n) Bool in
+    or_ [ feq a b; and_ [ both; same ] ]
+  end
+
+(* does list element [x] match [v] for in / includes / contains? *)
+and member_eq g x v i =
+  if x.sort <> Float64 then eq x v
+  else if g.info.language = "typescript" then or_ [ feq x v; and_ [ fpred "fp.isNaN" x; fpred "fp.isNaN" v ] ]
+  else held_feq g ~at:[| i |] x v
+
+(* Python raises OverflowError where a number rounds past the largest float *)
+and float_fits g ctx r loc message =
+  let ok = lt (abs_ r) (mk (Big float_max) Int) in
+  oblige g "overflow" ctx ok loc message;
+  if not (ctx.quiet || ctx.spec) then assume ctx ok
+
+(* languages agree on min/max of two floats unless one is NaN or both are zeros *)
+and float_minmax g name a b =
+  let a = as_float a and b = as_float b in
+  let plain = and_ [ not_ (fpred "fp.isNaN" a); not_ (fpred "fp.isNaN" b); not_ (and_ [ fpred "fp.isZero" a; fpred "fp.isZero" b ]) ] in
+  let pick = if name = "min" then ite (lt b a) b a else ite (lt a b) b a in
+  ite plain pick (fn (Printf.sprintf "float.%s.%s" name g.info.language) [| a; b |] Float64)
+
 and equal g a b =
   match (a, b) with
   | L x, L y ->
     let i = const (Printf.sprintf "eq!%d" (next g)) Int in
-    let same = forall [ i ] (implies (and_ [ le zero i; lt i x.len ]) (eq (at (x.arr, x.off) i) (at (y.arr, y.off) i))) in
+    let same = forall [ i ] (implies (and_ [ le zero i; lt i x.len ]) (rec_equal ~feq:(held_feq g ~at:[| i |]) (at (x.arr, x.off) i) (at (y.arr, y.off) i))) in
     and_ [ eq x.len y.len; same ]
   | O o, NoneV | NoneV, O o -> not_ o.some
-  | O x, O y -> and_ [ eq x.some y.some; implies x.some (eq x.v y.v) ]
-  | O o, T t | T t, O o -> and_ [ o.some; eq o.v t ]
+  | O x, O y ->
+    let feq = match x.v.sort with Rec _ -> held_feq g ~at:[||] | _ -> feq in
+    and_ [ eq x.some y.some; implies x.some (rec_equal ~feq x.v y.v) ]
+  | O o, T t | T t, O o ->
+    let feq = match o.v.sort with Rec _ -> held_feq g ~at:[||] | _ -> feq in
+    and_ [ o.some; rec_equal ~feq o.v t ]
   | D _, _ | _, D _ -> raise (Vc_error ("comparing whole dicts with == is not supported", Ir.noloc))
-  | T x, T y -> rec_equal x y
+  | T x, T y -> (match x.sort with Rec _ -> rec_equal ~feq:(held_feq g ~at:[||]) x y | _ -> rec_equal x y)
   | NoneV, NoneV -> tt
   | _ -> raise (Vc_error ("comparing values of different shapes", Ir.noloc))
 
@@ -778,13 +840,63 @@ and class_lifecycles g cls r pre post base =
         (cl, implies typed (term_of cl.cloc (ev g ctx cl.cexpr))))
       c.clcs
 
+(* Python int / int raises on a zero divisor and on a quotient past the largest float *)
+and truediv_checks g ctx a b loc =
+  let nonzero = ne b zero in
+  oblige g "div" ctx nonzero loc "divisor of '/' is non-zero";
+  if not (ctx.quiet || ctx.spec) then assume ctx nonzero;
+  let big = mk (Big (float_max ^ "/1")) Real in
+  let fits = lt (to_real (abs_ a)) (mul big (to_real (abs_ b))) in
+  oblige g "overflow" ctx fits loc "the quotient of '/' fits in a float";
+  if not (ctx.quiet || ctx.spec) then assume ctx fits
+
+(* the integers of a quotient of two integers (Python int / int, or
+   JavaScript integer-valued numbers), with the division's obligations *)
+and int_quotient g ctx (e : Ir.expr) =
+  let js_int (x : Ir.expr) = match x.e with Builtin ("js_real", [ y ]) when y.ty = TInt -> Some y | _ -> None in
+  match e.e with
+  | Builtin ("py_truediv", [ a; b ]) ->
+    let a = term_of e.loc (ev g ctx a) in
+    let b = term_of e.loc (ev g ctx b) in
+    truediv_checks g ctx a b e.loc;
+    Some (a, b)
+  | Binary ("rdiv", l, r) -> (
+    match (js_int l, js_int r) with
+    | Some l, Some r ->
+      let a = term_of e.loc (ev g ctx l) in
+      let b = term_of e.loc (ev g ctx r) in
+      let nonzero = ne b zero in
+      oblige g "div" ctx nonzero e.loc "divisor of '/' is non-zero";
+      if not (ctx.quiet || ctx.spec) then assume ctx nonzero;
+      Some (a, b)
+    | _ -> None)
+  | _ -> None
+
+(* an integer quotient's double, rounded to an integer: while |a| < 2^52 and
+   |b| <= 2^53 the double's single rounding never crosses an integer or a
+   half, so this is the exact quotient rounded; past that, unknown *)
+and round_quotient name a b =
+  let q = rdiv (to_real a) (to_real b) in
+  let exact =
+    match name with
+    | "floor" -> floor q
+    | "ceil" -> neg (floor (neg q))
+    | "trunc" -> ite (le (real (Q.of_int 0)) q) (floor q) (neg (floor (neg q)))
+    | "round_even" -> round_even q
+    | _ -> floor (add q (real (Q.make 1 2)))
+  in
+  let small = and_ [ lt (abs_ a) (int_ (1 lsl 52)); le (abs_ b) safe ] in
+  ite small exact (fn ("round_quotient." ^ name) [| a; b |] Int)
+
 and builtin g ctx (e : Ir.expr) name args =
   let loc = e.loc in
   let tm x = term_of loc x in
   let lit_str (a : Ir.expr) = match a.e with Lit (LStr s) -> s | Lit (LInt s) -> s | _ -> raise (Vc_error ("expected a literal", loc)) in
   let assume_ t = assume ctx t in
+  let quotient = match (name, args) with ("floor" | "ceil" | "trunc" | "round_even" | "round_up"), [ a ] -> int_quotient g ctx a | _ -> None in
   match name with
   | "py_int_parse" | "py_float_parse" | "js_parse_int" | "js_parse_float" -> parse_number g ctx e name (tm (ev g ctx (List.hd args)))
+  | _ when quotient <> None -> let a, b = Option.get quotient in T (round_quotient name a b)
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
   | "each" ->
     let seq = match ev g ctx (List.hd args) with L l -> l | _ -> raise (Vc_error ("comprehension over a non-list", loc)) in
@@ -793,7 +905,7 @@ and builtin g ctx (e : Ir.expr) name args =
      | TNone -> NoneV
      | t ->
        let r = fresh g "comprehension" t () in
-       (match r with L l -> assume ctx (le zero l.len) | _ -> ());
+       (match r with L l -> assume ctx (len_ok g l.len) | _ -> ());
        r)
   | "range_list" ->
     let lo, hi = match args with [ a; b ] -> (tm (ev g ctx a), tm (ev g ctx b)) | _ -> raise (Vc_error ("range_list takes two bounds", loc)) in
@@ -855,7 +967,7 @@ and builtin g ctx (e : Ir.expr) name args =
       let ty = e.ty in
       let tag = ty_str ty in
       let v = pack ty (List.map (fun (suffix, srt) -> fn (Printf.sprintf "unbox.%s.%s" tag suffix) (Array.of_list (flatten x)) srt) (components ty)) in
-      (match v with L l -> assume_ (le zero l.len) | _ -> ());
+      (match v with L l -> assume_ (len_ok g l.len) | _ -> ());
       (match ctx.state with
        | Some st ->
          List.iter assume_ (alloc_facts g v ty st.env);
@@ -963,7 +1075,34 @@ and builtin g ctx (e : Ir.expr) name args =
     | "abs", [ x ] -> T (abs_ (tm x))
     | ("min" | "max"), x :: rest ->
       let f = if name = "min" then min_ else max_ in
-      T (List.fold_left (fun acc y -> f acc (tm y)) (tm x) rest)
+      T (List.fold_left (fun acc y -> let y = tm y in if acc.sort = Float64 || y.sort = Float64 then float_minmax g name acc y else f acc y) (tm x) rest)
+    | "sum", [ L l ] when l.lty = TList TReal ->
+      (* the order and method of summing differ by language (Python compensates) *)
+      T (fn ("float.sum." ^ g.info.language) [| l.arr; l.off; add l.off l.len |] Float64)
+    | "count", [ L l; v ] when l.lty = TList TReal -> T (fn ("float.count." ^ g.info.language) [| l.arr; l.off; add l.off l.len; tm v |] Int)
+    | "f64_int", [ x ] ->
+      (* a JavaScript integer result is exact up to 2^53 in magnitude, then rounds
+         (rounding keeps the sign and never goes back inside 2^53) *)
+      let x = tm x in
+      let big = fn "f64.round_int" [| x |] Int in
+      T (ite (le (abs_ x) safe) x (ite (lt zero x) (max_ safe big) (min_ (int_ (-(1 lsl 53))) big)))
+    | "js_floordiv", [ a; b ] ->
+      (* Math.floor(a / b) on integer-valued numbers: a / b rounds, but never
+         across an integer while |a| <= 2^53 *)
+      let a = tm a and b = tm b in
+      oblige g "div" ctx (ne b zero) loc "divisor of '/' is non-zero";
+      let big = fn "js.floordiv_big" [| a; b |] Int in
+      (* (with the quotient's sign) *)
+      let signed = ite (eq (le zero a) (lt zero b)) (max_ zero big) (min_ zero big) in
+      T (ite (le (abs_ a) safe) (floordiv a b) signed)
+    | "js_int_sum", [ xs ] ->
+      (* xs.reduce((a, b) => a + b, 0): exact while every running total is within 2^53 *)
+      let l = lst xs in
+      let hi = add l.off l.len in
+      let k = const (Printf.sprintf "k!%d" (next g)) Int in
+      let part = fn "seqsum" [| l.arr; l.off; add l.off k |] Int in
+      let safe_all = forall [ k ] (implies (and_ [ le zero k; le k l.len ]) (le (abs_ part) safe)) in
+      T (ite safe_all (fn "seqsum" [| l.arr; l.off; hi |] Int) (fn "js.int_sum_big" [| l.arr; l.off; hi |] Int))
     | "sum", [ xs ] ->
       let l = lst xs in
       let elem = match l.lty with TList t -> t | _ -> TInt in
@@ -979,7 +1118,7 @@ and builtin g ctx (e : Ir.expr) name args =
     | "contains", [ xs; v ] ->
       let l = lst xs in
       let i = const (Printf.sprintf "in!%d" (next g)) Int in
-      T (exists [ i ] (and_ [ le zero i; lt i l.len; eq (at (l.arr, l.off) i) (tm v) ]))
+      T (exists [ i ] (and_ [ le zero i; lt i l.len; member_eq g (at (l.arr, l.off) i) (tm v) i ]))
     | "slice", [ xs; lo; hi ] ->
       let l = lst xs in
       let n = l.len in
@@ -1012,12 +1151,62 @@ and builtin g ctx (e : Ir.expr) name args =
       let lo2 = norm lo zero and hi2 = norm hi n in
       T (app "str.substr" [| s; lo2; max_ (sub hi2 lo2) zero |] Str)
     | "str_fn", _ -> T (fn ("str." ^ lit_str (List.hd args)) (Array.of_list flat_rest) (sort_of e.ty))
-    | "to_real", [ x ] -> T (to_real (tm x))
-    | "floor", [ x ] -> T (floor (tm x))
-    | "ceil", [ x ] -> T (neg (floor (neg (tm x))))
-    | "trunc", [ x ] -> let x = tm x in T (ite (le (real (Q.of_int 0)) x) (floor x) (neg (floor (neg x))))
-    | "round_even", [ x ] -> T (round_even (tm x))
-    | "round_up", [ x ] -> T (floor (add (tm x) (real (Q.make 1 2))))
+    | "same_value", [ a; b ] -> T (eq (tm a) (tm b))
+    | "py_truediv", [ a; b ] ->
+      (* Python int / int: the exact quotient, rounded once *)
+      let a = tm a and b = tm b in
+      truediv_checks g ctx a b loc;
+      (* both within 2^53: each converts exactly, and the division rounds once *)
+      let small = and_ [ le (abs_ a) safe; le (abs_ b) safe ] in
+      T (ite small (rdiv (as_float a) (as_float b)) (fn "py.int_truediv" [| a; b |] Float64))
+    | "js_real", [ x ] ->
+      (* an integer-valued JavaScript number as a double: exact, but a zero may be -0 *)
+      let x = tm x in
+      if x.sort = Float64 then T x
+      else
+        let neg0 = unknown g "js.neg_zero" Bool loc in
+        T (ite (eq x zero) (ite neg0 (fval (-0.0)) (fval 0.0)) (as_float x))
+    | "py_float", [ x ] ->
+      (* Python converts an int to the nearest float, or raises OverflowError *)
+      let x = tm x in
+      if x.sort = Float64 then T x
+      else begin
+        float_fits g ctx x loc (Printf.sprintf "'%s' is small enough to convert to a float" (expr_name (List.hd args)));
+        T (as_float x)
+      end
+    | "to_real", [ x ] -> T (as_float (tm x))
+    | ("is_nan" | "is_inf" | "is_finite"), [ x ] ->
+      let x = tm x in
+      if x.sort <> Float64 then T (bool_ (name = "is_finite"))
+      else T (match name with "is_nan" -> fpred "fp.isNaN" x | "is_inf" -> fpred "fp.isInfinite" x | _ -> is_finite x)
+    | "sign_bit", [ x ] ->
+      (* the sign of a NaN is not modelled *)
+      let x = tm x in
+      T (ite (fpred "fp.isNaN" x) (unknown g "nan_sign" Bool loc) (fpred_neg x))
+    | "trunc_sat", [ x ] ->
+      (* Rust 'as' from a float: NaN is 0, the infinities saturate (the caller clamps) *)
+      let x = tm x in
+      let r = fto_real x in
+      let t = ite (le (real (Q.of_int 0)) r) (floor r) (neg (floor (neg r))) in
+      T (ite (fpred "fp.isNaN" x) zero (ite (fpred "fp.isInfinite" x) (ite (fpred_neg x) (mk (Big ("-" ^ huge)) Int) (mk (Big huge) Int)) t))
+    | "is_int", [ x ] when (tm x).sort = Float64 -> let x = tm x in T (and_ [ is_finite x; is_int (fto_real x) ])
+    | ("floor" | "ceil" | "trunc" | "round_even" | "round_up"), [ x ] -> (
+      let x = tm x in
+      let x =
+        if x.sort <> Float64 then x
+        else begin
+          let fin = is_finite x in
+          oblige g "finite" ctx fin loc (Printf.sprintf "'%s' is a finite number (not NaN or \u{00b1}Infinity) where it is rounded to an integer" (expr_name (List.hd args)));
+          if not (ctx.quiet || ctx.spec) then assume ctx fin;
+          fto_real x
+        end
+      in
+      match name with
+      | "floor" -> T (floor x)
+      | "ceil" -> T (neg (floor (neg x)))
+      | "trunc" -> T (ite (le (real (Q.of_int 0)) x) (floor x) (neg (floor (neg x))))
+      | "round_even" -> T (round_even x)
+      | _ -> T (floor (add x (real (Q.make 1 2)))))
     | "is_int", [ x ] -> T (is_int (tm x))
     | _ -> raise (Fallback ("builtin " ^ name)))
 
@@ -1174,7 +1363,7 @@ and havoc g (st : state) names appends : state =
           | L o ->
             let keep = if List.mem name appends then None else Some o.len in
             let nv = match fresh g name ty ?len:keep () with L l -> l | _ -> assert false in
-            let nv = match keep with None -> Dynarray.add_last h.facts (le zero nv.len); nv | Some k -> { nv with off = o.off; len = k } in
+            let nv = match keep with None -> Dynarray.add_last h.facts (len_ok g nv.len); nv | Some k -> { nv with off = o.off; len = k } in
             h.env <- SM.add name (L nv) h.env
           | _ -> h.env <- SM.add name (fresh g name ty ()) h.env);
           if SM.mem "@alloc" h.env then List.iter (Dynarray.add_last h.facts) (alloc_facts g (SM.find name h.env) ty h.env)))
@@ -1256,21 +1445,20 @@ and comprehension g ctx (e : Ir.expr) seq =
 
 (* int(s)/float(s) (Python), parseInt(s)/parseFloat(s) (JavaScript) on a
    string: exact on plain decimal digits, otherwise a number telic does not
-   compute. Python raises ValueError on text outside its grammar (checked like
-   a raise statement); JavaScript gives NaN, which telic's numbers do not
-   include (a listed assumption). *)
+   compute (NaN or an infinity among them). Python raises ValueError on text
+   outside its grammar (checked like a raise statement); JavaScript gives NaN. *)
 and parse_number g ctx (e : Ir.expr) name s =
   let loc = e.loc in
   let py = String.sub name 0 3 = "py_" in
   let real = name <> "py_int_parse" in
   let tail = app "str.substr" [| s; one; Term.sub (app "str.len" [| s |] Int) one |] Str in
-  let other = fn name [| s |] (if real then Real else Int) in
+  let other = fn name [| s |] (if real then Float64 else Int) in
   let exact = ite (in_re s "digits") (str_to_int s) (ite (in_re s "neg_digits") (neg (str_to_int tail)) (str_to_int tail)) in
   let known = or_ [ in_re s "digits"; in_re s "neg_digits"; in_re s "pos_digits" ] in
   (* (z3 does not find these itself: digits spell a number >= 0) *)
   assume ctx (implies (in_re s "digits") (le zero (str_to_int s)));
   assume ctx (implies (or_ [ in_re s "neg_digits"; in_re s "pos_digits" ]) (le zero (str_to_int tail)));
-  let v = ite known (if real then to_real exact else exact) other in
+  let v = ite known (if real then as_float exact else exact) other in
   let what = match name with "py_int_parse" -> "int()" | "py_float_parse" -> "float()" | "js_parse_int" -> "parseInt" | _ -> "parseFloat" in
   if py then begin
     let ok = in_re s (if name = "py_int_parse" then "py_int" else "py_float") in
@@ -1283,13 +1471,12 @@ and parse_number g ctx (e : Ir.expr) name s =
          oblige g "raise" ctx (or_ [ ok; cond ]) loc (Printf.sprintf "%s of text it cannot parse raises ValueError outside '@raises %s'" what (List.hd g.info.fn.raises).text)
        end
        else if g.info.fn.requires <> [] || g.info.fn.ensures <> [] then
-         oblige g "raise" ctx ok loc (Printf.sprintf "%s can parse '%s' (else it raises ValueError)" what arg));
-    if name = "py_float_parse" then note_assumed g loc "float() of 'nan', 'inf' or an overflowing exponent is not a number telic models"
+         oblige g "raise" ctx ok loc (Printf.sprintf "%s can parse '%s' (else it raises ValueError)" what arg))
   end
   else begin
-    assume ctx (implies (in_re s "js_nonneg_prefix") (le (Term.real (Q.of_int 0)) other));
-    if name = "js_parse_int" then assume ctx (implies (in_re s "js_num_prefix") (is_int other));
-    note_assumed g loc (Printf.sprintf "%s of text without a leading number is NaN, which telic models as an unknown number" what)
+    assume ctx (implies (in_re s "js_nonneg_prefix") (le (fval 0.0) other));
+    (* a leading integer, or Infinity past the largest float *)
+    if name = "js_parse_int" then assume ctx (implies (in_re s "js_num_prefix") (and_ [ not_ (fpred "fp.isNaN" other); or_ [ fpred "fp.isInfinite" other; is_int (fto_real other) ] ]))
   end;
   T v
 
@@ -1420,7 +1607,7 @@ and extern g ctx (e : Ir.expr) name args =
          | Some (L _ | D _) ->
            let ty = match Hashtbl.find_opt fn.locals n with Some t -> t | None -> aty in
            let nv = fresh g n ty () in
-           (match nv with L l -> assume ctx (le zero l.len) | _ -> ());
+           (match nv with L l -> assume ctx (len_ok g l.len) | _ -> ());
            st.env <- SM.add n nv st.env
          | _ -> ())
        touched;
@@ -1436,7 +1623,7 @@ and extern g ctx (e : Ir.expr) name args =
       let short = match String.rindex_opt name '.' with Some k -> String.sub name (k + 1) (String.length name - k - 1) | None -> name in
       fresh g (short ^ "()") e.ty ()
   in
-  (match r with L l -> assume ctx (le zero l.len) | _ -> ());
+  (match r with L l -> assume ctx (len_ok g l.len) | _ -> ());
   (match (ctx.state, r) with
    | Some st, r when r <> NoneV ->
      List.iter (assume ctx) (alloc_facts g r e.ty st.env);
@@ -1569,7 +1756,7 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
         | Some (L old) ->
           let keep = if List.mem p callee.appends then None else Some old.len in
           let nv = match fresh g n pty ?len:keep () with L l -> l | _ -> assert false in
-          let nv = match keep with Some k -> { nv with off = old.off; len = k } | None -> assume ctx (le zero nv.len); nv in
+          let nv = match keep with Some k -> { nv with off = old.off; len = k } | None -> assume ctx (len_ok g nv.len); nv in
           st.env <- SM.add n (L nv) st.env;
           post := SM.add p (L nv) !post
         | _ -> raise (Vc_error ("mutated argument is not a list", loc)))
@@ -2220,7 +2407,7 @@ let run g =
       let v = param_val p ty in
       st.env <- SM.add p v st.env;
       g.inputs <- (p, v) :: g.inputs;
-      (match v with L l -> Dynarray.add_last st.facts (le zero l.len) | _ -> ());
+      (match v with L l -> Dynarray.add_last st.facts (len_ok g l.len) | _ -> ());
       List.iter (Dynarray.add_last st.facts) (alloc_facts g v ty st.env))
     fn.params;
   g.entry <- st.env;

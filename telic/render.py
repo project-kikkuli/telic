@@ -20,6 +20,11 @@ from .replay import call_text
 INTERNAL_STATE = ("alloc@", "comp@", "lit@", "range@", "rep@", "cat@")
 
 
+def _rounds(ob) -> bool:
+    """Does the obligation involve floating point, or a JavaScript integer past 2^53?"""
+    return any(x.sort == L.FLOAT or (isinstance(x, L.Fn) and x.name.startswith(("f64.", "js.", "float.", "py.int_truediv"))) for t in [*ob.hyps, ob.goal] for x in L.iter_terms(t))
+
+
 def _has_loop(fn: ir.Function) -> bool:
     return any(isinstance(st, (ir.While, ir.ForRange, ir.ForEach)) for st in ir.walk_stmts(fn.body))
 
@@ -111,6 +116,8 @@ KIND_HEADLINE = {
     "inv.step": "loop invariant may not survive an iteration",
     "variant": "may not terminate",
     "div": "division by zero is possible",
+    "finite": "a NaN or infinite number can reach an integer conversion",
+    "overflow": "a number can overflow",
     "index": "index can be out of bounds",
     "raise": "exception is reachable",
     "raises": "returns normally where it should raise",
@@ -125,6 +132,8 @@ KIND_NOUN = {
     "inv.step": "invariant (step)",
     "variant": "termination",
     "div": "division",
+    "finite": "finiteness",
+    "overflow": "overflow",
     "index": "bounds",
     "raise": "raise",
     "raises": "raises",
@@ -444,6 +453,8 @@ class Renderer:
                 return "add or fix '@decreases' on this loop"
             if v.replay is not None and "too weak to rule this out" in v.replay.summary:
                 return "add the missing fact to the callee's '@ensures'"
+            if _rounds(ob):
+                return "floating point rounds and has NaN and ±Infinity: state them in '@requires' (Number.isFinite, math.isfinite, Number.isSafeInteger), or keep exact quantities such as money in integers"
             if not _has_loop(f.fn):
                 calls = sorted({c.name.split("()")[0] for t in [*ob.hyps, ob.goal] for c in L.consts(t) if "()" in c.name})
                 named = f" ({', '.join(calls[:4])}{', …' if len(calls) > 4 else ''})" if calls else ""

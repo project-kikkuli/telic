@@ -100,7 +100,8 @@ export function lifecycleTexts(form) {
     return { relation: rel, probes };
   }
   const e = form.expr;
-  if (form.kind === "monotonic") return { relation: `old(${e}) <= ${par(e)}`, probes: [["grows", `old(${e}) < ${par(e)}`, null]] };
+  // a NaN that stays NaN keeps it too (NaN compares false, even with itself)
+  if (form.kind === "monotonic") return { relation: `old(${e}) <= ${par(e)} || (old(${e}) !== old(${e}) && ${par(e)} !== ${par(e)})`, probes: [["grows", `old(${e}) < ${par(e)}`, null]] };
   if (form.kind === "once") return { relation: `!${par(`old(${e})`)} || ${par(e)}`, probes: [["becomes true", `!${par(`old(${e})`)} && ${par(e)}`, e]] };
   return { relation: e, probes: [] };
 }

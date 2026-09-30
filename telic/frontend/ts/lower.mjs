@@ -3,13 +3,15 @@
 // Usage: node lower.mjs <root> <file.ts>...   (prints one JSON document)
 //
 // Semantics are JavaScript's, stated explicitly:
-//   * `number` is an exact rational unless integrality is known. A value is an
+//   * `number` is an IEEE double unless integrality is known. A value is an
 //     integer when the code guarantees it: integer literals, `.length`,
 //     Math.floor/ceil/trunc/round, int +,-,*,%, and parameters whose
 //     contract says `Number.isInteger(p)` (or whose type is an alias named
 //     `int`). Integrality of locals/returns is the greatest fixpoint of
-//     "every assignment is integer-valued".
-//   * `/` is real division; `%` truncates (sign of the dividend).
+//     "every assignment is integer-valued". Integer +,-,* are exact up to
+//     2^53 in magnitude (`f64_int`), and an integer seen as a double may be
+//     -0 (`js_real`).
+//   * `/` is double division; `%` truncates (sign of the dividend).
 //   * reading `xs[i]` out of bounds yields `undefined` -- telic treats it as
 //     an error and requires 0 <= i < xs.length.
 // Anything outside the modelled subset is reported as unsupported, with a line.
@@ -151,8 +153,6 @@ function parseAim(cl) {
 // ---------------------------------------------------------------------------
 
 const JS_ASSUMPTIONS = [
-  "number is modelled as an exact rational (no NaN, Infinity, or rounding error)",
-  "integer-valued numbers stay within the safe range ±2^53",
   "distinct array arguments do not alias each other",
   "console.* calls have no effect on program state",
   "objects of interface and object-literal types are not changed by other code while checked code reads them",
@@ -1433,7 +1433,7 @@ class FunctionLowerer {
       return e;
     }
     if (e.ty.k === "option" && ty.k !== "none") return this.coerce(this.unwrap(e), ty);
-    if (ty.k === "real" && e.ty.k === "int") return { e: "Builtin", ty: REAL, loc: e.loc, name: "to_real", args: [e] };
+    if (ty.k === "real" && e.ty.k === "int") return e.e === "Lit" ? { ...e, ty: REAL } : { e: "Builtin", ty: REAL, loc: e.loc, name: "js_real", args: [e] };  // a literal is its own double
     if (ty.k === "list" && e.e === "ListLit" && e.elems.length === 0) return { ...e, ty };
     if (ty.k === "dict" && e.e === "Builtin" && e.name === "dict_lit" && e.args.length === 0) return { ...e, ty };
     return e;
@@ -1593,7 +1593,7 @@ class FunctionLowerer {
       if (!isNum(t)) throw this.err(`'${e.operand.text}' is not a number`, node);
       const one = { e: "Lit", ty: t, loc, value: 1 };
       const cur = { e: "Var", ty: t, loc, name };
-      return [{ s: "Assign", loc, name, value: { e: "Binary", ty: t, loc, op: e.operator === K.PlusPlusToken ? "add" : "sub", left: cur, right: one } }];
+      return [{ s: "Assign", loc, name, value: this.rounded({ e: "Binary", ty: t, loc, op: e.operator === K.PlusPlusToken ? "add" : "sub", left: cur, right: one }) }];
     }
     if (ts.isCallExpression(e) && e.expression.kind === K.SuperKeyword) return this.superCall(e, node);
     if (ts.isCallExpression(e)) {
@@ -2209,7 +2209,12 @@ class FunctionLowerer {
       return { e: "Binary", ty: REAL, loc, op: "rdiv", left: this.coerce(x, REAL), right: this.coerce(y, REAL) };
     }
     const [x, y, t] = this.numPair(a, b, node);
-    return { e: "Binary", ty: t, loc, op, left: x, right: y };
+    return this.rounded({ e: "Binary", ty: t, loc, op, left: x, right: y });
+  }
+
+  // an integer +, - or * computed in doubles: exact up to 2^53, then rounded
+  rounded(e) {
+    return e.ty.k === "int" && ["add", "sub", "mul"].includes(e.op) ? { e: "Builtin", ty: INT, loc: e.loc, name: "f64_int", args: [e] } : e;
   }
 
   // String(x) / `${x}` / "a" + x, as JavaScript converts it.
@@ -2238,7 +2243,12 @@ class FunctionLowerer {
       const txt = n.text;
       if (/^\d+$/.test(txt)) return { e: "Lit", ty: INT, loc, value: Number(txt) };
       const f = decimalFraction(txt);
-      if (!f) throw this.err(`unsupported numeric literal ${txt}`, this.nline(n));
+      if (!f) {
+        // too long to keep as a fraction: the double it denotes
+        const x = Number(txt);
+        if (Number.isNaN(x)) throw this.err(`unsupported numeric literal ${txt}`, this.nline(n));
+        return Number.isInteger(x) && Math.abs(x) <= 9007199254740992 ? { e: "Lit", ty: INT, loc, value: x } : { e: "Lit", ty: REAL, loc, value: null, float: Number.isFinite(x) ? String(x) : "inf" };
+      }
       if (f[1] === 1) return { e: "Lit", ty: INT, loc, value: f[0] };
       return { e: "Lit", ty: REAL, loc, value: null, frac: f };
     }
@@ -2258,6 +2268,7 @@ class FunctionLowerer {
       const local = (this.bound && n.text in this.bound) || this.resolve(n.text) !== null;
       if (!local) {
         if (n.text === "undefined") return { e: "Lit", ty: expect && expect.k === "option" ? expect : NONE, loc, value: null };
+        if (n.text === "NaN" || n.text === "Infinity") return { e: "Lit", ty: REAL, loc, value: null, float: n.text === "NaN" ? "nan" : "inf" };
         if (n.text in this.ml.constants) return this.expr(this.ml.constants[n.text], expect);
         if (this.ml.enums[n.text] || this.ml.classes[n.text] || this.ml.sigs[n.text] || this.ml.globalsBound.has(n.text) || GLOBALS.has(n.text) || this.ml.imported[n.text] || this.ml.namespaces[n.text]) {
           if (this.spec) throw this.err(`'${n.text}' is not a value a specification can use`, this.nline(n));
@@ -2315,7 +2326,8 @@ class FunctionLowerer {
       if (a.ty.k === "opaque") return this.opaqueOp("unary", [a], opaque(""), loc);
       if (n.operator === K.MinusToken) {
         if (!isNum(a.ty)) throw this.err(`cannot negate ${tyStr(a.ty)}`, this.nline(n));
-        if (a.e === "Lit") return a.frac ? { ...a, loc, frac: [-a.frac[0], a.frac[1]] } : { ...a, loc, value: -a.value };
+        // (-0 stays a negation: the literal would lose its sign)
+        if (a.e === "Lit" && !a.float && (a.frac ? a.frac[0] !== 0 : a.value !== 0)) return a.frac ? { ...a, loc, frac: [-a.frac[0], a.frac[1]] } : { ...a, loc, value: -a.value };
         return { e: "Unary", ty: a.ty, loc, op: "neg", arg: a };
       }
       if (n.operator === K.PlusToken) return a;
@@ -2352,6 +2364,10 @@ class FunctionLowerer {
         }
         const ns = this.ml.namespaces[base];
         if (ns && ns.constants[name]) return this.expr(ns.constants[name], expect);
+        const special = base === "Number" && { POSITIVE_INFINITY: "inf", NEGATIVE_INFINITY: "-inf", NaN: "nan" }[name];
+        if (special) return { e: "Lit", ty: REAL, loc, value: null, float: special };
+        if (base === "Number" && name === "MAX_SAFE_INTEGER") return { e: "Lit", ty: INT, loc, value: 9007199254740991 };
+        if (base === "Number" && name === "MIN_SAFE_INTEGER") return { e: "Lit", ty: INT, loc, value: -9007199254740991 };
       }
       if (n.expression.kind === K.SuperKeyword) {
         const base = this.f.cls && this.ml.classes[this.f.cls] && this.ml.classes[this.f.cls].base;
@@ -2639,7 +2655,7 @@ class FunctionLowerer {
       const p = Number(n.right.text);
       if (p === 0) return { e: "Lit", ty: a.ty, loc, value: 1 };
       let out = a;
-      for (let i = 1; i < p; i++) out = { e: "Binary", ty: a.ty, loc, op: "mul", left: out, right: a };
+      for (let i = 1; i < p; i++) out = this.rounded({ e: "Binary", ty: a.ty, loc, op: "mul", left: out, right: a });
       return out;
     }
     if (k === K.AsteriskAsteriskToken && !this.spec) return this.opaqueOp("pow", [this.expr(n.left), this.expr(n.right)], REAL, loc);
@@ -2683,7 +2699,7 @@ class FunctionLowerer {
           const inner = ts.isParenthesizedExpression(a0) ? a0.expression : a0;
           if (m === "floor" && ts.isBinaryExpression(inner) && inner.operatorToken.kind === ts.SyntaxKind.SlashToken) {
             const l = this.expr(inner.left), r = this.expr(inner.right);
-            if (l.ty.k === "int" && r.ty.k === "int") return { e: "Binary", ty: INT, loc, op: "floordiv", left: l, right: r };
+            if (l.ty.k === "int" && r.ty.k === "int") return { e: "Builtin", ty: INT, loc, name: "js_floordiv", args: [l, r] };
           }
           const x = this.expr(a0);
           if (x.ty.k === "int") return x;
@@ -2703,6 +2719,16 @@ class FunctionLowerer {
           return { e: "Builtin", ty: t, loc, name: m, args: xs.map((x) => this.coerce(x, t)) };
         }
         return this.extern(`Math.${m}`, args.map((a) => this.expr(a)), REAL, loc);
+      }
+      if (ts.isIdentifier(c.expression) && c.expression.text === "Object" && m === "is" && args.length === 2) {
+        // SameValue: NaN is NaN, -0 is not 0
+        const [x, y] = args.map((a) => this.unwrap(this.expr(a)));
+        if (isNum(x.ty) && isNum(y.ty)) return { e: "Builtin", ty: BOOL, loc, name: "same_value", args: [this.coerce(x, REAL), this.coerce(y, REAL)] };
+      }
+      if (ts.isIdentifier(c.expression) && c.expression.text === "Number" && (m === "isFinite" || m === "isNaN") && args.length === 1) {
+        const x = this.unwrap(this.expr(args[0]));
+        if (!isNum(x.ty)) throw this.err(`Number.${m} needs a number`, this.nline(n));
+        return { e: "Builtin", ty: BOOL, loc, name: m === "isFinite" ? "is_finite" : "is_nan", args: [x] };
       }
       if (ts.isIdentifier(c.expression) && c.expression.text === "Number" && (m === "isInteger" || m === "isSafeInteger")) {
         const x = this.expr(args[0]);
@@ -2790,10 +2816,11 @@ class FunctionLowerer {
             if (ts.isParenthesizedExpression(body)) body = body.expression;
             if (ts.isBinaryExpression(body) && body.operatorToken.kind === ts.SyntaxKind.PlusToken && ts.isIdentifier(body.left) && ts.isIdentifier(body.right) && ((body.left.text === a && body.right.text === b) || (body.left.text === b && body.right.text === a))) {
               const init = this.expr(args[1]);
-              const s = { e: "Builtin", ty: obj.ty.elem, loc, name: "sum", args: [obj] };
+              // summed left to right in doubles
+              const s = { e: "Builtin", ty: obj.ty.elem, loc, name: obj.ty.elem.k === "int" ? "js_int_sum" : "sum", args: [obj] };
               if (init.e === "Lit" && init.value === 0) return s;
               const [x, y, t] = this.numPair(init, s, n);
-              return { e: "Binary", ty: t, loc, op: "add", left: x, right: y };
+              return this.rounded({ e: "Binary", ty: t, loc, op: "add", left: x, right: y });
             }
           }
           throw this.err("only xs.reduce((a, b) => a + b, init) is supported", this.nline(n));
@@ -3224,8 +3251,17 @@ function isIntExpr(fl, e, ints, params) {
     const t = staticType(fl, e.expression, ints, params);
     return !!(t && t.k === "list" && t.elem.k === "int");
   }
+  if (ts.isPropertyAccessExpression(e) && e.expression.kind === K.ThisKeyword) {
+    const self = fl.selfTy();
+    const ft = self && fl.ml.fieldOf(self.name, e.name.text);
+    return !!(ft && ft.k === "int");
+  }
   if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
     const t = staticType(fl, e.expression, ints, params);
+    if (t && t.k === "class") {
+      const ft = fl.ml.fieldOf(t.name, e.name.text);
+      return !!(ft && ft.k === "int");
+    }
     if (t && t.k === "record") {
       const f = t.fields.find((x) => x[0] === e.name.text);
       return !!(f && f[1].k === "int");

@@ -23,6 +23,7 @@ let read_terms (j : Json.t) : term array =
          | Json.List [ Json.String "Rec"; Json.String n; Json.List fs ] -> Rec (n, List.map (function Json.List [ Json.String f; s ] -> (f, sa.(Json.to_int s)) | _ -> failwith "rec field") fs)
          | Json.List [ Json.String "Int" ] -> Int
          | Json.List [ Json.String "Real" ] -> Real
+         | Json.List [ Json.String "Float64" ] -> Float64
          | Json.List [ Json.String "Bool" ] -> Bool
          | Json.List [ Json.String "Str" ] -> Str
          | Json.List [ Json.String "Opaque" ] -> Opaque
@@ -41,6 +42,7 @@ let read_terms (j : Json.t) : term array =
          | Json.List [ Json.String "i"; Json.String v ] -> ( match int_of_string_opt v with Some n -> int_ n | None -> mk (Big v) Int)
          | Json.List [ Json.String "r"; Json.String n; Json.String d ] -> (
            match (int_of_string_opt n, int_of_string_opt d) with Some n, Some d -> real (Q.make n d) | _ -> mk (Big (n ^ "/" ^ d)) Real)
+         | Json.List [ Json.String "x"; Json.String bits ] -> mk (Big bits) Float64
          | Json.List [ Json.String "b"; Json.Bool b ] -> bool_ b
          | Json.List [ Json.String "s"; Json.String s ] -> str s
          | Json.List [ Json.String "a"; Json.String op; s; xs ] -> app op (ids xs) !sorts.(Json.to_int s)
@@ -81,6 +83,7 @@ let rec wterm w (t : term) =
       match t.node with
       | Const n -> Json.List [ Json.String "c"; Json.String n; Json.Int (wsort w t.sort) ]
       | Num q -> if t.sort = Int then Json.List [ Json.String "i"; Json.String (string_of_int q.n) ] else Json.List [ Json.String "r"; Json.String (string_of_int q.n); Json.String (string_of_int q.d) ]
+      | Big s when t.sort = Float64 -> Json.List [ Json.String "x"; Json.String s ]
       | Big s -> (
         match String.index_opt s '/' with
         | Some k -> Json.List [ Json.String "r"; Json.String (String.sub s 0 k); Json.String (String.sub s (k + 1) (String.length s - k - 1)) ]
@@ -161,6 +164,8 @@ let solve_job z (jb : job) : Smt.result =
 (* [budget]: the wall-clock safety net and the resource limit *)
 let make_job th (wall_ms, rlimit) (ob : Vc.obligation) =
   let terms_ = ob.hyps @ [ ob.goal ] in
+  (* floating point is bit-blasted: many more steps per proof (as telic/smt.py) *)
+  let rlimit = if List.exists (Term.mentions_sort Float64) terms_ then rlimit * 10 else rlimit in
   let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
   let phases =
     (* an undecided stage is retried with recursive definitions (seqsum)
@@ -390,7 +395,8 @@ let () =
         let params = List.map (fun i -> terms.(Json.to_int i)) (Json.to_list (Json.member "params" d)) in
         let fsort = match body with Some b -> b.sort | None -> Int in
         let fsort = match Json.member "sort" d with Json.Int i -> terms.(i).sort | _ -> fsort in
-        Hashtbl.replace fundefs name { Smt.fname = name; params; fsort; body };
+        let expands = match Json.member "expands" d with Json.Bool b -> b | _ -> false in
+        Hashtbl.replace fundefs name { Smt.fname = name; params; fsort; body; expands };
         Hashtbl.replace Smt.defined_fns name ())
       (Json.to_list (Json.member "fundefs" (Json.member "theory" req)));
     let axioms =
@@ -425,6 +431,7 @@ let () =
               termination = (match Json.member "termination" pj with Json.Bool b -> b | _ -> true);
               resolve = (match Json.member "resolve" pj with Json.Assoc kvs -> List.map (fun (k, v) -> (k, Json.to_str v)) kvs | _ -> []);
               untrusted = List.map (fun x -> match Json.to_list x with [ c; i ] -> (Json.to_str c, Json.to_int i) | _ -> raise (Json.Error "expected [class, index]")) (Json.to_list (Json.member "untrusted" pj));
+              language = m.language;
             })
         m.functions)
     modules;

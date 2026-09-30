@@ -14,6 +14,7 @@ import ast
 import dataclasses
 import sys
 import io
+import math
 import os
 import tokenize
 from fractions import Fraction
@@ -35,7 +36,7 @@ from .python_rewrites import rewrites
 from ..lifecycle import build as build_lifecycle
 
 PY_ASSUMPTIONS = [
-    "float is modelled as exact rational arithmetic (rounding error ignored)",
+    "a parameter or field annotated float holds a float (an int passed there is outside the claim)",
     "distinct list arguments do not alias each other",
     "print() and logging calls have no effect on program state",
 ]
@@ -1143,7 +1144,7 @@ class FunctionLowerer:
         if isinstance(ty, ir.TDict) and isinstance(e, ir.Builtin) and e.name == "dict_lit" and not e.args:
             return ir.Builtin(ty, e.loc, "dict_lit", ())
         if isinstance(ty, ir.TReal) and isinstance(e.ty, ir.TInt):
-            return ir.Builtin(ir.REAL, e.loc, "to_real", (e,))
+            return ir.Builtin(ir.REAL, e.loc, "py_float", (e,))
         if isinstance(ty, ir.TList) and isinstance(e, ir.ListLit) and not e.elems:
             return ir.ListLit(ty, e.loc, ())
         return e
@@ -1853,6 +1854,7 @@ def _decorator_name(d: ast.expr) -> str:
     return "?"
 
 
+FLOAT_WORDS = {"nan", "inf", "-inf", "+inf", "infinity", "-infinity", "+infinity", "+nan", "-nan"}
 BUILTINS = {"len", "abs", "min", "max", "sum", "float", "int", "round", "bool", "all", "any", "range", "enumerate", "print"}
 
 
@@ -1960,7 +1962,7 @@ class ExprLowerer:
             if isinstance(v, int):
                 return ir.Lit(ir.INT, loc, v)
             if isinstance(v, float):
-                return ir.Lit(ir.REAL, loc, Fraction(repr(v)))
+                return ir.Lit(ir.REAL, loc, Fraction(v) if math.isfinite(v) else v)
             if isinstance(v, str):
                 return ir.Lit(ir.STR, loc, v)
             if v is None:
@@ -1998,7 +2000,7 @@ class ExprLowerer:
             if isinstance(n.op, ast.USub):
                 if not ir.is_numeric(a.ty):
                     raise self.err(f"cannot negate {a.ty}", n)
-                if isinstance(a, ir.Lit) and not isinstance(a.value, bool):
+                if isinstance(a, ir.Lit) and not isinstance(a.value, bool) and not (isinstance(a.ty, ir.TReal) and a.value == 0):  # -0.0 is its own float
                     return ir.Lit(a.ty, loc, -a.value)  # type: ignore[operator]
                 return ir.Unary(a.ty, loc, "neg", a)
             if isinstance(n.op, ast.UAdd):
@@ -2081,6 +2083,8 @@ class ExprLowerer:
                     if n.attr not in et.members:
                         raise self.err(f"{et.name} has no member '{n.attr}'", n)
                     return ir.Lit(et, loc, et.members.index(n.attr))
+                if n.value.id == "math" and n.attr in ("inf", "nan"):
+                    return ir.Lit(ir.REAL, loc, getattr(math, n.attr))
                 if n.value.id in fe.bound or n.value.id in PY_GLOBALS:
                     return ir.Extern(ir.TOpaque(f"{n.value.id}.{n.attr}"), loc, f"{n.value.id}.{n.attr}", ())
             obj = self.need(self.expr(n.value))
@@ -2201,14 +2205,13 @@ class ExprLowerer:
             name = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul"}[type(op)]
             return ir.Binary(t, loc, name, a, b)
         if isinstance(op, ast.Div):
-            a, b, _ = self.numeric_pair(a, b, n)
-            return ir.Binary(ir.REAL, loc, "rdiv", self.fl.coerce(a, ir.REAL), self.fl.coerce(b, ir.REAL))
+            a, b, t = self.numeric_pair(a, b, n)
+            if t == ir.INT:  # int / int: the exact quotient, rounded once
+                return ir.Builtin(ir.REAL, loc, "py_truediv", (a, b))
+            return ir.Binary(ir.REAL, loc, "rdiv", a, b)
         if isinstance(op, ast.FloorDiv):
             a, b, t = self.numeric_pair(a, b, n)
-            if t == ir.INT:
-                return ir.Binary(ir.INT, loc, "floordiv", a, b)
-            q = ir.Binary(ir.REAL, loc, "rdiv", a, b)
-            return ir.Builtin(ir.REAL, loc, "to_real", (ir.Builtin(ir.INT, loc, "floor", (q,)),))
+            return ir.Binary(t, loc, "floordiv", a, b)
         if isinstance(op, ast.Mod):
             a, b, t = self.numeric_pair(a, b, n)
             return ir.Binary(t, loc, "fmod", a, b)
@@ -2305,7 +2308,7 @@ class ExprLowerer:
                 if name not in ("eq", "ne"):
                     l2, r2 = self.need(left), self.need(right)
                 if ir.is_numeric(l2.ty) and ir.is_numeric(r2.ty):
-                    l2, r2, _ = self.numeric_pair(l2, r2, n)
+                    l2, r2 = self.need(l2), self.need(r2)  # an int compares with a float exactly, unconverted
                 elif l2.ty != r2.ty and name in ("eq", "ne") and isinstance(l2.ty, ir.TList) and isinstance(r2.ty, ir.TList) and (_has_opaque(l2.ty) or _has_opaque(r2.ty)):
                     # a list of unchecked values, compared with a checked list
                     l2, r2 = (self.fl.coerce(l2, r2.ty), r2) if _has_opaque(l2.ty) else (l2, self.fl.coerce(r2, l2.ty))
@@ -2363,7 +2366,7 @@ class ExprLowerer:
         # Module functions (math.sqrt, json.dumps, requests.get): unchecked.
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id not in self.fl.env and f.value.id not in self.bound and (f.value.id in fe.modules or (f.value.id in fe.bound and f.value.id not in fe.class_names) or f.value.id in PY_GLOBALS) and f.value.id != "math":
             return self.extern(f"{f.value.id}.{f.attr}", [], n, loc, expect)
-        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr not in ("floor", "ceil", "trunc"):
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr not in ("floor", "ceil", "trunc", "isnan", "isinf", "isfinite", "copysign"):
             return self.extern(f"math.{f.attr}", [], n, loc, expect or ir.REAL)
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.class_names and f.value.id not in self.fl.env:
             key = fe.member(f.value.id, f.attr)  # a static method
@@ -2425,6 +2428,15 @@ class ExprLowerer:
                 if not isinstance(x.ty, ir.TReal):
                     raise self.err(f"math.{f.attr} needs a number", n)
                 return ir.Builtin(ir.INT, loc, f.attr, (x,))
+            if isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr == "copysign":
+                x, y = (self.fl.coerce(a, ir.REAL) for a in self._args(n, 2))
+                mag = ir.Builtin(ir.REAL, loc, "abs", (x,))
+                return ir.Ite(ir.REAL, loc, ir.Builtin(ir.BOOL, loc, "sign_bit", (y,)), ir.Unary(ir.REAL, loc, "neg", mag), mag)
+            if isinstance(f.value, ast.Name) and f.value.id == "math" and f.attr in ("isnan", "isinf", "isfinite"):
+                (x,) = self._args(n, 1)
+                if not ir.is_numeric(x.ty):
+                    raise self.err(f"math.{f.attr} needs a number", n)
+                return ir.Builtin(ir.BOOL, loc, {"isnan": "is_nan", "isinf": "is_inf", "isfinite": "is_finite"}[f.attr], (x,))
             if f.attr == "count":
                 seq = self.expr(f.value)
                 if not isinstance(seq.ty, ir.TList):
@@ -2487,6 +2499,8 @@ class ExprLowerer:
                 raise self.err("sum() needs a list of numbers", n)
             return ir.sum_of(x, loc)
         if name == "float":
+            if len(n.args) == 1 and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str) and n.args[0].value.strip().lower() in FLOAT_WORDS:
+                return ir.Lit(ir.REAL, loc, float(n.args[0].value))
             (x,) = self._args(n, 1)
             if x.ty == ir.STR:
                 return ir.Builtin(ir.REAL, loc, "py_float_parse", (x, ir.Lit(ir.BOOL, loc, self.fl.try_depth > 0)))

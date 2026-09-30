@@ -72,10 +72,18 @@ func negateMin(_ a: Int) -> Int {
     return -a
 }
 
-// expect: proved
+// expect: refuted
+// (NaN, and the smallest subnormal: halving it gives 0)
 func half(_ x: Double) -> Double {
     //@ ensures result * 2 == x
     return x / 2
+}
+
+// expect: proved
+func nudge(_ x: Double) -> Double {
+    //@ requires x >= 0 && x <= 1000
+    //@ ensures result > x
+    return x + 1
 }
 
 // expect: refuted

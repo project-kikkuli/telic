@@ -136,6 +136,10 @@ def invariant_candidates(fn: ir.Function, site: LoopSite) -> list[ir.Clause]:
                 continue
             ln = ir.Builtin(ir.INT, loc, "len", (_v(xs, fn.locals[xs], loc),))
             add(_cmp("le", v, ln, loc))
+    if any(isinstance(x, ir.Builtin) and x.name == "f64_int" for st in ir.walk_stmts(body) for e in ir.stmt_exprs(st) for x in ir.walk_expr(e)):
+        # JavaScript integer arithmetic is exact while it stays within 2^53
+        for n in ints:
+            add(_cmp("le", ir.Builtin(ir.INT, loc, "abs", (_v(n, ir.INT, loc),)), _int(2**53, loc), loc))
     for a in ints:
         for b in ints:
             if a < b:

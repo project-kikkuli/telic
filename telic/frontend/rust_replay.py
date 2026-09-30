@@ -7,6 +7,7 @@ other harnesses report crashes."""
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -64,8 +65,12 @@ class _Values:
         if isinstance(ty, ir.TReal):
             if isinstance(v, dict) and "__real__" in v:
                 v = Fraction(*v["__real__"])
-            f = float(v or 0)
-            return f"({f!r})" if f < 0 else repr(f)
+            if isinstance(v, dict) and "__float__" in v:
+                v = float(v["__float__"])
+            f = float(v) if isinstance(v, (int, float, Fraction)) else 0.0
+            if not math.isfinite(f):
+                return "f64::NAN" if math.isnan(f) else "f64::INFINITY" if f > 0 else "f64::NEG_INFINITY"
+            return f"({f!r})" if math.copysign(1, f) < 0 else repr(f)
         if isinstance(ty, ir.TBool):
             return "true" if v else "false"
         if isinstance(ty, ir.TStr):

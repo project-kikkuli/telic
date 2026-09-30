@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from fractions import Fraction
 from typing import Any
@@ -11,6 +12,7 @@ from .swift import INT_KINDS, LOGGING, REAL_TYPES, STR_TYPES, FnInfo, LowerError
 from .swift_syntax import Unsupported, X, norm, text
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
+DOUBLE_CONSTS = {"zero": Fraction(0), "nan": math.nan, "infinity": math.inf, "greatestFiniteMagnitude": float.fromhex("0x1.fffffffffffffp+1023"), "ulpOfOne": Fraction(2) ** -52}
 SCALARS = (ir.TInt, ir.TReal, ir.TBool, ir.TEnum)
 STRING_TO_STRING = {"lowercased", "uppercased", "capitalized", "trimmingCharacters", "replacingOccurrences", "appending", "padding", "description", "debugDescription"}
 INT_MAX = (1 << 63) - 1
@@ -797,6 +799,8 @@ class ExprLowerer:
             if self.spec:
                 raise self.err(f"Int.{name} in a specification", x)
             return self.ranged(self.opaque(f"Int.{name}", [b], ir.INT, loc), self.kind_of(b) or "Int")
+        if t == ir.REAL and name in ("isNaN", "isFinite", "isInfinite"):
+            return ir.Builtin(ir.BOOL, loc, {"isNaN": "is_nan", "isFinite": "is_finite", "isInfinite": "is_inf"}[name], (b,))
         if t == ir.REAL:
             if self.spec:
                 raise self.err(f"Double.{name} in a specification", x)
@@ -827,8 +831,8 @@ class ExprLowerer:
             return self.kinded(ir.Lit(ir.INT, loc, hi if name == "max" else lo), tr.name)
         if tr.name in INT_KINDS and name == "zero":
             return self.kinded(ir.Lit(ir.INT, loc, 0), tr.name)
-        if tr.name in REAL_TYPES and name == "zero":
-            return ir.Lit(ir.REAL, loc, Fraction(0))
+        if tr.name in REAL_TYPES and name in DOUBLE_CONSTS:
+            return ir.Lit(ir.REAL, loc, DOUBLE_CONSTS[name])
         info = tr.info
         if info is not None and isinstance(info.ir_type, ir.TEnum) and name in info.ir_type.members:
             return ir.Lit(info.ir_type, loc, info.ir_type.members.index(name))

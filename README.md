@@ -175,8 +175,10 @@ cores / 2) and `TELIC_UI_SLOTS` browsers (default 2), and queue for them.
 
 - **Language semantics.** Python ints are exact; Rust and Swift integers are
   their fixed width, and overflow is a panic or a trap (debug semantics).
-  Floats and JavaScript numbers are exact rationals: no rounding, NaN or
-  Infinity. Swift `String` equality is Unicode canonical equivalence, which
+  Floats (Python `float`, JavaScript `number`, Rust `f64`, Swift `Double`)
+  are IEEE doubles in Z3's floating-point theory: rounding, NaN, ±Infinity
+  and -0.0 included; a JavaScript integer is exact only up to 2^53. Rust
+  `f32` and Swift `Float` are not modelled. Swift `String` equality is Unicode canonical equivalence, which
   telic treats as an uninterpreted function.
 - **Z3 and the Lean kernel.**
 - **The theory lemmas about sums and counts.** They are proved in

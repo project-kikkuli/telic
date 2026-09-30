@@ -14,6 +14,8 @@ expressed in terms of it by the VC generator.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import struct
 from fractions import Fraction
 from typing import Iterable
 
@@ -39,6 +41,7 @@ class Sort:
 
 INT = Sort("Int")
 REAL = Sort("Real")
+FLOAT = Sort("Float64")  # IEEE 754 binary64: Python float, JS number, f64, Double
 BOOL = Sort("Bool")
 STR = Sort("Str")
 OPAQUE = Sort("Opaque")  # values of unchecked code: an uninterpreted sort
@@ -89,6 +92,31 @@ class IntV(Term):
 class RealV(Term):
     value: Fraction
     sort: Sort = REAL
+
+
+@dataclass(frozen=True, repr=False)
+class FloatV(Term):
+    """A binary64 value, kept as its bit pattern so NaN equals itself and
+    -0.0 differs from 0.0 (structural equality, as SMT's ``=``)."""
+
+    bits: int
+    sort: Sort = FLOAT
+
+    @property
+    def f(self) -> float:
+        return struct.unpack("<d", struct.pack("<Q", self.bits))[0]
+
+
+def fval(x: float) -> FloatV:
+    return FloatV(struct.unpack("<Q", struct.pack("<d", float(x)))[0])
+
+
+def fnear(q: Fraction) -> FloatV:
+    """The double nearest ``q`` (ties to even), as a literal is read."""
+    try:
+        return fval(q.numerator / q.denominator)
+    except OverflowError:
+        return fval(math.inf if q > 0 else -math.inf)
 
 
 @dataclass(frozen=True, repr=False)
@@ -158,6 +186,8 @@ def lit(v, sort: Sort) -> Term:
         return IntV(int(v))
     if sort == REAL:
         return RealV(Fraction(v))
+    if sort == FLOAT:
+        return fnear(Fraction(v))
     if sort == BOOL:
         return BoolV(bool(v))
     if sort == STR:
@@ -166,6 +196,8 @@ def lit(v, sort: Sort) -> Term:
 
 
 def add(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT:
+        return fbin("fp.add", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x + y, a.sort)
@@ -182,6 +214,8 @@ def add(a: Term, b: Term) -> Term:
 
 
 def sub(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT:
+        return fbin("fp.sub", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x - y, a.sort)
@@ -199,6 +233,8 @@ def sub(a: Term, b: Term) -> Term:
 
 
 def mul(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT:
+        return fbin("fp.mul", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x * y, a.sort)
@@ -212,6 +248,8 @@ def mul(a: Term, b: Term) -> Term:
 
 
 def neg(a: Term) -> Term:
+    if a.sort == FLOAT:
+        return fneg(a)
     x = _num(a)
     if x is not None:
         return lit(-x, a.sort)
@@ -221,6 +259,8 @@ def neg(a: Term) -> Term:
 
 
 def rdiv(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT:
+        return fbin("fp.div", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None and y != 0:
         return RealV(Fraction(x) / Fraction(y))
@@ -270,6 +310,8 @@ def is_int(a: Term) -> Term:
 
 
 def lt(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT or b.sort == FLOAT:
+        return fcmp("fp.lt", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return BoolV(x < y)
@@ -279,6 +321,8 @@ def lt(a: Term, b: Term) -> Term:
 
 
 def le(a: Term, b: Term) -> Term:
+    if a.sort == FLOAT or b.sort == FLOAT:
+        return fcmp("fp.leq", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return BoolV(x <= y)
@@ -435,6 +479,8 @@ def exists(vs: Iterable[Const], body: Term) -> Term:
 
 
 def abs_(a: Term) -> Term:
+    if a.sort == FLOAT:
+        return fabs(a)
     return ite(le(lit(0, a.sort), a), a, neg(a))
 
 
@@ -444,6 +490,123 @@ def min_(a: Term, b: Term) -> Term:
 
 def max_(a: Term, b: Term) -> Term:
     return ite(le(a, b), b, a)
+
+
+# ---------------------------------------------------------------------------
+# Floating point (binary64, round to nearest even). Arithmetic and
+# comparisons are IEEE's: NaN compares false, -0.0 == 0.0, overflow gives
+# an infinity. ``eq`` stays structural (same bits, NaN included); ``feq``
+# is the language's ``==``. Constants fold with Python's own floats, which
+# are the same binary64 operations.
+
+_FOLD = {
+    "fp.add": lambda x, y: x + y,
+    "fp.sub": lambda x, y: x - y,
+    "fp.mul": lambda x, y: x * y,
+}
+
+
+def fbin(op: str, a: Term, b: Term) -> Term:
+    if isinstance(a, FloatV) and isinstance(b, FloatV):
+        x, y = a.f, b.f
+        if op in _FOLD:
+            return fval(_FOLD[op](x, y))
+        if op == "fp.div" and y != 0:
+            try:
+                return fval(x / y)
+            except OverflowError:
+                pass
+    return App(op, (a, b), FLOAT)
+
+
+def fneg(a: Term) -> Term:
+    if isinstance(a, FloatV):
+        return fval(-a.f)
+    if isinstance(a, App) and a.op == "fp.neg":
+        return a.args[0]
+    return App("fp.neg", (a,), FLOAT)
+
+
+def fabs(a: Term) -> Term:
+    if isinstance(a, FloatV):
+        return fval(abs(a.f))
+    return App("fp.abs", (a,), FLOAT)
+
+
+def as_float(a: Term) -> Term:
+    """An Int or Real term at sort Float64, rounded to nearest."""
+    if a.sort == FLOAT:
+        return a
+    if isinstance(a, (IntV, RealV)):
+        return fnear(Fraction(a.value))
+    if a.sort == INT:
+        return App("fp.of_int", (a,), FLOAT)
+    return App("fp.of_real", (a,), FLOAT)
+
+
+def fcmp(op: str, a: Term, b: Term) -> Term:
+    """``fp.lt``/``fp.leq``/``fp.eq``. An Int or Real side is compared by
+    its exact value (Python compares int with float exactly; a JavaScript
+    integer is already a double)."""
+    if a.sort != FLOAT or b.sort != FLOAT:
+        return xcmp(op, a, b)
+    if isinstance(a, FloatV) and isinstance(b, FloatV):
+        x, y = a.f, b.f
+        return BoolV(x < y if op == "fp.lt" else x <= y if op == "fp.leq" else x == y)
+    return App(op, (a, b), BOOL)
+
+
+def feq(a: Term, b: Term) -> Term:
+    return fcmp("fp.eq", a, b)
+
+
+def fpred(op: str, a: Term) -> Term:
+    """``fp.isNaN``/``fp.isInfinite``/``fp.isZero``/``fp.isNegative``. Of an
+    integer rounded to a double they are integer facts: only 0 rounds to
+    zero, and only a magnitude past the largest float to infinity."""
+    if isinstance(a, FloatV):
+        x = a.f
+        if op == "fp.isNegative":
+            return BoolV(math.copysign(1.0, x) < 0 and not math.isnan(x))
+        return BoolV(math.isnan(x) if op == "fp.isNaN" else math.isinf(x) if op == "fp.isInfinite" else x == 0)
+    if isinstance(a, App) and a.op == "ite":
+        return ite(a.args[0], fpred(op, a.args[1]), fpred(op, a.args[2]))
+    if isinstance(a, App) and a.op == "fp.of_int":
+        i = a.args[0]
+        return {"fp.isNaN": FALSE, "fp.isZero": eq(i, ZERO), "fp.isNegative": lt(i, ZERO), "fp.isInfinite": le(IntV(2**1024 - 2**970), abs_(i))}[op]
+    return App(op, (a,), BOOL)
+
+
+def is_finite(a: Term) -> Term:
+    return and_(not_(fpred("fp.isNaN", a)), not_(fpred("fp.isInfinite", a)))
+
+
+def fto_real(a: Term) -> Term:
+    """The exact value of a finite float (unspecified for NaN and infinities)."""
+    if isinstance(a, FloatV) and math.isfinite(a.f):
+        return RealV(Fraction(a.f))
+    return App("fp.to_real", (a,), REAL)
+
+
+def xcmp(op: str, a: Term, b: Term) -> Term:
+    """A float against an exact number: NaN is unordered, the infinities lie
+    beyond every number, a finite float compares by its exact value."""
+    flip = a.sort != FLOAT
+    f, x = (b, a) if flip else (a, b)
+    xr = x if x.sort == REAL else to_real(x)
+    fr = fto_real(f)
+    nan, inf = fpred("fp.isNaN", f), fpred("fp.isInfinite", f)
+    pos = not_(fpred_neg(f))
+    if op == "fp.eq":
+        return and_(not_(nan), not_(inf), eq(fr, xr))
+    # f < x (or x < f when flipped)
+    exact = (lt(xr, fr) if op == "fp.lt" else le(xr, fr)) if flip else (lt(fr, xr) if op == "fp.lt" else le(fr, xr))
+    beyond = pos if flip else not_(pos)  # +inf is above every number, -inf below
+    return and_(not_(nan), ite(inf, beyond, exact))
+
+
+def fpred_neg(a: Term) -> Term:
+    return fpred("fp.isNegative", a)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +702,22 @@ _REBUILD = {
     "is_int": is_int,
     "select": select,
     "store": store,
+    "fp.add": lambda a, b: fbin("fp.add", a, b),
+    "fp.sub": lambda a, b: fbin("fp.sub", a, b),
+    "fp.mul": lambda a, b: fbin("fp.mul", a, b),
+    "fp.div": lambda a, b: fbin("fp.div", a, b),
+    "fp.neg": fneg,
+    "fp.abs": fabs,
+    "fp.lt": lambda a, b: fcmp("fp.lt", a, b),
+    "fp.leq": lambda a, b: fcmp("fp.leq", a, b),
+    "fp.eq": lambda a, b: fcmp("fp.eq", a, b),
+    "fp.isNaN": lambda a: fpred("fp.isNaN", a),
+    "fp.isInfinite": lambda a: fpred("fp.isInfinite", a),
+    "fp.isZero": lambda a: fpred("fp.isZero", a),
+    "fp.isNegative": lambda a: fpred("fp.isNegative", a),
+    "fp.to_real": fto_real,
+    "fp.of_real": as_float,
+    "fp.of_int": as_float,
 }
 
 
@@ -574,6 +753,14 @@ class FunDef:
     # For guarded definitions f(x) = if guard then inner else default:
     guard: Term | None = None
     inner: Term | None = None
+
+
+def expands(d: FunDef) -> bool:
+    """A non-recursive definition over floats is expanded where it is used:
+    Z3's recursive-function unfolding is slow with bit-blasted floats."""
+    if d.body is None or d.recursive:
+        return False
+    return d.sort == FLOAT or any(p.sort == FLOAT for p in d.params) or any(x.sort == FLOAT for x in iter_terms(d.body))
 
 
 @dataclass
@@ -706,6 +893,13 @@ _INFIX = {
     "and": ("and", 2),
     "or": ("or", 1),
     "implies": ("==>", 0),
+    "fp.add": ("+.", 6),
+    "fp.sub": ("-.", 6),
+    "fp.mul": ("*.", 7),
+    "fp.div": ("/.", 7),
+    "fp.lt": ("<.", 4),
+    "fp.leq": ("<=.", 4),
+    "fp.eq": ("==.", 4),
 }
 
 
@@ -719,6 +913,8 @@ def show(t: Term, prec: int = -1) -> str:
         return str(v.numerator) if v.denominator == 1 else f"{v.numerator}/{v.denominator}"
     if isinstance(t, BoolV):
         return "true" if t.value else "false"
+    if isinstance(t, FloatV):
+        return repr(t.f)
     if isinstance(t, StrV):
         return repr(t.value)
     if isinstance(t, Quant):
@@ -744,7 +940,7 @@ def show(t: Term, prec: int = -1) -> str:
             s = f"{show(a.args[0], 5)} != {show(a.args[1], 5)}"
             return f"({s})" if 4 <= prec else s
         return f"not {show(a, 8)}"
-    if op == "neg":
+    if op in ("neg", "fp.neg"):
         return f"-{show(t.args[0], 8)}"
     if op == "ite":
         s = f"if {show(t.args[0])} then {show(t.args[1])} else {show(t.args[2])}"
@@ -769,6 +965,8 @@ def canonical(t: Term) -> str:
         return repr(t.value)
     if isinstance(t, RealV):
         return f"{t.value.numerator}/{t.value.denominator}"
+    if isinstance(t, FloatV):
+        return f"f{t.bits:016x}"
     if isinstance(t, Quant):
         return f"({t.kind} ({' '.join(canonical(v) for v in t.vars)}) {canonical(t.body)})"
     if isinstance(t, Fn):

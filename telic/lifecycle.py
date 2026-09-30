@@ -176,7 +176,8 @@ def texts(form: Form, lang: str) -> Texts:
         return Texts(rel, [(f"reaches {a}", st, cr) for a, st, cr in reached])
     e = form.expr
     if form.kind == "monotonic":
-        return Texts(f"old({e}) <= {par(e)}", [("grows", f"old({e}) < {par(e)}", None)])
+        # a NaN that stays NaN keeps it too (NaN compares false, even with itself)
+        return Texts(f"old({e}) <= {par(e)} {d.or_} {par(f'old({e}) != old({e}) {d.and_} {par(e)} != {par(e)}')}", [("grows", f"old({e}) < {par(e)}", None)])
     if form.kind == "once":
         return Texts(f"{d.not_}{par(f'old({e})')} {d.or_} {par(e)}", [("becomes true", f"{d.not_}{par(f'old({e})')} {d.and_} {par(e)}", e)])
     return Texts(e, [])

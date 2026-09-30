@@ -1,4 +1,6 @@
 // Counterexamples holding objects inside maps, arrays and sets.
+type int = number;
+
 class Lock {
   held: boolean;
   constructor() {
@@ -8,7 +10,7 @@ class Lock {
 
 //@ requires locks.has(k) && locks.get(k)!.held
 //@ ensures result
-function freeAt(locks: Map<number, Lock>, k: number): boolean {
+function freeAt(locks: Map<int, Lock>, k: int): boolean {
   return !locks.get(k)!.held;
 }
 

@@ -18,7 +18,7 @@ type loc = { line : int; col : int; end_col : int }
 
 let noloc = { line = 0; col = 0; end_col = 0 }
 
-type lit = LInt of string | LFrac of string * string | LBool of bool | LStr of string | LNone
+type lit = LInt of string | LFrac of string * string | LFloat of string  (** binary64 bits, hex *) | LBool of bool | LStr of string | LNone
 
 type expr = { e : enode; ty : ty; loc : loc }
 
@@ -134,7 +134,10 @@ let rec expr_of j : expr =
   let e =
     match to_str (member "e" j) with
     | "Lit" -> (
-      match member "frac" j with
+      match (member "bits" j, member "frac" j) with
+      | String b, _ -> Lit (LFloat b)
+      | _, frac ->
+      match frac with
       | List [ n; d ] -> Lit (LFrac (Json.to_string n, Json.to_string d))
       | _ -> (
         match member "value" j with

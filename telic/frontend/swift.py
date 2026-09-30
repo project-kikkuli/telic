@@ -51,7 +51,6 @@ from ..contracts import (
 from .swift_syntax import Unsupported, named, parser, text
 
 SWIFT_ASSUMPTIONS = [
-    "Double/Float are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
     "Int and UInt are 64 bits wide",
     "String equality (Unicode canonical equivalence) and other String operations are uninterpreted functions",
     "assert and precondition are checked (debug build semantics)",
@@ -62,7 +61,8 @@ INT_KINDS = {
     "Int": (True, 64), "Int8": (True, 8), "Int16": (True, 16), "Int32": (True, 32), "Int64": (True, 64),
     "UInt": (False, 64), "UInt8": (False, 8), "UInt16": (False, 16), "UInt32": (False, 32), "UInt64": (False, 64),
 }
-REAL_TYPES = {"Double", "Float", "Float32", "Float64", "CGFloat", "Float80"}
+REAL_TYPES = {"Double", "Float64", "CGFloat"}  # binary64 (CGFloat on 64-bit platforms)
+UNMODELLED_FLOATS = {"Float", "Float32", "Float16", "Float80"}
 STR_TYPES = {"String", "Character"}
 LOGGING = {"print", "debugPrint", "NSLog", "dump"}
 
@@ -683,6 +683,8 @@ class Project:
                 return ir.INT, name
             if name in REAL_TYPES:
                 return ir.REAL, None
+            if name in UNMODELLED_FLOATS:
+                return ir.TOpaque(f"{name}: only Double is modelled"), None
             if name == "Bool":
                 return ir.BOOL, None
             if name in STR_TYPES:

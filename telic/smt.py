@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -73,11 +74,13 @@ class Z3Encoder:
         self.json_containers: set[L.Term] = set()  # values the obligation looks inside
         self.json_lits: list[str] = []
         self.json_model: z3.ModelRef | None = None
+        self.macros: dict[str, L.FunDef] = {d.name: d for d in theory_defs if L.expands(d)}
         self.defs = {d.name: d for d in theory_defs}
         for d in theory_defs:
-            self.declare(d)
+            if d.name not in self.macros:
+                self.declare(d)
         for d in theory_defs:
-            if d.body is not None:
+            if d.body is not None and d.name not in self.macros:
                 self.define(d)
 
     # -- sorts ------------------------------------------------------------
@@ -88,6 +91,8 @@ class Z3Encoder:
             return z3.IntSort(c)
         if s == L.REAL:
             return z3.RealSort(c)
+        if s == L.FLOAT:
+            return z3.Float64(c)
         if s == L.BOOL:
             return z3.BoolSort(c)
         if s == L.STR:
@@ -148,6 +153,8 @@ class Z3Encoder:
             return z3.IntVal(t.value, c)
         if isinstance(t, L.RealV):
             return z3.RealVal(f"{t.value.numerator}/{t.value.denominator}", c)
+        if isinstance(t, L.FloatV):
+            return z3.fpBVToFP(z3.BitVecVal(t.bits, 64, c), z3.Float64(c), c)
         if isinstance(t, L.BoolV):
             return z3.BoolVal(t.value, c)
         if isinstance(t, L.StrV):
@@ -159,6 +166,9 @@ class Z3Encoder:
                 pats = [z3.MultiPattern(*[self.term(x) for x in p]) if len(p) > 1 else self.term(p[0]) for p in t.patterns]
                 return z3.ForAll(vs, body, patterns=pats)
             return z3.ForAll(vs, body) if t.kind == "forall" else z3.Exists(vs, body)
+        if isinstance(t, L.Fn) and t.name in self.macros:
+            d = self.macros[t.name]
+            return z3.substitute(self.term(d.body), *[(self.term(p), self.term(a)) for p, a in zip(d.params, t.args)])  # type: ignore[arg-type]
         if isinstance(t, L.Fn):
             f = self.funcs.get(t.name)  # a defined function
             if f is None:
@@ -209,6 +219,8 @@ class Z3Encoder:
             return z3.ToInt(a[0])
         if op == "is_int":
             return z3.IsInt(a[0])
+        if op.startswith("fp."):
+            return self.fp(op, a)
         if op == "select":
             return z3.Select(a[0], a[1])
         if op == "store":
@@ -249,6 +261,38 @@ class Z3Encoder:
         if op.startswith("mk:"):
             sort, _ = self.record(t.sort)
             return sort.constructor(0)(*a)
+        raise TypeError(f"no Z3 encoding for {op}")
+
+    def fp(self, op: str, a: list) -> z3.ExprRef:
+        c = self.ctx
+        rne = z3.RNE(c)
+        bins = {"fp.add": z3.fpAdd, "fp.sub": z3.fpSub, "fp.mul": z3.fpMul, "fp.div": z3.fpDiv}
+        if op in bins:
+            return bins[op](rne, a[0], a[1], c)
+        preds = {"fp.isNaN": z3.fpIsNaN, "fp.isInfinite": z3.fpIsInf, "fp.isZero": z3.fpIsZero, "fp.isNegative": z3.fpIsNegative}
+        if op in preds:
+            return preds[op](a[0], c)
+        if op == "fp.neg":
+            return z3.fpNeg(a[0], c)
+        if op == "fp.abs":
+            return z3.fpAbs(a[0], c)
+        if op == "fp.lt":
+            return z3.fpLT(a[0], a[1], c)
+        if op == "fp.leq":
+            return z3.fpLEQ(a[0], a[1], c)
+        if op == "fp.eq":
+            return z3.fpEQ(a[0], a[1], c)
+        if op == "fp.to_real":
+            return z3.fpToReal(a[0], c)
+        if op == "fp.of_real":
+            return z3.fpToFP(rne, a[0], z3.Float64(c), c)
+        if op == "fp.of_int":
+            # through a 64-bit integer, which Z3 decides far better than a real;
+            # a larger int rounds to some double telic does not pin down
+            i = a[0]
+            small = z3.And(i > -(2**63), i < 2**63)
+            big = z3.Function("f64.of_big_int", z3.IntSort(c), z3.Float64(c))
+            return z3.If(small, z3.fpSignedToFP(rne, z3.Int2BV(i, 64), z3.Float64(c), c), big(i))
         raise TypeError(f"no Z3 encoding for {op}")
 
     # -- model values -----------------------------------------------------
@@ -292,6 +336,8 @@ def _lit(k: Any, sort: L.Sort | None) -> L.Term:
 
 
 def to_python(v: z3.ExprRef) -> Any:
+    if z3.is_fp_value(v):
+        return float_of(v)
     if z3.is_int_value(v):
         return v.as_long()
     if z3.is_rational_value(v):
@@ -307,6 +353,16 @@ def to_python(v: z3.ExprRef) -> Any:
     if z3.is_app(v) and v.decl().kind() == z3.Z3_OP_DT_CONSTRUCTOR:
         return {v.decl().name(): [to_python(a) for a in v.children()]}
     return str(v)
+
+
+def float_of(v: z3.ExprRef) -> float:
+    if v.isNaN():
+        return math.nan
+    if v.isInf():
+        return -math.inf if v.isNegative() else math.inf
+    if v.isZero():
+        return -0.0 if v.isNegative() else 0.0
+    return float(Fraction(z3.simplify(z3.fpToReal(v, v.ctx)).as_fraction()))
 
 
 def array_entries(v: z3.ExprRef) -> tuple[list[tuple[Any, Any]], Any]:
@@ -497,6 +553,7 @@ def unchecked_json(enc: Z3Encoder, model: z3.ModelRef, t: L.Term, depth: int) ->
 # the same verdict on a loaded machine. It covers stating the problem, solving
 # it and reading a model; wall-clock time is only a safety net.
 RLIMIT = 2_000_000
+FLOAT_RLIMIT = 10
 SEED = 0
 
 
@@ -511,6 +568,8 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int =
     model may be spurious, so only a proof counts."""
     t0 = time.perf_counter()
     terms = list(ob.hyps) + [ob.goal]
+    if any(x.sort == L.FLOAT for t in terms for x in L.iter_terms(t)):
+        rlimit *= FLOAT_RLIMIT  # floating point is bit-blasted: many more steps per proof
     with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
     stages = [(with_lemmas, rlimit)] if len(with_lemmas[1]) == len(without[1]) else [(without, rlimit // 10), (with_lemmas, rlimit)]

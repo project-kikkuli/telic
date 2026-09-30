@@ -118,6 +118,8 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     if isinstance(ty, ir.TDict):
         if isinstance(ty.val, (ir.TList, ir.TDict, ir.TOption)):
             raise VCError(f"dict values of type {ty.val} are not supported yet")
+        if isinstance(ty.key, ir.TReal):
+            raise VCError("dicts keyed by floats are not modelled (0.0 and -0.0 are one key, NaN keys are compared by identity)")
         k = sort_of(ty.key)
         return [("vals", L.ARRAY(sort_of(ty.val), k)), ("has", L.ARRAY(L.BOOL, k))]
     return [("", sort_of(ty))]
@@ -151,7 +153,7 @@ def sort_of(ty: ir.Type) -> L.Sort:
     if isinstance(ty, ir.TInt):
         return L.INT
     if isinstance(ty, ir.TReal):
-        return L.REAL
+        return L.FLOAT
     if isinstance(ty, ir.TBool):
         return L.BOOL
     if isinstance(ty, ir.TStr):
@@ -203,21 +205,26 @@ def ite_val(c: L.Term, a: Val, b: Val) -> Val:
     return L.ite(c, a, b)  # type: ignore[arg-type]
 
 
-def rec_equal(a: L.Term, b: L.Term) -> L.Term:
+def rec_equal(a: L.Term, b: L.Term, feq=L.feq) -> L.Term:
     """Equality as the language sees it: an absent optional field equals
-    another absent one, whatever junk its value slot holds."""
+    another absent one, whatever junk its value slot holds; floats compare
+    by ``feq``."""
     s = a.sort
+    if s == L.FLOAT or b.sort == L.FLOAT:
+        return feq(a, b)
     if s.name != "Rec":
         return L.eq(a, b)
     if str(s.rec).startswith("Opt_"):
         sa, sb = L.field(a, "some"), L.field(b, "some")
-        return L.and_(L.eq(sa, sb), L.implies(sa, rec_equal(L.field(a, "val"), L.field(b, "val"))))
-    return L.and_(*[rec_equal(L.field(a, n), L.field(b, n)) for n, _ in s.fields])
+        return L.and_(L.eq(sa, sb), L.implies(sa, rec_equal(L.field(a, "val"), L.field(b, "val"), feq)))
+    return L.and_(*[rec_equal(L.field(a, n), L.field(b, n), feq) for n, _ in s.fields])
 
 
 def default_term(s: L.Sort) -> L.Term:
     if s == L.INT:
         return L.ZERO
+    if s == L.FLOAT:
+        return L.fval(0.0)
     if s == L.REAL:
         return L.RealV(Fraction(0))
     if s == L.BOOL:
@@ -725,7 +732,7 @@ class VCGen:
             env[p.name] = v
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
             if isinstance(v, ListVal):
-                facts.append(L.le(L.ZERO, v.len))
+                facts.append(self.len_ok(v.len))
             facts.extend(self.alloc_facts(v, p.ty, env))
         self.entry = dict(env)
         if any(suspends(x) for st_ in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st_) for x in ir.walk_expr(e)):
@@ -1216,7 +1223,7 @@ class VCGen:
                 nv = self.fresh(name, ty, len_=keep)
                 assert isinstance(nv, ListVal)
                 if keep is None:
-                    h.facts.append(L.le(L.ZERO, nv.len))
+                    h.facts.append(self.len_ok(nv.len))
                 else:
                     nv = ListVal(nv.arr, old.off, keep, nv.ty)
                 h.env[name] = nv
@@ -1467,10 +1474,12 @@ class VCGen:
             return L.BoolV(v)
         if isinstance(v, int):
             if isinstance(e.ty, ir.TReal):
-                return L.RealV(Fraction(v))
+                return L.fnear(Fraction(v))
             return L.IntV(v)
         if isinstance(v, Fraction):
-            return L.RealV(v)
+            return L.fnear(v)
+        if isinstance(v, float):
+            return L.fval(v)
         if isinstance(v, str):
             return L.StrV(v)
         raise VCError(f"unsupported literal {v!r}", e.loc)
@@ -1526,13 +1535,16 @@ class VCGen:
         if op == "ge":
             return L.ge(a, b)
         if op in ("rdiv", "floordiv", "fmod", "tmod", "tdiv"):
-            zero = L.lit(0, b.sort)
             sym = {"rdiv": "/", "floordiv": "//", "fmod": "%", "tmod": "%", "tdiv": "/"}[op]
-            self.oblige("div", ctx, L.ne(b, zero), e.loc, f"divisor of '{sym}' is non-zero")
+            nonzero = L.not_(L.fpred("fp.isZero", b)) if b.sort == L.FLOAT else L.ne(b, L.lit(0, b.sort))  # -0.0 is zero too
+            self.oblige("div", ctx, nonzero, e.loc, f"divisor of '{sym}' is non-zero")
             if not (ctx.quiet or ctx.spec):
-                ctx.assume(L.ne(b, zero))  # past this point it was not: the program would have failed
+                ctx.assume(nonzero)  # past this point it was not: the program would have failed
             if op == "rdiv":
                 return L.rdiv(a, b)
+            if a.sort == L.FLOAT:
+                # // and % on floats: exact in principle, but not modelled
+                return L.Fn(f"float.{op}.{self.module.language}", (a, b), L.FLOAT)
             if a.sort == L.REAL:
                 # % on reals: fmod floors the quotient, tmod truncates it
                 q = L.rdiv(a, b)
@@ -1549,11 +1561,103 @@ class VCGen:
             return L.sub(a, L.mul(b, truncdiv(a, b)))
         raise VCError(f"unknown operator {op}", e.loc)
 
+    def held_feq(self, a: L.Term, b: L.Term, at: tuple[L.Term, ...] = ()) -> L.Term:
+        """Floats held in a list or record, compared with it. Python compares
+        those by identity first, so a NaN may equal itself: unknown then."""
+        if self.module.language != "python":
+            return L.feq(a, b)
+        if self.definitional_mode:
+            raise VCError("== on lists or objects holding floats is not modelled here: Python compares a NaN inside them by identity")
+        both = L.and_(L.fpred("fp.isNaN", a), L.fpred("fp.isNaN", b))
+        same = L.Fn(f"same_nan!{next(self.counter)}", at, L.BOOL) if at else L.Const(f"same_nan!{next(self.counter)}", L.BOOL)
+        return L.or_(L.feq(a, b), L.and_(both, same))
+
+    def len_ok(self, n: L.Term) -> L.Term:
+        """What a list length can be: a JavaScript array has at most 2^32-1
+        elements; elsewhere a length is a signed 64-bit size."""
+        top = 2**32 - 1 if self.module.language == "typescript" else 2**63 - 1
+        return L.and_(L.le(L.ZERO, n), L.le(n, L.IntV(top)))
+
+    def unknown(self, name: str, sort: L.Sort, loc: ir.Loc) -> L.Term:
+        """A value the model does not determine. In a definition (loop-free,
+        pure) it is a function of the definition's inputs at this site."""
+        if not self.definitional_mode:
+            return L.Const(f"{name}!{next(self.counter)}", sort)
+        ins = tuple(t for v in self.entry.values() for t in flatten(v) if isinstance(t, L.Term))
+        return L.Fn(f"{name}@{loc.line}:{loc.col}", ins, sort)
+
+    def float_fits(self, r: L.Term, ctx: Ctx, loc: ir.Loc, message: str) -> None:
+        """Python raises OverflowError where a number rounds past the largest float."""
+        ok = L.lt(L.abs_(r), L.IntV(2**1024 - 2**970))
+        self.oblige("overflow", ctx, ok, loc, message)
+        if not (ctx.quiet or ctx.spec):
+            ctx.assume(ok)
+
+    def truediv_checks(self, a: L.Term, b: L.Term, ctx: Ctx, loc: ir.Loc) -> None:
+        """Python int / int raises on a zero divisor and on a quotient past the largest float."""
+        nonzero = L.ne(b, L.ZERO)
+        self.oblige("div", ctx, nonzero, loc, "divisor of '/' is non-zero")
+        if not (ctx.quiet or ctx.spec):
+            ctx.assume(nonzero)
+        big = L.RealV(Fraction(2**1024 - 2**970))
+        fits = L.lt(L.to_real(L.abs_(a)), L.mul(big, L.to_real(L.abs_(b))))
+        self.oblige("overflow", ctx, fits, loc, "the quotient of '/' fits in a float")
+        if not (ctx.quiet or ctx.spec):
+            ctx.assume(fits)
+
+    def int_quotient(self, e: ir.Expr, ctx: Ctx) -> tuple[L.Term, L.Term] | None:
+        """The integers of a quotient of two integers (Python int / int, or
+        JavaScript integer-valued numbers), with the division's obligations."""
+        if isinstance(e, ir.Builtin) and e.name == "py_truediv":
+            a, b = (self.ev(x, ctx) for x in e.args)
+            self.truediv_checks(a, b, ctx, e.loc)  # type: ignore[arg-type]
+            return a, b  # type: ignore[return-value]
+        ints = lambda x: isinstance(x, ir.Builtin) and x.name == "js_real" and isinstance(x.args[0].ty, ir.TInt)  # noqa: E731
+        if isinstance(e, ir.Binary) and e.op == "rdiv" and ints(e.left) and ints(e.right):
+            a = self.ev(e.left.args[0], ctx)  # type: ignore[attr-defined]
+            b = self.ev(e.right.args[0], ctx)  # type: ignore[attr-defined]
+            nonzero = L.ne(b, L.ZERO)  # type: ignore[arg-type]
+            self.oblige("div", ctx, nonzero, e.loc, "divisor of '/' is non-zero")
+            if not (ctx.quiet or ctx.spec):
+                ctx.assume(nonzero)
+            return a, b  # type: ignore[return-value]
+        return None
+
+    def round_quotient(self, name: str, a: L.Term, b: L.Term) -> L.Term:
+        """An integer quotient's double, rounded to an integer. While |a| < 2^52
+        and |b| <= 2^53 the double's single rounding never crosses an integer
+        or a half, so this is the exact quotient rounded; past that, unknown."""
+        q = L.rdiv(L.to_real(a), L.to_real(b))
+        exact = {
+            "floor": lambda: L.floor(q),
+            "ceil": lambda: L.neg(L.floor(L.neg(q))),
+            "trunc": lambda: L.ite(L.le(L.RealV(Fraction(0)), q), L.floor(q), L.neg(L.floor(L.neg(q)))),
+            "round_even": lambda: round_even(q),
+            "round_up": lambda: L.floor(L.add(q, L.RealV(Fraction(1, 2)))),
+        }[name]()
+        small = L.and_(L.lt(L.abs_(a), L.IntV(2**52)), L.le(L.abs_(b), SAFE))
+        return L.ite(small, exact, L.Fn(f"round_quotient.{name}", (a, b), L.INT))
+
+    def float_minmax(self, name: str, a: L.Term, b: L.Term) -> L.Term:
+        """Languages agree on min/max of two floats unless one is NaN or both are zeros."""
+        a, b = L.as_float(a), L.as_float(b)
+        plain = L.and_(L.not_(L.fpred("fp.isNaN", a)), L.not_(L.fpred("fp.isNaN", b)), L.not_(L.and_(L.fpred("fp.isZero", a), L.fpred("fp.isZero", b))))
+        pick = L.ite(L.lt(b, a), b, a) if name == "min" else L.ite(L.lt(a, b), b, a)
+        return L.ite(plain, pick, L.Fn(f"float.{name}.{self.module.language}", (a, b), L.FLOAT))
+
+    def member_eq(self, x: L.Term, v: L.Term, i: L.Term) -> L.Term:
+        """Does list element ``x`` match ``v`` for ``in`` / ``includes`` / ``contains``?"""
+        if x.sort != L.FLOAT:
+            return L.eq(x, v)
+        if self.module.language == "typescript":  # includes: SameValueZero, NaN finds NaN
+            return L.or_(L.feq(x, v), L.and_(L.fpred("fp.isNaN", x), L.fpred("fp.isNaN", v)))
+        return self.held_feq(x, v, (i,))
+
     def equal(self, a: Val, b: Val) -> L.Term:
         if isinstance(a, ListVal) or isinstance(b, ListVal):
             assert isinstance(a, ListVal) and isinstance(b, ListVal)
             i = L.Const(f"eq!{next(self.counter)}", L.INT)
-            same = L.forall([i], L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, a.len)), L.eq(a.at(i), b.at(i))))
+            same = L.forall([i], L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, a.len)), rec_equal(a.at(i), b.at(i), lambda x, y: self.held_feq(x, y, (i,)))))
             return L.and_(L.eq(a.len, b.len), same)
         if isinstance(a, OptVal) or isinstance(b, OptVal):
             if not isinstance(a, OptVal):
@@ -1561,11 +1665,14 @@ class VCGen:
             assert isinstance(a, OptVal)
             if b is NONE_V:
                 return L.not_(a.some)
+            held = self.held_feq if a.val.sort.name == "Rec" else L.feq
             if isinstance(b, OptVal):
-                return L.and_(L.eq(a.some, b.some), L.implies(a.some, L.eq(a.val, b.val)))
-            return L.and_(a.some, L.eq(a.val, b))  # type: ignore[arg-type]
+                return L.and_(L.eq(a.some, b.some), L.implies(a.some, rec_equal(a.val, b.val, held)))
+            return L.and_(a.some, rec_equal(a.val, b, held))  # type: ignore[arg-type]
         if isinstance(a, DictVal) or isinstance(b, DictVal):
             raise VCError("comparing whole dicts with == is not supported")
+        if a.sort.name == "Rec":  # type: ignore[union-attr]
+            return rec_equal(a, b, self.held_feq)  # type: ignore[arg-type]
         return rec_equal(a, b)  # type: ignore[arg-type]
 
     def ev_Ite(self, e: ir.Ite, ctx: Ctx) -> Val:
@@ -1688,6 +1795,10 @@ class VCGen:
                 vals = L.store(vals, k, v)  # type: ignore[arg-type]
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
             return DictVal(vals, has, e.ty)
+        if name in ROUNDINGS and len(e.args) == 1:
+            q = self.int_quotient(e.args[0], ctx)
+            if q is not None:
+                return self.round_quotient(name, *q)
         args = [self.ev(a, ctx) for a in e.args]
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
@@ -1722,7 +1833,7 @@ class VCGen:
             if isinstance(x, L.Term):  # a list[opaque] seen at list[T] is no box
                 self.box_facts(x, v, ty, ctx, known=False)
             if isinstance(v, ListVal):
-                ctx.assume(L.le(L.ZERO, v.len))
+                ctx.assume(self.len_ok(v.len))
             if ctx.state is not None:
                 for fact in self.alloc_facts(v, ty, ctx.state.env):
                     ctx.assume(fact)
@@ -1908,8 +2019,27 @@ class VCGen:
             f = L.min_ if name == "min" else L.max_
             out = args[0]
             for a in args[1:]:
-                out = f(out, a)  # type: ignore[arg-type]
+                out = self.float_minmax(name, out, a) if L.FLOAT in (out.sort, a.sort) else f(out, a)  # type: ignore[union-attr,arg-type]
             return out
+        if name == "sum" and args[0].ty.elem == ir.REAL:  # type: ignore[union-attr]
+            (xs,) = args
+            assert isinstance(xs, ListVal)
+            # the order and method of summing differ by language (Python compensates)
+            return L.Fn(f"float.sum.{self.module.language}", (xs.arr, xs.off, L.add(xs.off, xs.len)), L.FLOAT)
+        if name == "count" and args[0].ty.elem == ir.REAL:  # type: ignore[union-attr]
+            xs, v = args
+            assert isinstance(xs, ListVal)
+            return L.Fn(f"float.count.{self.module.language}", (xs.arr, xs.off, L.add(xs.off, xs.len), v), L.INT)  # type: ignore[arg-type]
+        if name == "js_int_sum":
+            # xs.reduce((a, b) => a + b, 0): exact while every running total is within 2^53
+            (xs,) = args
+            assert isinstance(xs, ListVal)
+            self.theory_fns.add("seqsum")
+            hi = L.add(xs.off, xs.len)
+            k = L.Const(f"k!{next(self.counter)}", L.INT)
+            part = L.Fn("seqsum", (xs.arr, xs.off, L.add(xs.off, k)), L.INT)
+            safe = L.forall([k], L.implies(L.and_(L.le(L.ZERO, k), L.le(k, xs.len)), L.le(L.abs_(part), SAFE)))
+            return L.ite(safe, L.Fn("seqsum", (xs.arr, xs.off, hi), L.INT), L.Fn("js.int_sum_big", (xs.arr, xs.off, hi), L.INT))
         if name == "sum":
             (xs,) = args
             assert isinstance(xs, ListVal)
@@ -1928,7 +2058,7 @@ class VCGen:
             xs, v = args
             assert isinstance(xs, ListVal)
             i = L.Const(f"in!{next(self.counter)}", L.INT)
-            return L.exists([i], L.and_(L.le(L.ZERO, i), L.lt(i, xs.len), L.eq(xs.at(i), v)))  # type: ignore[arg-type]
+            return L.exists([i], L.and_(L.le(L.ZERO, i), L.lt(i, xs.len), self.member_eq(xs.at(i), v, i)))  # type: ignore[arg-type]
         if name == "slice":
             xs, lo, hi = args
             assert isinstance(xs, ListVal)
@@ -1945,10 +2075,65 @@ class VCGen:
             lo2 = norm(lo, L.ZERO)
             hi2 = norm(hi, n)
             return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty)
+        if name == "same_value":
+            return L.eq(args[0], args[1])  # type: ignore[arg-type]
+        if name == "js_floordiv":
+            # Math.floor(a / b) on integer-valued numbers: a / b rounds, but
+            # never across an integer while |a| <= 2^53
+            a, b = args
+            self.oblige("div", ctx, L.ne(b, L.ZERO), e.loc, "divisor of '/' is non-zero")  # type: ignore[arg-type]
+            big = L.Fn("js.floordiv_big", (a, b), L.INT)  # (with the quotient's sign)
+            signed = L.ite(L.eq(L.le(L.ZERO, a), L.lt(L.ZERO, b)), L.max_(L.ZERO, big), L.min_(L.ZERO, big))  # type: ignore[arg-type]
+            return L.ite(L.le(L.abs_(a), SAFE), floordiv(a, b), signed)  # type: ignore[arg-type]
+        if name == "py_truediv":
+            # Python int / int: the exact quotient, rounded once
+            a, b = args
+            self.truediv_checks(a, b, ctx, e.loc)  # type: ignore[arg-type]
+            # both within 2^53: each converts exactly, and the division rounds once
+            small = L.and_(L.le(L.abs_(a), SAFE), L.le(L.abs_(b), SAFE))  # type: ignore[arg-type]
+            return L.ite(small, L.rdiv(L.as_float(a), L.as_float(b)), L.Fn("py.int_truediv", (a, b), L.FLOAT))  # type: ignore[arg-type]
         (x,) = args[:1]
         assert not isinstance(x, ListVal)
+        if name == "f64_int":
+            # a JavaScript integer result is exact up to 2^53 in magnitude, then rounds
+            # (rounding keeps the sign and never goes back inside 2^53)
+            big = L.Fn("f64.round_int", (x,), L.INT)
+            return L.ite(L.le(L.abs_(x), SAFE), x, L.ite(L.lt(L.ZERO, x), L.max_(SAFE, big), L.min_(L.neg(SAFE), big)))
+        if name == "js_real":
+            # an integer-valued JavaScript number as a double: exact, but a zero may be -0
+            if x.sort == L.FLOAT:
+                return x
+            neg0 = self.unknown("js.neg_zero", L.BOOL, e.loc)
+            return L.ite(L.eq(x, L.ZERO), L.ite(neg0, L.fval(-0.0), L.fval(0.0)), L.as_float(x))
+        if name == "py_float":
+            # Python converts an int to the nearest float, or raises OverflowError
+            if x.sort == L.FLOAT:
+                return x
+            self.float_fits(x, ctx, e.loc, f"'{_expr_name(e.args[0])}' is small enough to convert to a float")
+            return L.as_float(x)
         if name == "to_real":
-            return L.to_real(x)
+            return L.as_float(x)
+        if name == "sign_bit":
+            # the sign of a NaN is not modelled
+            return L.ite(L.fpred("fp.isNaN", x), self.unknown("nan_sign", L.BOOL, e.loc), L.fpred_neg(x))
+        if name in ("is_nan", "is_inf", "is_finite"):
+            if x.sort != L.FLOAT:
+                return L.BoolV(name == "is_finite")
+            return {"is_nan": L.fpred("fp.isNaN", x), "is_inf": L.fpred("fp.isInfinite", x), "is_finite": L.is_finite(x)}[name]
+        if name == "trunc_sat":
+            # Rust 'as' from a float: NaN is 0, the infinities saturate (the caller clamps)
+            r = L.fto_real(x)
+            t = L.ite(L.le(L.RealV(Fraction(0)), r), L.floor(r), L.neg(L.floor(L.neg(r))))
+            huge = L.IntV(2**1100)
+            return L.ite(L.fpred("fp.isNaN", x), L.ZERO, L.ite(L.fpred("fp.isInfinite", x), L.ite(L.fpred_neg(x), L.neg(huge), huge), t))
+        if name == "is_int" and x.sort == L.FLOAT:
+            return L.and_(L.is_finite(x), L.is_int(L.fto_real(x)))
+        if x.sort == L.FLOAT and name in ("floor", "ceil", "trunc", "round_even", "round_up"):
+            fin = L.is_finite(x)
+            self.oblige("finite", ctx, fin, e.loc, f"'{_expr_name(e.args[0])}' is a finite number (not NaN or ±Infinity) where it is rounded to an integer")
+            if not (ctx.quiet or ctx.spec):
+                ctx.assume(fin)
+            x = L.fto_real(x)
         if name == "floor":
             return L.floor(x)
         if name == "ceil":
@@ -2012,19 +2197,19 @@ class VCGen:
     def parse_number(self, name: str, s: L.Term, e: ir.Builtin, ctx: Ctx) -> L.Term:
         """``int(s)``/``float(s)`` (Python), ``parseInt(s)``/``parseFloat(s)``
         (JavaScript) on a string: exact on plain decimal digits; otherwise a
-        number telic does not compute. Python raises ValueError on text
-        outside its grammar (checked like a raise statement); JavaScript
-        gives NaN, which telic's numbers do not include (a listed assumption)."""
+        number telic does not compute (NaN or an infinity among them). Python
+        raises ValueError on text outside its grammar (checked like a raise
+        statement); JavaScript gives NaN."""
         py = name.startswith("py_")
         real = name != "py_int_parse"
         tail = L.App("str.substr", (s, L.ONE, L.sub(L.App("str.len", (s,), L.INT), L.ONE)), L.STR)
-        other = L.Fn(name, (s,), L.REAL if real else L.INT)
+        other = L.Fn(name, (s,), L.FLOAT if real else L.INT)
         exact = L.ite(L.in_re(s, "digits"), L.str_to_int(s), L.ite(L.in_re(s, "neg_digits"), L.neg(L.str_to_int(tail)), L.str_to_int(tail)))
         known = L.or_(L.in_re(s, "digits"), L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits"))
         # (Z3 does not find these itself: digits spell a number >= 0)
         ctx.assume(L.implies(L.in_re(s, "digits"), L.le(L.ZERO, L.str_to_int(s))))
         ctx.assume(L.implies(L.or_(L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits")), L.le(L.ZERO, L.str_to_int(tail))))
-        v = L.ite(known, L.to_real(exact) if real else exact, other)
+        v = L.ite(known, L.as_float(exact) if real else exact, other)
         what = {"py_int_parse": "int()", "py_float_parse": "float()", "js_parse_int": "parseInt", "js_parse_float": "parseFloat"}[name]
         if py:
             ok = L.in_re(s, "py_int" if name == "py_int_parse" else "py_float")
@@ -2036,14 +2221,12 @@ class VCGen:
                     self.oblige("raise", ctx, L.or_(ok, cond), e.loc, f"{what} of text it cannot parse raises ValueError outside '@raises {self.fn.raises[0].text}'")
                 elif self.fn.requires or self.fn.ensures:
                     self.oblige("raise", ctx, ok, e.loc, f"{what} can parse '{_expr_name(e.args[0])}' (else it raises ValueError)")
-            if name == "py_float_parse":
-                self.note(e.loc, "float() of 'nan', 'inf' or an overflowing exponent is not a number telic models")
         else:
             prefix = L.in_re(s, "js_num_prefix")
-            ctx.assume(L.implies(L.in_re(s, "js_nonneg_prefix"), L.le(L.RealV(Fraction(0)), other)))
+            ctx.assume(L.implies(L.in_re(s, "js_nonneg_prefix"), L.le(L.fval(0.0), other)))
             if name == "js_parse_int":
-                ctx.assume(L.implies(prefix, L.is_int(other)))
-            self.note(e.loc, f"{what} of text without a leading number is NaN, which telic models as an unknown number")
+                # a leading integer, or Infinity past the largest float
+                ctx.assume(L.implies(prefix, L.and_(L.not_(L.fpred("fp.isNaN", other)), L.or_(L.fpred("fp.isInfinite", other), L.is_int(L.fto_real(other))))))
         return v
 
     def comprehension(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> Val:
@@ -2221,7 +2404,7 @@ class VCGen:
             return NONE_V
         r = self.fresh("comprehension", e.ty)
         if isinstance(r, ListVal):
-            ctx.assume(L.le(L.ZERO, r.len))
+            ctx.assume(self.len_ok(r.len))
         return r
 
     def _effectful(self, e: ir.Expr) -> bool:
@@ -2313,7 +2496,7 @@ class VCGen:
                     ty = self.fn.locals.get(a_e.name) or a_e.ty
                     nv = self.fresh(a_e.name, ty)
                     if isinstance(nv, ListVal):
-                        ctx.assume(L.le(L.ZERO, nv.len))
+                        ctx.assume(self.len_ok(nv.len))
                     env[a_e.name] = nv
             if self.program.extern_writes_unchecked(e, self.fn, self.views, set(ctx.state.env)):
                 self.havoc_unchecked(ctx)
@@ -2327,7 +2510,7 @@ class VCGen:
                     self.note(e.loc, "unchecked code changes objects only as their lifecycles allow")
         r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
         if isinstance(r, ListVal):
-            ctx.assume(L.le(L.ZERO, r.len))
+            ctx.assume(self.len_ok(r.len))
         if ctx.state is not None and r is not NONE_V:
             for fact in self.alloc_facts(r, e.ty, ctx.state.env):
                 ctx.assume(fact)
@@ -2491,7 +2674,7 @@ class VCGen:
                 if keep is not None:
                     nv = ListVal(nv.arr, old.off, keep, nv.ty)
                 else:
-                    ctx.assume(L.le(L.ZERO, nv.len))
+                    ctx.assume(self.len_ok(nv.len))
                 env[a_expr.name] = nv
                 post[p.name] = nv
         views = [a.name for p, a in zip(fn.params, arg_exprs) if p.name in muts and isinstance(a, ir.Var) and a.name in self.views]
@@ -2681,7 +2864,7 @@ class VCGen:
                 continue
             nv = self.fresh(n, tys[n])
             if isinstance(nv, ListVal):
-                ctx.assume(L.le(L.ZERO, nv.len))
+                ctx.assume(self.len_ok(nv.len))
             env[n] = nv
 
     def havoc_call(self, callee: FuncRef, args: list[Val], new_self: bool, ctx: Ctx) -> None:
@@ -2815,6 +2998,10 @@ def _shorter(a: L.Term, b: L.Term) -> L.Term:
 def _triggerable(ts: tuple[L.Term, ...]) -> bool:
     """Can these terms be an SMT trigger (no connectives or ite inside)?"""
     return not any(isinstance(x, L.Quant) or (isinstance(x, L.App) and x.op not in ("select", "add", "sub", "field")) for t in ts for x in L.iter_terms(t))
+
+
+SAFE = L.IntV(2**53)  # every integer up to this magnitude is a double
+ROUNDINGS = ("floor", "ceil", "trunc", "round_even", "round_up")
 
 
 def floordiv(a: L.Term, b: L.Term) -> L.Term:
@@ -2951,6 +3138,8 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
 def default_value(s: L.Sort) -> L.Term:
     if s == L.INT:
         return L.ZERO
+    if s == L.FLOAT:
+        return L.fval(0.0)
     if s == L.REAL:
         return L.RealV(Fraction(0))
     if s == L.BOOL:
@@ -3004,7 +3193,7 @@ def build_axioms(program: Program, ref: FuncRef, fundef: L.FunDef) -> list[L.Axi
     for p in ref.fn.params:
         v = env[p.name]
         if isinstance(v, ListVal):
-            hyps.append(L.le(L.ZERO, v.len))
+            hyps.append(g.len_ok(v.len))
     ectx = Ctx(base=base, env=env, module=ref.module, old_env=env, result=call, spec=True, quiet=True)
     goals = [g.ev(en.expr, ectx) for en in ref.fn.ensures]
     formula = L.forall(tuple(fundef.params) + tuple(extra), L.implies(L.and_(*base, *hyps), L.and_(*goals)))

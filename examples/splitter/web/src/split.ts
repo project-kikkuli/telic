@@ -2,6 +2,7 @@ export type int = number
 
 export function shareOf(amount: int, parts: int, index: int): int {
   //@ [SPLIT-AGREE] mirrors ../../server/split.py::share_of
+  //@ requires Number.isSafeInteger(amount)
   //@ requires amount >= 0
   //@ requires parts >= 1
   //@ requires 0 <= index && index < parts
@@ -12,6 +13,7 @@ export function shareOf(amount: int, parts: int, index: int): int {
 
 export function splitEqual(amount: int, parts: int): int[] {
   //@ [SPLIT-AGREE] mirrors ../../server/split.py::split_equal
+  //@ requires Number.isSafeInteger(amount)
   //@ requires amount >= 0
   //@ requires parts >= 1
   //@ ensures result.length === parts
