@@ -10,7 +10,8 @@ accept. telic proves it for loop-free code by running both bodies through the
 same symbolic executor (so Python's ``//`` and JavaScript's ``Math.trunc``
 really are different operators) and asking Z3 for a disagreement. A
 disagreement is then executed in both real runtimes before it is reported.
-Code with loops is compared by differential testing and labelled as such.
+Code with loops is proved equal from the two proved contracts when they pin
+the result, and otherwise compared by differential testing, labelled as such.
 """
 
 from __future__ import annotations
@@ -124,6 +125,47 @@ def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val], side: st
     raises = L.or_(*[L.and_(*facts) for facts in g.raise_paths])
     defs = [L.or_(*paths, raises)] + [L.implies(p, L.eq(r, ex.value)) for p, ex in zip(paths, exits)]  # type: ignore[arg-type]
     return r, list(rctx.base) + reqs + defs, raises
+
+
+SCALARS = (ir.TInt, ir.TReal, ir.TBool, ir.TStr)
+
+
+def contract_result(program: Program, ref: FuncRef, inputs: dict[str, Val], side: str) -> tuple[Val, list[L.Term]]:
+    """A result the function's proved contract allows: a fresh value, its
+    preconditions over ``inputs`` and its postconditions over both."""
+    g = VCGen(program, ref, inputs=inputs)
+    g.counter = itertools.count(1 if side == "a" else 1_000_000)
+    g.definitional_mode = True
+    env = dict(inputs)
+    g.heap_init(env)
+    g.entry = dict(env)
+    r = g.fresh(f"mirror.{side}.result", ref.fn.ret)
+    ctx = Ctx(base=[], env=env, module=ref.module, spec=True, quiet=True, old_env=dict(env), result=r)
+    facts = [g.ev(c.expr, ctx) for c in ref.fn.requires] + [g.ev(c.expr, ctx) for c in ref.fn.ensures]
+    if isinstance(r, ListVal):
+        facts.append(L.le(L.ZERO, r.len))
+    return r, list(ctx.base) + facts  # type: ignore[return-value]
+
+
+def agree_by_contracts(program: Program, theory: Theory, a: FuncRef, b: FuncRef, ina: dict[str, Val], inb: dict[str, Val], loc: ir.Loc, timeout_ms: int) -> bool:
+    """Do the two proved contracts pin the same result on every input both
+    accept? Only for scalar parameters (nothing to mutate) and functions
+    that never raise."""
+    if a.fn.raises or b.fn.raises or not all(isinstance(p.ty, SCALARS) for p in a.fn.params + b.fn.params):
+        return False
+    ra, ha = contract_result(program, a, ina, "a")
+    rb, hb = contract_result(program, b, inb, "b")
+    if isinstance(ra, ListVal) != isinstance(rb, ListVal):
+        return False
+    if isinstance(ra, ListVal) and isinstance(rb, ListVal):
+        i = L.Const("mirror.i", L.INT)
+        x, y = _coerce_pair(ra.at(i), rb.at(i))
+        goal = L.and_(L.eq(ra.len, rb.len), L.forall([i], L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ra.len)), L.eq(x, y))))
+    else:
+        x, y = _coerce_pair(ra, rb)  # type: ignore[arg-type]
+        goal = L.eq(x, y)
+    ob = Obligation(id=f"{a.fn.name}~{b.fn.name}/contracts", func=a.key, kind="mirror", loc=loc, site=None, message=f"the contracts of {a.fn.name} and {b.fn.name} pin the same result", hyps=ha + hb, goal=goal, inputs=[])
+    return solve(ob, theory, timeout_ms).status == "proved"
 
 
 def _coerce_pair(ra: L.Term, rb: L.Term) -> tuple[L.Term, L.Term]:
@@ -281,9 +323,10 @@ def explain_difference(a: ir.Function, b: ir.Function, notes: list[str]) -> str:
     return notes[0] if notes else ""
 
 
-def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300, aims: list[str] | None = None) -> MirrorReport:
+def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300, aims: list[str] | None = None, proved: set[str] | None = None) -> MirrorReport:
     """``aims``: the tags on the ``@mirrors`` line; untagged, the mirror
-    serves every aim either function cites."""
+    serves every aim either function cites. ``proved``: functions whose
+    every obligation is proved, whose contracts may stand in for them."""
     rep = MirrorReport(a, b, loc, aims or sorted(set(a.fn.aims) | set(b.fn.aims)), "open", verdicts=["mirror"])
     try:
         ina, inb, shown, notes = _shared_inputs(a.fn, b.fn)
@@ -329,6 +372,13 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
             rep.reason = f"solver: {res.reason}"
         except (Incomparable, VCError) as e:
             rep.reason = str(e)
+    if proved is not None and a.key in proved and b.key in proved:
+        try:
+            if agree_by_contracts(program, theory, a, b, ina, inb, loc, timeout_ms):
+                rep.status, rep.method, rep.reason = "proved", "contracts", ""
+                return rep
+        except (Incomparable, VCError):
+            pass
     # Differential testing (loops, or the solver gave up).
     rnd = random.Random(0x7E11C)
     batch_a, batch_b = [], []
@@ -404,7 +454,7 @@ def mirror_targets(modules: list[ir.Module]) -> list[str]:
     return out
 
 
-def check_mirrors(program: Program, theory: Theory, opts, root: str | None = None) -> list[MirrorReport]:
+def check_mirrors(program: Program, theory: Theory, opts, root: str | None = None, proved: set[str] | None = None) -> list[MirrorReport]:
     root = root or getattr(program, "root", os.getcwd())
     out: list[MirrorReport] = []
     for m in program.modules:
@@ -419,5 +469,5 @@ def check_mirrors(program: Program, theory: Theory, opts, root: str | None = Non
                     rep.reason = f"cannot find '{spec}' (path is relative to {m.path}; the file must be checkable)"
                     out.append(rep)
                     continue
-                out.append(check_pair(program, theory, target, owner, root, loc, opts.timeout_ms, aims=list(tags)))
+                out.append(check_pair(program, theory, target, owner, root, loc, opts.timeout_ms, aims=list(tags), proved=proved))
     return out

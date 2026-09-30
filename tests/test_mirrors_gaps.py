@@ -1,3 +1,5 @@
+import pytest
+
 from telic.checker import CheckOptions
 from telic.gaps import find_gaps
 
@@ -69,6 +71,57 @@ def total2(xs: list[int]) -> int:
     rep = run_check(tmp_path, {"a.py": a})
     (m,) = rep.mirrors
     assert m.status == "refuted" and m.method == "testing"
+
+
+SPLIT_PY = """
+def share(amount: int, parts: int, i: int) -> int:
+    #@ requires amount >= 0 and parts >= 1 and 0 <= i < parts
+    if i < amount % parts:
+        return amount // parts + 1
+    return amount // parts
+
+
+def split(amount: int, parts: int) -> list[int]:
+    #@ requires amount >= 0 and parts >= 1
+    #@ ensures len(result) == parts
+    #@ ensures all(result[i] == share(amount, parts, i) for i in range(parts))
+    out: list[int] = []
+    for i in range(parts):
+        #@ invariant len(out) == i
+        #@ invariant all(out[k] == share(amount, parts, k) for k in range(i))
+        out.append(share(amount, parts, i))
+    return out
+"""
+
+SPLIT_TS = """type int = number;
+function shareOf(amount: int, parts: int, i: int): int {
+  //@ requires amount >= 0 && parts >= 1 && 0 <= i && i < parts
+  const base = Math.floor(amount / parts);
+  return i < amount % parts ? base + 1 : base;
+}
+
+export function splitAll(amount: int, parts: int): int[] {
+  //@ mirrors ../server/split.py::split
+  //@ requires amount >= 0 && parts >= 1
+  //@ ensures result.length === parts
+  //@ ensures range(0, parts).every(i => result[i] === shareOf(amount, parts, i))
+  const out: int[] = [];
+  for (let i = 0; i < parts; i++) {
+    //@ invariant out.length === i
+    //@ invariant range(0, i).every(k => out[k] === shareOf(amount, parts, k))
+    out.push(shareOf(amount, parts, i));
+  }
+  return out;
+}
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("web,status,method", [(SPLIT_TS, "proved", "contracts"), (SPLIT_TS.replace("base + 1 : base", "base : base + 1"), "refuted", "testing")])
+def test_mirror_of_loops_is_proved_from_their_contracts(tmp_path, web, status, method):
+    rep = run_check(tmp_path, {"server/split.py": SPLIT_PY, "web/split.ts": web})
+    (m,) = rep.mirrors
+    assert (m.status, m.method) == (status, method), m.reason
 
 
 REFUND = """

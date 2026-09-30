@@ -438,6 +438,13 @@ automatically. The two functions must take the same number of parameters (matche
 by position) and must agree on every input both preconditions accept. An `int`
 parameter against a `number` parameter is compared on integers.
 
+Loop-free functions are compared by symbolic execution. With loops, the
+mirror is proved from the two contracts when both functions are fully
+proved, take only scalars, never raise, and their `@ensures` pin the same
+result (for a list: the length and every element, e.g. through a
+loop-free helper that is itself mirrored). Otherwise the two are compared
+by differential testing, which never proves.
+
 A mirror is a lemma. Tagged (`//@ [PRICE-AGREE] mirrors ...`), it backs
 that aim only; untagged, it backs every aim either function cites.
 

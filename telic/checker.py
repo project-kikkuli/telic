@@ -1016,7 +1016,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if any(f.mirrors for m in modules for f in m.functions.values()):
         from .equiv import check_mirrors
 
-        mirrors = check_mirrors(program, theory, opts, root=root)
+        proved = {r.ref.key for r in reports if r.status == "proved" and not r.open_deps}
+        mirrors = check_mirrors(program, theory, opts, root=root, proved=proved)
 
     cache.save()
     rep = Report(modules, program, reports, [], mirrors, time.perf_counter() - t0, hits, solved)
