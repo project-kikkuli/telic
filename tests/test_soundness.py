@@ -69,6 +69,8 @@ TRUE_HELPERS = {
     "t34.ts": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__"},
     "t35.py": {"Acct.__init__", "Checked.__init__"},
     "t35.ts": {"Acct.__init__", "Checked.__init__"},
+    "t36.py": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift", "first_v"},
+    "t36.ts": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs", ".swift"))

@@ -410,3 +410,20 @@ export function stretch(s: Span, x: number): void {
   if (x < 0) throw new Error("negative");
   s.hi = s.lo;
 }
+
+// expect: proved
+export function bumpWallets(ws: Wallet[]): void {
+  for (const w of ws) {
+    w.cents = w.cents + 1;
+  }
+}
+
+// expect: proved
+export function totalCents(ws: Wallet[]): number {
+  //@ ensures result >= 0
+  let t = 0;
+  for (const w of ws) {
+    t += w.cents;
+  }
+  return t;
+}

@@ -438,6 +438,48 @@ let fresh_expr (e : Ir.expr option) = match e with Some { e = ListLit _ | Call _
 let written_key cls = "%written." ^ cls
 let is_written_key k = String.length k > 9 && String.sub k 0 9 = "%written."
 let no_writes = const_array (Array (Int, Bool)) ff
+let any_writes = const_array (Array (Int, Bool)) tt
+
+(* can code other than this initializer reach the object it builds? *)
+let self_escapes g =
+  let out = ref false in
+  Ir.walk_stmts
+    (fun s ->
+      List.iter
+        (fun (e : Ir.expr) ->
+          let skip = match s with FieldAssign (_, o, _, _, _) -> o == e | _ -> false in
+          if not skip then begin
+            let selfs = ref 0 and through = ref 0 and base_init = ref 0 in
+            Ir.walk_expr
+              (fun (x : Ir.expr) ->
+                match x.e with
+                | Var "self" -> incr selfs
+                | Field ({ e = Var "self"; _ }, _) -> incr through
+                | Call (f, { e = Var "self"; _ } :: _) when String.length f >= 8 && String.sub f (String.length f - 8) 8 = "__init__" -> incr base_init
+                | _ -> ())
+              e;
+            if !selfs > !through + !base_init then out := true
+          end)
+        (Ir.stmt_exprs s))
+    g.info.fn.body;
+  !out
+
+(* invariants of cls (or its bases) that read a field an ancestor introduced:
+   code typed as the ancestor may break them unchecked *)
+let held_skip g cls =
+  List.concat_map
+    (fun cn ->
+      match class_of g cn with
+      | Some c ->
+        List.concat
+          (List.mapi
+             (fun i (inv : Ir.clause) ->
+               let bad = ref false in
+               Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Field ({ e = Var "self"; _ }, f) when field_owner g cn f <> cn -> bad := true | _ -> ()) inv.cexpr;
+               if !bad then [ (cn, i) ] else [])
+             c.cinvs)
+      | None -> [])
+    (mro g cls)
 let has_invariants g cls = List.exists (fun c -> match class_of g c with Some ci -> ci.cinvs <> [] | None -> false) (mro g cls)
 
 (* parameters whose own return check covers every invariant of cls *)
@@ -514,11 +556,15 @@ let rec ev g ctx (e : Ir.expr) : value =
     | D d ->
       let k = tm (ev g ctx i) in
       oblige g "key" ctx (select d.has k) loc (Printf.sprintf "key looked up in '%s' is present" (expr_name s));
-      T (select d.vals k)
+      let v = T (select d.vals k) in
+      assume_held g ctx v e.ty;
+      v
     | L l ->
       let i = tm (ev g ctx i) in
       let j = index_of g (l.arr, l.off, l.len) i wrap ctx loc (expr_name s) in
-      T (at (l.arr, l.off) j)
+      let v = T (at (l.arr, l.off) j) in
+      assume_held g ctx v e.ty;
+      v
     | _ -> raise (Vc_error ("indexing a non-list", loc)))
   | Field (o, f) -> (
     let obj = tm (ev g ctx o) in
@@ -945,7 +991,10 @@ and extern g ctx (e : Ir.expr) name args =
            st.env <- SM.add n nv st.env
          | _ -> ())
        touched;
-     if extern_touches_heap g args || (g.prog.classes <> [] && fn.escaped <> []) then havoc_heap g ctx
+     if extern_touches_heap g args || (g.prog.classes <> [] && fn.escaped <> []) then begin
+       havoc_heap g ctx;
+       if List.exists (fun c -> c.cinvs <> []) g.prog.classes then note_assumed g loc "unchecked code leaves objects satisfying their class invariants"
+     end
    | None -> ());
   let r =
     if e.ty = TNone then NoneV
@@ -1034,6 +1083,10 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
             (class_invariants g c r heap_pre ctx.base)
         | _ -> ())
       (zip fn.params args);
+  (match ctx.state with
+   | Some st when (not ctx.spec) && (not new_self) && List.exists (fun (_, pty) -> Ir.reaches_object pty) fn.params ->
+     check_objects g ~guard:ctx.guard st.facts st.env loc (Printf.sprintf "when calling '%s'" fn.name)
+   | _ -> ());
   if fn.raises <> [] && not ctx.spec then begin
     let rc = or_ (List.map (fun (r : Ir.clause) -> term_of loc (ev g cctx r.cexpr)) fn.raises) in
     oblige g "call" ctx (not_ rc) loc (Printf.sprintf "call to '%s' cannot raise ('@raises %s')" fn.name (List.hd fn.raises).text)
@@ -1189,9 +1242,11 @@ and written_claims g cls env base =
    run then) *)
 and check_objects g ?(guard = []) facts env (site : Ir.loc) when_ =
   let ctx = spec_ctx g ~quiet:false ~guard ~base:facts ~env () in
+  let calling = String.length when_ >= 12 && String.sub when_ 0 12 = "when calling" in
   List.iter
     (fun (p, (ty : Ir.ty)) ->
       match (ty, SM.find_opt p g.entry) with
+      | TClass _, _ when calling && is_init g && p = "self" && not (self_escapes g) -> () (* the object being built: nothing else can reach it yet *)
       | TClass c, Some (T r) ->
         List.iter
           (fun ((inv : Ir.clause), t) -> oblige g ~site ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds for '%s' %s" c inv.text p when_))
@@ -1211,6 +1266,22 @@ and check_objects g ?(guard = []) facts env (site : Ir.loc) when_ =
           (written_claims g cls env facts)
       | _ -> ())
     g.prog.classes
+
+(* an object read out of a list or dict satisfies its class invariants unless
+   this function was passed it or wrote it: every other object was checked
+   when last written, and callers check theirs at calls *)
+and assume_held g ctx (v : value) (ty : Ir.ty) =
+  match (ctx.state, ty, v) with
+  | Some st, TClass cls, T r when (not ctx.spec) && has_invariants g cls -> (
+    match List.map snd (class_invariants ~skip:(held_skip g cls) g cls r st.env ctx.base) with
+    | [] -> ()
+    | ts ->
+      let exempt =
+        List.filter_map (fun (k, w) -> match w with T w when is_written_key k && w != no_writes -> Some (select w r) | _ -> None) (SM.bindings st.env)
+        @ List.filter_map (fun (p, (pty : Ir.ty)) -> match (pty, SM.find_opt p g.entry) with TClass _, Some (T x) -> Some (eq r x) | _ -> None) g.info.fn.params
+      in
+      assume ctx (if exempt = [] then and_ ts else implies (not_ (or_ exempt)) (and_ ts)))
+  | _ -> ()
 
 let state_ctx g ?(spec = false) (st : state) =
   { base = st.facts; modpath = g.info.modpath; env = st.env; live = Some st; guard = []; bound = SM.empty; old_env = None; result = None; spec; quiet = false; state = Some st }
@@ -1319,6 +1390,8 @@ and stmt g (s : Ir.stmt) (st : state) : state =
         :: List.mapi
              (fun i h ->
                let hst = havoc g entry names appends in
+               (* the body may have broken any object it wrote before raising *)
+               List.iter (fun k -> if is_written_key k then hst.env <- SM.add k (T any_writes) hst.env) names;
                Dynarray.add_last hst.facts (eq choice (int_ (i + 1)));
                block g h hst)
              handlers
@@ -1674,7 +1747,8 @@ and loop_each g (r : Ir.stmt) (st : state) : state =
   let out =
     counted_loop g loc invariants body st zero l.len idx (fun bst k ->
         bst.env <- SM.add elem (T (at (l.arr, l.off) k)) bst.env;
-        bst.env <- SM.add idx (T k) bst.env)
+        bst.env <- SM.add idx (T k) bst.env;
+        assume_held g (state_ctx g bst) (T (at (l.arr, l.off) k)) (match seq.ty with TList t -> t | t -> t))
   in
   out.env <- SM.remove (idx ^ "$k") out.env;
   List.iter

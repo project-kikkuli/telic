@@ -94,6 +94,7 @@ NONE_V = L.Const("None", L.Sort("None"))
 # callees and other tasks do not add to it)
 WRITTEN = "%written."
 NO_WRITES = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
+ANY_WRITES = L.const_array(L.ARRAY(L.BOOL), L.TRUE)
 
 
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
@@ -386,6 +387,7 @@ class VCGen:
         self.raise_paths: list[list[L.Term]] = []
         # lines of the field writes to each class with an invariant
         self.written: dict[str, list[int]] = {}
+        self._self_escapes: bool | None = None
         self.loop_notes: list[tuple[int, str]] = []
 
     # -- naming -----------------------------------------------------------
@@ -484,10 +486,15 @@ class VCGen:
     def check_objects(self, st: State, site: ir.Loc, when: str, guard: tuple[L.Term, ...] = ()) -> None:
         """The objects this function was passed, and every other object it
         wrote a field of, satisfy their invariants ``when`` control leaves it:
-        on return, on raise, and while it is suspended (other tasks, or a
-        generator's consumer, run then)."""
+        on return, on raise, while it is suspended (other tasks, or a
+        generator's consumer, run then), and at a call that can reach objects
+        (the callee assumes the invariants of objects it reads out of lists
+        and dicts)."""
         ctx = Ctx(base=st.facts, env=st.env, module=self.module, guard=guard, spec=True)
+        calling = when.startswith("when calling")
         for p in self.fn.params:
+            if calling and self.is_init and p.name == "self" and not self.self_escapes:
+                continue  # (the object being built: nothing else can reach it yet)
             if isinstance(p.ty, ir.TClass):
                 for inv, t in self.class_invariants(p.ty.name, self.entry[p.name], st.env, st.facts):  # type: ignore[arg-type]
                     self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' {when}", site=site, clause=inv)
@@ -498,6 +505,49 @@ class VCGen:
             what = f"every object written at line {at}" if at else "every object written so far"
             for inv, t in self.written_claims(cls, st.env, st.facts):
                 self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds {when} for {what}", site=site, clause=inv)
+
+    @property
+    def self_escapes(self) -> bool:
+        """Can code other than this initializer reach the object it builds?"""
+        if self._self_escapes is None:
+            self._self_escapes = False
+            for s in ir.walk_stmts(self.fn.body):
+                for e in ir.stmt_exprs(s):
+                    if isinstance(s, ir.FieldAssign) and e is s.obj:
+                        continue
+                    subs = list(ir.walk_expr(e))
+                    selfs = sum(1 for x in subs if isinstance(x, ir.Var) and x.name == "self")
+                    through = sum(1 for x in subs if isinstance(x, ir.Field) and isinstance(x.obj, ir.Var) and x.obj.name == "self")
+                    base_init = sum(1 for x in subs if isinstance(x, ir.Call) and x.func.endswith("__init__") and x.args and isinstance(x.args[0], ir.Var) and x.args[0].name == "self")
+                    if selfs > through + base_init:
+                        self._self_escapes = True
+        return self._self_escapes
+
+    def held_skip(self, cls: str) -> set[tuple[str, int]]:
+        """Invariants of ``cls`` (or its bases) that read a field an ancestor
+        introduced: code typed as the ancestor may break them unchecked."""
+        out = set()
+        for c in self.program.mro(cls):
+            decl = self.program.classes[c]
+            for i, inv in enumerate(decl.invariants):
+                read = {x.name for x in ir.walk_expr(inv.expr) if isinstance(x, ir.Field) and isinstance(x.obj, ir.Var) and x.obj.name == "self"}
+                if any(decl.field_owner(f) != c for f in read):
+                    out.add((c, i))
+        return out
+
+    def assume_held(self, v: Val, ty: ir.Type, ctx: Ctx) -> None:
+        """An object read out of a list or dict satisfies its class invariants
+        unless this function was passed it or wrote it: every other object
+        was checked when last written, and callers check theirs at calls."""
+        if ctx.state is None or ctx.spec or not isinstance(ty, ir.TClass) or not self.has_invariants(ty.name) or not isinstance(v, L.Term):
+            return
+        env = ctx.state.env
+        ts = [t for _, t in self.class_invariants(ty.name, v, env, ctx.base, self.held_skip(ty.name))]
+        if not ts:
+            return
+        exempt = [L.select(w, v) for k, w in env.items() if k.startswith(WRITTEN) and w is not NO_WRITES]  # type: ignore[arg-type]
+        exempt += [L.eq(v, self.entry[p.name]) for p in self.fn.params if isinstance(p.ty, ir.TClass)]  # type: ignore[arg-type]
+        ctx.assume(L.implies(L.not_(L.or_(*exempt)), L.and_(*ts)) if exempt else L.and_(*ts))
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
         keys = self.heap_keys(cls, fname, strict=True)
@@ -824,6 +874,9 @@ class VCGen:
                 names, appends = self.modified(list(s.body))
                 for i, h in enumerate(s.handlers):
                     hst = self.havoc(entry, names, appends)
+                    for key in names:
+                        if key.startswith(WRITTEN):
+                            hst.env[key] = ANY_WRITES  # (the body may have broken any object it wrote before raising)
                     hst.facts.append(L.eq(choice, L.IntV(i + 1)))
                     outs.append(self.block(h, hst))
             del k
@@ -1159,6 +1212,7 @@ class VCGen:
         def bind(body_st: State, k: L.Term) -> None:
             body_st.env[s.elem] = seq.at(k)
             body_st.env[s.idx] = k
+            self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
 
         out = self._counted_loop(s, st, L.ZERO, seq.len, s.idx, bind)
         out.env.pop(f"{s.idx}$k", None)
@@ -1313,12 +1367,16 @@ class VCGen:
         if isinstance(seq, DictVal):
             k = self.ev(e.idx, ctx)
             self.oblige("key", ctx, L.select(seq.has, k), e.loc, f"key looked up in '{_expr_name(e.seq)}' is present")  # type: ignore[arg-type]
-            return L.select(seq.vals, k)  # type: ignore[arg-type]
+            v = L.select(seq.vals, k)  # type: ignore[arg-type]
+            self.assume_held(v, e.ty, ctx)
+            return v
         assert isinstance(seq, ListVal)
         i = self.ev(e.idx, ctx)
         assert not isinstance(i, ListVal)
         j = self.index_of(seq, i, e.wrap, ctx, e.loc, _expr_name(e.seq))
-        return seq.at(j)
+        x = seq.at(j)
+        self.assume_held(x, e.ty, ctx)
+        return x
 
     def ev_Field(self, e: ir.Field, ctx: Ctx) -> Val:
         obj = self.ev(e.obj, ctx)
@@ -1785,6 +1843,8 @@ class VCGen:
                     env[a_e.name] = nv
             if self.program.extern_touches_heap(e) or (self.program.classes and self.fn.escaped):
                 self.havoc_heap(ctx)
+                if any(c.invariants for c in self.program.classes.values()):
+                    self.note(e.loc, "unchecked code leaves objects satisfying their class invariants")
         r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
         if isinstance(r, ListVal):
             ctx.assume(L.le(L.ZERO, r.len))
@@ -1886,6 +1946,8 @@ class VCGen:
                 if isinstance(p.ty, ir.TClass) and not (new_self and i == 0):
                     for inv, t in self.class_invariants(p.ty.name, args[i], {**heap_pre}, ctx.base):  # type: ignore[arg-type]
                         self.oblige("call", ctx, t, loc, f"'{p.name}' satisfies the invariant of {p.ty.name} ('{inv.text}') when calling '{fn.name}'", clause=inv)
+        if ctx.state is not None and not ctx.spec and not new_self and any(ir.reaches_object(p.ty) for p in fn.params):
+            self.check_objects(ctx.state, loc, f"when calling '{fn.name}'", ctx.guard)
         if fn.raises and not ctx.spec:
             rc = L.or_(*[self.ev(r.expr, cctx) for r in fn.raises])
             self.oblige("call", ctx, L.not_(rc), loc, f"call to '{fn.name}' cannot raise ('@raises {fn.raises[0].text}')")

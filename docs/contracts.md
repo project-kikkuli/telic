@@ -424,8 +424,12 @@ in the class body) reads only the object's own fields: not another object's,
 and not through a function it passes an object, list or dict of objects to. It
 is assumed for objects passed in, proved when they are passed on, and proved
 for them and for any object a function writes whenever control leaves it: on return, on raise, and
-at each `await` or `yield`. Inside a loop, the objects written so far must
-satisfy it after every iteration. A call changes only the fields the callee may write, and only
+at each `await` or `yield`, and at each call that is handed objects (or
+lists or dicts of them). Inside a loop, the objects written so far must
+satisfy it after every iteration. An object read out of a list or dict is
+assumed to satisfy it unless the function was passed it or wrote it (an
+invariant over a field a base class introduced is not assumed: code typed as
+the base may break it). A call changes only the fields the callee may write, and only
 on objects it can reach. Dataclasses, pydantic models, TypeScript parameter
 properties, getters and setters work as in the language.
 

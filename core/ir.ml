@@ -94,6 +94,14 @@ type modul = {
 
 open Json
 
+(* can a value of this type lead to an object's fields? *)
+let rec reaches_object = function
+  | TClass _ -> true
+  | TList t | TOption t -> reaches_object t
+  | TDict (k, v) -> reaches_object k || reaches_object v
+  | TRecord (_, fs) -> List.exists (fun (_, t) -> reaches_object t) fs
+  | _ -> false
+
 let rec ty_of j =
   match to_str (member "k" j) with
   | "int" -> TInt

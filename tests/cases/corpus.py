@@ -481,3 +481,25 @@ def stretch(s: Span, x: int) -> None:
     if x < 0:
         raise ValueError("negative")
     s.hi = s.lo
+
+
+# expect: proved
+def bump_wallets(ws: list[Wallet]) -> None:
+    for w in ws:
+        w.cents = w.cents + 1
+
+
+# expect: proved
+def total_cents(ws: list[Wallet]) -> int:
+    #@ ensures result >= 0
+    t = 0
+    for w in ws:
+        t += w.cents
+    return t
+
+
+# expect: proved
+def top_up(book: dict[str, Wallet], who: str, c: int) -> None:
+    #@ requires c >= 0
+    if who in book:
+        book[who].cents = book[who].cents + c
