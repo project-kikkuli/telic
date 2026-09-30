@@ -477,6 +477,26 @@ class VCGen:
     def assume_written(self, classes: list[str], st: State) -> None:
         for cls in classes:
             st.facts.extend(t for _, t in self.written_claims(cls, st.env, st.facts))
+            # (an object written so far exists: calls and allocations leave it alone unless they may write it)
+            w, r = st.env[WRITTEN + cls], L.Const(f"r!{next(self.counter)}", L.INT)
+            st.facts.append(L.Quant("forall", (r,), L.implies(L.select(w, r), L.select(st.env["@alloc"], r)), patterns=((L.select(w, r),),)))  # type: ignore[arg-type]
+
+    def check_suspended(self, ctx: Ctx, site: ir.Loc, what: str) -> None:
+        """Other tasks, or a generator's consumer, run while this code is
+        suspended: the objects it wrote and was passed must satisfy their
+        invariants there."""
+        st = ctx.state
+        assert st is not None
+        sctx = Ctx(base=st.facts, env=st.env, module=self.module, guard=ctx.guard, spec=True)
+        for cls in self.program.classes:
+            if st.env.get(WRITTEN + cls, NO_WRITES) is NO_WRITES:
+                continue
+            for inv, t in self.written_claims(cls, st.env, st.facts):
+                self.oblige("class.inv", sctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds at the {what} for every object written so far", site=site, clause=inv)
+        for p in self.fn.params:
+            if isinstance(p.ty, ir.TClass):
+                for inv, t in self.class_invariants(p.ty.name, self.entry[p.name], st.env, st.facts):  # type: ignore[arg-type]
+                    self.oblige("class.inv", sctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' at the {what}", site=site, clause=inv)
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
         keys = self.heap_keys(cls, fname, strict=True)
@@ -1385,6 +1405,8 @@ class VCGen:
         name = e.name
         if name == "comp":
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
+        if name == "await" and ctx.state is not None and not ctx.spec:
+            self.check_suspended(ctx, e.loc, "await")
         if name == "dict_lit" and e.ty.key == ir.NONE:  # type: ignore[union-attr]
             return DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), e.ty)  # type: ignore[arg-type]
         if name == "dict_lit":
@@ -1750,6 +1772,8 @@ class VCGen:
             raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
         if not e.name.startswith(("caught exception", "default of")):
             self.note(e.loc, f"call:{e.name}")
+        if e.name == "yield" and ctx.state is not None:
+            self.check_suspended(ctx, e.loc, "yield")
         if ctx.state is not None:
             env = ctx.state.env
             # It may change any list/dict variable passed to it, and, if it

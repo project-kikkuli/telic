@@ -635,6 +635,7 @@ and builtin g ctx (e : Ir.expr) name args =
     pairs args;
     D { vals = !vals; has = !has; dty = e.ty }
   | _ -> (
+    (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_suspended g ctx st loc "await" | _ -> ());
     let vals = List.map (ev g ctx) args in
     let lst = function L l -> l | _ -> raise (Vc_error ("builtin on a non-list: " ^ name, loc)) in
     let dct = function D d -> d | _ -> raise (Vc_error ("builtin on a non-dict: " ^ name, loc)) in
@@ -914,6 +915,7 @@ and extern g ctx (e : Ir.expr) name args =
   let _vals = List.map (ev g ctx) args in
   if ctx.spec then raise (Vc_error (Printf.sprintf "specifications cannot call unchecked code ('%s')" name, loc));
   if not (starts_with "caught exception" name || starts_with "default of" name) then note_assumed g loc ("call:" ^ name);
+  (match ctx.state with Some st when name = "yield" -> check_suspended g ctx st loc "yield" | _ -> ());
   let fn = g.info.fn in
   (match ctx.state with
    | Some st ->
@@ -1142,6 +1144,42 @@ and recursion_check g (callee : finfo) pmap ctx loc =
   | _ -> oblige g "variant" ctx ff loc (Printf.sprintf "recursive call to '%s' terminates (add '@decreases <measure>')" callee.fn.name)
 
 (* -- statements ----------------------------------------------------------- *)
+
+(* every object of cls this function wrote a field of, other than the
+   parameters (checked on their own), satisfies each invariant *)
+and written_claims g cls env base =
+  let w = match SM.find_opt (written_key cls) env with Some (T w) -> w | _ -> raise (Vc_error ("no written set for " ^ cls, Ir.noloc)) in
+  let r = const (Printf.sprintf "r!%d" (next g)) Int in
+  let held = and_ (select w r :: List.map (fun p -> not_ (eq r p)) (checked_params g cls)) in
+  (* a trigger only where the set is a havocked constant: in a goal it is not needed *)
+  let pats = match w.node with Const _ -> [ [| select w r |] ] | _ -> [] in
+  List.map (fun (inv, t) -> (inv, quant "forall" [ r ] (implies held t) pats)) (class_invariants g cls r env base)
+
+(* other tasks, or a generator's consumer, run while this code is suspended:
+   the objects it wrote and was passed must satisfy their invariants there *)
+and check_suspended g ctx (st : state) (site : Ir.loc) what =
+  let sctx = spec_ctx g ~quiet:false ~guard:ctx.guard ~base:st.facts ~env:st.env () in
+  List.iter
+    (fun c ->
+      let cls = c.cname in
+      match SM.find_opt (written_key cls) st.env with
+      | Some (T w) when w != no_writes ->
+        List.iter
+          (fun ((inv : Ir.clause), t) ->
+            oblige g ~site ~clause:inv "class.inv" sctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds at the %s for every object written so far" cls inv.text what))
+          (written_claims g cls st.env st.facts)
+      | _ -> ())
+    g.prog.classes;
+  List.iter
+    (fun (p, (ty : Ir.ty)) ->
+      match (ty, SM.find_opt p g.entry) with
+      | TClass c, Some (T r) ->
+        List.iter
+          (fun ((inv : Ir.clause), t) ->
+            oblige g ~site ~clause:inv "class.inv" sctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds for '%s' at the %s" c inv.text p what))
+          (class_invariants g c r st.env st.facts)
+      | _ -> ())
+    g.info.fn.params
 
 let state_ctx g ?(spec = false) (st : state) =
   { base = st.facts; modpath = g.info.modpath; env = st.env; live = Some st; guard = []; bound = SM.empty; old_env = None; result = None; spec; quiet = false; state = Some st }
@@ -1431,16 +1469,6 @@ and assume_invs g invs (st : state) overrides =
       Dynarray.add_last st.facts (term_of inv.cloc (ev g ctx inv.cexpr)))
     invs
 
-(* every object of cls this function wrote a field of, other than the
-   parameters (checked on their own), satisfies each invariant *)
-and written_claims g cls env base =
-  let w = match SM.find_opt (written_key cls) env with Some (T w) -> w | _ -> raise (Vc_error ("no written set for " ^ cls, Ir.noloc)) in
-  let r = const (Printf.sprintf "r!%d" (next g)) Int in
-  let held = and_ (select w r :: List.map (fun p -> not_ (eq r p)) (checked_params g cls)) in
-  (* a trigger only where the set is a havocked constant: in a goal it is not needed *)
-  let pats = match w.node with Const _ -> [ [| select w r |] ] | _ -> [] in
-  List.map (fun (inv, t) -> (inv, quant "forall" [ r ] (implies held t) pats)) (class_invariants g cls r env base)
-
 (* objects a loop writes keep their invariants from one iteration to the next:
    the loop's exit state is a havocked head, so the conditions under which a
    write happened no longer describe it *)
@@ -1457,7 +1485,17 @@ and check_written g classes (st : state) (site : Ir.loc) ~entry =
       end)
     classes
 
-and assume_written g classes (st : state) = List.iter (fun cls -> List.iter (fun (_, t) -> Dynarray.add_last st.facts t) (written_claims g cls st.env st.facts)) classes
+and assume_written g classes (st : state) =
+  List.iter
+    (fun cls ->
+      List.iter (fun (_, t) -> Dynarray.add_last st.facts t) (written_claims g cls st.env st.facts);
+      (* (an object written so far exists: calls and allocations leave it alone unless they may write it) *)
+      match SM.find_opt (written_key cls) st.env with
+      | Some (T w) ->
+        let r = const (Printf.sprintf "r!%d" (next g)) Int in
+        Dynarray.add_last st.facts (quant "forall" [ r ] (implies (select w r) (select (alloc_of st.env) r)) [ [| select w r |] ])
+      | _ -> ())
+    classes
 
 and run_iteration g body st =
   let frame = { breaks = []; continues = [] } in

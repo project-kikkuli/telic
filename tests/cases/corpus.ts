@@ -366,3 +366,12 @@ export function fillWallets(ws: Wallet[], c: number): void {
     }
   }
 }
+
+// expect: proved
+export function newWallets(ws: Wallet[], out: Wallet[]): void {
+  for (let i = 0; i < ws.length; i++) {
+    const w = new Wallet();
+    w.cents = 5;
+    out.push(w);
+  }
+}

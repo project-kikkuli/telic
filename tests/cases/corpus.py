@@ -456,3 +456,11 @@ def fill_wallets(ws: list[Wallet], c: int) -> None:
     for i in range(len(ws)):
         if ws[i].cents < c:
             ws[i].cents = c
+
+
+# expect: proved
+def new_wallets(ws: list[Wallet], n: int) -> None:
+    for i in range(n):
+        w = Wallet()
+        w.cents = 5
+        ws.append(w)
