@@ -477,6 +477,7 @@ export function findGuarded(xs: number[]): number {
 
 // expect: refuted
 export function findUnguarded(xs: number[]): number {
+  //@ requires xs.length <= 3
   //@ ensures result === 0
   const y = xs.find((x) => posNum(x) > 1);
   return 0;
