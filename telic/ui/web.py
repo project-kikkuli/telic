@@ -16,6 +16,7 @@ from .tree import OVERLAYS, TEXT_ENTRY, Action, Node, Snapshot, route
 _LINE = re.compile(r"^(?P<indent>\s*)- (?P<body>.*)$")
 _ATTR = re.compile(r"\s*\[(?P<a>[^\]]*)\]")
 _ROLE = re.compile(r"[a-zA-Z]+")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 _HIT_JS = """
 (el, [block, visual]) => {
@@ -204,18 +205,31 @@ _HANDLERS_JS = """
 """
 
 # A value as the model keeps it: scalars exactly, collections by size (0, 1,
-# 2+: which items are data, as in the tree), records by their fields.
+# 2+: which items are data, as in the tree), records by their fields. A
+# moment (milliseconds within ten years of now) and a random id differ on
+# every run, so they are kept as what they are, not their value.
 _ABSTRACT_JS = """
 function () {
   'use strict';
+  const now = Date.now(), decade = 3.2e11;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const abs = (v, depth) => {
     if (v === null || v === undefined) return String(v);
     const t = typeof v;
-    if (t === 'boolean' || t === 'number') return v;
-    if (t === 'string') return v.length <= 40 ? v : 'text';
+    if (t === 'boolean') return v;
+    if (t === 'number') return Math.abs(v - now) < decade ? 'moment' : v;
+    if (v instanceof Date) return 'moment';
+    if (t === 'string') return uuid.test(v) ? 'id' : v.length <= 40 ? v : 'text';
     if (t !== 'object') return t;
     try {
       if ('v' in v && typeof v.f === 'number' && ('reactions' in v || 'wv' in v)) return abs(v.v, depth);  // a Svelte signal
+      if (v.__v_isRef) return abs(v.value, depth);  // a Vue ref
+      if (typeof v.subscribe === 'function' && (typeof v.set === 'function' || v.subscribe.length === 1)) {  // a Svelte store
+        let got, stop;
+        stop = v.subscribe((x) => { got = x; });
+        if (typeof stop === 'function') stop(); else if (stop && typeof stop.unsubscribe === 'function') stop.unsubscribe();
+        return abs(got, depth);
+      }
       if (v instanceof Node || v === window) return 'element';
       const n = Array.isArray(v) ? v.length : v instanceof Map || v instanceof Set ? v.size : -1;
       if (n >= 0) return n === 0 ? '[0]' : n === 1 ? '[1]' : '[2+]';
@@ -258,6 +272,41 @@ _FIBERS_JS = """
 """.replace("ABSTRACT", _ABSTRACT_JS.strip())
 
 
+# What the page keeps in storage, as the model keeps values: each entry
+# parsed as JSON where it is JSON.
+_STORAGE_JS = """
+(apis) => {
+  const abs = (ABSTRACT);
+  const parse = (v) => { try { return JSON.parse(v); } catch (e) { return v; } };
+  const out = {};
+  for (const api of apis) {
+    try {
+      const entries = {};
+      if (api === 'cookie') {
+        for (const c of document.cookie.split(';')) if (c.trim()) { const i = c.indexOf('='); entries[c.slice(0, i).trim()] = parse(decodeURIComponent(c.slice(i + 1).trim())); }
+      } else {
+        const st = window[api];
+        for (let i = 0; i < st.length; i++) entries[st.key(i)] = parse(st.getItem(st.key(i)));
+      }
+      out[api] = JSON.stringify(Object.keys(entries).sort().map((k) => [k, abs.call(entries[k])]));
+    } catch (e) {}
+  }
+  return out;
+}
+""".replace("ABSTRACT", _ABSTRACT_JS.strip())
+
+# the kinds of storage read with _STORAGE_JS; IndexedDB answers only asynchronously, so it is never read
+READABLE_STORAGE = ("localStorage", "sessionStorage", "cookie")
+
+
+def _in_scope(desc: str, h) -> bool:
+    """Is a scope DevTools describes as ``desc`` where ``h`` is declared? Only
+    asked when the name is bound more than once in its file."""
+    if h.component is None:
+        return desc in ("Script", "Module") or (h.path.endswith((".svelte", ".vue")) and desc.startswith("Closure"))
+    return desc == f"Closure ({h.component})"
+
+
 # An element's name from aria-label or aria-labelledby, which the snapshot
 # leaves out for some roles (a dialog titled by its heading).
 _NAME_JS = """
@@ -275,11 +324,14 @@ def _scalar(o: dict):
         return "undefined"
     if t == "object" and o.get("subtype") == "null":
         return "null"
-    if t in ("boolean", "number"):
-        return o.get("value", o.get("unserializableValue"))
+    if t == "boolean":
+        return o.get("value")
+    if t == "number":
+        v = o.get("value", o.get("unserializableValue"))
+        return "moment" if isinstance(v, (int, float)) and abs(v - time.time() * 1000) < 3.2e11 else v
     if t == "string":
         v = o.get("value", "")
-        return v if len(v) <= 40 else "text"
+        return "id" if _UUID.match(v) else v if len(v) <= 40 else "text"
     if t in ("function", "symbol", "bigint"):
         return t
     return None
@@ -482,7 +534,7 @@ class WebDriver(Driver):
         cdp = self._cdp
         want: dict[str, list] = {}
         for h in self._watch:
-            if not h.react:
+            if not h.react and h.kind == "var":
                 want.setdefault(h.name, []).append(h)
         got: dict[str, set[str]] = {}
 
@@ -516,12 +568,13 @@ class WebDriver(Driver):
                             continue
                         for sc in cdp.send("Runtime.getProperties", {"objectId": scopes, "ownProperties": True})["result"]:
                             obj = sc["value"]
-                            if obj.get("description") == "Global" or not obj.get("objectId"):
+                            desc = obj.get("description") or ""
+                            if desc == "Global" or not obj.get("objectId"):
                                 continue
                             for var in cdp.send("Runtime.getProperties", {"objectId": obj["objectId"], "ownProperties": True})["result"]:
                                 v = var.get("value") or {}
                                 for h in want.get(var["name"], []):
-                                    if where.endswith("/" + h.path):
+                                    if where.endswith("/" + h.path) and (h.unique or _in_scope(desc, h)):
                                         got.setdefault(f"{h.path}:{h.name}", set()).add(value(v))
                                 if depth == 0 and v.get("type") == "object" and v.get("subtype") is None and v.get("objectId") and len(holders) < 64:
                                     holders.append(v["objectId"])
@@ -541,6 +594,13 @@ class WebDriver(Driver):
                     if h.react and h.component in fib:
                         got.setdefault(f"{h.path}:{h.component}", set()).update(fib[h.component])
                         self.read.add(f"{h.path}:{h.name}")
+            apis = sorted({h.name for h in self._watch if h.kind == "storage" and h.name in READABLE_STORAGE})
+            if apis:
+                kept = self.page.evaluate(_STORAGE_JS, apis)
+                for h in self._watch:
+                    if h.kind == "storage" and h.name in kept:
+                        got[f"{h.path}:{h.name}"] = {kept[h.name]}
+                        self.read.add(f"{h.path}:{h.name}")
         except Exception:  # noqa: BLE001 - navigating: read at the next snapshot
             return None
         finally:
@@ -548,7 +608,7 @@ class WebDriver(Driver):
                 cdp.send("Runtime.releaseObjectGroup", {"objectGroup": "telic"})
             except Exception:  # noqa: BLE001 - the page went away
                 pass
-        self.read.update(f"{h.path}:{h.name}" for h in self._watch if not h.react and f"{h.path}:{h.name}" in got)
+        self.read.update(f"{h.path}:{h.name}" for h in self._watch if not h.react and h.kind == "var" and f"{h.path}:{h.name}" in got)
         return {k: sorted(v) for k, v in sorted(got.items())}
 
     @_confined

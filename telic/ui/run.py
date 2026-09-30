@@ -18,7 +18,7 @@ from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
 from .driver import DriverError
-from .spec import Scan, UiDecl, UiLemma
+from .spec import Pred, Scan, UiDecl, UiLemma
 
 CACHE = os.path.join(".telic", "ui.json")
 AUTO_STATES = 100
@@ -214,8 +214,8 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
         app.error = str(e)
         return {lem.name: UiResult(lem, cfg.path, "open", "", f"the app did not run: {e}") for lem in lems}
     outs: dict[str, list[Outcome]] = {lem.name: [] for lem in lems}
-    for model, got in done:
-        app.models.append(model)
+    for models, got in done:
+        app.models += models
         for name, o in got.items():
             outs[name].append(o)
     out: dict[str, UiResult] = {}
@@ -225,14 +225,14 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     return out
 
 
-def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, i: int, size: tuple[int, int] | str, log) -> tuple[list[dict[str, Any]], dict[str, Outcome]]:
     # one browser (or simulator) slot each, machine-wide: runs in other processes queue for them
     vp = f"{size[0]}x{size[1]}" if isinstance(size, tuple) else size or "iOS"
     with slots.hold(max(1, cfg.settings.workers) if cfg.platform == "web" else 1, log=lambda m: log(f"{vp}: {m}")) as n:
         return _learn(cfg, url, lems, atoms, facts, size, n, log)
 
 
-def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, size: tuple[int, int] | str, browsers: int, log) -> tuple[list[dict[str, Any]], dict[str, Outcome]]:
     from .learn import Explorer
 
     drivers: list = []
@@ -255,48 +255,90 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, si
                 drivers.append(d)
                 d.start()
                 d.viewport(w, h)
-        # a variable a timer also changes is not waited for (like a timer longer than [ui] wait)
-        watched = [h for h in facts.hidden if not h.clock]
-        for d in drivers:
-            d.watch(watched)
         occluding = [lem for lem in lems if lem.prop and lem.prop.kind == "unobscured"]
 
-        def learn(settings):
-            occl = {lem.name: Occlusion() for lem in occluding}
+        def learn(group: list[UiLemma], atoms: Atoms, settings):
+            occl = {lem.name: Occlusion() for lem in occluding if lem in group}
             holder: list[Explorer] = []
 
             def probe(state, snap, driver, paths):
                 for lem in occluding:
                     p = lem.prop
-                    if p.cond.eval(snap, holder[0].model.home):
+                    if lem.name in occl and p.cond.eval(snap, holder[0].model.home):
                         occl[lem.name].record(state.id, *hit_test(driver, p.goal, snap), paths)
 
             ex = Explorer(drivers, atoms.preds, settings, vp, probe, lambda m: log(f"{vp}: {m}"))
             holder.append(ex)
             return ex, ex.learn(), occl
 
-        s = cfg.settings
-        if s.abstraction == "auto":
-            # the exact abstraction when the app is small enough for it; else screens
-            ex, model, occl = learn(replace(s, abstraction="controls", max_states=min(s.max_states, AUTO_STATES)))
-            if "state budget" in model.stop:
-                ex, model, occl = learn(replace(s, abstraction="screens", max_seconds=max(1.0, s.max_seconds - model.seconds)))
-                model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
-        else:
-            ex, model, occl = learn(s)
-        dialogs = sum(getattr(d, "dialogs", 0) for d in drivers)
-        if dialogs:
-            model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
-        _source_notes(model, facts, watched, set().union(*(d.read for d in drivers)))
-        _dump(cfg, model)
-        mc = ModelCheck(ex, atoms, occl, cfg.witnesses)
         got: dict[str, Outcome] = {}
-        for lem in lems:
-            got[lem.name] = mc.persists(lem) if lem.prop.kind == "persists" else mc.check(lem)
-        return model.summary(), got
+        summaries = []
+        for group, watched in _cones(lems, facts):
+            gatoms = Atoms(group)
+            for d in drivers:
+                d.read = set()
+                d.watch(watched)
+            s = cfg.settings
+            if s.abstraction == "auto":
+                # the exact abstraction when the app is small enough for it; else screens
+                ex, model, occl = learn(group, gatoms, replace(s, abstraction="controls", max_states=min(s.max_states, AUTO_STATES)))
+                if "state budget" in model.stop:
+                    ex, model, occl = learn(group, gatoms, replace(s, abstraction="screens", max_seconds=max(1.0, s.max_seconds - model.seconds)))
+                    model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
+            else:
+                ex, model, occl = learn(group, gatoms, s)
+            dialogs = sum(getattr(d, "dialogs", 0) for d in drivers)
+            if dialogs:
+                model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
+            _source_notes(model, facts, watched, set().union(*(d.read for d in drivers)))
+            if len(group) < len(lems):
+                model.lemmas = [lem.name for lem in group]
+            _dump(cfg, model)
+            mc = ModelCheck(ex, gatoms, occl, cfg.witnesses)
+            for lem in group:
+                got[lem.name] = mc.persists(lem) if lem.prop.kind == "persists" else mc.check(lem)
+            summaries.append(model.summary())
+        return summaries, got
     finally:
         for d in drivers:
             d.stop()
+
+
+def _observes_content(lem: UiLemma) -> bool:
+    """Does the lemma look at what the tree shows of an element (a name, a
+    state, a value, where it is drawn), not only at which elements exist?"""
+    p = lem.prop
+    if p is None or p.kind in ("unobscured", "persists"):
+        return True
+
+    def content(x) -> bool:
+        if not isinstance(x, Pred):
+            return False
+        if x.op == "overlay":
+            return bool(x.args)
+        if x.op in ("is", "eq"):
+            return True
+        if x.op == "present":
+            t = x.args[0]
+            return t.name is not None or t.pattern is not None
+        return any(content(a) for a in x.args if isinstance(a, Pred))
+
+    return content(p.goal) or content(p.cond)
+
+
+def _cones(lems: list[UiLemma], facts) -> list[tuple[list[UiLemma], list]]:
+    """The lemmas in groups that can share a model, each with the state the
+    model must read: what can change what its lemmas observe. Every lemma
+    watches the state that decides which elements exist (and so which
+    actions there are); only one that looks at names, states or values
+    watches the state that decides only those."""
+    every = list(facts.hidden)
+    shaped = [h for h in every if "structure" in h.affects]
+    if len(shaped) == len(every):
+        return [(lems, every)]
+    blind = [lem for lem in lems if not _observes_content(lem)]
+    seeing = [lem for lem in lems if _observes_content(lem)]
+    return [(g, w) for g, w in ((blind, shaped), (seeing, every)) if g]
 
 
 def _source_notes(model, facts, watched, read: set[str]) -> None:
@@ -310,18 +352,23 @@ def _source_notes(model, facts, watched, read: set[str]) -> None:
         model.notes.append(f"state the tree does not show, read from the app: {', '.join(h.name for h in watched if f'{h.path}:{h.name}' in read)}")
     if model.unread:
         model.notes.insert(0, f"cannot read {', '.join(model.unread)} from the app: handlers change it and it decides what renders")
-    clocked = [h for h in facts.hidden if h.clock]
+    clocked = [h for h in watched if h.clock]
     if clocked:
-        model.notes.append("changed by timers, not waited for: " + ", ".join(f"{h.describe()}, timer at line {', '.join(map(str, h.clock))}" for h in clocked))
+        model.notes.append("also changed by timers, not waited for: " + ", ".join(f"{h.describe()}, timer at line {', '.join(map(str, h.clock))}" for h in clocked))
+    if facts.gaps:
+        model.unpressed = [g.describe() for g in facts.gaps]
+        model.notes.insert(0, "key handlers react to keys the source does not spell out: " + ", ".join(model.unpressed))
     for e in facts.errors[:3]:
         model.notes.append(e)
 
 
 def _dump(cfg: UiConfig, model) -> None:
-    """The learned model, next to the app: .telic/ui-model-<viewport>.json."""
+    """The learned model, next to the app: .telic/ui-model-<viewport>.json
+    (-<lemmas> when it is for some of them)."""
     try:
         d = os.path.join(cfg.dir, ".telic")
         os.makedirs(d, exist_ok=True)
-        Path(d, f"ui-model-{model.viewport}.json").write_text(json.dumps(model.dump(), indent=1, ensure_ascii=False))
+        tail = f"-{'+'.join(model.lemmas)}"[:80] if model.lemmas else ""
+        Path(d, f"ui-model-{model.viewport}{tail}.json").write_text(json.dumps(model.dump(), indent=1, ensure_ascii=False))
     except OSError:
         pass

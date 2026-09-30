@@ -567,9 +567,15 @@ a handler changes that decide what renders (a flag, a step counter, an
 `{#if}` or `&&` condition, a `useState`) are read from the running page
 along with every snapshot (through the handlers' closures and React's
 fibers) and are part of the state: scalars exactly, lists as 0, 1 or 2+
-items. A variable the model could not read (a minified build, an unmounted
-component) leaves every model-wide verdict open, naming it. A variable a
-timer also changes is not waited for, and the model says so.
+items. Svelte stores, Vue refs and localStorage, sessionStorage and
+cookies are read the same way. A variable the model could not read (a
+minified build, an unmounted component, a worker, IndexedDB) leaves every
+model-wide verdict open, naming it, and so does a key handler whose keys
+the source does not spell out. A variable a timer also changes is read,
+though the timer is not waited for. Each lemma's model reads only the state
+that can change what it observes: what decides which elements exist for
+every lemma, what decides only names, states and values for lemmas that
+look at those.
 
 Verdicts are cached in `.telic/ui.json` by the app's sources (every file
 under the `telic.toml`'s directory except dependencies and the build output

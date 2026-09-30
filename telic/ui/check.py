@@ -201,9 +201,14 @@ class ModelCheck:
         """A proof over every state rests on the model seeing what decides
         what renders: when the source names state it could not read, the
         model may have merged states the app keeps apart."""
-        if self.m.unread and out.status in ("proved", "vacuous"):
+        if (self.m.unread or self.m.unpressed) and out.status in ("proved", "vacuous"):
             what = "proved" if out.status == "proved" else "vacuous"
-            return Outcome("open", out.method, f"{what} on the model, but it cannot see {', '.join(self.m.unread[:3])}: handlers change it and it decides what renders ({out.detail})", out.viewport, out.trace, out.replay, out.relevant)
+            why = []
+            if self.m.unread:
+                why.append(f"it cannot see {', '.join(self.m.unread[:3])}: handlers change it and it decides what renders")
+            if self.m.unpressed:
+                why.append(f"it cannot tell which keys to press: {', '.join(self.m.unpressed[:3])}")
+            return Outcome("open", out.method, f"{what} on the model, but {'; and '.join(why)} ({out.detail})", out.viewport, out.trace, out.replay, out.relevant)
         return out
 
     def _states(self, p: Pred) -> list[UiState]:

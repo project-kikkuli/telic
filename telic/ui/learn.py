@@ -93,6 +93,8 @@ class Model:
     keys: list[str] = field(default_factory=list)  # found in the source, pressed like any action ('Escape (app.js:3)')
     hidden: list[str] = field(default_factory=list)  # read from the app into every state
     unread: list[str] = field(default_factory=list)  # decides what renders, but the model cannot see it
+    unpressed: list[str] = field(default_factory=list)  # key handlers whose keys the source does not spell out
+    lemmas: list[str] = field(default_factory=list)  # the lemmas it is for, when not all of them
 
     @property
     def transitions(self) -> int:
@@ -217,6 +219,8 @@ class Model:
             "keys": self.keys,
             "hidden": self.hidden,
             "unread": self.unread,
+            **({"unpressed": self.unpressed} if self.unpressed else {}),
+            **({"lemmas": self.lemmas} if self.lemmas else {}),
             "notes": self.notes,
         }
 

@@ -58,10 +58,24 @@ The tree is not all there is. telic also reads the app's source for the keys
 its handlers listen for (pressed like any action: `keys found in the source`
 under the model) and for variables a handler changes that decide what renders
 (a step counter, an open flag). Those are read from the page into every state
-(`state the tree does not show`). One it cannot read, say in a minified
-build, is named, and no model-wide verdict is `proved` while it is unseen:
-serve a development build, or keep that state in the tree (an
-`aria-expanded`, a visible step number).
+(`state the tree does not show`), along with Svelte stores, Vue refs, and
+what the page keeps in localStorage, sessionStorage and cookies. One it
+cannot read (a minified build, a worker, IndexedDB, a global `var`) is
+named, and no model-wide verdict is `proved` while it is unseen: serve a
+development build, or keep that state in the tree (an `aria-expanded`, a
+visible step number). The same goes for a key handler whose keys the source
+does not spell out (`keys[e.key]` over a table built at run time, a handler
+from another file): it is named, and nothing model-wide is `proved`.
+
+Each lemma's model reads only the state that can change what the lemma
+observes. State that decides which elements exist, their roles or whether
+they can be used matters to every lemma, since it decides which actions
+there are; state that only decides names, states or values (a timer's
+text, a field's contents) matters only to lemmas that look at those. So
+`always reachable home from overlay` is learned without the timer, and
+`unobscured` or `is expanded` with it: a viewport can have two models,
+`.telic/ui-model-<viewport>-<lemmas>.json`. A moment (a timestamp) and a
+random id are kept as `moment` and `id`, since they differ on every run.
 
 ## Examples
 
@@ -84,7 +98,9 @@ lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
   drawer is no longer the same state as "Discard changes?", and every route
   out of the stacked dialogs replays. Reading the state the tree does not
   show (filters, settings, the open task, the focus queue) multiplies the
-  states past the default budget, so escape is open at `max_states = 300`.
+  states: escape's model, which leaves out the focus timer, is about 90
+  states at 390x844 but does not finish within `max_seconds = 600`, so
+  escape is open.
 
 `examples/splitter` is an app built with telic from the first line: a
 Python API and a TypeScript front end with aims for money, a lifecycle, a

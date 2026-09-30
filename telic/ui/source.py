@@ -39,6 +39,11 @@ class Hidden:
     clock: tuple[int, ...] = ()  # also written by a timer
     component: str | None = None
     react: bool = False
+    unique: bool = True  # the only binding of that name in its file
+    kind: str = "var"  # or "storage": what the page keeps in localStorage, sessionStorage, cookies or IndexedDB (``name``)
+    # what it can change in the tree: "structure" (which elements exist, their roles,
+    # whether they can be used) and "content" (what the tree shows of them: names, states, values)
+    affects: tuple[str, ...] = ("structure", "content")
 
     def at(self) -> str:
         return f"{self.path}:{self.line}"
@@ -48,10 +53,23 @@ class Hidden:
         return f"`{self.name}` ({self.at()}{w})"
 
 
+@dataclass(frozen=True)
+class Gap:
+    """A key handler whose keys the source does not spell out."""
+
+    path: str
+    line: int
+    why: str
+
+    def describe(self) -> str:
+        return f"{self.path}:{self.line} ({self.why})"
+
+
 @dataclass
 class Facts:
     keys: list[Key] = field(default_factory=list)
     hidden: list[Hidden] = field(default_factory=list)
+    gaps: list[Gap] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -105,9 +123,27 @@ def _web(top: str, facts: Facts) -> None:
     facts.errors += got.get("errors", [])
     facts.keys += [Key(k["key"], k["path"], k["line"]) for k in got.get("keys", [])]
     facts.hidden += [
-        Hidden(s["name"], s["path"], s["line"], tuple(s.get("writes", ())), tuple(s.get("reads", ())), tuple(s.get("clock", ())), s.get("component"), bool(s.get("react")))
+        Hidden(
+            s["name"],
+            s["path"],
+            s["line"],
+            tuple(s.get("writes", ())),
+            tuple(s.get("reads", ())),
+            tuple(s.get("clock", ())),
+            s.get("component"),
+            bool(s.get("react")),
+            bool(s.get("unique", True)),
+            affects=tuple(s.get("affects", ("structure", "content"))),
+        )
         for s in got.get("state", [])
     ]
+    first: dict[str, list[dict]] = {}
+    for s in got.get("storage", []):
+        first.setdefault(s["api"], []).append(s)
+    for api, uses in sorted(first.items()):
+        writes = tuple(sorted({u["line"] for u in uses if u["write"] and u["path"] == uses[0]["path"]}))[:3]
+        facts.hidden.append(Hidden(api, uses[0]["path"], uses[0]["line"], writes, kind="storage"))
+    facts.gaps = [Gap(g["path"], g["line"], g["why"]) for g in got.get("unresolved", [])]
 
 
 # ---------------------------------------------------------------------------
