@@ -351,7 +351,7 @@ SOURCE_EXT = (
     ".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".svelte", ".vue", ".astro",
     ".html", ".htm", ".rs", ".swift", ".kt", ".kts", ".dart", ".java", ".m", ".cs",
 )
-HOST_EXT = (".py", ".ts", ".tsx", ".mts", ".cts", ".rs")  # a language frontend reads their aims
+HOST_EXT = (".py", ".ts", ".tsx", ".mts", ".cts", ".rs", ".swift")  # a language frontend reads their aims
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "dist", "build", "target", ".git", ".telic", ".svelte-kit", "coverage"}
 
 _MARK = re.compile(r"^\s*(?:<!--|//|#|--|\*|/\*+)@\s?(?P<body>.*?)(?:\s*-->|\s*\*/)?\s*$")

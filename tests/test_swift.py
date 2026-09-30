@@ -224,3 +224,24 @@ def test_swift_mirror_divergence_is_replayed_in_both_runtimes(tmp_path):
     (m,) = rep.mirrors
     assert m.status == "refuted", m.reason
     assert m.witness["replay"]["confirmed"], m.witness
+
+
+def test_a_changed_swift_file_affects_its_whole_module(tmp_path):
+    from telic.ledger import affected_files
+
+    (tmp_path / "a.swift").write_text("func a() -> Int {\n    return 1\n}\n")
+    (tmp_path / "b.swift").write_text("func b() -> Int {\n    return a()\n}\n")
+    assert affected_files(str(tmp_path), {"a.swift"}, None) >= {"a.swift", "b.swift"}
+
+
+def test_calls_across_files_use_the_callee_contract(tmp_path):
+    rep = run_check(
+        tmp_path,
+        {
+            "a.swift": "func small() -> Int {\n    //@ ensures result >= 0 && result < 10\n    return 3\n}\n",
+            "b.swift": "func twice() -> Int {\n    //@ ensures result < 20\n    return small() * 2\n}\n",
+        },
+        lean=False,
+        replay=False,
+    )
+    assert {f.fn.name: f.status for f in rep.functions} == {"small": "proved", "twice": "proved"}

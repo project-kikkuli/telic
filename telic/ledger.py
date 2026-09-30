@@ -282,6 +282,11 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
                     touched.add(dep)
                     todo.append(dep)
         files |= {os.path.relpath(f, root) for f in touched if os.path.exists(f)}
+    if any(language_of(f) == "swift" for f in files | deleted):
+        # the Swift files of a run are one module: each sees every other's declarations
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build")]
+            files |= {os.path.relpath(os.path.join(dirpath, fn), root) for fn in filenames if language_of(fn) == "swift"}
     grow = True
     named: set[str] = set()  # aim ids the affected code declares or cites
     while grow:
