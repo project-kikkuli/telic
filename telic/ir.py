@@ -574,6 +574,8 @@ class Module:
     class_origin: dict[str, str] = field(default_factory=dict)
     # class name used here that several checked files define, and telic cannot tell which -> why
     ambiguous_classes: dict[str, str] = field(default_factory=dict)
+    # (subclass, base as written, loc) for subclasses the frontend does not model
+    opaque_subclasses: list[tuple[str, str, Loc]] = field(default_factory=list)
 
 
 def source_name(name: str) -> str:

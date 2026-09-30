@@ -228,3 +228,29 @@ def test_since_follows_imports_as_a_full_check_does(tmp_path, case):
     since, full = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never"), telic(tmp_path, "ci", "--color", "never")
     assert since.returncode == full.returncode, since.stdout
     assert [l for l in since.stdout.splitlines() if "→" in l] == [l for l in full.stdout.splitlines() if "→" in l]
+
+
+TS_BASE = "export class Shape {\n  area(): number {\n    //@ ensures result >= 0\n    return 0;\n  }\n}\n"
+TS_SUB = 'import { Shape } from "./base";\n\nexport class Square extends Shape {\n  area(): number {\n    return -1;\n  }\n}\n'
+TS_CALLER = '//@ aim POS: Every area is non-negative.\n\nimport { Shape } from "./base";\n\nexport function total(s: Shape): number {\n  //@ aim POS\n  //@ ensures result >= 0\n  return s.area();\n}\n'
+
+
+def test_a_new_ts_subclass_rechecks_callers_through_the_base(tmp_path):
+    import shutil
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    (tmp_path / "base.ts").write_text(TS_BASE)
+    (tmp_path / "caller.ts").write_text(TS_CALLER)
+    sh(tmp_path, "git", "init", "-q", "-b", "main")
+    sh(tmp_path, "git", "config", "user.email", "t@example.com")
+    sh(tmp_path, "git", "config", "user.name", "t")
+    assert telic(tmp_path, "init", "--no-hook").returncode == 0
+    sh(tmp_path, "git", "add", "-A")
+    sh(tmp_path, "git", "commit", "-qm", "init")
+    (tmp_path / "square.ts").write_text(TS_SUB)
+    sh(tmp_path, "git", "add", "-A")
+    commit(tmp_path, "a subclass")
+    since, full = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never"), telic(tmp_path, "ci", "--color", "never")
+    assert "aim POS: backed →" in full.stdout, full.stdout
+    assert [l for l in since.stdout.splitlines() if "→" in l] == [l for l in full.stdout.splitlines() if "→" in l]

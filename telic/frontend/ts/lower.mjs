@@ -140,7 +140,7 @@ class ModuleLowerer {
     this.sf = sf;
     this.src = sf.text;
     this.lines = sf.text.split(/\r?\n/);
-    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
+    this.module = { path: rel, language: "typescript", source: sf.text, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, opaque_subclasses: [], problems: [], notes: [], assumptions: JS_ASSUMPTIONS };
     this.aliases = {};
     this.sigs = {}; // name -> {params, ret, node}
     this.classes = {}; // name -> {node, fields: [[n, ty]], props, setters, statics, home: ModuleLowerer}
@@ -210,7 +210,10 @@ class ModuleLowerer {
           this.globalsBound.add(st.name.text);
           const base = ext.types[0] ? ext.types[0].expression.getText(this.sf) : "?";
           // an Error subclass is only ever thrown; other subclasses are library-like values
-          if (!/(Error|Exception)$/.test(base)) this.module.notes.push([`class ${st.name.text}: subclass of ${base}; inheritance is not modelled for TypeScript yet, so its instances are treated as library values`, this.line(st)]);
+          if (!/(Error|Exception)$/.test(base)) {
+            this.module.notes.push([`class ${st.name.text}: subclass of ${base}; inheritance is not modelled for TypeScript yet, so its instances are treated as library values`, this.line(st)]);
+            this.module.opaque_subclasses.push([st.name.text, base, this.line(st)]);
+          }
           continue;
         }
         this.classes[st.name.text] = { node: st, fields: [], props: new Set(), setters: new Set(), statics: new Set(), home: this };
@@ -2698,7 +2701,7 @@ function main() {
         }
       } catch (e) {
         ml.stage = "done";
-        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
+        ml.module = { path: ml.rel, language: "typescript", source: ml.src, functions: [], aims: [], records: {}, classes: {}, imports: {}, class_origin: {}, opaque_subclasses: [], problems: [[`internal error: ${e.message}`, e.line || 0]], notes: [], assumptions: JS_ASSUMPTIONS };
       }
     }
   };

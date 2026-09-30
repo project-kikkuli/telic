@@ -247,13 +247,15 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
             if os.path.exists(os.path.join(root, p)):
                 files.add(p)
     if any(language_of(f) in ("python", "typescript") for f in files | deleted):
-        from .frontend.python import ancestor_files
+        from .frontend.python import ancestor_files as py_ancestors
         from .frontend.python import project_imports as py_imports
+        from .frontend.typescript import ancestor_files as ts_ancestors
         from .frontend.typescript import project_imports as ts_imports
 
         touched = {os.path.normpath(os.path.join(root, f)) for f in files | deleted if language_of(f) in ("python", "typescript")}
-        for f in [f for f in files if f.endswith(".py")]:
-            for a in ancestor_files(os.path.join(root, f), root):
+        for f in files:
+            ancestors = {"python": py_ancestors, "typescript": ts_ancestors}.get(language_of(f) or "")
+            for a in ancestors(os.path.join(root, f), root) if ancestors else ():
                 touched.add(os.path.normpath(a))
         imports: dict[str, set[str]] = {}
         for dirpath, dirnames, filenames in os.walk(root):

@@ -59,6 +59,7 @@ class Program:
                 p.class_module[cname] = m
         p._overrides()
         p._call_graph()
+        p._opaque_subclasses()
         p._sccs()
         p._mutation()
         p._heap()
@@ -132,6 +133,27 @@ class Program:
                 if more:
                     subs |= more
                     changed = True
+
+    def _opaque_subclasses(self) -> None:
+        """A checked class with a subclass the frontend does not model: a call
+        to its methods may run an override telic never saw, so it is not checked."""
+        opened: dict[str, str] = {}
+        for m in self.modules:
+            for sub, base, loc in m.opaque_subclasses:
+                b = base.rsplit(".", 1)[-1]
+                for c in self.classes:
+                    if ir.source_name(c) == b and (self.class_module[c] is m or self.class_module[c].path == m.class_origin.get(c)):
+                        for a in self.mro(c):
+                            opened.setdefault(a, f"{sub} ({m.path}:{loc.line}) extends {b}, and telic does not model TypeScript inheritance, so a call to a method of {ir.source_name(a)} may run an override it never checked")
+        if not opened:
+            return
+        methods = {k: opened[c] for k, r in self.funcs.items() for c in opened if r.fn.name.startswith(c + ".") and not r.fn.name.endswith(".__init__")}
+        for k in methods:
+            self.dispatch.setdefault(k, set())
+        for key, ref in self.funcs.items():
+            why = next((methods[c] for c in sorted(self.callees.get(key, ())) if c in methods and c != key), None)
+            if why is not None:
+                ref.fn.unsupported.append((why, ref.fn.loc))
 
     def resolve(self, module: ir.Module, name: str) -> FuncRef | None:
         hit = self.funcs.get(f"{module.path}::{name}")

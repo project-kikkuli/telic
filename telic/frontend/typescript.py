@@ -222,6 +222,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
         m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")))  # type: ignore[misc]
     m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.class_origin = dict(d.get("class_origin") or {})
+    m.opaque_subclasses = [(s, b, ir.Loc(int(line))) for s, b, line in d.get("opaque_subclasses", [])]
     m.aims = [ir.AimDecl(i["id"], i["text"], ir.Loc(int(i["line"]), int(i.get("col", 0)))) for i in d.get("aims", [])]
     m.problems = [(msg, ir.Loc(int(line))) for msg, line in d.get("problems", [])]
     m.notes = [(msg, ir.Loc(int(line))) for msg, line in d.get("notes", [])]
@@ -247,6 +248,38 @@ def project_imports(path: str, root: str) -> list[str]:
                 out.append(cand)
                 break
     return sorted(set(out))
+
+
+_CLASS = re.compile(r"\bclass\s+(\w+)")
+_EXTENDS = re.compile(r"\bclass\s+\w+(?:\s*<[^>{]*>)?\s+extends\s+([\w.]+)")
+
+
+def ancestor_files(path: str, root: str) -> list[str]:
+    """TypeScript files under ``root``, other than ``path``, that define an
+    ancestor of a class ``path`` defines (best effort, by name through imports)."""
+    out: list[str] = []
+    todo = [os.path.abspath(path)]
+    seen: set[str] = set(todo)
+    while todo:
+        cur = todo.pop()
+        try:
+            bases = {b.rsplit(".", 1)[-1] for b in _EXTENDS.findall(Path(cur).read_text())}
+        except OSError:
+            continue
+        if not bases:
+            continue
+        for imp in project_imports(cur, root):
+            if imp in seen:
+                continue
+            try:
+                defined = set(_CLASS.findall(Path(imp).read_text()))
+            except OSError:
+                continue
+            if defined & bases:
+                seen.add(imp)
+                out.append(imp)
+                todo.append(imp)
+    return sorted(out)
 
 
 def lower_typescript_files(files: list[str], root: str) -> dict[str, ir.Module]:
