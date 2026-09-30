@@ -141,6 +141,13 @@ def _match(item: str, key: str, name: str) -> bool:
     return item == name
 
 
+def _ui_match(item: str, lemma: Any) -> bool:
+    """Does a ``by:`` item name this ui lemma? ``name``, ``ui:name`` or
+    ``path::name``."""
+    n = item.removeprefix("ui:")
+    return _match(n, f"{lemma.path}::{lemma.name}", lemma.name)
+
+
 def build(rep: Any) -> list[AimReport]:
     from .frontend.aim_file import LANGUAGE, scope_of
 
@@ -174,7 +181,7 @@ def build(rep: Any) -> list[AimReport]:
         for res in ui.results:
             for i in res.lemma.aims:
                 uis.setdefault(i, []).append(res)
-    ui_names = {res.lemma.name for rs in uis.values() for res in rs}
+    ui_lemmas = [res.lemma for rs in uis.values() for res in rs]
     lcs: dict[str, list[Any]] = {}
     for lr in getattr(rep, "lifecycles", []):
         for i in lr.aims:
@@ -214,8 +221,8 @@ def build(rep: Any) -> list[AimReport]:
                 if classes and not hit:
                     if not any(_match(item, f"{lr.module.path}::{lr.cls}", _src(lr.cls)) for lr in lcs.get(iid, [])):
                         r.pointers.append(f"'{item}' is listed in by: but none of its lifecycles cites {iid}")
-                elif item.removeprefix("ui:") in ui_names:
-                    if not any(res.lemma.name == item.removeprefix("ui:") for res in uis.get(iid, [])):
+                elif any(_ui_match(item, lm) for lm in ui_lemmas):
+                    if not any(_ui_match(item, res.lemma) for res in uis.get(iid, [])):
                         r.pointers.append(f"'{item}' is listed in by: but that ui lemma does not cite {iid}")
                 elif not hit:
                     if not context:  # an ancestor's aim file may list code outside this check
@@ -229,7 +236,7 @@ def build(rep: Any) -> list[AimReport]:
                 if not any(_match(item, f"{lr.module.path}::{lr.cls}", _src(lr.cls)) for item in by):
                     r.pointers.append(f"the lifecycle of {_src(lr.cls)} cites {iid} but {_src(lr.cls)} is not in its by: list")
             for res in uis.get(iid, []):
-                if res.lemma.name not in {item.removeprefix("ui:") for item in by}:
+                if not any(_ui_match(item, res.lemma) for item in by):
                     r.pointers.append(f"ui {res.lemma.name} cites {iid} but is not in its by: list")
         if scope is not None:
             _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context, root=getattr(rep, "root", None) or ".")

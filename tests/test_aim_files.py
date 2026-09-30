@@ -223,3 +223,16 @@ def test_a_tagged_mirror_backs_only_its_tag(tmp_path, name, source):
     assert got["AGREE"].status == "backed" and not got["AGREE"].pointers
     assert got["OTHER"].status == "backed" and not got["OTHER"].pointers
     assert not any(x.kind == "mirror" for x in got["OTHER"].lemmas)
+
+
+@pytest.mark.parametrize("item", ["home", "ui:home", "web/app.ts::home", "app.ts::home"])
+def test_by_names_a_ui_lemma_by_name_or_path(tmp_path, item):
+    files = {
+        "web/telic.toml": '[ui]\ncommand = "true"\n',
+        "web/app.ts": '//@ [HOME] ui home: always reachable home\nexport const x = 1\n',
+        **aims("", ("HOME", SAME, item)),
+    }
+    root = tree(tmp_path, files)
+    rep = check([str(root)], CheckOptions(cache_path=None, lean=False, replay=False, ui=False), root=str(root))
+    (a,) = [x for x in rep.aims if x.id == "HOME"]
+    assert not a.pointers
