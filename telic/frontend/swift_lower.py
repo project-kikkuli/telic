@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import dataclasses
 import re
-from fractions import Fraction
 from typing import Any
 
 from .. import ir
 from ..contracts import FUNCTION_KEYWORDS, LOOP_KEYWORDS, STATEMENT_KEYWORDS, ContractLine, ContractSyntaxError, parse_aim_directive
-from .swift import INT_KINDS, LOGGING, FnInfo, LowerError, Project, TypeInfo, _base_name, _line, int_range
+from .swift import FnInfo, LowerError, Project, TypeInfo, _line, int_range
 from .swift_syntax import Unsupported, X, named, norm, parse_expression, text
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
@@ -408,6 +407,9 @@ class FunctionLowerer:
     def block(self, stmts_node: Any, out: list[ir.Stmt], tail: bool = False) -> None:
         """Lower a 'statements' node into ``out``. With ``tail``, a body that
         is a single expression returns it (Swift's implicit return)."""
+        for c in stmts_node.children if stmts_node is not None else []:
+            if not c.is_named and c.type not in (";",):
+                raise self.err(f"unsupported statement '{text(c)}'", c)
         self.push_scope()
         try:
             items = [c for c in stmts_node.children if c.is_named and c.type not in EXPR_STMT_SKIP] if stmts_node is not None else []
@@ -645,12 +647,17 @@ class FunctionLowerer:
         ('let', (name, X, is_var)), ('case', (pattern text, X, node))."""
         stop = {"{", "else", "statements"}
         groups: list[list[Any]] = [[]]
+        depth = 0
         for i, c in enumerate(s.children):
             if i == 0:
                 continue  # the keyword
-            if c.type in stop or c.type == "else":
+            if depth == 0 and (c.type in stop or c.type == "else"):
                 break
-            if c.type == ",":
+            if c.type == "(":
+                depth += 1
+            elif c.type == ")":
+                depth -= 1
+            if c.type == "," and depth == 0:
                 groups.append([])
                 continue
             groups[-1].append((s.field_name_for_child(i), c))
@@ -1136,7 +1143,7 @@ class FunctionLowerer:
                 where_i = next((j for j, c in enumerate(entry.children) if c.type == "where_keyword"), None)
                 guard_n = entry.children[where_i + 1] if where_i is not None else None
                 body_n = next((c for c in entry.children if c.type == "statements"), None)
-                if body_n is not None and any(c.type == "control_transfer_statement" and text(c).startswith("fallthrough") for c in body_n.children):
+                if any(c.type == "fallthrough" or c.type == "control_transfer_statement" and text(c).startswith("fallthrough") for c in list(entry.children) + (list(body_n.children) if body_n is not None else [])):
                     raise self.err("fallthrough is not supported", entry)
                 self.push_scope()
                 try:
@@ -1401,10 +1408,6 @@ def _has_continue(n: Any) -> bool:
     if n.type in ("while_statement", "for_statement", "repeat_while_statement"):
         return False
     return any(_has_continue(c) for c in n.children)
-
-
-def _has_continue_ir(stmts: list[ir.Stmt]) -> bool:
-    return any(isinstance(s, ir.Continue) for s in ir.walk_stmts(stmts))
 
 
 def _has_error(n: Any) -> bool:

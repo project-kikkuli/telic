@@ -7,7 +7,7 @@ from fractions import Fraction
 from typing import Any
 
 from .. import ir
-from .swift import INT_KINDS, LOGGING, REAL_TYPES, STR_TYPES, FnInfo, LowerError, TypeInfo, _base_name, _line, int_range
+from .swift import INT_KINDS, LOGGING, REAL_TYPES, STR_TYPES, FnInfo, LowerError, TypeInfo, int_range
 from .swift_syntax import Unsupported, X, norm, text
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
@@ -1121,7 +1121,7 @@ class ExprLowerer:
     def maybe_throw_extern(self, name: str, args: list[ir.Expr], expect: Any, loc: ir.Loc, x: Any) -> ir.Expr:
         if self.try_kind is not None:
             self.throw_point(None, [], loc, x, name)
-        return self.extern(name, [self.fl.coerce(a, ir.TOpaque("")) if isinstance(a.ty, (ir.TList, ir.TDict)) and False else a for a in args], expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of {name}"), loc, x)
+        return self.extern(name, args, expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of {name}"), loc, x)
 
     def _never(self, expect: Any, loc: ir.Loc) -> ir.Expr:
         if expect is None or expect == ir.NONE:
@@ -1514,8 +1514,7 @@ class ExprLowerer:
         if self.spec:
             raise self.err(f".{m}() is not supported in specifications here", x)
         vals = [self.expr(a, None) for _, a in args]
-        pure_recv = self.fl.coerce(b, ir.TOpaque("")) if isinstance(b.ty, (ir.TList, ir.TDict)) and False else b
-        return self.maybe_throw_extern(f"{t}.{m}", [pure_recv, *vals], expect, loc, x)
+        return self.maybe_throw_extern(f"{t}.{m}", [b, *vals], expect, loc, x)
 
     def mutating_call(self, fi: FnInfo, b: ir.Expr, base_x: X | None, args: list[tuple[str | None, X]], x: X, expect: Any) -> ir.Expr:
         """A mutating method changes its receiver in place: the receiver's own
@@ -1575,7 +1574,6 @@ class ExprLowerer:
         t = b.ty
         assert isinstance(t, ir.TList)
         ek = self.kind_of_elems(b)
-        n = ir.Builtin(ir.INT, loc, "len", (b,))
         labels = [lbl for lbl, _ in args]
         if m == "contains" and labels == [None] and args[0][1].kind != "closure":
             v = self.expr(args[0][1], t.elem, ek)
@@ -1916,7 +1914,7 @@ class ExprLowerer:
                 raise self.err(f"assigning the static property {tr.name}.{lx.name} is not modelled", lx)
             obj = self.expr(base, None)
             if isinstance(obj.ty, ir.TOpaque):
-                raise self.err(f"assigning a property of an unchecked value", lx)
+                raise self.err("assigning a property of an unchecked value", lx)
             if not isinstance(obj.ty, ir.TClass):
                 raise self.err(f"cannot assign a property of {obj.ty}", lx)
             info = self.pj.types.get(obj.ty.name)
@@ -2095,11 +2093,6 @@ def parse_expr_src(src: str) -> tuple[Any, Any]:
 
 def _relocated(x: X, anchor: Any) -> X:
     """Report a synthetic expression at ``anchor``."""
-
-    class _At:
-        start_point = anchor.start_point
-        end_point = anchor.end_point
-        text = anchor.text if hasattr(anchor, "text") else b""
 
     def walk(y: Any) -> None:
         if isinstance(y, X):

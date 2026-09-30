@@ -239,7 +239,7 @@ class Harness:
         values bypass the type's own initializers)."""
         if t.name in self.inits:
             return self.inits[t.name]
-        params = ", ".join([f"__telic: ()"] + [f"_ f{k}: {self.ty_text(fi.tnode)}" for k, fi in enumerate(fields)])
+        params = ", ".join(["__telic: ()"] + [f"_ f{k}: {self.ty_text(fi.tnode)}" for k, fi in enumerate(fields)])
         sets = "; ".join(f"self.{fi.name} = f{k}" for k, fi in enumerate(fields))
         text_ = f"init({params}) {{ {sets} }}"
         self.inits[t.name] = text_
@@ -423,7 +423,7 @@ class Harness:
             checks_code = [f"if let __v = __v {{ {' '.join(checks_code)} }}"] if checks_code else []
         enc = self.encoder(ret_n) if not is_void and info.kind != "init" else ("telicVoid" if is_void else "telicInitE")
         if info.kind == "init":
-            self.decls.append(f"func telicInitE(_ v: Any) -> String {{ telicQuote(String(describing: v)) }}")
+            self.decls.append("func telicInitE(_ v: Any) -> String { telicQuote(String(describing: v)) }")
         self.decls.append("func telicVoid(_ v: Void) -> String { \"null\" }")
         call_line = f"let __v = {call}" if not is_void else f"{call}; let __v: Void = ()"
         body = "\n    ".join(lines + pre_code)

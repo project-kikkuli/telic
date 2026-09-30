@@ -528,8 +528,10 @@ A protocol is a base class of its conformers: a call through it is checked
 against the requirement's contract, and every conformer's implementation
 (or the protocol extension's default) is checked against that contract. A
 protocol is opaque (its values and calls unchecked) when telic cannot see
-every conformer: a `public` protocol, or one an enum or a type it does not
-model conforms to. A mutating requirement called through a protocol that
+every conformer: a `public` protocol, or one that an enum, a nested or local
+type, a constrained extension or a type it does not model conforms to. Type
+aliases are followed. Check a module's files in one run: a conformer in a
+file telic is not given is one it cannot see. A mutating requirement called through a protocol that
 structs conform to is not modelled. A generic parameter is opaque, or its
 protocol when one checked protocol constrains it.
 
@@ -541,6 +543,6 @@ compiling the file with `swiftc` together with a generated harness, which
 builds the counterexample's values (struct and class fields directly), calls
 the function, and checks its `@ensures` and its type's invariants. Not yet
 modelled (reported unsupported, or opaque): class inheritance (calls
-through a base that has subclasses are unsupported), `defer`, labelled
-statements, `inout` scalars, subscripts, key paths, `Set`, tuples, string
+through a base that has subclasses are unsupported), `defer`, `fallthrough`,
+labelled statements, `lazy` properties and property wrappers, `inout` scalars, subscripts, key paths, `Set`, tuples, string
 indices, `async let` and actors.

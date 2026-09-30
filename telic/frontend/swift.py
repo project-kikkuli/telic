@@ -39,20 +39,16 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from fractions import Fraction
 from typing import Any
 
 from .. import ir
 from ..contracts import (
-    FUNCTION_KEYWORDS,
-    LOOP_KEYWORDS,
-    STATEMENT_KEYWORDS,
     ContractLine,
     ContractSyntaxError,
     parse_aim_directive,
     parse_comment_lines,
 )
-from .swift_syntax import Unsupported, X, named, norm, parse_expression, parser, text
+from .swift_syntax import Unsupported, named, parser, text
 
 SWIFT_ASSUMPTIONS = [
     "Double/Float are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
@@ -228,6 +224,10 @@ class Project:
         self.consts: dict[str, tuple[Any, str]] = {}  # global constant -> (literal node, path)
         self.globals: set[str] = set()  # global variables: unchecked shared state
         self.extensions: list[tuple[Any, str]] = []
+        self.aliases: dict[str, str] = {}  # typealias name -> what it names
+        self.nested_aliases: dict[str, str] = {}
+        self.stray: list[tuple[str, list[str], str, int]] = []  # unmodelled types: (name, what they inherit, path, line)
+        self.partial: list[tuple[str, str]] = []  # (protocol, type) conformances telic does not model
 
     # -- entry ----------------------------------------------------------
 
@@ -275,6 +275,8 @@ class Project:
                 f.module.problems.append((str(e), ir.Loc(e.line, e.col)))
                 f.contracts = []
         for f in self.files.values():
+            self._scan(f.tree.root_node, f.path, top=True)
+        for f in self.files.values():
             self._collect(f.tree.root_node, f.path)
         for node, path in self.extensions:
             self._extension(node, path)
@@ -316,6 +318,42 @@ class Project:
 
     # -- declarations ---------------------------------------------------
 
+    def _scan(self, n: Any, path: str, top: bool) -> None:
+        """Type aliases, and the conformances of types telic does not model
+        (nested in a type or declared in a function): a protocol or class
+        they extend has a conformer or subclass telic never sees."""
+        for c in n.children:
+            if c.type == "typealias_declaration":
+                names = [x for x in c.children_by_field_name("name")]
+                if len(names) == 2:
+                    # (a nested alias only widens what conformance clauses may mean)
+                    (self.aliases if top else self.nested_aliases).setdefault(_base_name(text(names[0])), text(names[1]))
+            elif c.type in ("class_declaration", "protocol_declaration") and not top:
+                inherits = [text(ch) for ch in c.children if ch.type == "inheritance_specifier"]
+                if inherits:
+                    self.stray.append((_base_name(text(c.child_by_field_name("name"))), inherits, path, _line(c)))
+            self._scan(c, path, False)
+
+    def names(self, inherits: str) -> list[str]:
+        """The type names an inheritance clause entry means: 'A & B' is two,
+        and a type alias is what it names."""
+        out: list[str] = []
+        todo = [inherits]
+        seen: set[str] = set()
+        while todo:
+            t = todo.pop()
+            for part in t.split("&"):
+                name = _base_name(part)
+                if name in self.aliases and name not in seen:
+                    seen.add(name)
+                    todo.append(self.aliases[name])
+                elif name:
+                    out.append(name)
+                    if name in self.nested_aliases and name not in seen:
+                        seen.add(name)
+                        todo.append(self.nested_aliases[name])
+        return out
+
     def _collect(self, container: Any, path: str) -> None:
         for c in named(container):
             if c.type == "class_declaration":
@@ -351,7 +389,7 @@ class Project:
         t.generics = [text(tp.children[0]) for ch in c.children if ch.type == "type_parameters" for tp in ch.children if tp.type == "type_parameter"]
         for ch in c.children:
             if ch.type == "inheritance_specifier":
-                t.conforms.append(_base_name(text(ch)))
+                t.conforms.extend(self.names(text(ch)))
         if name in self.types:
             self.files[path].module.problems.append((f"type {name} is declared twice; telic checks neither", ir.Loc(_line(c))))
             self.types[name].open_why = f"{name} is declared twice"
@@ -369,7 +407,7 @@ class Project:
         t = TypeInfo(name, "protocol", c, path, _modifiers(c))
         for ch in c.children:
             if ch.type == "inheritance_specifier":
-                t.conforms.append(_base_name(text(ch)))
+                t.conforms.extend(self.names(text(ch)))
         body = c.child_by_field_name("body")
         self.types[name] = t
         for m in named(body) if body is not None else []:
@@ -413,7 +451,7 @@ class Project:
                 return
             if ext:
                 return  # extensions cannot add stored properties
-            if any(ch.type == "property_behavior_modifier" or ch.type == "willset_didset_block" for ch in m.children) or any(a.startswith("@") for a in _attributes(m)):
+            if "lazy" in mods or any(ch.type == "property_behavior_modifier" or ch.type == "willset_didset_block" for ch in m.children) or any(a.startswith("@") for a in _attributes(m)):
                 t.open_why = t.open_why or f"{t.name}.{text(bid)} has observers or a property wrapper, which telic does not model"
             is_let = any(ch.type == "value_binding_pattern" and "let" in text(ch) for ch in m.children)
             t.fields.append(FieldInfo(text(bid), tnode, is_let, m.child_by_field_name("value"), m))
@@ -444,27 +482,23 @@ class Project:
             return
 
     def _extension(self, c: Any, path: str) -> None:
-        name = _base_name(text(c.child_by_field_name("name")))
+        names = self.names(text(c.child_by_field_name("name")))
+        name = names[0] if len(names) == 1 else text(c.child_by_field_name("name"))
         t = self.types.get(name)
-        conforms = [_base_name(text(ch)) for ch in c.children if ch.type == "inheritance_specifier"]
+        conforms = [n for ch in c.children if ch.type == "inheritance_specifier" for n in self.names(text(ch))]
         if t is None:
             # an extension of a type telic does not model: what it conforms to is open
-            for p in conforms:
-                self.types.setdefault(p, None)  # type: ignore[arg-type]
-                self._foreign_conformance(p, name, c, path)
+            self.partial += [(p, name) for p in conforms]
             self.files[path].module.notes.append((f"extension of {name}, a type telic does not model: its members are unchecked", ir.Loc(_line(c))))
             return
         if any(ch.type == "type_constraints" or ch.type == "where_clause" for ch in c.children):
+            self.partial += [(p, f"{name} (where ...)") for p in conforms]
             self.files[path].module.notes.append((f"constrained extension of {name} is not modelled: its members are unchecked", ir.Loc(_line(c))))
             return
         t.conforms.extend(conforms)
         body = c.child_by_field_name("body")
         for m in named(body) if body is not None else []:
             self._member(t, m, path, True)
-
-    def _foreign_conformance(self, proto: str, typ: str, node: Any, path: str) -> None:
-        self._foreign = getattr(self, "_foreign", [])
-        self._foreign.append((proto, typ))
 
     # -- the model of each type -------------------------------------------
 
@@ -483,10 +517,17 @@ class Project:
                 continue
             if "public" in t.access or "open" in t.access:
                 t.open_why = t.open_why or f"protocol {t.name} is public, so conformers outside these files may exist"
-        for proto, typ in getattr(self, "_foreign", []):
+        for proto, typ in self.partial:
             p = self.types.get(proto)
             if p is not None and p.kind == "protocol":
                 p.open_why = p.open_why or f"{typ} conforms to {proto}, and telic does not model {typ}"
+        for sub, inherits, path, line in self.stray:
+            for n in (x for i in inherits for x in self.names(i)):
+                b = self.types.get(n)
+                if b is not None and b.kind == "protocol":
+                    b.open_why = b.open_why or f"{sub} ({path}:{line}) conforms to {n}, and telic does not model a type declared inside another declaration"
+                elif b is not None and b.kind == "class":
+                    self.files[path].module.opaque_subclasses.append((sub, n, ir.Loc(line)))
         changed = True
         while changed:  # conformance is transitive through protocol inheritance
             changed = False
@@ -627,6 +668,11 @@ class Project:
         if k == "user_type":
             name = _base_name(text(tn))
             args = _generic_args(tn)
+            if name in self.aliases and not args:
+                resolved = self.names(name)
+                if len(resolved) != 1:
+                    return ir.TOpaque(text(tn)), None
+                name = resolved[0]
             if len(tn.named_children) > 1 and "." in text(tn).split("<")[0]:
                 pass  # a qualified name: Swift.Int, Foo.Bar
             if name == "Self" and self_ty:
