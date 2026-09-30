@@ -29,8 +29,9 @@ class Slots:
             return max(1, self.default())
 
     def directory(self) -> Path:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-        d = Path(base, "telic", self.name)
+        # TELIC_SLOTS_DIR isolates a budget without moving everything else that lives in XDG_CACHE_HOME (browsers)
+        base = os.environ.get("TELIC_SLOTS_DIR") or os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "telic")
+        d = Path(base, self.name)
         d.mkdir(parents=True, exist_ok=True)
         return d
 

@@ -370,7 +370,7 @@ def test_a_browser_slot_is_released_however_its_holder_ends(tmp_path, monkeypatc
     from telic.ui import slots
 
     monkeypatch.setenv("TELIC_UI_SLOTS", "1")
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("TELIC_SLOTS_DIR", str(tmp_path))
     holder = subprocess.Popen([sys.executable, "-c", HOLDER], stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "held"
@@ -393,7 +393,7 @@ def test_concurrent_browsers_never_exceed_the_machine_budget(tmp_path, monkeypat
     from telic.ui.web import WebDriver
 
     monkeypatch.setenv("TELIC_UI_SLOTS", str(budget))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("TELIC_SLOTS_DIR", str(tmp_path))
     live, peak, lock = [0], [0], threading.Lock()
     start, stop = WebDriver.start, WebDriver.stop
 
@@ -412,7 +412,7 @@ def test_concurrent_browsers_never_exceed_the_machine_budget(tmp_path, monkeypat
     monkeypatch.setattr(WebDriver, "stop", counted_stop)
     d = fixture_app(tmp_path, viewports=("390x844", "1280x800", "1024x768"))
     _, got = run_ui(d)
-    assert got["escape"].status == "proved"
+    assert got["escape"].status == "proved", got["escape"].detail
     assert peak[0] == budget and live[0] == 0
 
 
