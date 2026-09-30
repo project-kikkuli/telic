@@ -14,6 +14,14 @@
 //@ [NOTES-CONTROLS] ui menu-visible: unobscured button "Menu"
 //@ [NOTES-CONTROLS] ui close-visible: unobscured button "Close"
 
+//@ aim NOTES-KEYBOARD: WHILE a dialog with a Close button is open, pressing Escape shall close it.
+//@   by: escape-key
+//@ [NOTES-KEYBOARD] ui escape-key: always reachable not overlay from overlay and button "Close" by key "Escape"
+
+//@ aim NOTES-SIGN-OUT: WHEN the user signs out, the app shall show the sign-in screen.
+//@   by: sign-out
+//@ [NOTES-SIGN-OUT] ui sign-out: always reachable screen "/login" from screen "/account"
+
 import { useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { NavBar } from './components/NavBar'

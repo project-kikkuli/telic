@@ -14,6 +14,12 @@
 <!--@ [TASKS-CONTROLS] ui settings-link-visible: unobscured link "⚙ Settings" while not overlay and not button "Open sidebar" is collapsed -->
 <!--@ [TASKS-CONTROLS] ui close-visible: unobscured button "Close" -->
 
+<!--@ aim TASKS-DRAWER: The task drawer shall always show its Close button and its Save button, and keeping on editing shall return to it. -->
+<!--@   by: drawer-close, save-visible, keep-editing -->
+<!--@ [TASKS-DRAWER] ui drawer-close: never overlay "Task details" and not button "Close" -->
+<!--@ [TASKS-DRAWER] ui save-visible: unobscured button "Save" -->
+<!--@ [TASKS-DRAWER] ui keep-editing: always reachable overlay "Task details" and not overlay "Discard changes?" from overlay "Discard changes?" -->
+
 <script lang="ts">
   import Sidebar from './lib/components/Sidebar.svelte'
   import TaskList from './lib/components/TaskList.svelte'
