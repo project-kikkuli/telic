@@ -7,10 +7,9 @@ import shutil
 from pathlib import Path
 
 import pytest
+from test_ui import needs_browser, run_ui
 
 from telic.ui.source import scan, swift_keys
-
-from test_ui import needs_browser, run_ui
 
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not available")
 

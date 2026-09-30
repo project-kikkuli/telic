@@ -239,7 +239,7 @@ function () {
 _FIBERS_JS = """
 (names) => {
   const want = new Set(names), out = {}, seen = new Set();
-  const abs = (%s);
+  const abs = (ABSTRACT);
   for (const el of document.querySelectorAll('*')) {
     const k = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
     for (let f = k && el[k]; f; f = f.return) {
@@ -254,7 +254,7 @@ _FIBERS_JS = """
   }
   return out;
 }
-""" % _ABSTRACT_JS.strip()
+""".replace("ABSTRACT", _ABSTRACT_JS.strip())
 
 
 def _scalar(o: dict):
