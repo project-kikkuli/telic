@@ -1375,7 +1375,18 @@ class FunctionLowerer {
     return false;
   }
 
+  // An existing array, map or record as an untyped value: the same JavaScript
+  // object, so a write through it changes one telic models as a value.
+  boxedValue(v) {
+    if (v.e !== "Builtin" || v.name !== "to_opaque") return null;
+    const x = v.args[0];
+    const t = x.ty.k === "option" ? x.ty.inner : x.ty;
+    return ["list", "dict", "record"].includes(t.k) && ["Var", "Field", "Index"].includes(x.e) ? x : null;
+  }
+
   noAlias(name, v, node) {
+    const x = this.boxedValue(v);
+    if (x) throw this.err(`'${name} = ...' makes an untyped alias of a ${tyStr(x.ty)}, which telic models as a value; changes through it would go unseen`, node);
     if (v.ty.k !== "list" && v.ty.k !== "dict") return;
     if (!this.freshList(v)) throw this.err(`'${name} = ...' would alias an existing array; telic models arrays as values, so copy with .slice()`, node);
   }
@@ -1601,6 +1612,7 @@ class FunctionLowerer {
     let v = this.expr(valueNode, f[1]);
     if (op) v = this.arith(op, { e: "Field", ty: f[1], loc, obj, name }, v, node);
     v = this.coerce(v, f[1]);
+    if (this.boxedValue(v)) throw this.err(`storing a ${tyStr(this.boxedValue(v).ty)} in untyped field '${name}' makes an alias of a value; changes through it would go unseen`, node);
     if (["list", "dict"].includes(f[1].k) && !this.freshList(v)) throw this.err(`storing an existing ${tyStr(f[1])} in a field would alias it; store a copy`, node);
     return [{ s: "FieldAssign", loc, obj, cls, field: name, value: v }];
   }
@@ -2174,7 +2186,12 @@ class FunctionLowerer {
       if (ts.isTypeReferenceNode(n.type) && ts.isIdentifier(n.type.typeName) && n.type.typeName.text === "const") return x;
       const t = this.ml.typeOf(n.type);
       if (tyEq(t, x.ty)) return x;
-      if (x.ty.k === "opaque" || t.k === "opaque") return this.coerce(x, t); // listed as an assumption
+      if (x.ty.k === "opaque" || t.k === "opaque") {
+        const v = this.coerce(x, t); // listed as an assumption
+        const b = this.boxedValue(v);
+        if (b) throw this.err(`'as' makes an untyped alias of a ${tyStr(b.ty)}, which telic models as a value; changes through it would go unseen`, this.nline(n));
+        return v;
+      }
       if (isNum(t) && isNum(x.ty)) return this.coerce(x, t);
       throw this.err(`'as ${tyStr(t)}' on a ${tyStr(x.ty)} hides a type change telic would have to trust`, this.nline(n));
     }
@@ -2741,6 +2758,8 @@ class FunctionLowerer {
         } else if (p.ty.k === "option" || p.ty.k === "opaque") v = this.coerce({ e: "Lit", ty: NONE, loc: this.nloc(n), value: null }, p.ty);
         else throw this.err(`'${key}' is missing argument '${p.name}'`, this.nline(n));
       } else v = this.coerce(this.expr(a, p.ty), p.ty);
+      const boxed = this.boxedValue(v);
+      if (boxed) throw this.err(`argument '${p.name}' of '${key}' has a type telic does not model, so it could change the ${tyStr(boxed.ty)} passed to it unseen; give the parameter that type`, this.nline(n));
       if (!tyEq(v.ty, p.ty) && !(p.ty.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none") && !(p.ty.k === "dict" && v.ty.k === "dict" && v.ty.key.k === "none")) {
         if (p.ty.k === "int" && v.ty.k === "real") throw this.err(`argument '${p.name}' of '${key}' must be an integer; telic cannot show this number is one`, this.nline(n));
         throw this.err(`argument '${p.name}' of '${key}' expects ${tyStr(p.ty)}, got ${tyStr(v.ty)}`, this.nline(n));
@@ -2882,6 +2901,31 @@ function resolveBases(mls) {
       delete ml.module.class_origin[k];
     }
   }
+}
+
+// A checked class used as a value (a class expression's base, a mixin's
+// argument, anything but 'new C', 'C.member' or 'instanceof C') can be
+// subclassed where telic does not look.
+function escapedClasses(mls) {
+  for (const ml of mls) {
+    const visit = (n) => {
+      if (ts.isIdentifier(n) && ml.classes[n.text] && valueUse(n)) ml.module.opaque_subclasses.push(["", n.text, ml.line(n)]);
+      ts.forEachChild(n, visit);
+    };
+    visit(ml.sf);
+  }
+}
+
+function valueUse(id) {
+  const p = id.parent;
+  if (ts.isShorthandPropertyAssignment(p)) return true;
+  if (p.name === id || ts.isExportSpecifier(p) || ts.isExportAssignment(p)) return false;
+  if (ts.isPropertyAccessExpression(p)) return p.name.text === "prototype";
+  if (ts.isNewExpression(p) && p.expression === id) return false;
+  if (ts.isBinaryExpression(p) && p.right === id && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword) return false;
+  if (ts.isTypeReferenceNode(p) || ts.isTypeQueryNode(p) || ts.isQualifiedName(p)) return false;
+  if (ts.isExpressionWithTypeArguments(p)) return p.parent.token === ts.SyntaxKind.ExtendsKeyword && ts.isClassExpression(p.parent.parent);
+  return true;
 }
 
 // A subclass without a constructor takes its base's parameters and passes
@@ -3107,6 +3151,7 @@ function main() {
   advance("names");
   link(mls, byFile, "names");
   resolveBases(mls);
+  escapedClasses(mls);
   advance("signatures");
   inheritConstructors(mls);
   link(mls, byFile, "signatures");

@@ -202,7 +202,8 @@ class Program:
                 for c in self.classes:
                     if ir.source_name(c) == b and (self.class_module[c] is m or self.class_module[c].path == m.class_origin.get(c)):
                         for a in self.mro(c):
-                            opened.setdefault(a, f"{sub} ({m.path}:{loc.line}) extends {b}, and telic does not model TypeScript inheritance, so a call to a method of {ir.source_name(a)} may run an override it never checked")
+                            where = f"{sub} ({m.path}:{loc.line}) extends {b}, which telic does not check" if sub else f"{b} is used as a value at {m.path}:{loc.line}, so it may be subclassed where telic does not look"
+                            opened.setdefault(a, f"{where}; a call to a method of {ir.source_name(a)} may run an override it never checked")
         if not opened:
             return
         methods = {k: opened[c] for k, r in self.funcs.items() for c in opened if r.fn.name.startswith(c + ".") and not r.fn.name.endswith(".__init__")}
