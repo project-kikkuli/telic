@@ -52,11 +52,16 @@ done looks like. Soundness items come first: they can make telic say
 - **Runtime contracts (`telic run`, the pytest plugin).** Inherited contracts
   are applied only when the base class is in the same module
   (`_with_inherited_contracts` in `telic/runtime.py`).
-- **Swift and Dart (task 17).** Not started. The plan: parse with tree-sitter
-  (check PyPI wheels for tree-sitter-swift and tree-sitter-dart) and follow
-  `frontend/rust.py`. Swift: overflow traps, optionals and value structs. Dart:
-  sound null safety and 64-bit ints. Each gets a corpus, soundness exploits,
-  and replay when `swiftc` or `dart` is on the PATH.
+- **Swift.** `frontend/swift*.py`; what it models and what it does not is in
+  [contracts.md](contracts.md) under "Swift". tree-sitter-swift groups mixed
+  precedence operators wrongly and attaches prefix operators, `try` and
+  postfix chains to the wrong operand; `swift_syntax.py` refolds them, and
+  `tests/test_swift.py` compares the result with `swiftc` on random
+  expressions. There is no fuzzing for Swift; replay compiles one harness per
+  function (cached in the temp directory) and restarts it after a trap.
+- **Dart (task 17).** Not started. The plan: parse with tree-sitter and follow
+  `frontend/rust.py`: sound null safety and 64-bit ints, a corpus, soundness
+  exploits, and replay when `dart` is on the PATH.
 
 ## Engine (OxCaml, `core/`)
 
@@ -107,5 +112,5 @@ work. Re-run them to refresh the numbers when the frontends change.
   binary, telic uses the Python core (`TELIC_ENGINE=ox` selects the engine).
 - Jev: set `JEV_API_KEY` in your environment (never in the repo).
   `telic oracle --probe` checks it.
-- Rust replay needs `rustc`; TypeScript needs Node ≥ 18; Lean tests skip
-  without Lean.
+- Rust replay needs `rustc`, Swift replay `swiftc`; TypeScript needs Node ≥ 18;
+  Lean tests skip without Lean.

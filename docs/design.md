@@ -31,8 +31,8 @@ the function, cost nothing at runtime, and can be switched on when you want them
 C0's `-d`.
 
 **2. One small IR, many languages.** Frontends lower Python (via `ast`),
-TypeScript (via the official compiler API) and Rust (via tree-sitter) into one
-small imperative IR. Operators
+TypeScript (via the official compiler API), Rust and Swift (via tree-sitter)
+into one small imperative IR. Operators
 that differ between languages are different IR operators: Python's `//` is
 `floordiv`, JavaScript's `%` is `tmod`, Rust's `/` on integers is `tdiv`,
 `round` is `round_even`, and `Math.round` is `round_up`. Nothing is shared by accident. What the IR models exactly, it
@@ -67,8 +67,8 @@ trusted blindly:
 A solver model the real program cannot reproduce is not reported as a bug. It
 means an invariant is too weak, and telic says so. The theory lemmas Z3 is given
 are proved in Lean (`telic/lean/Theory.lean`). The arithmetic semantics are
-differentially tested against CPython and Node, and Rust counterexamples are
-compiled with `rustc` and run.
+differentially tested against CPython, Node and `swiftc`, and Rust and Swift
+counterexamples are compiled with `rustc` or `swiftc` and run.
 
 **5. The contract is attacked too.** A proof certifies code against a spec, and a
 weak spec certifies wrong code. `telic gaps` mutates proved code and re-verifies
@@ -106,7 +106,8 @@ facts fully specify a system.
 ```
   Python ──── frontend/python.py ───┐
   TypeScript ─ frontend/ts/*.mjs ───┼─▶ ir.Module ─▶ program.py (call graph, overrides,
-  Rust ────── frontend/rust.py ─────┘                SCCs, definitional fns, heap writes)
+  Rust ────── frontend/rust.py ─────┤                SCCs, definitional fns, heap writes)
+  Swift ───── frontend/swift*.py ───┘
                                                         │
                                    infer.py (Houdini) ──┤
                                                         ▼
@@ -119,7 +120,8 @@ facts fully specify a system.
                   │                      │         (@mirrors)        + equiv)
                   ▼                      ▼
         replay.py: run the real code   sidecar proofs, agent loop,
-        (CPython / Node / rustc),      axiom audit, staleness
+        (CPython / Node / rustc /      axiom audit, staleness
+         swiftc),
         fuzz + shrink
                   └──────────────┬───────────────┘
                                  ▼
