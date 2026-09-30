@@ -188,3 +188,43 @@ def test_since_judges_aim_file_changes_as_a_full_check_does(repo, change):
     sh(repo, "git", "commit", "-qm", "change")
     since, full = telic(repo, "ci", "--since", "main", "--color", "never"), telic(repo, "ci", "--color", "never")
     assert (since.returncode, since.stdout.splitlines()[1:]) == (full.returncode, full.stdout.splitlines()[1:])
+
+
+TRANSITIVE = {
+    "python": (
+        {"pkg/__init__.py": "", "pkg/a.py": "def g(x: int) -> int:\n    return x\n", "pkg/b.py": "from pkg.a import g\n\n\ndef f(x: int) -> int:\n    return g(x)\n", "pkg/c.py": "from pkg.b import f\n\n\ndef h(x: int) -> int:\n    #@ ensures result == x\n    return f(x)\n"},
+        ("pkg/a.py", "return x\n", "return x + 1\n"),
+    ),
+    "typescript": (
+        {"a.ts": "export function g(x: number): number {\n  //@ ensures result === x\n  return x;\n}\n", "c.ts": 'import { g } from "./a";\n\nexport function h(x: number): number {\n  //@ ensures result === x\n  return g(x);\n}\n'},
+        ("a.ts", "result === x\n  return x;", "result === x + 1\n  return x + 1;"),
+    ),
+    "typescript importer": (
+        {"a.ts": "export function g(x: number): number {\n  //@ ensures result === x\n  return x;\n}\n", "c.ts": 'import { g } from "./a";\n\nexport function h(x: number): number {\n  //@ ensures result === x\n  return g(x);\n}\n'},
+        ("c.ts", "return g(x);", "return g(x) + 0;"),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TRANSITIVE))
+def test_since_follows_imports_as_a_full_check_does(tmp_path, case):
+    if "typescript" in case:
+        import shutil
+
+        if shutil.which("node") is None:
+            pytest.skip("Node.js not available")
+    files, (path, old, new) = TRANSITIVE[case]
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    sh(tmp_path, "git", "init", "-q", "-b", "main")
+    sh(tmp_path, "git", "config", "user.email", "t@example.com")
+    sh(tmp_path, "git", "config", "user.name", "t")
+    assert telic(tmp_path, "init", "--no-hook").returncode == 0
+    sh(tmp_path, "git", "add", "-A")
+    sh(tmp_path, "git", "commit", "-qm", "init")
+    (tmp_path / path).write_text((tmp_path / path).read_text().replace(old, new))
+    commit(tmp_path, "change")
+    since, full = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never"), telic(tmp_path, "ci", "--color", "never")
+    assert since.returncode == full.returncode, since.stdout
+    assert [l for l in since.stdout.splitlines() if "→" in l] == [l for l in full.stdout.splitlines() if "→" in l]

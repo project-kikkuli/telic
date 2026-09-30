@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from fractions import Fraction
@@ -226,6 +227,26 @@ def _module(d: dict[str, Any]) -> ir.Module:
     m.notes = [(msg, ir.Loc(int(line))) for msg, line in d.get("notes", [])]
     m.assumptions = list(d.get("assumptions", []))
     return m
+
+
+_IMPORT = re.compile(r"""(?:\bfrom|\bimport|\brequire\s*\()\s*["'](\.[^"']*)["']""")
+
+
+def project_imports(path: str, root: str) -> list[str]:
+    """TypeScript files under ``root`` that ``path`` imports by relative
+    specifier, resolved as ``lower.mjs`` resolves them."""
+    try:
+        src = Path(path).read_text()
+    except OSError:
+        return []
+    out = []
+    for spec in _IMPORT.findall(src):
+        base = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(path)), spec))
+        for cand in (base, base + ".ts", base + ".tsx", os.path.join(base, "index.ts"), os.path.join(base, "index.tsx"), re.sub(r"\.js$", ".ts", base)):
+            if os.path.isfile(cand) and cand.startswith(os.path.abspath(root) + os.sep) and cand != os.path.abspath(path):
+                out.append(cand)
+                break
+    return sorted(set(out))
 
 
 def lower_typescript_files(files: list[str], root: str) -> dict[str, ir.Module]:

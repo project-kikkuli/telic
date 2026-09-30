@@ -19,8 +19,9 @@ Because it only ratchets, telic can be adopted on a codebase with known
 failures: snapshot today's state, and from then on nothing may get worse.
 
 What a change can affect is computed exactly: calls resolve within a module
-so the affected files are the changed ones, the files importing them, the
-files defining the bases of changed classes (a call through a base may run an
+so the affected files are the changed ones, the files importing them
+(transitively), what the TypeScript files among them import, the files
+defining the bases of changed classes (a call through a base may run an
 override) and their importers, mirror partners, and the files sharing an
 aim with them.
 """
@@ -223,8 +224,8 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     the changed contracts), their @mirrors partners, and files that share an
     aim with them. A changed subclass also affects the files defining its
     ancestors and their importers: a call through a base may run any
-    override. Importers of importers are unaffected: a proof depends on its
-    callees' contracts, not on what those rest on."""
+    override. Importers are affected transitively: a proof may unfold a pure
+    callee's body, and that body may call into the changed file."""
     from .frontend.aim_file import aim_entry, is_aim_file, lower_aim_entry
     from .aim import _match, split_by
 
@@ -245,21 +246,40 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
             p = key.split("::")[0]
             if os.path.exists(os.path.join(root, p)):
                 files.add(p)
-    if any(f.endswith(".py") for f in files | deleted):
-        from .frontend.python import ancestor_files, project_imports
+    if any(language_of(f) in ("python", "typescript") for f in files | deleted):
+        from .frontend.python import ancestor_files
+        from .frontend.python import project_imports as py_imports
+        from .frontend.typescript import project_imports as ts_imports
 
-        touched = {os.path.normpath(os.path.join(root, f)) for f in files | deleted if f.endswith(".py")}
+        touched = {os.path.normpath(os.path.join(root, f)) for f in files | deleted if language_of(f) in ("python", "typescript")}
         for f in [f for f in files if f.endswith(".py")]:
             for a in ancestor_files(os.path.join(root, f), root):
                 touched.add(os.path.normpath(a))
-                files.add(os.path.relpath(a, root))
+        imports: dict[str, set[str]] = {}
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv", "dist", "build")]
             for fn in filenames:
-                if fn.endswith(".py"):
-                    full = os.path.join(dirpath, fn)
-                    if touched & {os.path.normpath(x) for x in project_imports(full, root)}:
-                        files.add(os.path.relpath(full, root))
+                full = os.path.normpath(os.path.join(dirpath, fn))
+                lang = language_of(fn)
+                if lang in ("python", "typescript"):
+                    imports[full] = {os.path.normpath(x) for x in (py_imports if lang == "python" else ts_imports)(full, root)}
+        # A proof may unfold a pure callee's body, which may call further
+        # modules, so importers are affected transitively.
+        todo = list(touched)
+        while todo:
+            cur = todo.pop()
+            for f, deps in imports.items():
+                if cur in deps and f not in touched:
+                    touched.add(f)
+                    todo.append(f)
+        # TypeScript resolves calls only among the files of a run: bring what they import.
+        todo = [f for f in touched if language_of(f) == "typescript"]
+        while todo:
+            for dep in imports.get(todo.pop(), ()):
+                if dep not in touched:
+                    touched.add(dep)
+                    todo.append(dep)
+        files |= {os.path.relpath(f, root) for f in touched if os.path.exists(f)}
     grow = True
     named: set[str] = set()  # aim ids the affected code declares or cites
     while grow:
