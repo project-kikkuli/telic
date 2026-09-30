@@ -220,6 +220,8 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
     if kind == "Call":
         return ir.Call(ty, loc, d["func"], tuple(_expr(a) for a in d["args"]))
     if kind == "Builtin":
+        if d["name"] == "js_regex_exec" and len(d["args"]) == 2:
+            return _regex_exec(ty, loc, _expr(d["args"][0]), d["args"][1].get("value", ""))
         if d["name"] == "sum" and len(d["args"]) == 1:
             return ir.sum_of(_expr(d["args"][0]), loc)
         return ir.Builtin(ty, loc, d["name"], tuple(_expr(a) for a in d["args"]))
@@ -454,3 +456,17 @@ def run_ts(path: str, func: str, args: list[Any], timeout: float, extra: dict | 
     if not lines:
         return {"harness_error": (p.stderr or p.stdout).strip()[-500:]}
     return json.loads(lines[-1])
+
+
+def _regex_exec(ty: ir.Type, loc: ir.Loc, s: ir.Expr, literal: str) -> ir.Expr:
+    """``/re/.exec(s)`` with the pattern as SMT-LIB languages (what a string
+    it matches is, what each group captures), or an unchecked call."""
+    from .. import regex
+
+    try:
+        t = regex.translate(literal)
+    except regex.Untranslatable:
+        rx = ir.Builtin(ir.TOpaque("RegExp"), loc, "opaque_op", (ir.Lit(ir.STR, loc, "regexp"), ir.Lit(ir.STR, loc, literal)))
+        return ir.Extern(ty, loc, f"{literal}.exec", (rx, s))
+    groups = json.dumps([[g.index, g.regex, g.mandatory] for g in t.groups])
+    return ir.Builtin(ty, loc, "js_regex_exec", (s, ir.Lit(ir.STR, loc, t.search), ir.Lit(ir.STR, loc, groups)))

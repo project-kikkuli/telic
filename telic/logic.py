@@ -685,6 +685,11 @@ def in_re(s: Term, name: str) -> Term:
     return App("str.in_re", (s, StrV(REGEXES[name])), BOOL)
 
 
+def in_re_text(s: Term, regex: str) -> Term:
+    """``s`` is in a regular language written in SMT-LIB."""
+    return App("str.in_re", (s, StrV(regex)), BOOL)
+
+
 def str_to_int(s: Term) -> Term:
     """The number a string of decimal digits spells (-1 for any other string)."""
     return App("str.to_int", (s,), INT)

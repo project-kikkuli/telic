@@ -1728,6 +1728,8 @@ class VCGen:
         args = [self.ev(a, ctx) for a in e.args]
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
+        if name == "js_regex_exec":
+            return self.regex_exec(args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
             assert isinstance(e.ty, ir.TOption)
             return coerce(args[0], e.ty)
@@ -2045,6 +2047,9 @@ class VCGen:
             # lower(), strip(), replace(), ...: deterministic, not interpreted
             op = e.args[0]
             assert isinstance(op, ir.Lit)
+            padded = _pad(str(op.value), args[1:])
+            if padded is not None:
+                return padded
             flat: list[L.Term] = []
             for a in args[1:]:
                 flat.extend(flatten(a))
@@ -2087,6 +2092,22 @@ class VCGen:
                 ctx.assume(L.implies(prefix, L.is_int(other)))
             self.note(e.loc, f"{what} of text without a leading number is NaN, which telic models as an unknown number")
         return v
+
+    def regex_exec(self, s: L.Term, e: ir.Builtin, ctx: Ctx) -> L.Term:
+        """``/re/.exec(s)``: null exactly when no part of ``s`` matches; else
+        each group that takes part in every match holds a string of its
+        language, and any other holds one or is undefined."""
+        search, groups = e.args[1], e.args[2]
+        assert isinstance(search, ir.Lit) and isinstance(groups, ir.Lit)
+        r = L.Const(f"exec()@{next(self.counter)}", L.OPAQUE)
+        null = L.Fn("opaque.is_null.Bool", (r,), L.BOOL)
+        ctx.assume(L.eq(null, L.not_(L.in_re_text(s, str(search.value)))))
+        for index, regex, mandatory in json.loads(str(groups.value)):
+            get = L.Fn("opaque.getitem.Opaque", (r, L.IntV(index)), L.OPAQUE)
+            held = L.and_(L.Fn("opaque.isinstance.Bool", (get, L.StrV("str")), L.BOOL), L.in_re_text(L.Fn("unbox.str.", (get,), L.STR), regex))
+            undefined = L.Fn("opaque.is_undefined.Bool", (get,), L.BOOL)
+            ctx.assume(L.implies(L.not_(null), L.and_(L.not_(undefined), held) if mandatory else L.or_(undefined, L.and_(L.not_(undefined), held))))
+        return r
 
     def comprehension(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> Val:
         assert isinstance(seq, ListVal) and isinstance(e.ty, ir.TList)
@@ -2874,6 +2895,23 @@ def _unboxed(b: L.Term, v: L.Term, ty: ir.Type) -> L.Term:
     (whether it is one is for the code to check)."""
     kind = _SCALAR_KIND[type(ty)]
     return L.implies(L.Fn("opaque.isinstance.Bool", (b, L.StrV(kind)), L.BOOL), L.eq(L.Fn(f"unbox.{kind}.", (b,), sort_of(ty)), v))
+
+
+def _pad(op: str, args: list) -> L.Term | None:
+    """JavaScript's ``s.padEnd(n, c)``/``s.padStart(n, c)`` for a literal
+    ``n`` up to 8 and one literal character ``c`` (default a space)."""
+    if op not in ("padEnd", "padStart") or not 2 <= len(args) <= 3 or not isinstance(args[1], L.IntV) or not 0 <= args[1].value <= 8:
+        return None
+    c = args[2] if len(args) == 3 else L.StrV(" ")
+    if not (isinstance(c, L.StrV) and len(c.value) == 1):
+        return None
+    s, n = args[0], args[1].value
+    length = L.App("str.len", (s,), L.INT)
+    out: L.Term = s
+    for k in range(1, n + 1):  # k characters short
+        fill = L.StrV(c.value * k)
+        out = L.ite(L.eq(length, L.IntV(n - k)), L.App("str.++", (s, fill) if op == "padEnd" else (fill, s), L.STR), out)
+    return out
 
 
 def _shorter(a: L.Term, b: L.Term) -> L.Term:

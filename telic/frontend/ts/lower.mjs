@@ -2182,7 +2182,9 @@ class FunctionLowerer {
     if (this.spec || args.length < 1) return null;
     const radix = which === "parseInt" && args.length === 2 && ts.isNumericLiteral(args[1]) && args[1].text === "10";
     if (args.length > (radix ? 2 : 1)) return null;
-    const s = this.unwrap(this.expr(args[0]));
+    let s = this.unwrap(this.expr(args[0]));
+    // an unchecked value is read as the string it is converted to
+    if (s.ty.k === "opaque") s = this.coerce(s, STR);
     if (s.ty.k !== "str") return null;
     return { e: "Builtin", ty: REAL, loc, name: which === "parseInt" ? "js_parse_int" : "js_parse_float", args: [s] };
   }
@@ -2901,6 +2903,15 @@ class FunctionLowerer {
     }
     if (t.k === "str") return this.strMethod(obj, m, n, loc, expect);
     if (t.k === "dict") return this.dictMethod(obj, m, n, loc, expect);
+    if (t.k === "opaque" && !this.spec && m === "exec" && obj.e === "Builtin" && obj.name === "opaque_op" && obj.args[0].value === "regexp" && args.length === 1) {
+      // /re/.exec(s): its match, as far as telic can read the pattern
+      const s = this.unwrap(this.expr(args[0]));
+      if (s.ty.k === "str") return { e: "Builtin", ty: opaque(`result of ${obj.args[1].value}.exec`), loc, name: "js_regex_exec", args: [s, obj.args[1]] };
+    }
+    if (t.k === "opaque" && !this.spec && ["padStart", "padEnd", "trim", "trimStart", "trimEnd", "toLowerCase", "toUpperCase"].includes(m) && obj.e === "Builtin" && obj.name === "opaque_op" && obj.args[0].value === "getitem") {
+      // a string a match holds (m[1].padEnd(...)): read as one
+      return this.strMethod(this.coerce(obj, STR), m, n, loc, expect);
+    }
     if (t.k === "opaque" || t.k === "enum" || t.k === "record") {
       if (this.spec) throw this.err(`specifications cannot call unchecked code ('.${m}')`, this.nline(n));
       return this.extern(`${n.expression.expression.getText(this.ml.sf).slice(0, 30)}.${m}`, [this.coerce(obj, opaque("")), ...args.map((a) => this.argValue(a))], expect, loc);
