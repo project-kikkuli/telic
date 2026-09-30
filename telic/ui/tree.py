@@ -248,10 +248,11 @@ def value_of(n: Node) -> str | None:
 # ---------------------------------------------------------------------------
 # Screen names from URLs
 
-_ID_SEG = re.compile(r"^(\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,}|[A-Za-z0-9_-]{16,})$", re.I)
+_ID_SEG = re.compile(r"^(\d+|[A-Za-z_-]{1,3}\d{6,}|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,}|[A-Za-z0-9_-]{16,})$", re.I)
 
 
 def route(path: str) -> str:
-    """``/notes/42`` -> ``/notes/:id``: a record's id is data, not a screen."""
+    """``/notes/42``, ``/groups/g1790764571078`` -> ``/notes/:id``,
+    ``/groups/:id``: a record's id is data, not a screen."""
     segs = path.split("/")
     return "/".join(":id" if s and _ID_SEG.match(s) and any(ch.isdigit() for ch in s) else s for s in segs)
