@@ -24,7 +24,7 @@ for the known gaps.
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
 | `telic/aim.py` | aims: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
 | `telic/propose.py`, `telic/phrase.py` | `telic propose`: proved facts, crash-free preconditions, facts rendered as EARS drafts |
-| `telic/ui/` | UI lemmas (`@ui`): grammar (`spec.py`), the accessibility-tree driver interface (`driver.py`) and its web adapter (`web.py`, Playwright), model learning (`learn.py`), checking and replay (`check.py`), app start-up, config and caching (`app.py`, `config.py`, `run.py`) |
+| `telic/ui/` | UI lemmas (`@ui`): grammar (`spec.py`), the accessibility-tree driver interface (`driver.py`) and its adapters (`web.py`, Playwright; `ios.py` and `sim.py`, the iOS Simulator through AXe), model learning (`learn.py`), checking and replay (`check.py`), app start-up, config and caching (`app.py`, `config.py`, `run.py`) |
 | `telic/oracle.py` | the only place a judgment is delegated to a model: typed questions, pluggable backends (builtin, Jev, HTTP, command, Python, LLM), cache. Answers are labelled, never proof |
 | `core/`, `telic/engine.py`, `telic/irjson.py` | the native engine (OxCaml): VC generation + parallel solving, `--engine ox` / `TELIC_ENGINE=ox`; covers everything the Python core models (heap, optionals, dicts, opaque values, try, async); a function it cannot handle falls back to the Python core. `tests/test_engine.py` compares it with the Python core obligation by obligation |
 | `telic/lean/Theory.lean` | Lean proofs of every theory lemma Z3 is given |
