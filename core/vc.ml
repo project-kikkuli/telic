@@ -164,6 +164,7 @@ type finfo = {
   logic_name : string;
   scc : string list;
   recursive : bool;
+  termination : bool;  (** does its recursion group need a termination proof *)
   resolve : (string * string) list;  (** call name -> function key *)
 }
 
@@ -991,7 +992,7 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
     let rc = or_ (List.map (fun (r : Ir.clause) -> term_of loc (ev g cctx r.cexpr)) fn.raises) in
     oblige g "call" ctx (not_ rc) loc (Printf.sprintf "call to '%s' cannot raise ('@raises %s')" fn.name (List.hd fn.raises).text)
   end;
-  if same_scc g g.info.key callee.key then recursion_check g callee pmap ctx loc;
+  if same_scc g g.info.key callee.key && g.info.termination then recursion_check g callee pmap ctx loc;
   if not (List.mem callee.key g.deps) then g.deps <- g.deps @ [ callee.key ];
   let r =
     if definitional then apply_def g callee args heap_pre

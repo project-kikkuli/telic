@@ -413,3 +413,25 @@ def dict_lookup_pos(d: dict[str, int], k: str) -> int:
     if k in d:
         return d[k]
     return 0
+
+
+# expect: proved
+def collatz_trail(n: int, out: list[int]) -> None:
+    # no claim and not a logical definition: only crash-freedom is checked, as for loops
+    if n <= 1:
+        return
+    out.append(n)
+    collatz_trail(n // 2 if n % 2 == 0 else 3 * n + 1, out)
+
+
+# expect: open
+def claims_through_helper(n: int) -> int:
+    #@ ensures result == 0
+    return helper_without_claim(n)
+
+
+def helper_without_claim(n: int) -> int:
+    # its group makes a claim, so every edge of the cycle needs a measure
+    if n == 0:
+        return 0
+    return claims_through_helper(n + 1)

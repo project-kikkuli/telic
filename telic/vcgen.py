@@ -1804,7 +1804,7 @@ class VCGen:
         if fn.raises and not ctx.spec:
             rc = L.or_(*[self.ev(r.expr, cctx) for r in fn.raises])
             self.oblige("call", ctx, L.not_(rc), loc, f"call to '{fn.name}' cannot raise ('@raises {fn.raises[0].text}')")
-        if self.program.same_scc(self.ref.key, callee.key):
+        if self.program.same_scc(self.ref.key, callee.key) and self.program.needs_termination(self.ref.key):
             self.recursion_check(callee, pmap, ctx, loc)
         self.deps.add(callee.key)
         # Result.

@@ -397,6 +397,7 @@ let () =
               logic_name = (match Json.member "logic_name" pj with Json.String s -> s | _ -> f.name);
               scc = strs "scc";
               recursive = Json.to_bool (Json.member "recursive" pj);
+              termination = (match Json.member "termination" pj with Json.Bool b -> b | _ -> true);
               resolve = (match Json.member "resolve" pj with Json.Assoc kvs -> List.map (fun (k, v) -> (k, Json.to_str v)) kvs | _ -> []);
             })
         m.functions)

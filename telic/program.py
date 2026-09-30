@@ -225,6 +225,17 @@ class Program:
             if v not in index:
                 strong(v)
 
+    def needs_termination(self, key: str) -> bool:
+        """Must recursion through ``key`` be proved to terminate? When some
+        function in its recursion group makes a claim (a contract) or is a
+        logical definition (a non-terminating one could be inconsistent).
+        Without claims telic checks only that nothing crashes, as it does
+        for loops."""
+        if key not in self.recursive:
+            return False
+        group = [k for k in self.funcs if self.same_scc(key, k)]
+        return any(self.funcs[k].fn.has_contract or k in self.definitional for k in group)
+
     def same_scc(self, a: str, b: str) -> bool:
         return a in self.recursive and self.scc_of.get(a) == self.scc_of.get(b)
 

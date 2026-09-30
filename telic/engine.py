@@ -133,6 +133,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "logic_name": program.logic_names.get(key, ref.fn.name),
             "scc": sorted(k for k in program.funcs if k != key and program.same_scc(key, k)),
             "recursive": key in program.recursive,
+            "termination": program.needs_termination(key),
             "resolve": resolve,
         }
     req = {
