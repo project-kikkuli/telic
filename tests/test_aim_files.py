@@ -177,8 +177,31 @@ def test_missing_path_is_one_line_error(tmp_path, capsys, args):
 
 
 @pytest.mark.parametrize("paths", [["."], ["a"], ["a/x.py"]])
-def test_a_symlinked_aims_dir_is_read_from_every_check(tmp_path, paths):
-    tree(tmp_path, {"shared/PAY.md": f"{SAME}\n", "shared/NOTES.md/x": "", "a/x.py": fn("charge", "PAY")})
+def test_a_symlinked_aims_dir_is_read_once_from_every_check(tmp_path, paths):
+    tree(tmp_path, {"shared/PAY.md": f"{SAME}\n", "a/x.py": fn("charge", "PAY")})
     (tmp_path / "aims").symlink_to("shared")
+    (tmp_path / "a/aims").symlink_to("../shared")
     _, got = report(tmp_path, paths)
     assert (got["PAY"].status, got["PAY"].loc, got["PAY"].pointers) == ("backed", ("aims/PAY.md", 1), [])
+
+
+@pytest.mark.parametrize(
+    "stray, named",
+    [
+        ("aims/OTHER.MD", "file 'OTHER.MD'"),
+        ("aims/PAY.txt", "file 'PAY.txt'"),
+        ("aims/notes", "file 'notes'"),
+        ("aims/sub/OTHER.md", "directory 'sub'"),
+        ("aims/sub/aims/OTHER.md", "directory 'sub'"),
+        ("aims/OTHER.md/x", "directory 'OTHER.md'"),
+        ("aims/.DS_Store", None),
+    ],
+)
+@pytest.mark.parametrize("check", [".", "a/x.py", "aims"])
+def test_anything_else_in_aims_is_an_error_naming_it(tmp_path, capsys, stray, named, check):
+    tree(tmp_path, {**aims("", ("PAY", SAME, "")), stray: f"{SAME}\n", "a/x.py": fn("charge", "PAY")})
+    rep, got = report(tmp_path, [check])
+    problems = [msg for m in rep.modules for msg, _ in m.problems]
+    assert got["PAY"].status == ("unbacked" if check == "aims" else "backed")
+    assert (len(problems), all(named in p for p in problems)) == ((1, True) if named else (0, True))
+    assert run(tmp_path, capsys=capsys)[0] == (1 if named else 0)

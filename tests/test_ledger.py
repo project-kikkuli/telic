@@ -166,6 +166,8 @@ def test_changed_override_rechecks_callers_through_the_base(tmp_path, parent, cl
         [("mkdir", "aims"), ("git", "mv", "lib/aims/PAY.md", "aims/PAY.md")],
         [("git", "rm", "-q", "lib/aims/PAY.md")],
         [("write", "lib/aims/NEW.md", "The shop shall log.\nby: f\n")],
+        [("write", "lib/aims/NOTES.txt", "The shop shall log.\n")],
+        [("mkdir", "lib/aims/sub"), ("write", "lib/aims/sub/NEW.md", "The shop shall log.\n")],
     ],
 )
 def test_since_judges_aim_file_changes_as_a_full_check_does(repo, change):

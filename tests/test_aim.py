@@ -10,7 +10,7 @@ from pathlib import Path
 from telic.checker import CheckOptions, check
 from telic.aim import accept, ears_problems, judge, split_by
 
-CASES = Path(__file__).parent / "cases" / "aims"
+CASES = Path(__file__).parent / "cases" / "aim"
 
 
 def aims(root: Path):

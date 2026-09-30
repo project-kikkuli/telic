@@ -106,7 +106,9 @@ by: discounted_total, web/checkout.ts::displayTotal
 ```
 
 The filename is the ID, under the same rules as a comment ID; a file named
-otherwise is reported. The contents are one EARS sentence, then an optional
+otherwise is reported. Besides aim files, `aims/` may hold only a README and
+hidden files; any other file or subdirectory is reported. An `aims/` reached
+through two symlinks is read once, at the wider scope. The contents are one EARS sentence, then an optional
 `by:` line, with no heading. Code cites the aim exactly as it cites a
 comment-declared one.
 
