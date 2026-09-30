@@ -45,6 +45,7 @@ TRUE_HELPERS = {
     "t26.rs": {"fine"},
     "t27.py": {"Box.__init__", "Box.get"},
     "t30.ts": {"Shape.area", "Shape.__init__"},
+    "t31.py": {"claim", "claim2"},  # proved only assuming the recursion, which stays open
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))
@@ -153,3 +154,10 @@ def test_the_timeout_bounds_unfolding_a_diverging_definition(tmp_path, engine):
     rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
     (f,) = rep.functions
     assert f.status == "open" and [v.reason for v in f.verdicts] == ["timeout"]
+
+
+def test_non_terminating_recursion_backs_no_aim():
+    rep = check([str(DIR / "t31.py")], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
+    status = {f.fn.name: f.status for f in rep.functions}
+    assert status["spin"] != "proved" and status["ping"] != "proved"
+    assert [i.status for i in rep.aims] == ["partial"]

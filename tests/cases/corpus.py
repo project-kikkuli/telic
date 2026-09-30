@@ -415,9 +415,9 @@ def dict_lookup_pos(d: dict[str, int], k: str) -> int:
     return 0
 
 
-# expect: proved
+# expect: open
 def collatz_trail(n: int, out: list[int]) -> None:
-    # no claim and not a logical definition: only crash-freedom is checked, as for loops
+    # no claim, but recursion that never ends raises RecursionError: crash-freedom needs termination
     if n <= 1:
         return
     out.append(n)
