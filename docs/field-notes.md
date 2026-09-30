@@ -51,6 +51,8 @@ A few were soundness bugs, now fixed:
 | `e4c60a2` (48 files: `telic/ui/` added) | 11 | 102 | 162 | 306 | 278 | 6 |
 | `45d034a` | 7 | 70 | 182 | 323 | 279 | 6 |
 | `4ef8dc7` (every recursion needs a termination proof again) | 7 | 107 | 163 | 313 | 282 | 6 |
+| `97e1209` (51 files: Swift frontend and JSON predicates added) | 10 | 122 | 115 | 557 | 418 | 8 |
+| `b428b1f` (recursion measures inferred) | 10 | 113 | 126 | 563 | 423 | 8 |
 
 The 17 refuted functions were triaged:
 
@@ -101,6 +103,27 @@ classes apart (`FunctionLowerer`, `ExprLowerer` in the Python and Rust
 frontends), and 39 from `for a, b in pairs` loops. Open rose because functions that became checkable, and
 callers of the new preconditions, have obligations Z3 cannot close without
 loop invariants.
+
+Termination measures (`97e1209` to `b428b1f`): telic now infers them per
+recursion group. Functions open for want of one fell from 59 to 49, and 12
+carry an inferred measure. 10 now prove, all by structure (`depth(ty)` over
+frozen `ir.Type`, `ir.Expr` and `L.Sort` values): `sort_of`,
+`default_term`, `_sort_tag`, `irjson.ty`, `type_desc`, `_expr_name`,
+`_has_opaque`, `_forget_classes`, `_upcast`, `_opaque_inside`.
+`VCGen.input_view` terminates by `depth(ty)` but keeps an open dict lookup.
+Open fell by 9, net of one new function. The 49 left recurse through:
+
+- mutable `ast` and tree-sitter nodes (the frontends, `runtime`), which can
+  be cyclic, so no depth is sound for them;
+- a helper's result (`lean_sort` recurses on `L.index_sort(s)`,
+  `rec_equal` on `L.field(a, n)`), or a tuple element (`render(e.args[0])`);
+- parser positions held in `self` (`ui/spec.py`), and caches (`Harness.encoder`).
+
+The corpora (`tests/cases/corpus.*`) did not move: 5 open in `corpus.py`,
+none elsewhere; their recursion was already over int parameters. The
+cases added with this change (`ackermann`, mutual `even_steps`/`odd_steps`,
+ranked `hand_off`/`take_back`, `leaves` over a frozen tree) prove, and
+`tests/cases/soundness/t37.py` holds recursions that must stay open.
 
 ## TypeScript classes and idioms
 
