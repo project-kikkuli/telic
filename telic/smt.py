@@ -254,6 +254,18 @@ class Z3Encoder:
         return out
 
 
+def _object(enc: Z3Encoder, model: z3.ModelRef, cls: str, ref: Any, fields: tuple) -> dict[str, Any]:
+    """An object held in a list or dict, with its fields as the model's heap has them."""
+    from .vcgen import pack
+
+    if not fields or not isinstance(ref, int):
+        return {"__class__": cls, "__ref__": ref, "__stub__": True}
+    out: dict[str, Any] = {"__class__": cls, "__ref__": ref}
+    for fname, fty, arrays in fields:
+        out[fname] = decode(enc, model, pack(fty, [L.select(a, L.IntV(ref)) for a in arrays]))
+    return out
+
+
 def _lit(k: Any, sort: L.Sort | None) -> L.Term:
     if isinstance(k, bool):
         return L.BoolV(k)
@@ -261,6 +273,8 @@ def _lit(k: Any, sort: L.Sort | None) -> L.Term:
         return L.IntV(k)
     if isinstance(k, str):
         return L.StrV(k)
+    if isinstance(k, Fraction):
+        return L.RealV(k)  # a TypeScript number key
     raise ValueError(k)
 
 
@@ -317,7 +331,9 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
             if isinstance(ty.elem, ir.TEnum):
                 return [{"__enum__": ty.elem.name, "member": ty.elem.members[i] if isinstance(i, int) and 0 <= i < len(ty.elem.members) else ty.elem.members[0]} for i in items]
             if isinstance(ty.elem, ir.TClass):
-                return [{"__class__": ty.elem.name, "__ref__": r, "__stub__": True} for r in items]
+                return [_object(enc, model, ty.elem.name, r, val.fields) for r in items]
+        if isinstance(ty, ir.TDict) and isinstance(ty.val, ir.TClass):
+            return {k: _object(enc, model, ty.val.name, r, val.fields) for k, r in decode(enc, model, val.val).items()}
         return decode(enc, model, val.val)
 
     if isinstance(val, ListVal):
@@ -543,7 +559,7 @@ def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Te
     m = s.model()
     enc.key_candidates = {}
     for _, v in ob.inputs:
-        if isinstance(v, L.Term) and v.sort in (L.INT, L.STR, L.BOOL):
+        if isinstance(v, L.Term) and v.sort in (L.INT, L.REAL, L.STR, L.BOOL):
             x = enc.value(m, v)
             enc.key_candidates.setdefault(v.sort.name, []).append(x)
     for sname, default in (("Str", ""), ("Int", 0)):

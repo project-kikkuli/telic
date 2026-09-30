@@ -86,6 +86,8 @@ class TypedView:
 
     val: "Val"
     ty: ir.Type
+    # for a list or dict of objects: each field of theirs, with the heap arrays holding it
+    fields: tuple[tuple[str, ir.Type, tuple[L.Term, ...]], ...] = ()
 
 
 Val = Union[L.Term, ListVal, OptVal, DictVal]
@@ -771,6 +773,11 @@ class VCGen:
             return ObjVal(v, ty.name, fs)  # type: ignore[arg-type]
         if isinstance(ty, ir.TOption) and isinstance(ty.inner, (ir.TClass, ir.TEnum)) and isinstance(v, OptVal):
             return OptVal(v.some, self.input_view(v.val, ty.inner, env, depth), ty)  # type: ignore[arg-type]
+        elem = ty.elem if isinstance(ty, ir.TList) else ty.val if isinstance(ty, ir.TDict) else None
+        if isinstance(elem, ir.TClass) and elem.name in self.program.classes:
+            decl = self.program.classes[elem.name]
+            fs = tuple((f, fty, tuple(env[k] for k, _ in self.heap_keys(elem.name, f))) for f, fty in decl.fields if self.heap_keys(elem.name, f))
+            return TypedView(v, ty, fs)  # type: ignore[arg-type]
         if isinstance(ty, (ir.TEnum, ir.TRecord)) or (isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum, ir.TRecord))):
             return TypedView(v, ty)
         return v

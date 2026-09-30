@@ -56,7 +56,8 @@ def _anything(ty: ir.Type) -> bool:
 
 def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(v, dict) and "__json__" in v:
-        return v  # an unchecked value rebuilt from the model, passed as it is
+        # rebuilt from the model: a real input only where any value is (a Set is not JSON)
+        return v if _anything(ty) else {"__opaque__": True, "any": False}
     if isinstance(v, dict) and "__opaque__" in v:
         return {"__opaque__": True, "any": _anything(ty)}
     if isinstance(v, dict) and "__enum__" in v:
@@ -402,6 +403,8 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
     if "harness_error" in out:
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
     if out.get("violation") == "requires" and out.get("func") == ir.source_name(fn.name) and ob.kind != "call":
+        if any(isinstance(p.ty, ir.TOpaque) and not _anything(p.ty) for p in fn.params):
+            return False, f"{runtime}: not replayed: the counterexample holds values telic does not model (shown as …)", None
         if any(_opaque_inside(p.ty) for p in fn.params):
             return False, f"{runtime}: the unchecked values rebuilt from the model violate '@requires {out.get('text', '')}' (telic models them only in part)", None
         return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
