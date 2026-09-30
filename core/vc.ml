@@ -240,10 +240,19 @@ type ctx = {
   spec : bool;
   quiet : bool;
   state : state option;
+  binders : term list;  (** enclosing quantifier variables *)
 }
 
 let hyps ctx = Dynarray.to_list ctx.base @ ctx.guard
 let assume ctx t = Dynarray.add_last ctx.base (if ctx.guard = [] then t else implies (and_ ctx.guard) t)
+(* assume t for every value of the enclosing quantifier variables: sound only
+   when every fresh symbol in t is a function of them *)
+let assume_for_all_binders ctx t = Dynarray.add_last ctx.base (forall ctx.binders (implies (and_ ctx.guard) t))
+(* a new symbol and how to assume its definition: under a quantifier, a
+   function of its variables, defined for all of them at once *)
+let defined_symbol ?(pure = true) ctx name srt =
+  if ctx.binders <> [] && pure then (fn name (Array.of_list ctx.binders) srt, assume_for_all_binders) else (const name srt, assume)
+
 let sub_ctx ?cond ctx = { ctx with guard = (match cond with Some c -> ctx.guard @ [ c ] | None -> ctx.guard) }
 let cur_env ctx = match ctx.live with Some st -> st.env | None -> ctx.env
 
@@ -421,7 +430,7 @@ let lit_value (e : Ir.expr) =
 let rec zip xs ys = match (xs, ys) with x :: xs, y :: ys -> (x, y) :: zip xs ys | _ -> []
 
 let spec_ctx g ?(modpath = g.info.modpath) ?old_env ?result ?(quiet = true) ?(guard = []) ~base ~env () =
-  { base; modpath; env; live = None; guard; bound = SM.empty; old_env; result; spec = true; quiet; state = None }
+  { base; modpath; env; live = None; guard; bound = SM.empty; old_env; result; spec = true; quiet; state = None; binders = [] }
 
 let alloc_of env = match SM.find_opt "@alloc" env with Some (T a) -> a | _ -> raise (Vc_error ("no allocation map", Ir.noloc))
 
@@ -644,7 +653,7 @@ let rec ev g ctx (e : Ir.expr) : value =
         let k = const (Printf.sprintf "%s!%d" el (next g)) (sort_of kty) in
         let held = select d.has k in
         let sub = sub_ctx ~cond:held ctx in
-        let body = tm (ev g { sub with bound = SM.add el (T k) sub.bound } q.body) in
+        let body = tm (ev g { sub with bound = SM.add el (T k) sub.bound; binders = ctx.binders @ [ k ] } q.body) in
         if q.kind = "forall" then T (forall [ k ] (implies held body)) else T (exists [ k ] (and_ [ held; body ]))
       | _ -> raise (Vc_error ("quantifier over a non-dict", loc)))
     | _ -> raise (Vc_error ("quantifier over a dict needs a name", loc)))
@@ -660,7 +669,7 @@ let rec ev g ctx (e : Ir.expr) : value =
       | Some s, Some el -> ( match ev g ctx s with L l -> SM.add el (T (at (l.arr, l.off) i)) bound | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
       | _ -> bound
     in
-    let body = tm (ev g { sub with bound } q.body) in
+    let body = tm (ev g { sub with bound; binders = ctx.binders @ [ i ] } q.body) in
     if q.kind = "forall" then T (forall [ i ] (implies rng body)) else T (exists [ i ] (and_ [ rng; body ]))
   | Builtin (name, args) -> builtin g ctx e name args
   | Call (f, args) ->
@@ -742,10 +751,21 @@ and builtin g ctx (e : Ir.expr) name args =
   | "range_list" ->
     let lo, hi = match args with [ a; b ] -> (tm (ev g ctx a), tm (ev g ctx b)) | _ -> raise (Vc_error ("range_list takes two bounds", loc)) in
     let n = next g in
-    let arr = const (Printf.sprintf "range@%d.arr" n) (sort_of e.ty) and k = const (Printf.sprintf "k!%d" n) Int in
-    let ln = ite (lt lo hi) (Term.sub hi lo) zero in
+    let arr, assume = defined_symbol ctx (Printf.sprintf "range@%d.arr" n) (sort_of e.ty) in
+    let k = const (Printf.sprintf "i!%d" n) Int in
+    let ln = max_ (Term.sub hi lo) zero in
     assume ctx (quant "forall" [ k ] (implies (and_ [ le zero k; lt k ln ]) (eq (select arr k) (add lo k))) [ [| select arr k |] ]);
     L { arr; off = zero; len = ln; lty = e.ty }
+  | "list_repeat" ->
+    let xs, k = match args with [ a; b ] -> (ev g ctx a, tm (ev g ctx b)) | _ -> raise (Vc_error ("list_repeat takes a list and a count", loc)) in
+    let xs = match xs with L l -> l | _ -> raise (Vc_error ("list_repeat of a non-list", loc)) in
+    let width = match (List.hd args).e with ListLit es -> List.length es | _ -> raise (Fallback "list_repeat of a non-literal") in
+    let n = next g in
+    let arr, assume = defined_symbol ctx (Printf.sprintf "rep@%d.arr" n) (sort_of xs.lty) in
+    let i = const (Printf.sprintf "i!%d" n) Int in
+    let ln = mul (int_ width) (max_ k zero) in
+    assume ctx (quant "forall" [ i ] (implies (and_ [ le zero i; lt i ln ]) (eq (select arr i) (at (xs.arr, xs.off) (emod i (int_ width))))) [ [| select arr i |] ]);
+    L { arr; off = zero; len = ln; lty = xs.lty }
   | "threw" -> threw g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
     D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
@@ -1138,13 +1158,17 @@ and comprehension g ctx (e : Ir.expr) seq =
     | _ -> raise (Fallback "comprehension shape")
   in
   let n = next g in
-  let arr = const (Printf.sprintf "comp@%d.arr" n) (sort_of e.ty) in
   let is_pure = pure g body && match cond with Some c -> pure g c | None -> true in
+  (* under a quantifier the new list is a function of its variables, defined for all of them *)
+  let under = ctx.binders <> [] && is_pure in
+  let sym name srt = if under then fn name (Array.of_list ctx.binders) srt else const name srt in
+  let assume = if under then assume_for_all_binders else assume in
+  let arr = sym (Printf.sprintf "comp@%d.arr" n) (sort_of e.ty) in
   let ln =
     match cond with
     | None -> seq.len
     | Some _ ->
-      let ln = const (Printf.sprintf "comp@%d.len" n) Int in
+      let ln = sym (Printf.sprintf "comp@%d.len" n) Int in
       assume ctx (and_ [ le zero ln; le ln seq.len ]);
       ln
   in
@@ -1343,7 +1367,7 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
   let with_pmap h = SM.union (fun _ _ b -> Some b) h pmap in
   let definitional = callee.definitional in
   if ctx.spec && not definitional then raise (Vc_error (Printf.sprintf "specs may only call pure (loop-free, mutation-free) functions; '%s' is not" fn.name, loc));
-  let cctx = { ctx with env = with_pmap heap_pre; modpath = callee.modpath; live = None; bound = SM.empty; old_env = None; result = None; spec = true; quiet = true; state = None } in
+  let cctx = { ctx with env = with_pmap heap_pre; modpath = callee.modpath; live = None; bound = SM.empty; old_env = None; result = None; spec = true; quiet = true; state = None; binders = [] } in
   List.iter
     (fun (rq : Ir.clause) ->
       let gl = term_of loc (ev g cctx rq.cexpr) in
@@ -1499,11 +1523,11 @@ and recursion_check g (callee : finfo) pmap ctx loc =
   let them = match List.assoc_opt callee.key g.opts.measures with Some m -> Some m | None -> Option.map (fun (c : Ir.clause) -> c.cexpr) callee.fn.decreases in
   match (me, them) with
   | Some me, Some them ->
-    let mctx = { ctx with env = g.entry; modpath = g.info.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None } in
+    let mctx = { ctx with env = g.entry; modpath = g.info.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None; binders = [] } in
     (* a list literal is a lexicographic measure, compared left to right *)
     let parts (m : Ir.expr) = match m.e with ListLit xs -> xs | _ -> [ m ] in
     let m0 = List.map (fun e -> term_of loc (ev g mctx e)) (parts me) in
-    let cctx = { ctx with env = pmap; modpath = callee.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None } in
+    let cctx = { ctx with env = pmap; modpath = callee.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None; binders = [] } in
     let m1 = List.map (fun e -> term_of loc (ev g cctx e)) (parts them) in
     if List.length m0 <> List.length m1 then
       raise (Vc_error (Printf.sprintf "'%s' and '%s' recurse into each other but their '@decreases' have different lengths" g.info.fn.name callee.fn.name, loc));
@@ -1614,7 +1638,7 @@ and assume_held g ctx (v : value) (ty : Ir.ty) =
   | _ -> ()
 
 let state_ctx g ?(spec = false) (st : state) =
-  { base = st.facts; modpath = g.info.modpath; env = st.env; live = Some st; guard = []; bound = SM.empty; old_env = None; result = None; spec; quiet = false; state = Some st }
+  { base = st.facts; modpath = g.info.modpath; env = st.env; live = Some st; guard = []; bound = SM.empty; old_env = None; result = None; spec; quiet = false; state = Some st; binders = [] }
 
 let rec block g stmts (st : state) : state = List.fold_left (fun st s -> if st.alive then stmt g s st else st) st stmts
 

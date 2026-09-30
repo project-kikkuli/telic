@@ -1649,8 +1649,6 @@ class VCGen:
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
         if name == "each":
             return self.ev_each(e, ctx)
-        if name == "range_list":
-            return self.ev_range_list(e, ctx)
         if name == "threw":
             return self.ev_threw(e, ctx)
         if name == "await" and ctx.state is not None and not ctx.spec:
@@ -2105,16 +2103,6 @@ class VCGen:
         if isinstance(r, ListVal):
             ctx.assume(L.le(L.ZERO, r.len))
         return r
-
-    def ev_range_list(self, e: ir.Builtin, ctx: Ctx) -> Val:
-        """``range(lo, hi)`` as the list it iterates."""
-        lo, hi = (self.ev(a, ctx) for a in e.args)
-        n = next(self.counter)
-        arr = L.Const(f"range@{n}.arr", sort_of(e.ty))
-        k = L.Const(f"k!{n}", L.INT)
-        ln = L.ite(L.lt(lo, hi), L.sub(hi, lo), L.ZERO)  # type: ignore[arg-type]
-        ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.eq(L.select(arr, k), L.add(lo, k))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
-        return ListVal(arr, L.ZERO, ln, e.ty)  # type: ignore[arg-type]
 
     def _effectful(self, e: ir.Expr) -> bool:
         """Runs code that may change state or raise beyond its obligations."""
