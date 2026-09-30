@@ -153,6 +153,8 @@ class App:
             if p.returncode != 0:
                 tail = (p.stderr or p.stdout).strip().splitlines()[-3:]
                 raise AppError(f"'{cfg.build}' failed (exit {p.returncode}): {' | '.join(tail)}")
+        if cfg.platform == "ios":
+            return self._ios_app()
         if cfg.static:
             root = os.path.join(cfg.dir, cfg.static)
             if not os.path.isdir(root):
@@ -183,6 +185,28 @@ class App:
         if not answers(url):
             raise AppError(f"nothing answers at {url}: start the app, or give [ui] a 'command' or 'static'")
         return url
+
+    def _ios_app(self) -> str:
+        """The .app bundle: 'app' as built, or what xcodebuild makes of the scheme."""
+        cfg = self.cfg
+        if cfg.app:
+            app = os.path.join(cfg.dir, cfg.app)
+            if not os.path.isfile(os.path.join(app, "Info.plist")):
+                raise AppError(f"{cfg.app} is not an app bundle in {cfg.dir}{' (did build make it?)' if cfg.build else ': add a build command'}")
+            return app
+        derived = os.path.join(cfg.dir, ".telic", "DerivedData")
+        which = ["-workspace", cfg.workspace] if cfg.workspace else ["-project", cfg.project or ""]
+        cmd = ["xcodebuild", *which, "-scheme", cfg.scheme or "", "-sdk", "iphonesimulator", "-configuration", "Debug", "-derivedDataPath", derived, "-jobs", "4", "build"]
+        self.log(f"building: {' '.join(cmd)}")
+        p = subprocess.run(cmd, cwd=cfg.dir, capture_output=True, text=True, check=False)
+        if p.returncode != 0:
+            errors = [x.strip() for x in p.stdout.splitlines() if "error:" in x] or (p.stderr or p.stdout).strip().splitlines()[-3:]
+            raise AppError(f"xcodebuild failed (exit {p.returncode}): {' | '.join(errors[:3])}")
+        products = os.path.join(derived, "Build", "Products", "Debug-iphonesimulator")
+        apps = sorted(f for f in os.listdir(products) if f.endswith(".app")) if os.path.isdir(products) else []
+        if not apps:
+            raise AppError(f"xcodebuild made no .app in {products}")
+        return os.path.join(products, f"{cfg.scheme}.app" if f"{cfg.scheme}.app" in apps else apps[0])
 
     def _tail(self) -> str:
         self.out.seek(0)

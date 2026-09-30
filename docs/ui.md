@@ -75,3 +75,37 @@ A first run takes a few minutes per app (one browser per viewport; `workers`
 adds more); later runs reuse the verdicts until a source file changes. Every
 browser takes one of `TELIC_UI_SLOTS` (default 2) slots shared by all telic
 runs on the machine, so concurrent runs queue instead of stacking browsers.
+
+## iOS apps
+
+iOS adapter: not yet run on a real simulator. Its tests drive it through a
+fake simulator (`tests/fake_simulator.py`); `sh scripts/ios_e2e.sh` runs the
+fixture app on a real one once Xcode is installed.
+
+An iOS app is learned in the iOS Simulator, one device at a time, through
+its accessibility tree ([AXe](https://github.com/cameroncooke/AXe) reads it
+and taps where a finger would).
+
+1. **Install the driver** (once): Xcode, one simulator runtime
+   (`xcodebuild -downloadPlatform iOS`) and `brew install cameroncooke/axe/axe`.
+2. **Say how to build the app.** Either a bundle a command makes, or an
+   Xcode scheme telic builds with `xcodebuild`:
+
+   ```toml
+   [ui]
+   platform = "ios"
+   build = "sh build.sh"          # or: project = "Notes.xcodeproj" (or workspace)
+   app = "build/Notes.app"        #     scheme = "Notes"
+   devices = ["iPhone 17"]        # device types; default: the newest plain iPhone
+   launch_args = ["-UITesting", "YES"]
+   ```
+
+3. **Write lemmas** in any Swift file, in the same comment syntax:
+   `//@ [ESCAPE] ui escape: always reachable home from overlay`.
+
+A fresh start reinstalls the app (no stored data); reopening terminates and
+relaunches it. A screen is named by its navigation title. Each device gets
+a simulator named `telic <device type>`, created on the newest runtime and
+shut down afterwards if telic booted it. `tests/cases/ui/ios-app` is a
+SwiftUI app built with `swiftc` alone, with known-bad variants chosen by
+`launch_args = ["-TelicBugs", "trap"]` (also `forget`, `banner`).

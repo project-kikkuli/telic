@@ -1,0 +1,5 @@
+[ui]
+platform = "ios"
+build = "sh build.sh"
+app = "build/Fixture.app"
+settle_ms = 150

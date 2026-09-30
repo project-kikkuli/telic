@@ -8,6 +8,15 @@
     max_states = 300
     max_depth = 30
 
+An iOS app runs in the iOS Simulator, one device at a time:
+
+    [ui]
+    platform = "ios"
+    app = "build/Notes.app"                    # after 'build'; or: project/workspace + scheme
+    build = "sh build.sh"                      #  (telic runs xcodebuild)
+    devices = ["iPhone 17", "iPad Air 11-inch (M3)"]
+    launch_args = ["-UITesting", "YES"]
+
 The nearest ``telic.toml`` with a ``[ui]`` section above a lemma's file is
 the app that lemma is about.
 """
@@ -46,6 +55,13 @@ class UiConfig:
     seed: bool = False
     witnesses: int = 20
     settle_ms: int = 50
+    platform: str = "web"
+    app: str | None = None  # ios: the .app bundle, relative to dir
+    project: str | None = None
+    workspace: str | None = None
+    scheme: str | None = None
+    devices: list[str] = field(default_factory=list)  # ios: device types; empty: the newest plain iPhone
+    launch_args: list[str] = field(default_factory=list)
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.raw, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -96,11 +112,20 @@ def load(path: str, root: str) -> UiConfig:
     known = {
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
         "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms",
+        "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
     }
     unknown = sorted(set(ui) - known)
     if unknown:
         raise ConfigError(f"{os.path.relpath(path, root)}: unknown [ui] key{'s' * (len(unknown) > 1)} {', '.join(unknown)} (known: {', '.join(sorted(known))})")
-    if not (ui.get("url") or ui.get("command") or ui.get("static")):
+    platform = str(ui.get("platform", "web"))
+    if platform not in ("web", "ios"):
+        raise ConfigError(f"{os.path.relpath(path, root)}: [ui] platform is \"web\" (the default) or \"ios\"")
+    if platform == "ios":
+        if not (ui.get("app") or (ui.get("scheme") and (ui.get("project") or ui.get("workspace")))):
+            raise ConfigError(f"{os.path.relpath(path, root)}: [ui] platform \"ios\" needs 'app' (a .app bundle, made by 'build') or 'scheme' with 'project' or 'workspace'")
+        if "viewports" in ui:
+            raise ConfigError(f"{os.path.relpath(path, root)}: on iOS the screen is the device's: list device types in 'devices', not 'viewports'")
+    elif not (ui.get("url") or ui.get("command") or ui.get("static")):
         raise ConfigError(f"{os.path.relpath(path, root)}: [ui] needs 'command' (starts the app), 'static' (a directory telic serves) or 'url' (an app already running)")
     s = Settings()
     for k in ("max_states", "max_depth", "walks", "walk_length", "workers"):
@@ -137,6 +162,13 @@ def load(path: str, root: str) -> UiConfig:
         seed=bool(ui.get("seed", False)),
         witnesses=int(ui.get("witnesses", 20)),
         settle_ms=int(ui.get("settle_ms", 50)),
+        platform=platform,
+        app=ui.get("app"),
+        project=ui.get("project"),
+        workspace=ui.get("workspace"),
+        scheme=ui.get("scheme"),
+        devices=[str(d) for d in ui.get("devices", [])],
+        launch_args=[str(a) for a in ui.get("launch_args", [])],
     )
     if "viewports" in ui:
         cfg.viewports = [_size(v) for v in ui["viewports"]]

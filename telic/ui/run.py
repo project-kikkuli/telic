@@ -195,8 +195,9 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
             app.url = url
             atoms = Atoms(lems)
             seeds = propose(cfg, lems) if cfg.seed else None
-            jobs = list(enumerate(cfg.viewports))
-            with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            # one simulator at a time: each device is learned after the last
+            jobs = list(enumerate(cfg.viewports if cfg.platform == "web" else cfg.devices or [""]))
+            with ThreadPoolExecutor(max_workers=len(jobs) if cfg.platform == "web" else 1) as pool:
                 done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, seeds, job[0], job[1], log), jobs))
     except (AppError, DriverError) as e:
         app.error = str(e)
@@ -213,25 +214,36 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     return out
 
 
-def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, i: int, size: tuple[int, int], log) -> tuple[dict[str, Any], dict[str, Outcome]]:
-    # one browser slot each, machine-wide: runs in other processes queue for them
-    with slots.hold(max(1, cfg.settings.workers), log=lambda m: log(f"{size[0]}x{size[1]}: {m}")) as n:
+def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+    # one browser (or simulator) slot each, machine-wide: runs in other processes queue for them
+    vp = f"{size[0]}x{size[1]}" if isinstance(size, tuple) else size or "iOS"
+    with slots.hold(max(1, cfg.settings.workers) if cfg.platform == "web" else 1, log=lambda m: log(f"{vp}: {m}")) as n:
         return _learn(cfg, url, lems, atoms, seeds, size, n, log)
 
 
-def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, size: tuple[int, int], browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     from .learn import Explorer
-    from .web import WebDriver
 
-    w, h = size
-    vp = f"{w}x{h}"
-    drivers = []
+    drivers: list = []
     try:
-        for _ in range(browsers):
-            d = WebDriver(url, settle_ms=cfg.settle_ms)
+        if cfg.platform == "ios":
+            from . import sim
+            from .ios import IosDriver
+
+            vp = str(size) or sim.default_device()
+            d = IosDriver(url, vp, launch_args=cfg.launch_args, settle_ms=cfg.settle_ms)
             drivers.append(d)
             d.start()
-            d.viewport(w, h)
+        else:
+            from .web import WebDriver
+
+            w, h = size  # type: ignore[misc]
+            vp = f"{w}x{h}"
+            for _ in range(browsers):
+                d = WebDriver(url, settle_ms=cfg.settle_ms)
+                drivers.append(d)
+                d.start()
+                d.viewport(w, h)
         occluding = [lem for lem in lems if lem.prop and lem.prop.kind == "unobscured"]
 
         def learn(settings):
