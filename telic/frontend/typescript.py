@@ -338,6 +338,14 @@ def _module(d: dict[str, Any]) -> ir.Module:
     m.problems = [(msg, ir.Loc(int(line))) for msg, line in d.get("problems", [])]
     m.notes = [(msg, ir.Loc(int(line))) for msg, line in d.get("notes", [])]
     m.assumptions = list(d.get("assumptions", []))
+    c = d.get("code") or {}
+    m.code = ir.CodeGraph(
+        units={k: (ir.Loc(int(line), int(col)), label, text) for k, (line, col, label, text) in (c.get("units") or {}).items()},
+        calls=[(src, ir.Loc(int(line), int(col)), label, tuple(ts)) for src, line, col, label, ts in c.get("calls") or []],
+        bindings={k: tuple(v) for k, v in (c.get("bindings") or {}).items()},
+        imports={k: (v[0], v[1]) for k, v in (c.get("imports") or {}).items()},
+        escaped=set(c.get("escaped") or []),
+    )
     return m
 
 

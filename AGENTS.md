@@ -14,6 +14,8 @@ for the known gaps.
 | `telic/ir.py` | the IR. Language differences are distinct operators, never shared names |
 | `telic/contracts.py` | `@`-comment grammar shared by all frontends |
 | `telic/frontend/python.py`, `telic/frontend/ts/lower.mjs`, `telic/frontend/rust.py`, `telic/frontend/swift*.py` | lowering; what can't be modelled exactly becomes opaque (with its assumption recorded) or `Unsupported(reason)` |
+| `telic/frontend/python_code.py`, `telic/frontend/ts/codegraph.mjs` | `ir.CodeGraph`: calls through function values, lambdas, nested functions and decorators, which `program.py` adds to the call graph |
+| `telic/frontend/python_rewrites.py` | code that can rewrite or reclass a frozen object, which withdraws depth measures from the classes it reaches |
 | `telic/logic.py` | VC terms, smart constructors, theory definitions and lemmas |
 | `telic/vcgen.py` | symbolic execution → `Obligation`s; pure functions → definitions |
 | `telic/infer.py` | Houdini invariants, loop variants, recursion measures |

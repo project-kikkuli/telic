@@ -15,7 +15,7 @@ from . import logic as L
 from .infer import Inferred, cached_measures, infer, infer_measures
 from .jobs import exit_with_parent
 from .jobs import take as take_jobs
-from .program import FuncRef, Program
+from .program import ANY, FuncRef, Program
 from .render_expr import render
 from .smt import SmtResult, Theory, solve
 from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
@@ -361,6 +361,9 @@ def inference_key(program: Program, key: str) -> str:
         todo.extend(program.callees.get(k, ()))
     h = hashlib.sha256(f"infer {__version__} {toolchain_id()} {key}".encode())
     for k in sorted(seen):
+        if k not in program.funcs:
+            h.update(f"{k}\n{program.units[k][3] if k in program.units else ''}".encode())
+            continue
         ref = program.ref(k)
         h.update(f"{k}\n{ref.fn.source}\n{sorted(ref.module.records)}".encode())
     return "infer:" + h.hexdigest()[:24]
@@ -431,6 +434,9 @@ def function_key(program: Program, key: str, root: str | None) -> str:
     h = hashlib.sha256(f"fn {toolchain_id()} {key}".encode())
     h.update(_classes(program).encode())
     for k in sorted(seen):
+        if k not in program.funcs:
+            h.update(f"{k}\n{program.units[k][3] if k in program.units else ''}".encode())
+            continue
         ref = program.ref(k)
         h.update(f"{k}\n{ref.module.language}\n{ref.fn.source}\n{sorted((n, str(t)) for n, t in ref.module.records.items())}\n{_lowered(program, k)}".encode())
     ref = program.ref(key)
@@ -440,6 +446,36 @@ def function_key(program: Program, key: str, root: str | None) -> str:
     if os.path.exists(side):
         h.update(Path(side).read_bytes())
     return "fn:" + h.hexdigest()[:24]
+
+
+def code_value_calls(program: Program, rep: "FunctionReport") -> None:
+    """A call through a function value runs code no ``Call`` names: the
+    proof rests on the functions it reaches, and recursion through it needs
+    a termination proof telic cannot give, as it cannot see the call."""
+    key = rep.ref.key
+    seen: set[str] = set()
+
+    def reach(k: str) -> None:
+        if k in seen:
+            return
+        seen.add(k)
+        if k in program.funcs:
+            rep.deps.add(k)
+            return
+        if k in program.recursive:
+            rep.deps.add(k)
+        if k != ANY:
+            for c in program.callees.get(k, ()):
+                reach(c)
+
+    for loc, label, keys in program.code_calls.get(key, ()):
+        for k in keys:
+            reach(k)
+        again = sorted(k for k in keys if program.same_scc(key, k))
+        if again:
+            me = program.describe(key)
+            how = f"may run {me} again" if key in again else f"may run {program.describe(again[0])}, which leads back to {me}"
+            rep.problems.append((f"termination not proved: '{label}' {how}; no '@decreases' bounds recursion through a function value, so call it directly", loc))
 
 
 def obligation_key(ob: Obligation, theory: Theory) -> str:
@@ -759,6 +795,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             return False
         rep.assumptions = gen.assumptions
         rep.deps = set(gen.deps)
+        code_value_calls(program, rep)
         entry_checks.append((rep, gen))
         for line, note in gen.loop_notes:
             if note == "no-variant" and ref.fn.has_contract:
@@ -855,6 +892,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 continue
             rep.assumptions = a["assumptions"]
             rep.deps = a["deps"]
+            code_value_calls(program, rep)
             gen = VCGen(program, ref, inf.options)
             try:
                 gen.enter()

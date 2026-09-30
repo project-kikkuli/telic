@@ -14,6 +14,10 @@ from . import ir
 
 _LANGS = {"typescript": "TypeScript", "swift": "Swift", "python": "Python", "rust": "Rust"}
 
+# The node for a call through a function value of unknown origin: it may run
+# any function whose value escaped (was stored, returned, passed or decorated).
+ANY = "::a function passed as a value"
+
 
 @dataclass
 class FuncRef:
@@ -56,6 +60,13 @@ class Program:
     # override key -> (class, index) of invariants of its own class that a call
     # through a base does not establish, so its entry may not assume them
     untrusted: dict[str, set[tuple[str, int]]] = field(default_factory=dict)
+    # code telic does not check as a function (a lambda, a nested function, a
+    # method of an unchecked class): key -> (module, loc, label, source)
+    units: dict[str, tuple[ir.Module, ir.Loc, str, str]] = field(default_factory=dict)
+    # function key -> (loc, callee as written, keys it may run) for each call
+    # through a function value, which no 'Call' names
+    code_calls: dict[str, list[tuple[ir.Loc, str, set[str]]]] = field(default_factory=dict)
+    passthrough: set[str] = field(default_factory=set)  # see ir.CodeGraph.passthrough
 
     @classmethod
     def build(cls, modules: list[ir.Module]) -> "Program":
@@ -75,7 +86,13 @@ class Program:
                 p.classes[cname] = decl
                 p.class_module[cname] = m
         p._overrides()
+        for m in modules:
+            for name in m.code.passthrough:
+                ref = p.own(m, name)
+                if ref is not None:
+                    p.passthrough.add(ref.key)
         p._call_graph()
+        p._code_values()
         p._opaque_subclasses()
         p._escaping_constructors()
         p._sccs()
@@ -235,6 +252,22 @@ class Program:
             if why is not None:
                 ref.fn.unsupported.append((why, ref.fn.loc))
 
+    def own(self, module: ir.Module, name: str) -> FuncRef | None:
+        """A function of ``module`` by the name its source gives it (a class
+        of the same name elsewhere qualifies it: ``Lowerer@rust.run``)."""
+        hit = self.funcs.get(f"{module.path}::{name}")
+        if hit is None:
+            hit = next((self.funcs[f"{module.path}::{f}"] for f in sorted(module.functions) if ir.source_name(f) == name), None)
+        return hit
+
+    def through_wrapper(self, module: ir.Module, name: str) -> FuncRef | None:
+        """The checked function an unchecked call ``@wrapper f`` runs with the
+        same arguments (``passthrough``), or None."""
+        if not name.startswith("@") or " " not in name:
+            return None
+        tgt = self.resolve(module, name.split(" ", 1)[1])
+        return tgt if tgt is not None and tgt.key in self.passthrough else None
+
     def resolve(self, module: ir.Module, name: str) -> FuncRef | None:
         hit = self.funcs.get(f"{module.path}::{name}")
         if hit is not None:
@@ -285,11 +318,110 @@ class Program:
                     tgt = self.resolve(ref.module, sub.func)
                     if tgt is not None:
                         out.add(tgt.key)
+                elif isinstance(sub, ir.Extern):
+                    tgt = self.through_wrapper(ref.module, sub.name)
+                    if tgt is not None:
+                        out.add(tgt.key)
+                elif isinstance(sub, ir.New):
+                    for m in ("__init__", "__post_init__"):
+                        tgt = self.member(sub.cls, m)
+                        if tgt is not None:
+                            out.add(tgt.key)
         return out
 
     def _call_graph(self) -> None:
         for key, ref in self.funcs.items():
             self.callees[key] = self._calls_in(ref)
+
+    def _code_values(self) -> None:
+        """Edges no ``Call`` shows: calls through function values, lambdas,
+        nested functions and decorators' wrappers (``ir.CodeGraph``). ``ANY``
+        leads to every function whose value escaped."""
+        by_path = {m.path: m for m in self.modules}
+
+        def res(m: ir.Module, name: str, seen: set[tuple[str, str]]) -> set[str]:
+            if (m.path, name) in seen:
+                return set()
+            seen.add((m.path, name))
+            if name == "?":
+                return {ANY}
+            if name.startswith("param:"):
+                unit, param = name[len("param:"):].rsplit(":", 1)
+                keys = res(m, unit, set())
+                key = next(iter(keys)) if len(keys) == 1 else None
+                if key is None or key not in self.funcs or key in escaped or key in starred:
+                    return {ANY}
+                return set().union(*(res(fm, t, seen) for fm, t in into.get((key, param), ())))
+            if name.startswith("="):
+                return res(m, name[1:], seen) - {ANY}
+            if name.startswith("@"):
+                tgt = self.own(m, name[1:]) or self.resolve(m, name[1:])
+                return set() if tgt is not None and tgt.key in self.passthrough else {ANY}  # else a wrapper runs
+            if "::" in name:
+                path, rest = name.split("::", 1)
+                other = by_path.get(path)
+                return res(other, rest, seen) if other is not None else set()
+            if name in m.functions:
+                return {f"{m.path}::{name}"}
+            hit = sorted(f for f in m.functions if ir.source_name(f) == name)
+            if hit:
+                return {f"{m.path}::{hit[0]}"}
+            if name in m.code.units:
+                return {f"{m.path}::{name}"}
+            if name in m.code.bindings:
+                return set().union(*(res(m, t, seen) for t in m.code.bindings[name]))
+            where = m.code.imports.get(name) or m.imports.get(name)
+            if where is None and "." in name:
+                head, rest = name.split(".", 1)
+                if f"{head}.*" in m.code.imports:
+                    where = (m.code.imports[f"{head}.*"][0], rest)
+            other = by_path.get(where[0]) if where else None
+            return res(other, where[1], seen) if other is not None and where is not None else set()
+
+        for m in self.modules:
+            for name, (loc, label, source) in m.code.units.items():
+                if name not in m.functions:
+                    self.units[f"{m.path}::{name}"] = (m, loc, label, source)
+        # what each call passes for each parameter of a checked function
+        escaped: set[str] = set()
+        for m in self.modules:
+            for e in m.code.escaped:
+                if not e.startswith("param:"):
+                    escaped |= res(m, e, set())
+        into: dict[tuple[str, str], list[tuple[ir.Module, str]]] = {}
+        starred: set[str] = set()
+        for m in self.modules:
+            for callees, at, targets in m.code.flows:
+                for c in callees:
+                    for key in res(m, c, set()):
+                        if key not in self.funcs:
+                            continue
+                        params = [p.name for p in self.funcs[key].fn.params]
+                        if at == "*":
+                            starred.add(key)
+                            continue
+                        if isinstance(at, str) and at.startswith("^"):  # bound: the receiver fills 'self'
+                            at = int(at[1:]) + (1 if params and params[0] in ("self", "cls") else 0)
+                        pname = params[at] if isinstance(at, int) and at < len(params) else at if isinstance(at, str) else None
+                        if pname is not None:
+                            into.setdefault((key, pname), []).extend((m, t) for t in targets)
+        for m in self.modules:
+            for src, loc, label, targets in m.code.calls:
+                keys = set().union(*(res(m, t, set()) for t in targets))
+                for k in res(m, src, set()):
+                    self.callees.setdefault(k, set()).update(keys)
+                    if k in self.funcs:
+                        self.code_calls.setdefault(k, []).append((loc, label, keys))
+            for e in m.code.escaped:
+                self.callees.setdefault(ANY, set()).update(res(m, e, set()))
+
+    def describe(self, key: str) -> str:
+        """A function, unit or ``ANY`` as a reader knows it."""
+        if key in self.units:
+            return self.units[key][2]
+        if key == ANY:
+            return "a function passed as a value"
+        return f"'{ir.source_name(key.split('::')[-1])}'"
 
     def _sccs(self) -> None:
         index: dict[str, int] = {}
@@ -323,7 +455,7 @@ class Program:
                     self.recursive.update(members)
                 comp[0] += 1
 
-        for v in self.funcs:
+        for v in list(self.funcs) + list(self.units) + [ANY]:
             if v not in index:
                 strong(v)
 
@@ -443,8 +575,8 @@ class Program:
                     cparams = [p.name for p in self.funcs[callee].fn.params]
                     if is_new:
                         cparams = cparams[1:]  # 'self' is the fresh object
-                    for f, tgts in self.heap_writes.get(callee, {}).items():
-                        for t in tgts:
+                    for f, tgts in list(self.heap_writes.get(callee, {}).items()):
+                        for t in list(tgts):
                             if t in ("*", "@new"):
                                 mapped = t
                             elif is_new and t == "self":

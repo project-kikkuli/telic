@@ -599,6 +599,28 @@ class ClassDecl:
 
 
 @dataclass
+class CodeGraph:
+    """Calls that may run code of this module although no ``Call`` names it:
+    through a function value, a lambda, a nested function or a decorator's
+    wrapper. A target is a function of the module, a unit (code telic does
+    not check as a function), a name bound at module level (``bindings``),
+    an imported name, or ``?``: any function whose value escaped."""
+
+    units: dict[str, tuple[Loc, str, str]] = field(default_factory=dict)  # id -> (loc, label, source)
+    calls: list[tuple[str, Loc, str, tuple[str, ...]]] = field(default_factory=list)  # (caller, loc, callee as written, targets)
+    bindings: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    imports: dict[str, tuple[str, str]] = field(default_factory=dict)  # name -> (module path, name there)
+    escaped: set[str] = field(default_factory=set)
+    # functions whose calls are unchecked (``@wrapper f``) but run the
+    # function itself with the same arguments: generators, library decorators
+    passthrough: set[str] = field(default_factory=set)
+    # (callees, argument position ('^i' after a receiver), keyword or '*'
+    # (any), targets): what a call passes, so a call through a parameter
+    # runs only what its callers pass
+    flows: list[tuple[tuple[str, ...], int | str, tuple[str, ...]]] = field(default_factory=list)
+
+
+@dataclass
 class Module:
     path: str  # as given on the command line / relative to project root
     language: str  # "python" | "typescript"
@@ -622,6 +644,7 @@ class Module:
     ambiguous_classes: dict[str, str] = field(default_factory=dict)
     # (subclass, base as written, loc) for subclasses the frontend does not model
     opaque_subclasses: list[tuple[str, str, Loc]] = field(default_factory=list)
+    code: CodeGraph = field(default_factory=CodeGraph)
 
 
 def source_name(name: str) -> str:

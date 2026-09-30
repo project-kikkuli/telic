@@ -600,6 +600,39 @@ def leaves(t: Tree) -> int:
     return leaves(t.left) + leaves(t.right)
 
 
+@dataclass(frozen=True)
+class Link:
+    nxt: "Chain"
+
+
+Chain = Union[Link, Leaf]
+
+
+# expect: open
+def chain_len(c: Chain) -> int:
+    # knot() ties a Link to itself, so its depth is not finite; leaves() above keeps its proof
+    if isinstance(c, Leaf):
+        return 0
+    return chain_len(c.nxt) + 1
+
+
+# expect: proved
+def knot() -> Link:
+    link = Link(Leaf(0))
+    object.__setattr__(link, "nxt", link)
+    return link
+
+
+# expect: open
+def countdown_by_value(n: int) -> int:
+    # terminates, but recursion through a function value has no measure telic can check
+    #@ requires n >= 0
+    f = countdown_by_value
+    if n == 0:
+        return 0
+    return f(n - 1)
+
+
 class Ticket:
     #@ lifecycle state: 0 -> 1 -> 2, 0 | 1 -> 3
     #@ lifecycle never state: 2 -> 0

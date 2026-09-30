@@ -8,6 +8,10 @@ telic could not prove (a callee, or an override a call may dispatch to) is
 not a proof: it names the unproved contract.
 """
 
+import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -53,6 +57,8 @@ TRUE_HELPERS = {
     "t39.py": {"knot"},
     "t40.py": {"knot"},
     "t41.py": {"knot", "Loop.nxt"},
+    "t42.py": {"wraps_deco", "plain_deco"},
+    "t42.ts": {"wrap"},
     "inh1.py": {"Base.__init__", "Base.setx", "Base.helper", "Sub.__init__"},
     "inh2.py": {"Base.size", "Sub.size"},
     "async1.py": {"Counter.__init__", "bump"},
@@ -207,3 +213,31 @@ def test_non_terminating_recursion_backs_no_aim():
     status = {f.fn.name: f.status for f in rep.functions}
     assert status["spin"] != "proved" and status["ping"] != "proved"
     assert [i.status for i in rep.aims] == ["partial"]
+
+
+HIDDEN = {
+    "t42.py": ("claim_rebound", "claim_lambda", "claim_wraps", "claim_decorated", "claim_aliased", "claim_passed", "claim_constructor"),
+    "t42.ts": ("claimRebound", "claimWrapped", "claimCall", "claimBind", "claimPassed"),
+}
+
+
+def _raises(name: str, fn: str) -> str:
+    if name.endswith(".py"):
+        code = f"import {name[:-3]} as m\ntry:\n    m.{fn}(0)\nexcept RecursionError:\n    print('RecursionError')"
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=DIR).stdout.strip()
+    ts_path = Path(__file__).parent.parent / "telic" / "frontend" / "ts" / "node_modules" / "typescript"
+    js = (
+        f"const ts = require({json.dumps(str(ts_path))});\n"
+        f"const src = require('fs').readFileSync({json.dumps(str(DIR / name))}, 'utf8');\n"
+        "const out = ts.transpileModule(src, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;\n"
+        "const m = { exports: {} }; new Function('module', 'exports', out)(m, m.exports);\n"
+        f"try {{ m.exports[{json.dumps(fn)}](0); }} catch (e) {{ console.log(e.constructor.name); }}\n"
+    )
+    return subprocess.run(["node", "-e", js], capture_output=True, text=True).stdout.strip()
+
+
+@pytest.mark.parametrize("name,fn", [(n, f) for n, fs in HIDDEN.items() for f in fs])
+def test_recursion_through_a_function_value_really_recurses(name, fn):
+    if name.endswith(".ts") and shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    assert _raises(name, fn) == ("RecursionError" if name.endswith(".py") else "RangeError")

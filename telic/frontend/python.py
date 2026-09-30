@@ -30,6 +30,8 @@ from ..contracts import (
     parse_aim_directive,
 )
 from ..lifecycle import LifecycleError
+from .python_code import code_graph
+from .python_rewrites import rewrites
 from ..lifecycle import build as build_lifecycle
 
 PY_ASSUMPTIONS = [
@@ -99,6 +101,7 @@ class PythonFrontend:
         self.foreign_classes: dict[str, ir.ClassDecl] = {}
         self.linked_classes: dict[str, "PythonFrontend"] = {}
         self.linked_functions: dict[str, tuple["PythonFrontend", str]] = {}
+        self.nested_imports: dict[int, str] = {}  # id of an ImportFrom inside a function -> the checked module it names
         self.module_aliases: dict[str, "PythonFrontend"] = {}
         self.imports: list[tuple[str, int, str, str | None]] = []  # (module, level, name, asname)
         self.class_bases: dict[str, list[str]] = {}  # checked bases, also of foreign ancestors
@@ -253,7 +256,7 @@ class PythonFrontend:
                     subs[n] |= more
                     changed = True
         structs: dict[str, frozenset[str]] = {}
-        reopened = self._reopened(set(by_name))
+        reopened = self._reopened(subs)
         if reopened is None:
             self._structs = (structs, aliases)
             return self._structs
@@ -268,22 +271,29 @@ class PythonFrontend:
         self._structs = (structs, aliases)
         return self._structs
 
-    def _reopened(self, names: set[str]) -> set[str] | None:
-        """Classes of ``names`` subclassed outside this module's top level
-        (inside a function, or in another module), or None when some module
-        can rewrite any object: ``object.__setattr__``, ``setattr``,
-        ``vars``, ``__dict__``, assigning ``__class__``, or ``type(name,
-        bases, ns)``."""
+    def _reopened(self, subs: dict[str, set[str]]) -> set[str] | None:
+        """Classes of this module (keys of ``subs``, each to its subclasses)
+        whose objects checked code may rewrite or whose subclasses telic does
+        not model (see ``python_rewrites``): the classes a site names and,
+        for a rewrite, their subclasses. None when a site could reach any
+        class."""
+        written = {c.name: {_decorator_name(b) for b in c.bases} for c in getattr(self, "tree", ast.Module([], [])).body if isinstance(c, ast.ClassDef)}
+        bases: dict[str, set[str]] = {n: set(written.get(n, ())) for n in subs}
+        for n, below in subs.items():
+            for d in below - {n}:
+                bases[d] |= {n} | written.get(n, set())
         out: set[str] = set()
-        top = set(map(id, getattr(self, "tree", ast.Module([], [])).body))
         for fe in self.peers:
-            for n in ast.walk(getattr(fe, "tree", ast.Module([], []))):
-                if isinstance(n, ast.Attribute) and (n.attr in ("__setattr__", "__dict__") or n.attr == "__class__" and isinstance(n.ctx, ast.Store)):
+            tree = getattr(fe, "tree", None)
+            if tree is None:
+                continue
+            for kind, names in rewrites(tree, set(self.project), fe is not self):
+                if names is None:
                     return None
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and (n.func.id in ("setattr", "vars") or n.func.id == "type" and len(n.args) == 3):
-                    return None
-                if isinstance(n, ast.ClassDef) and not (fe is self and id(n) in top):
-                    out.update(b for b in map(_decorator_name, n.bases) if b in names)
+                if kind == "sub":
+                    out |= names & set(subs)
+                else:
+                    out |= {n for n in subs if names & ({n} | bases[n])}
         return out
 
     def import_function(self, other: "PythonFrontend", name: str) -> None:
@@ -449,6 +459,9 @@ class PythonFrontend:
         for node, cname, key in methods:
             fn = self._lower_safely(node, cname, key)
             self.module.functions[fn.name] = fn
+        imports = {local: (other.path, name) for local, (other, name) in self.linked_functions.items()}
+        imports.update({f"{alias}.*": (other.path, "*") for alias, other in self.module_aliases.items()})
+        self.module.code = code_graph(tree, set(self.module.functions) | set(self.signatures), set(self.wrapped), TRANSPARENT_DECORATORS | {"setter"}, imports, set(self.module_aliases), self.nested_imports)
 
         # Module-level aim declarations (anything not consumed by a function).
         for cl in self.contract_lines:
@@ -2967,6 +2980,11 @@ def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
 
     advance("names")
     for fe in fes:
+        for node in ast.walk(getattr(fe, "tree", ast.Module([], []))):
+            if isinstance(node, ast.ImportFrom) and node not in fe.tree.body:
+                other = find(fe, node.module or "", node.level)
+                if other is not None and other is not fe:
+                    fe.nested_imports[id(node)] = other.path
         for module, level, name, asname in fe.imports:
             if not name:  # 'import pkg.mod [as m]'
                 other = find(fe, module, 0)

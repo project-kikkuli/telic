@@ -1009,8 +1009,13 @@ and havoc_heap g ctx =
 
 and extern g ctx (e : Ir.expr) name args =
   let loc = e.loc in
-  let _vals = List.map (ev g ctx) args in
+  let vals = List.map (ev g ctx) args in
   if ctx.spec then raise (Vc_error (Printf.sprintf "specifications cannot call unchecked code ('%s')" name, loc));
+  (* '@wrapper f' runs checked f with these arguments (a generator, a library decorator) *)
+  (match if starts_with "@" name then resolve g ctx.modpath name else None with
+   | Some callee when same_scc g g.info.key callee.key && g.info.termination ->
+     recursion_check g callee (List.fold_left (fun m ((p, _), a) -> SM.add p a m) SM.empty (zip callee.fn.params vals)) ctx loc
+   | _ -> ());
   if not (starts_with "caught exception" name || starts_with "default of" name) then note_assumed g loc ("call:" ^ name);
   (match ctx.state with Some st when name = "yield" -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the yield" | _ -> ());
   let fn = g.info.fn in

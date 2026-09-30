@@ -1957,6 +1957,9 @@ class VCGen:
         args = [self.ev(a, ctx) for a in e.args]
         if ctx.spec:
             raise VCError(f"specifications cannot call unchecked code ('{e.name}')", e.loc)
+        callee = self.program.through_wrapper(self.module, e.name)
+        if callee is not None and self.program.same_scc(self.ref.key, callee.key) and self.program.needs_termination(self.ref.key):
+            self.recursion_check(callee, {p.name: a for p, a in zip(callee.fn.params, args)}, ctx, e.loc)
         if not e.name.startswith(("caught exception", "default of")):
             self.note(e.loc, f"call:{e.name}")
         if e.name == "yield" and ctx.state is not None:

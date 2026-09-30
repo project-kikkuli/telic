@@ -58,6 +58,8 @@ def _calls(fn: ir.Function, extra: list[ir.Clause]) -> set[str]:
         for sub in ir.walk_expr(e):
             if isinstance(sub, ir.Call):
                 names.add(sub.func)
+            elif isinstance(sub, ir.Extern) and sub.name.startswith("@"):
+                names.add(sub.name)  # a wrapper that runs a checked function: resolved only then
     return names
 
 
@@ -99,7 +101,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
     for m in program.modules:
         tbl = resolve_tbl.setdefault(m.path, {})
         for name in sorted(names):
-            tgt = program.resolve(m, name)
+            tgt = program.resolve(m, name) or program.through_wrapper(m, name)
             if tgt is not None:
                 tbl[name] = tgt.key
 
@@ -125,7 +127,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
     for key, ref in program.funcs.items():
         resolve = {}
         for name in _calls(ref.fn, extra_by_key.get(key, [])):
-            tgt = program.resolve(ref.module, name)
+            tgt = program.resolve(ref.module, name) or program.through_wrapper(ref.module, name)
             if tgt is not None:
                 resolve[name] = tgt.key
         info[key] = {

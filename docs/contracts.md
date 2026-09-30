@@ -55,14 +55,23 @@ telic tries measures derived from its condition (`hi - lo + 1`, `len(xs) - i`,
 other, none with `@decreases`) it tries, in order, one shape in every function
 (an int parameter, that parameter less a bound it is compared with, `len` of a
 list or string, `hi - lo`, the depth of a frozen dataclass or NamedTuple
-value, whose fields are always shallower unless some checked module can
-rewrite objects (`object.__setattr__`, `setattr`, `vars`, `__dict__`, assigning
-`__class__`, three-argument `type`) or subclasses it outside a module's top
-level, and a trusted `int` predicate of
-one argument, like `depth(t)` below), that shape paired with each
+value, whose fields are always shallower unless checked code can rewrite
+such an object (`object.__setattr__`, `setattr`, `vars`, writing through
+`__dict__`, assigning `__class__`) or subclasses its class outside a module's
+top level or with three-argument `type` (the class the code names and its
+subclasses lose the measure; every class does when the target's class is
+not written in the code, as for `object.__new__(cls)`), and a trusted `int`
+predicate of one argument, like `depth(t)` below), that shape paired with each
 function's rank in the calls that keep it, then lexicographic pairs. It proves
 the first that works and shows it (`telic check -v`, and `inferred.measure` in
 `--json`). When nothing works, termination is reported as open.
+Recursion through a function value (a rebound name, a lambda, a function
+passed as an argument or stored, a decorator's wrapper, `.call`/`.bind`) is
+recursion too: a call no `@decreases` can bound, so it stays open, and so
+does every proof resting on it. A call through a value of unknown origin
+(a parameter, a field, a dict entry) may run any function whose value
+escaped. Calling a generator, or a function under a library decorator, runs
+the function itself with the same arguments, so its measure applies.
 
 **`raises C`** is for exceptions you intend. A `raise`/`throw` must only be
 reachable when `C` holds, and the function must not return normally when `C`

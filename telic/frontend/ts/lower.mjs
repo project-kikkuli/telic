@@ -17,6 +17,7 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { codeGraph } from "./codegraph.mjs";
 import { LifecycleError, lifecycleTexts, parseLifecycle } from "./lifecycle.mjs";
 
 const require = createRequire(import.meta.url);
@@ -314,6 +315,14 @@ class ModuleLowerer {
       const fl = new FunctionLowerer(this, f);
       this.module.functions.push(fl.lower());
     }
+    const imports = {}, namespaces = {};
+    for (const [local, { mod, name }] of Object.entries(this.imported)) imports[local] = [mod.rel, name];
+    Object.assign(imports, this.module.imports);
+    for (const [local, mod] of Object.entries(this.namespaces)) {
+      namespaces[local] = mod.rel;
+      imports[`${local}.*`] = [mod.rel, "*"];
+    }
+    this.module.code = codeGraph(this.sf, new Set([...this.module.functions.map((f) => f.name), ...Object.keys(this.sigs)]), imports, namespaces);
     for (const cl of this.contracts) {
       if (cl.consumed) continue;
       if (cl.keyword === "aim") {
