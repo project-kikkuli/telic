@@ -42,9 +42,19 @@ DUP = Path(__file__).parent / "cases" / "dupclass"
 
 
 @pytest.fixture(scope="module")
-def dup():
-    rep = check([str(DUP)], CheckOptions(cache_path=None, lean=False), root=str(DUP))
-    return {f.fn.name: f for f in rep.functions}
+def dup_report():
+    return check([str(DUP)], CheckOptions(cache_path=None, lean=False), root=str(DUP))
+
+
+@pytest.fixture(scope="module")
+def dup(dup_report):
+    return {f.fn.name: f for f in dup_report.functions}
+
+
+def test_same_named_classes_keep_their_own_lifecycles(dup_report):
+    got = {(lc.cls, lc.status) for lc in dup_report.lifecycles}
+    # via_signature is unsupported and may change a's Box
+    assert got == {("Box@a_shapes", "open"), ("Box@b_shapes", "proved")}
 
 
 @pytest.mark.parametrize(

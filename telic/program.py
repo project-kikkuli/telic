@@ -899,6 +899,7 @@ def _rename(m: ir.Module, view: dict[str, str]) -> None:
         decl.name = name(decl.name)
         decl.fields = [(f, rw(t)) for f, t in decl.fields]
         decl.invariants = rw(decl.invariants)
+        decl.lifecycles = rw(decl.lifecycles)
         decl.bases = [name(b) for b in decl.bases]
         decl.owner = {f: name(o) for f, o in decl.owner.items()}
         classes[name(cname)] = decl
