@@ -31,3 +31,18 @@ def test_stand_ins_confirm_nothing(tmp_path, name, src, fn, status):
     assert r.status == status
     replays = [v.replay for v in r.verdicts if v.replay is not None]
     assert replays and all(x.confirmed == (status == "refuted") for x in replays)
+
+
+def test_a_failing_input_is_shrunk_to_one_that_fails_the_same_way():
+    import types
+
+    from telic.replay_harness import shrink
+    from telic.runtime import ContractViolation
+
+    def f(xs, n):
+        if any(x > 1000 for x in xs) and n > 50:
+            raise IndexError("boom")
+        return 0
+
+    args, out = shrink(f, [[5, 2000, 7, 3000] * 60, 9000], {"crash": "IndexError"}, types.SimpleNamespace(__file__="none"), ContractViolation, "f")
+    assert args == [[1001], 51] and out["crash"] == "IndexError"

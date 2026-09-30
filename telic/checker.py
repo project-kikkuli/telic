@@ -185,6 +185,7 @@ class Replay:
     fuzz_summary: str | None = None
     fuzz_desc: str | None = None
     timed_out: bool = False  # cut short by the wall-clock safety net: decided nothing
+    shrunk: str | None = None  # the same failure on a smaller input
 
 
 @dataclass

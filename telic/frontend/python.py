@@ -2308,6 +2308,9 @@ class ExprLowerer:
                     l2, r2 = self.need(left), self.need(right)
                 if ir.is_numeric(l2.ty) and ir.is_numeric(r2.ty):
                     l2, r2, _ = self.numeric_pair(l2, r2, n)
+                elif l2.ty != r2.ty and name in ("eq", "ne") and isinstance(l2.ty, ir.TList) and isinstance(r2.ty, ir.TList) and any(isinstance(x, ir.ListLit) and not x.elems for x in (l2, r2)):
+                    # xs == []: the empty list at the other side's type
+                    l2, r2 = (self.fl.coerce(l2, r2.ty), r2) if isinstance(l2, ir.ListLit) and not l2.elems else (l2, self.fl.coerce(r2, l2.ty))
                 elif l2.ty != r2.ty and name in ("eq", "ne") and isinstance(l2.ty, ir.TList) and isinstance(r2.ty, ir.TList) and (_has_opaque(l2.ty) or _has_opaque(r2.ty)):
                     # a list of unchecked values, compared with a checked list
                     l2, r2 = (self.fl.coerce(l2, r2.ty), r2) if _has_opaque(l2.ty) else (l2, self.fl.coerce(r2, l2.ty))

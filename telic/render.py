@@ -20,6 +20,10 @@ from .replay import call_text
 INTERNAL_STATE = ("alloc@", "comp@", "lit@", "range@", "rep@", "cat@")
 
 
+def _clip(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
 def _has_loop(fn: ir.Function) -> bool:
     return any(isinstance(st, (ir.While, ir.ForRange, ir.ForEach)) for st in ir.walk_stmts(fn.body))
 
@@ -405,8 +409,12 @@ class Renderer:
                 out.append(p.dim(f"   {pad('', 16)}which means a loop invariant is also missing"))
         else:
             if solver_cex and v.status in ("refuted", "unconfirmed"):
-                out.append(f"   {p.bold(pad('counterexample', 16))}{solver_cex}")
-                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith(("()", ".arr")) and "@new" not in k and not k.startswith(INTERNAL_STATE)}
+                if rp is not None and rp.shrunk:
+                    out.append(f"   {p.bold(pad('counterexample', 16))}{rp.shrunk}")
+                    out.append(p.dim(f"   {pad('', 16)}(shrunk from the solver's {_clip(solver_cex, 60)})"))
+                else:
+                    out.append(f"   {p.bold(pad('counterexample', 16))}{solver_cex}")
+                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith(("()", ".arr", ".off")) and "@new" not in k and "$" not in k.split("@")[0] and not k.startswith(INTERNAL_STATE)}
                 if interesting and v.status == "unconfirmed" and not race:
                     st = ", ".join(f"{state_name(k)}={fmt_state_value(val)}" for k, val in list(interesting.items())[:6])
                     out.append(f"   {p.dim(pad('loop state' if _has_loop(f.fn) else 'unknowns', 16))}{p.dim(st)}")

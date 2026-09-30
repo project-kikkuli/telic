@@ -138,8 +138,10 @@ def _smaller(v: Any):
     if isinstance(v, int):
         if v != 0:
             yield 0
-            yield v // 2 if v > 0 else -((-v) // 2)
-            yield v - 1 if v > 0 else v + 1
+            a = abs(v)
+            for d in dict.fromkeys((a // 2, a // 4, a // 16, 1)):  # toward 0 by a half, a quarter, ...
+                if d:
+                    yield v - d if v > 0 else v + d
         return
     if isinstance(v, float):
         if v != 0.0:
@@ -148,6 +150,9 @@ def _smaller(v: Any):
             yield v / 2
         return
     if isinstance(v, list):
+        if len(v) > 3:  # big lists first lose halves
+            yield v[: len(v) // 2]
+            yield v[len(v) // 2 :]
         for i in range(len(v)):
             yield v[:i] + v[i + 1:]
         for i, x in enumerate(v):
@@ -159,15 +164,13 @@ def shrink(fn: Any, args: list, found: dict, module: Any, ContractViolation: Any
     key = (found.get("violation"), found.get("text"), found.get("crash"))
     for _ in range(200):
         progress = False
-        for i, a in enumerate(args):
-            for b in _smaller(a):
+        for i in range(len(args)):
+            for b in _smaller(args[i]):
                 cand = args[:i] + [b] + args[i + 1:]
                 out = _outcome(fn, cand, module, ContractViolation, fname)
                 if out and (out.get("violation"), out.get("text"), out.get("crash")) == key:
                     args, found, progress = cand, out, True
                     break
-            if progress:
-                break
         if not progress:
             break
     return args, found
@@ -295,7 +298,7 @@ def main() -> None:
         r = settle(fn(*args))
         emit({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED})
     except ContractViolation as e:
-        emit({"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail})
+        emit(_shrunk(req, fn, mod, ContractViolation, {"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}))
     except RecursionError:
         emit({"crash": "RecursionError", "msg": "maximum recursion depth exceeded"})
     except Exception as e:
@@ -303,7 +306,21 @@ def main() -> None:
         for fr in traceback.extract_tb(e.__traceback__):
             if fr.filename == path:
                 line = fr.lineno
-        emit({"crash": type(e).__name__, "msg": str(e), "line": line})
+        emit(_shrunk(req, fn, mod, ContractViolation, {"crash": type(e).__name__, "msg": str(e), "line": line}))
+
+
+def _shrunk(req: dict, fn: Any, mod: Any, ContractViolation: Any, found: dict) -> dict:
+    """The solver's input, made as small as still fails the same way."""
+    if not req.get("shrink") or STAND_IN:
+        return found
+    raw = req.get("args", [])
+    was = list(STAND_IN)
+    small, _ = shrink(fn, [decode(a, mod, {}) for a in raw], found, mod, ContractViolation, req["func"])
+    shown = ", ".join(show(a) for a in small)
+    if shown != ", ".join(show(a) for a in [decode(a, mod, {}) for a in raw]):
+        found["shrunk_repr"] = shown
+    STAND_IN[:] = was
+    return found
 
 
 if __name__ == "__main__":

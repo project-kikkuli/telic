@@ -521,7 +521,7 @@ def replay_verdicts(program: Program, rep) -> None:
         args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
         try:
             if lang == "python":
-                out = run_python(full, fn.name, args, limit)
+                out = run_python(full, fn.name, args, limit, extra={"shrink": True})
             else:
                 out = run_typescript(full, fn.name, args, limit, extra={"contracts": ts_contracts(rep.ref.module), "types": [type_desc(p.ty, rep.ref.module.classes) for p in fn.params]})
         except Exception as e:  # pragma: no cover - defensive
@@ -536,6 +536,7 @@ def replay_verdicts(program: Program, rep) -> None:
             violation=violation,
             runtime="node" if lang == "typescript" else "python",
             timed_out=cut_short(out),
+            shrunk=f"{fn.name}({out['shrunk_repr']})" if confirmed and out.get("shrunk_repr") is not None else None,
         )
     # The solver's state was unreachable? Search for a real failing input.
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
