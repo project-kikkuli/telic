@@ -257,3 +257,21 @@ def test_a_new_ts_subclass_rechecks_callers_through_the_base(tmp_path):
     since, full = telic(tmp_path, "ci", "--since", "HEAD~1", "--color", "never"), telic(tmp_path, "ci", "--color", "never")
     assert "aim POS: backed →" in full.stdout, full.stdout
     assert [l for l in since.stdout.splitlines() if "→" in l] == [l for l in full.stdout.splitlines() if "→" in l]
+
+
+@pytest.mark.parametrize(
+    "files,has,lacks",
+    [
+        ({"a.py": ""}, ["pip install git+"], ["playwright", "npm", "elan"]),
+        ({"web/telic.toml": "[ui]\ncommand = 'x'\n", "web/package.json": "{}", "web/package-lock.json": "{}"}, ["telic[ui]", "playwright install", "npm ci\n        working-directory: web"], ["elan"]),
+        ({"a.py": "", "a.py.proof.lean": ""}, ["elan", "lean-toolchain"], ["playwright"]),
+    ],
+)
+def test_init_installs_what_the_project_needs(tmp_path, files, has, lacks):
+    from telic.ledger import workflow
+
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    w = workflow(str(tmp_path))
+    assert all(h in w for h in has) and not any(x in w for x in lacks)

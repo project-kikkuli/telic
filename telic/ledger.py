@@ -465,8 +465,7 @@ jobs:
           restore-keys: |
             telic-${{ github.ref_name }}-
             telic-main-
-      - run: pip install git+https://github.com/project-kikkuli/telic
-      - name: Check what this change can affect against the ledger
+{install}      - name: Check what this change can affect against the ledger
         if: github.event_name == 'pull_request'
         run: telic ci --since origin/${{ github.base_ref }} --format github --color always
       - name: Check everything on main
@@ -478,6 +477,45 @@ jobs:
           path: .telic
           key: telic-main-${{ github.sha }}
 """
+
+SKIP_DIRS = {"node_modules", ".git", ".telic", ".venv", "dist", "build", "target"}
+
+
+def _project_files(root: str):
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+        for f in files:
+            yield Path(d, f)
+
+
+def workflow(root: str) -> str:
+    """The CI workflow, with what the project needs installed: the browser
+    driver and each app's packages when it has ui lemmas, and the pinned
+    Lean toolchain when it keeps Lean proofs."""
+    files = list(_project_files(root))
+    ui_dirs = sorted({f.parent for f in files if f.name == "telic.toml" and "[ui]" in f.read_text(errors="replace")})
+    lean = any(f.name.endswith(".proof.lean") for f in files)
+    steps = []
+    if ui_dirs:
+        steps.append("      - run: pip install 'telic[ui] @ git+https://github.com/project-kikkuli/telic'\n")
+        steps.append("      - run: python -m playwright install --with-deps chromium\n")
+        for d in ui_dirs:
+            if (d / "package.json").exists():
+                rel = d.relative_to(root).as_posix()
+                cmd = "npm ci" if (d / "package-lock.json").exists() else "npm install"
+                steps.append(f"      - run: {cmd}\n        working-directory: {rel}\n" if rel != "." else f"      - run: {cmd}\n")
+    else:
+        steps.append("      - run: pip install git+https://github.com/project-kikkuli/telic\n")
+    if lean:
+        steps.append(
+            "      - name: Lean, for the saved proofs\n"
+            "        run: |\n"
+            "          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none\n"
+            '          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"\n'
+            "          \"$HOME/.elan/bin/elan\" toolchain install \"$(python -c 'import pathlib, telic; print((pathlib.Path(telic.__file__).parent / \"lean\" / \"lean-toolchain\").read_text().strip())')\"\n"
+        )
+    return WORKFLOW.replace("{install}", "".join(steps))
+
 
 HOOK = """#!/bin/sh
 # telic pre-push hook: check what this push can affect, keep the ledger current.
@@ -493,7 +531,7 @@ def cmd_init(args) -> int:
     wf.parent.mkdir(parents=True, exist_ok=True)
     made = []
     if not wf.exists():
-        wf.write_text(WORKFLOW)
+        wf.write_text(workflow(root))
         made.append(str(wf.relative_to(root)))
     gi = Path(root, ".gitignore")
     lines = gi.read_text().splitlines() if gi.exists() else []
