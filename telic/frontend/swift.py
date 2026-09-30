@@ -894,8 +894,13 @@ class Project:
         self.by_name.setdefault(base, []).append(info)
 
     def _keys(self) -> None:
-        """Function keys: 'Type.name', or with argument labels when overloaded."""
-        for base, infos in self.by_name.items():
+        """Function keys: 'Type.name', or with argument labels when overloaded.
+        A default implementation of a protocol requirement is the
+        requirement's key with '$default'."""
+        for base, all_infos in self.by_name.items():
+            reqs = [i for i in all_infos if i.kind == "requirement"]
+            defaults = [i for i in all_infos if i.kind != "requirement" and any(r.labels == i.labels for r in reqs)]
+            infos = [i for i in all_infos if i not in defaults]
             if len(infos) == 1:
                 infos[0].key = base
             else:
@@ -908,7 +913,12 @@ class Project:
                     else:
                         seen[k] = 1
                     i.key = k
-            for i in infos:
+            for d in defaults:
+                req = next(r for r in reqs if r.labels == d.labels)
+                d.key = f"{req.key}$default"
+                d.alias_of = req.key
+                d.inherit = req
+            for i in all_infos:
                 self.fns[i.key] = i
 
     def _protocols(self) -> None:
@@ -930,23 +940,6 @@ class Project:
                     for impl in self.by_name.get(f"{t.name}.{req}", []):
                         if impl.labels == reqs[0].labels or impl.kind in ("getter", "field-getter"):
                             impl.inherit = reqs[0]
-        for t in self.types.values():
-            if t.kind != "protocol" or t.open_why:
-                continue
-            for base, infos in list(self.by_name.items()):
-                if not base.startswith(t.name + "."):
-                    continue
-                reqs = [i for i in infos if i.kind == "requirement"]
-                defaults = [i for i in infos if i.kind != "requirement"]
-                if reqs and defaults:
-                    for d in defaults:
-                        d.alias_of = reqs[0].key
-                        d.inherit = reqs[0]
-                        old = d.key
-                        d.key = f"{old}$default"
-                        self.fns.pop(old, None)
-                        self.fns[d.key] = d
-                        self.fns[reqs[0].key] = reqs[0]
 
     def invariant_lines(self, t: TypeInfo) -> list[ContractLine]:
         """The '@invariant' lines in a type's body (outside its members)."""

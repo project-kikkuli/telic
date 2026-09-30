@@ -63,6 +63,8 @@ def test_swift_corpus(report):
     bad = []
     for name, verdict in want.items():
         f = got.get(name)
+        if f is not None and f.status == "trusted" and f"{name}$default" in got:
+            f = got[f"{name}$default"]  # a default implementation in a protocol extension
         have = f.status if f else "missing"
         if have != verdict:
             detail = [f"{v.ob.id}:{v.status}" for v in f.verdicts if v.status != "proved"] if f else []
@@ -76,7 +78,8 @@ def test_swift_refutations_are_real_failures(report):
     for name, want in expectations(CORPUS).items():
         if want != "refuted":
             continue
-        vs = [v for v in got[name].verdicts if v.status == "refuted"]
+        f = got.get(f"{name}$default") if got[name].status == "trusted" else got[name]
+        vs = [v for v in f.verdicts if v.status == "refuted"]
         confirmed = [v for v in vs if v.replay is not None and v.replay.confirmed]
         assert confirmed, (name, [(v.ob.id, v.replay.summary if v.replay else None) for v in vs])
 

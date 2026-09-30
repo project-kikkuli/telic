@@ -531,3 +531,204 @@ func emptyName(_ name: String) -> Bool {
     //@ ensures result == name.isEmpty
     return name == ""
 }
+
+// MARK: more control flow
+
+// expect: proved
+func evens(_ n: Int) -> Int {
+    //@ requires n >= 0 && n <= 1000
+    //@ ensures result >= 0
+    var count = 0
+    //@ invariant count >= 0 && count <= i
+    for i in stride(from: 0, to: n, by: 2) {
+        count += 1
+    }
+    return count
+}
+
+// expect: proved
+func drain(_ xs: [Int]) -> Int {
+    //@ ensures result == 0
+    var ys = xs
+    //@ decreases ys.count
+    while let _ = ys.popLast() {
+    }
+    return ys.count
+}
+
+// expect: proved
+func atLeastOnce(_ n: Int) -> Int {
+    //@ requires n >= 0 && n <= 100
+    //@ ensures result >= 1
+    var k = 0
+    //@ invariant k >= 0 && k <= 101
+    //@ decreases 101 - k
+    repeat {
+        k += 1
+    } while k < n
+    return k
+}
+
+// expect: proved
+func sign(_ x: Int) -> Int {
+    //@ ensures result == 0 || result == 1 || result == -1
+    let s: Int = if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
+    return s
+}
+
+// expect: proved
+func classify(_ x: Int?) -> Int {
+    //@ ensures x == nil ? result == 0 : result >= 1
+    switch x {
+    case .none: return 0
+    case .some(let v) where v > 0: return v
+    case .some: return 1
+    }
+}
+
+// MARK: more structs and classes
+
+struct Pair: Equatable {
+    var a: Int
+    var b: Int
+}
+
+struct Holder {
+    var inner: Pair
+    var tag: Int = 0
+}
+
+// expect: proved
+func nested(_ h: Holder) -> Holder {
+    //@ requires h.inner.a < 100
+    //@ ensures result.inner.a == h.inner.a + 1 && result.inner.b == h.inner.b
+    var g = h
+    g.inner.a += 1
+    return g
+}
+
+// expect: proved
+func memberwise(_ x: Int) -> Int {
+    //@ ensures result == x
+    let h = Holder(inner: Pair(a: x, b: 2))
+    return h.inner.a
+}
+
+// expect: proved
+func elementUpdate(_ ps: [Pair]) -> [Pair] {
+    //@ requires ps.count == 2 && ps[0].a == 0
+    //@ ensures result[0].a == 1 && result.count == 2
+    var qs = ps
+    qs[0].a = 1
+    return qs
+}
+
+final class Counter {
+    //@ invariant count >= 0 && count <= limit
+    private(set) var count: Int = 0
+    let limit: Int
+
+    init(limit: Int) {
+        //@ requires limit >= 0
+        self.limit = limit
+    }
+
+    // expect: proved
+    func tick() -> Bool {
+        //@ ensures result == (old(count) < limit)
+        if count < limit {
+            count += 1
+            return true
+        }
+        return false
+    }
+
+    // expect: proved
+    var remaining: Int {
+        //@ ensures result >= 0
+        return limit - count
+    }
+}
+
+// MARK: more protocols
+
+protocol Describable {
+    //@ ensures result >= 1
+    func weight() -> Int
+}
+
+extension Describable {
+    // expect: proved
+    func weight() -> Int {
+        return 1
+    }
+}
+
+struct Light1: Describable {}
+
+struct Heavy: Describable {
+    var w: Int
+
+    // expect: refuted
+    func weight() -> Int {
+        return w
+    }
+}
+
+// expect: proved
+func totalWeight(_ a: Describable, _ b: Describable) -> Int {
+    //@ ensures result >= 2
+    let x = a.weight()
+    let y = b.weight()
+    return x > Int.max - y ? Int.max : x + y
+}
+
+// MARK: more collections
+
+// expect: proved
+func insertFront(_ xs: [Int], _ v: Int) -> [Int] {
+    //@ ensures result.count == xs.count + 1 && result[0] == v
+    var ys = xs
+    ys.insert(v, at: 0)
+    return ys
+}
+
+// expect: refuted
+func removeAt(_ xs: [Int], _ i: Int) -> Int {
+    var ys = xs
+    return ys.remove(at: i)
+}
+
+// expect: proved
+func filled(_ n: Int) -> [Int] {
+    //@ requires n >= 0 && n <= 100
+    //@ ensures result.count == n
+    return Array(repeating: 7, count: n)
+}
+
+// expect: proved
+func positives(_ xs: [Int]) -> [Int] {
+    //@ ensures result.allSatisfy { $0 > 0 }
+    return xs.filter { $0 > 0 }
+}
+
+// expect: proved
+func doubled(_ xs: [Int]) -> [Int] {
+    //@ requires xs.allSatisfy { $0 >= 0 && $0 <= 1000 }
+    //@ ensures result.count == xs.count
+    return xs.map { $0 * 2 }
+}
+
+// expect: proved
+func upsert(_ d: [String: Int], _ k: String) -> Int? {
+    //@ ensures result == d[k]
+    var e = d
+    let old = e.updateValue(1, forKey: k)
+    return old
+}
+
+// expect: proved
+func interpolate(_ n: Int) -> String {
+    //@ ensures result == "n = \(n)"
+    return "n = \(n)"
+}

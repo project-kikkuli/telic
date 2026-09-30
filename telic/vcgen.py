@@ -1338,7 +1338,11 @@ class VCGen:
         assert not isinstance(obj, (ListVal, OptVal, DictVal))
         if isinstance(e.obj.ty, ir.TClass):
             env = ctx.env if ctx.state is None else ctx.state.env
-            return self.heap_read(env, e.obj.ty.name, e.name, obj)
+            v = self.heap_read(env, e.obj.ty.name, e.name, obj)
+            if ctx.state is not None and (isinstance(e.ty, ir.TClass) or isinstance(e.ty, ir.TOption) and isinstance(e.ty.inner, ir.TClass)):
+                for fact in self.alloc_facts(v, e.ty, ctx.state.env):  # the heap holds only allocated objects
+                    ctx.assume(fact)
+            return v
         raw = L.field(obj, e.name)
         if isinstance(e.ty, ir.TOption):
             return OptVal(L.field(raw, "some"), L.field(raw, "val"), e.ty)

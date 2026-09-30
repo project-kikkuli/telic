@@ -525,7 +525,12 @@ let rec ev g ctx (e : Ir.expr) : value =
     match o.ty with
     | TClass cls ->
       let env = match ctx.state with Some st -> st.env | None -> ctx.env in
-      heap_read g env cls f obj
+      let v = heap_read g env cls f obj in
+      (* the heap holds only allocated objects *)
+      (match (ctx.state, e.ty) with
+       | Some st, (TClass _ | TOption (TClass _)) -> List.iter (assume ctx) (alloc_facts g v e.ty st.env)
+       | _ -> ());
+      v
     | _ -> (
       let raw = field obj f in
       match e.ty with TOption _ -> O { some = field raw "some"; v = field raw "val"; oty = e.ty } | _ -> T raw))

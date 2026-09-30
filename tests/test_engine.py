@@ -49,7 +49,7 @@ def _differential(path: Path):
     return compared, diffs
 
 
-DIFF_CASES = ["corpus.py", "corpus.ts", "corpus.rs"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
+DIFF_CASES = ["corpus.py", "corpus.ts", "corpus.rs", "corpus.swift"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
 
 
 @pytest.mark.parametrize("name", DIFF_CASES)
@@ -58,6 +58,8 @@ def test_engine_agrees_with_python_core(name):
         pytest.skip("Node.js not available")
     if name.endswith(".rs"):
         pytest.importorskip("tree_sitter_rust")
+    if name.endswith(".swift"):
+        pytest.importorskip("tree_sitter_swift")
     compared, diffs = _differential(CASES / name)
     assert compared > 20
     assert not diffs, "\n".join(diffs)
@@ -71,6 +73,11 @@ def test_engine_models_everything_in_the_corpora():
         if name.endswith(".rs"):
             try:
                 import tree_sitter_rust  # noqa: F401
+            except ImportError:
+                continue
+        if name.endswith(".swift"):
+            try:
+                import tree_sitter_swift  # noqa: F401
             except ImportError:
                 continue
         path = CASES / name
@@ -89,6 +96,11 @@ def test_engine_proves_no_exploit():
     for name in FILES:
         if name.endswith(".ts") and not HAS_NODE:
             continue
+        if name.endswith(".swift"):
+            try:
+                import tree_sitter_swift  # noqa: F401
+            except ImportError:
+                continue
         rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000, engine="ox"), root=str(DIR))
         proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
         bad += [f"{name}:{n}" for n in proved - TRUE_HELPERS.get(name, set())]

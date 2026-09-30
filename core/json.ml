@@ -5,6 +5,7 @@ type t =
   | Null
   | Bool of bool
   | Int of int
+  | BigInt of string  (* an integer too wide for a native int, kept exact *)
   | Float of float
   | String of string
   | List of t list
@@ -95,7 +96,7 @@ let parse (s : string) : t =
     done;
     let txt = String.sub s start (!pos - start) in
     if !is_float then Float (float_of_string txt)
-    else match int_of_string_opt txt with Some i -> Int i | None -> Float (float_of_string txt)
+    else match int_of_string_opt txt with Some i -> Int i | None -> BigInt txt
   in
   let rec value () =
     ws ();
@@ -160,6 +161,7 @@ let rec write (b : Buffer.t) (v : t) =
   | Null -> Buffer.add_string b "null"
   | Bool x -> Buffer.add_string b (if x then "true" else "false")
   | Int i -> Buffer.add_string b (string_of_int i)
+  | BigInt t -> Buffer.add_string b t
   | Float f -> Buffer.add_string b (Printf.sprintf "%.17g" f)
   | String s -> escape b s
   | List xs ->

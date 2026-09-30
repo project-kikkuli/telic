@@ -86,7 +86,8 @@ class FunctionLowerer:
         if body is not None and body.type == "statements":
             first = next((c for c in body.children if c.is_named and c.type not in EXPR_STMT_SKIP), None)
             limit = _line(first) if first is not None else body.end_point[0] + 1
-            top = _line(node.child_by_field_name("body")) if node.child_by_field_name("body") is not None else _line(body)
+            braces = node.child_by_field_name("body") or node.child_by_field_name("computed_value") or next((c for c in node.children if c.type == "computed_property"), None)
+            top = _line(braces) if braces is not None else _line(body)
             above += [cl for cl in f.contracts if top <= cl.line < limit and cl.keyword in FUNCTION_KEYWORDS and cl not in above and _line(node) <= cl.line]
         elif body is not None:
             above += [cl for cl in f.contracts if _line(body) <= cl.line <= body.end_point[0] + 1 and cl.keyword in FUNCTION_KEYWORDS and cl not in above]
@@ -659,6 +660,9 @@ class FunctionLowerer:
             if first.type == "value_binding_pattern":
                 bid = next((c for f, c in g if f == "bound_identifier"), None)
                 rest = [c for f, c in g[1:] if f == "condition" and c.type != "="]
+                if bid is None and rest and any(c.type == "wildcard_pattern" or text(c) == "_" for _, c in g[1:]):
+                    out.append(("let", ("_", norm(rest[-1]), False)))
+                    continue
                 if bid is None:
                     raise self.err("unsupported optional binding", first)
                 val = norm(rest[-1]) if rest else X("name", bid, id=text(bid))
@@ -710,13 +714,14 @@ class FunctionLowerer:
                 v = ir.Var(v.ty, loc, t)
             k = el.kind_of(v)
             inner: list[ir.Stmt] = []
-            irn = self.declare(name, v.ty.inner, node, let=not is_var)
-            if k:
-                self.kinds[irn] = k
-            u = ir.Builtin(v.ty.inner, loc, "unwrap", (v,))
-            inner.append(ir.Assign(loc, irn, self._copy_now(u, inner, loc)))
-            if k and v.ty.inner == ir.INT:
-                inner.append(ir.ExprStmt(loc, self.in_range(ir.Var(ir.INT, loc, irn), k)))
+            if name != "_":
+                irn = self.declare(name, v.ty.inner, node, let=not is_var)
+                if k:
+                    self.kinds[irn] = k
+                u = ir.Builtin(v.ty.inner, loc, "unwrap", (v,))
+                inner.append(ir.Assign(loc, irn, self._copy_now(u, inner, loc)))
+                if k and v.ty.inner == ir.INT:
+                    inner.append(ir.ExprStmt(loc, self.in_range(ir.Var(ir.INT, loc, irn), k)))
             inner.extend(self.cond_chain(conds[1:], on_success, loc, node))
             out.append(ir.If(loc, ir.Unary(ir.BOOL, loc, "not", ir.Builtin(ir.BOOL, loc, "is_none", (v,))), tuple(inner), ()))
             return out
@@ -851,6 +856,8 @@ class FunctionLowerer:
                     v = ir.Var(v.ty, loc, t)
                 k = el.kind_of(v)
                 out.append(ir.If(loc, ir.Builtin(ir.BOOL, loc, "is_none", (v,)), tuple(otherwise()), ()))
+                if name == "_":
+                    continue
                 irn = self.declare(name, v.ty.inner, node, let=not is_var)
                 if k:
                     self.kinds[irn] = k

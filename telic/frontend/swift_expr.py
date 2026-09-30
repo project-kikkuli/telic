@@ -706,7 +706,7 @@ class ExprLowerer:
                 return None
             if x.id == "Self" and self.fl.t is not None:
                 return TypeRef(self.fl.t.name, self.fl.t)
-            if x.id in self.pj.types or x.id in INT_KINDS or x.id in REAL_TYPES or x.id in STR_TYPES or x.id in ("Bool", "Swift"):
+            if x.id in self.pj.types or x.id in INT_KINDS or x.id in REAL_TYPES or x.id in STR_TYPES or x.id in ("Bool", "Swift", "Array", "Dictionary", "Optional", "Set"):
                 return TypeRef(x.id, self.pj.types.get(x.id))
             return None
         if x.kind == "member" and x.base.kind == "name" and x.base.id == "Swift" and self.fl.resolve("Swift") is None:
@@ -1968,7 +1968,7 @@ class ExprLowerer:
         if k == "opt" or k == "case" and ast[2] == "some" and isinstance(scrut.ty, ir.TOption):
             if not isinstance(scrut.ty, ir.TOption):
                 raise self.err("'?' pattern on a non-optional", p)
-            sub = ast[1] if k == "opt" else (ast[3][0][1] if len(ast[3]) == 1 else None)
+            sub = ast[1] if k == "opt" else (ast[3][0][1] if len(ast[3]) == 1 else ("wild",) if not ast[3] else None)
             if sub is None:
                 raise self.err("'.some' takes one pattern", p)
             u = ir.Builtin(scrut.ty.inner, loc, "unwrap", (scrut,))
