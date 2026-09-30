@@ -691,3 +691,25 @@ def reopen_first(ts: list[Ticket]) -> None:
     if len(ts) > 0:
         t = ts[0]
         t.state = 0
+
+
+# expect: proved
+def no_flows_yet(n: int) -> list[Item]:
+    #@ requires n >= 0
+    #@ ensures all(sum(t.price for t in result if t.qty == m) == 0 for m in range(n))
+    out: list[Item] = []
+    return out
+
+
+# expect: refuted
+def flows_differ(xs: list[Item], n: int) -> int:
+    #@ requires n >= 2
+    #@ ensures all(sum(t.price for t in xs if t.qty == m) == 0 for m in range(n))
+    return 0
+
+
+# expect: refuted
+def flows_by_member(xs: list[Item]) -> int:
+    #@ requires all(sum(t.price for t in xs if t.qty == m) == m for m in range(3))
+    #@ ensures sum(t.price for t in xs if t.qty == 2) == 1
+    return 0

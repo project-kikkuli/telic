@@ -329,6 +329,7 @@ class Ctx:
     quiet: bool = False  # suppress safety obligations (callee specs)
     state: State | None = None
     label: str = ""
+    binders: tuple[L.Const, ...] = ()  # enclosing quantifier variables
 
     def sub(self, cond: L.Term | None = None, **kw) -> "Ctx":
         c = Ctx(
@@ -343,6 +344,7 @@ class Ctx:
             quiet=self.quiet,
             state=self.state,
             label=self.label,
+            binders=self.binders,
         )
         for k, v in kw.items():
             setattr(c, k, v)
@@ -353,6 +355,12 @@ class Ctx:
 
     def assume(self, t: L.Term) -> None:
         self.base.append(L.implies(L.and_(*self.guard), t) if self.guard else t)
+
+    def assume_for_all_binders(self, t: L.Term) -> None:
+        """Assume ``t`` for every value of the enclosing quantifier
+        variables. Sound only when every fresh symbol in ``t`` is a
+        function of them."""
+        self.base.append(L.forall(self.binders, L.implies(L.and_(*self.guard), t)))
 
 
 @dataclass
@@ -1609,7 +1617,7 @@ class VCGen:
             assert isinstance(d, DictVal) and e.elem is not None
             k = L.Const(f"{e.elem}!{next(self.counter)}", sort_of(e.seq.ty.key))
             held = L.select(d.has, k)
-            sub = ctx.sub(held)
+            sub = ctx.sub(held, binders=ctx.binders + (k,))
             sub.bound[e.elem] = k
             body = self.ev(e.body, sub)
             assert not isinstance(body, ListVal)
@@ -1621,7 +1629,7 @@ class VCGen:
         assert not isinstance(lo, ListVal) and not isinstance(hi, ListVal)
         i = L.Const(f"{e.idx.split('$')[0]}!{next(self.counter)}", L.INT)
         rng = L.and_(L.le(lo, i), L.lt(i, hi))
-        sub = ctx.sub(rng)
+        sub = ctx.sub(rng, binders=ctx.binders + (i,))
         sub.bound[e.idx] = i
         if e.seq is not None and e.elem is not None:
             seq = self.ev(e.seq, ctx)
@@ -1953,13 +1961,21 @@ class VCGen:
         elem = str(elem_lit.value)
         body, cond = e.args[2], (e.args[3] if len(e.args) > 3 else None)
         n = next(self.counter)
-        arr = L.Const(f"comp@{n}.arr", sort_of(e.ty))
         pure = all(self._pure(x) for x in (body, cond) if x is not None)
+        # Under a quantifier the new list depends on its variables: a
+        # function of them, defined for all of them at once.
+        under = bool(ctx.binders) and pure
+
+        def sym(name: str, srt: L.Sort) -> L.Term:
+            return L.Fn(name, ctx.binders, srt) if under else L.Const(name, srt)
+
+        assume = ctx.assume_for_all_binders if under else ctx.assume
+        arr = sym(f"comp@{n}.arr", sort_of(e.ty))
         if cond is None:
             ln: L.Term = seq.len
         else:
-            ln = L.Const(f"comp@{n}.len", L.INT)
-            ctx.assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
+            ln = sym(f"comp@{n}.len", L.INT)
+            assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
         i = L.Const(f"{elem}!{n}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
         sub = ctx.sub(rng, spec=True) if pure else ctx.sub(rng, spec=True, quiet=True)
@@ -1971,7 +1987,7 @@ class VCGen:
             return ListVal(arr, L.ZERO, ln, e.ty)
         b = self.ev(body, sub)
         if cond is None:
-            ctx.assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
+            assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
         else:
             c = self.ev(cond, sub)
             k = L.Const(f"k!{n}", L.INT)
@@ -1981,7 +1997,7 @@ class VCGen:
             bj = self.ev(body, sub_j)
             cj = self.ev(cond, sub_j)
             # every element comes from some accepted source element
-            ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
+            assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
             del c
         return ListVal(arr, L.ZERO, ln, e.ty)
 
