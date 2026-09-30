@@ -713,3 +713,32 @@ def flows_by_member(xs: list[Item]) -> int:
     #@ requires all(sum(t.price for t in xs if t.qty == m) == m for m in range(3))
     #@ ensures sum(t.price for t in xs if t.qty == 2) == 1
     return 0
+
+
+# expect: proved
+def zero_balances(n: int) -> list[int]:
+    #@ requires n >= 0
+    #@ ensures len(result) == n
+    #@ ensures sum(result) == 0
+    return [0 for _ in range(n)]
+
+
+# expect: proved
+def zero_balances_rep(n: int) -> list[int]:
+    #@ ensures len(result) == max(n, 0)
+    #@ ensures sum(result) == 0
+    return [0] * n
+
+
+# expect: proved
+def squares_upto(n: int) -> list[int]:
+    #@ requires n >= 0
+    #@ ensures all(result[i] == i * i for i in range(n))
+    return [i * i for i in range(n)]
+
+
+# expect: refuted
+def alternating(n: int) -> list[int]:
+    #@ requires n >= 1
+    #@ ensures all(x == 0 for x in result)
+    return [0, 1] * n

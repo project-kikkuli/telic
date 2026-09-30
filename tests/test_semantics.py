@@ -161,6 +161,12 @@ VALUE_IDIOMS = [
     "len([a] + [])",
     "((a if a > 1 else None) or b)",
     "(1 if (a > 0 and 'q' or '') else 0)",
+    "len([0] * a)",
+    "len(b * [a, b])",
+    "len(range(a))",
+    "len(range(b, a))",
+    "len(list(range(a, 4)))",
+    "len([x * 2 for x in range(b, a)])",
 ]
 
 
@@ -218,3 +224,32 @@ def test_python_unchecked_comparisons_match_cpython(e, same):
             assert want in got, (e, x, b, got)
             if type(x) is same:
                 assert got == [want], (e, x, b, got)
+
+
+LIST_IDIOMS = ["([a, b] * 3)[4]", "([7] * a)[a - 1]", "[i * i for i in range(b, 9)][2]", "list(range(a, b + 12))[3]", "(b * [a, 5])[b + 1]"]
+
+
+@pytest.mark.parametrize("e", LIST_IDIOMS)
+def test_python_built_lists_match_cpython(e):
+    """range(), list(), [..] * n and comprehensions over them: the facts the
+    model states pin each element to what CPython computes."""
+    src = f"def f(a: int, b: int) -> int:\n    return {e}\n"
+    mod = lower_python("v.py", src)
+    assert not mod.functions["f"].unsupported, (e, mod.functions["f"].unsupported)
+    program = Program.build([mod])
+    ref = program.resolve(mod, "f")
+    for a, b in INPUTS:
+        try:
+            want = eval(e, {"a": a, "b": b})
+        except IndexError:
+            continue
+        g = VCGen(program, ref, inputs={"a": L.IntV(a), "b": L.IntV(b)})
+        g.definitional_mode = True
+        g.run()
+        (ex,) = [x for x in g.exits if x.value is not None]
+        enc = Z3Encoder([])
+        s = z3.Solver(ctx=enc.ctx)
+        for f in g.lemmas + ex.facts:
+            s.add(enc.term(f))
+        s.add(z3.Not(enc.term(L.eq(ex.value, L.IntV(want)))))
+        assert s.check() == z3.unsat, (e, a, b, want)

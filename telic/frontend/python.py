@@ -1729,7 +1729,7 @@ def fresh_list(e: ir.Expr) -> bool:
     may not return their list parameters)."""
     if isinstance(e, (ir.ListLit, ir.Call)):
         return True
-    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat"):
+    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat", "list_repeat", "range_list"):
         return True
     if isinstance(e, ir.Builtin) and e.name == "await":
         return fresh_list(e.args[0])
@@ -2184,6 +2184,11 @@ class ExprLowerer:
             if b.ty != a.ty:
                 raise self.err(f"cannot concatenate {a.ty} and {b.ty}", n)
             return ir.Builtin(a.ty, loc, "list_concat", (a, b))
+        if isinstance(op, ast.Mult) and (isinstance(a, ir.ListLit) or isinstance(b, ir.ListLit)):
+            lst, k = (a, b) if isinstance(a, ir.ListLit) else (b, a)
+            if not lst.elems or not isinstance(k.ty, ir.TInt):
+                raise self.err(f"'*' repeats a non-empty list literal an int number of times, not {a.ty} and {b.ty}", n)
+            return ir.Builtin(lst.ty, loc, "list_repeat", (lst, k))
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TStr):
             if b.ty != ir.STR:
                 raise self.err(f"cannot concatenate str and {b.ty}", n)
@@ -2499,6 +2504,15 @@ class ExprLowerer:
         if name == "bool":
             (x,) = self._args(n, 1)
             return self.truthy(x, n)
+        if name == "list" and name not in fe.bound and not n.keywords and len(n.args) == 1:
+            x = self.expr(n.args[0])
+            if isinstance(x.ty, ir.TList):
+                return ir.Builtin(x.ty, loc, "slice", (x, ir.Lit(ir.NONE, loc, None), ir.Lit(ir.NONE, loc, None)))
+        if name == "range" and not self.spec and not n.keywords and len(n.args) in (1, 2):
+            bounds = [self.expr(a) for a in n.args]
+            if all(isinstance(b.ty, ir.TInt) for b in bounds):
+                lo, hi = (ir.Lit(ir.INT, loc, 0), bounds[0]) if len(bounds) == 1 else bounds
+                return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (lo, hi))
         if name in self.fl.fe.module.records:
             rec = self.fl.fe.module.records[name]
             vals: dict[str, ir.Expr] = {}

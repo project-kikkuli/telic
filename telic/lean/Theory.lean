@@ -85,6 +85,27 @@ theorem seqsum_nonneg (a : Int → Int) (lo hi : Int)
     have e : lo + ((hi - lo).toNat : Int) = hi := by omega
     rwa [e] at this
 
+theorem seqsum_nonpos_aux (a : Int → Int) (lo : Int) (k : Nat)
+    (h : ∀ i, lo ≤ i → i < lo + k → a i ≤ 0) : seqsum a lo (lo + k) ≤ 0 := by
+  induction k with
+  | zero => rw [seqsum_empty a lo _ (by omega)]; omega
+  | succ k ih =>
+    rw [seqsum_last a lo _ (by omega)]
+    have e : lo + ((k + 1 : Nat) : Int) - 1 = lo + k := by omega
+    rw [e]
+    have h1 := ih (fun i hi1 hi2 => h i hi1 (by omega))
+    have h2 := h (lo + k) (by omega) (by omega)
+    omega
+
+/-- `seqsum_nonpos`: a sum of non-positives is non-positive. -/
+theorem seqsum_nonpos (a : Int → Int) (lo hi : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i ≤ 0) : seqsum a lo hi ≤ 0 := by
+  by_cases hl : hi ≤ lo
+  · rw [seqsum_empty a lo hi hl]; omega
+  · have := seqsum_nonpos_aux a lo (hi - lo).toNat (fun i h1 h2 => h i ⟨h1, by omega⟩)
+    have e : lo + ((hi - lo).toNat : Int) = hi := by omega
+    rwa [e] at this
+
 theorem seqsum_store_aux (a : Int → Int) (lo k v : Int) (n : Nat) :
     seqsum (upd a k v) lo (lo + n) = seqsum a lo (lo + n) + (if lo ≤ k ∧ k < lo + n then v - a k else 0) := by
   induction n with
@@ -228,6 +249,27 @@ theorem seqsumR_nonneg (a : Int → Rat) (lo hi : Int)
   by_cases hl : hi ≤ lo
   · rw [seqsumR_empty a lo hi hl]; grind
   · have := seqsumR_nonneg_aux a lo (hi - lo).toNat (fun i h1 h2 => h i ⟨h1, by omega⟩)
+    have e : lo + ((hi - lo).toNat : Int) = hi := by omega
+    rwa [e] at this
+
+theorem seqsumR_nonpos_aux (a : Int → Rat) (lo : Int) (k : Nat)
+    (h : ∀ i, lo ≤ i → i < lo + k → a i ≤ 0) : seqsumR a lo (lo + k) ≤ 0 := by
+  induction k with
+  | zero => rw [seqsumR_empty a lo _ (by omega)]; grind
+  | succ k ih =>
+    rw [seqsumR_last a lo _ (by omega)]
+    have e : lo + ((k + 1 : Nat) : Int) - 1 = lo + k := by omega
+    rw [e]
+    have h1 := ih (fun i hi1 hi2 => h i hi1 (by omega))
+    have h2 := h (lo + k) (by omega) (by omega)
+    grind
+
+/-- `seqsumR_nonpos`: a sum of non-positives is non-positive. -/
+theorem seqsumR_nonpos (a : Int → Rat) (lo hi : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i ≤ 0) : seqsumR a lo hi ≤ 0 := by
+  by_cases hl : hi ≤ lo
+  · rw [seqsumR_empty a lo hi hl]; grind
+  · have := seqsumR_nonpos_aux a lo (hi - lo).toNat (fun i h1 h2 => h i ⟨h1, by omega⟩)
     have e : lo + ((hi - lo).toNat : Int) = hi := by omega
     rwa [e] at this
 

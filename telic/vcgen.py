@@ -1811,6 +1811,24 @@ class VCGen:
             ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(arr, i), xs.at(i))), patterns=((L.select(arr, i),),)))
             ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(xs.len, k), L.lt(k, ln)), L.eq(L.select(arr, k), ys.at(L.sub(k, xs.len)))), patterns=((L.select(arr, k),),)))
             return ListVal(arr, L.ZERO, ln, xs.ty)
+        if name == "range_list":
+            lo, hi = args
+            n = next(self.counter)
+            arr, assume = self.defined_symbol(ctx, f"range@{n}.arr", L.ARRAY(L.INT))
+            i = L.Const(f"i!{n}", L.INT)
+            ln = L.max_(L.sub(hi, lo), L.ZERO)  # type: ignore[arg-type]
+            assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), L.add(lo, i))), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
+            return ListVal(arr, L.ZERO, ln, e.ty)
+        if name == "list_repeat":
+            xs, k = args
+            assert isinstance(xs, ListVal) and isinstance(e.args[0], ir.ListLit)
+            width = len(e.args[0].elems)
+            n = next(self.counter)
+            arr, assume = self.defined_symbol(ctx, f"rep@{n}.arr", sort_of(xs.ty))
+            i = L.Const(f"i!{n}", L.INT)
+            ln = L.mul(L.IntV(width), L.max_(k, L.ZERO))  # type: ignore[arg-type]
+            assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), xs.at(L.App("emod", (i, L.IntV(width)), L.INT)))), patterns=((L.select(arr, i),),)))
+            return ListVal(arr, L.ZERO, ln, xs.ty)
         if name == "dict_copy":
             return args[0]  # dicts are values in the model; aliasing is excluded
         if name == "list_append":
@@ -1962,19 +1980,11 @@ class VCGen:
         body, cond = e.args[2], (e.args[3] if len(e.args) > 3 else None)
         n = next(self.counter)
         pure = all(self._pure(x) for x in (body, cond) if x is not None)
-        # Under a quantifier the new list depends on its variables: a
-        # function of them, defined for all of them at once.
-        under = bool(ctx.binders) and pure
-
-        def sym(name: str, srt: L.Sort) -> L.Term:
-            return L.Fn(name, ctx.binders, srt) if under else L.Const(name, srt)
-
-        assume = ctx.assume_for_all_binders if under else ctx.assume
-        arr = sym(f"comp@{n}.arr", sort_of(e.ty))
+        arr, assume = self.defined_symbol(ctx, f"comp@{n}.arr", sort_of(e.ty), pure)
         if cond is None:
             ln: L.Term = seq.len
         else:
-            ln = sym(f"comp@{n}.len", L.INT)
+            ln, _ = self.defined_symbol(ctx, f"comp@{n}.len", L.INT, pure)
             assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
         i = L.Const(f"{elem}!{n}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
@@ -2000,6 +2010,14 @@ class VCGen:
             assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
             del c
         return ListVal(arr, L.ZERO, ln, e.ty)
+
+    def defined_symbol(self, ctx: Ctx, name: str, srt: L.Sort, pure: bool = True):
+        """A new symbol and how to assume its definition. Under a quantifier
+        it depends on the quantifier's variables: a function of them,
+        defined for all of them at once."""
+        if ctx.binders and pure:
+            return L.Fn(name, ctx.binders, srt), ctx.assume_for_all_binders
+        return L.Const(name, srt), ctx.assume
 
     def _pure(self, e: ir.Expr) -> bool:
         for sub in ir.walk_expr(e):

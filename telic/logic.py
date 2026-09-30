@@ -619,6 +619,8 @@ def theory_lemmas(elem: Sort) -> list[Axiom]:
     out.append(Axiom(f"{ss}_front", q((a, lo, hi), implies(lt(lo, hi), eq(S(a, lo, hi), add(select(a, lo), S(a, add(lo, ONE), hi)))), ((S(a, lo, hi), select(a, lo)),)), "", "sum peels off its first element", ss))
     inner = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(zero, select(a, i))))
     out.append(Axiom(f"{ss}_nonneg", q((a, lo, hi), implies(inner, le(zero, S(a, lo, hi))), ((S(a, lo, hi),),)), "", "sum of non-negatives is non-negative", ss))
+    inner_np = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(select(a, i), zero)))
+    out.append(Axiom(f"{ss}_nonpos", q((a, lo, hi), implies(inner_np, le(S(a, lo, hi), zero)), ((S(a, lo, hi),),)), "", "sum of non-positives is non-positive", ss))
     upd = store(a, k, v)
     out.append(
         Axiom(

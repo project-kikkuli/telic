@@ -627,6 +627,10 @@ optional where a value is needed (`x + 1`, `x.f`, `x!`) is an obligation that it
 is present. Proving it uses whatever checks came before, so no narrowing syntax
 is needed. `?.` and `??` work.
 
+**Lists.** Building a list is exact: literals, `+`, `[x] * n` (a
+literal repeated), `range(lo, hi)`, `list(xs)`, `append`, slices, and
+comprehensions over any of them (`[0 for _ in range(n)]`).
+
 **Dicts and Maps.** `d[k]` / `m.get(k)!` must find the key. `get`, `in`/`has`,
 assignment, `del`/`delete`, `keys()`/`values()`/`items()` and iteration are
 modelled.
