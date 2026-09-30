@@ -186,6 +186,8 @@ type program = {
   heap_writes : (string, (string * string list) list) Hashtbl.t;  (** key -> [Cls.field, targets] *)
   allocates : (string, unit) Hashtbl.t;
   def_heap : (string, string list) Hashtbl.t;  (** definitional key -> heap keys its body reads *)
+  by_name : (string, classinfo) Hashtbl.t;  (** classes by name *)
+  hkeys : (string * string, (string * sort) list option) Hashtbl.t;  (** heap_keys, memoized (None: not modelled) *)
 }
 
 type options = {
@@ -296,7 +298,7 @@ let param_val name (ty : Ir.ty) =
 
 let finfo_of g key = try Hashtbl.find g.prog.funcs key with Not_found -> raise (Fallback ("unknown function " ^ key))
 let resolve g modpath name = Option.map (finfo_of g) (Hashtbl.find_opt g.prog.resolve_tbl (modpath, name))
-let class_of g name = List.find_opt (fun c -> c.cname = name) g.prog.classes
+let class_of g name = Hashtbl.find_opt g.prog.by_name name
 let is_init g = let n = g.info.fn.name in String.length n >= 9 && String.sub n (String.length n - 9) 9 = ".__init__"
 
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
@@ -316,10 +318,23 @@ let field_owner g cls fname = match class_of g cls with Some c -> (match List.as
 (* A field telic cannot model has no maps: only code that reads or writes it
    ([strict]) fails. *)
 let heap_keys ?(strict = false) g cls fname =
-  let owner = field_owner g cls fname in
-  match components (field_type g cls fname) with
-  | comps -> List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" owner fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) comps
-  | exception Vc_error _ when not strict -> []
+  let keys =
+    match Hashtbl.find_opt g.prog.hkeys (cls, fname) with
+    | Some k -> k
+    | None ->
+      let owner = field_owner g cls fname in
+      let k =
+        match components (field_type g cls fname) with
+        | comps -> Some (List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" owner fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) comps)
+        | exception Vc_error _ -> None
+      in
+      Hashtbl.replace g.prog.hkeys (cls, fname) k;
+      k
+  in
+  match keys with
+  | Some k -> k
+  | None when strict -> ignore (components (field_type g cls fname)); []
+  | None -> []
 
 let mro g cls =
   let out = ref [] in
@@ -1279,9 +1294,14 @@ and merge _g (states : state list) : state =
 (* -- loops ---------------------------------------------------------------- *)
 
 and modified g body =
+  (* sets kept as lists (their order names the havocked constants) plus a
+     table for membership: a program with many classes has thousands of heap
+     keys, and list membership made this quadratic *)
   let names = ref (Ir.assigned_names body) and appends = ref [] in
-  let addn n = if not (List.mem n !names) then names := n :: !names in
-  let adda n = if not (List.mem n !appends) then appends := n :: !appends in
+  let seen_n = Hashtbl.create 64 and seen_a = Hashtbl.create 16 in
+  List.iter (fun n -> Hashtbl.replace seen_n n ()) !names;
+  let addn n = if not (Hashtbl.mem seen_n n) then (Hashtbl.add seen_n n (); names := n :: !names) in
+  let adda n = if not (Hashtbl.mem seen_a n) then (Hashtbl.add seen_a n (); appends := n :: !appends) in
   let add_writes key =
     List.iter
       (fun (cf, _) ->

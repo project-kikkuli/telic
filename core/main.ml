@@ -352,9 +352,13 @@ let infer prog th jobs_n timeout (tasks : itask list) =
     (fun t _ i -> t.measure <- Some i)
 
 
+let t_start = Unix.gettimeofday ()
+let phase name = if debug then Printf.eprintf "phase %s: %.2fs\n%!" name (Unix.gettimeofday () -. t_start)
+
 let () =
   let input = In_channel.input_all stdin in
   let req = Json.parse input in
+  phase "parse";
   let terms = read_terms (Json.member "theory" req) in
   let th =
     let fundefs = Hashtbl.create 16 in
@@ -430,7 +434,9 @@ let () =
   (match Json.member "allocates" req with Json.List l -> List.iter (fun k -> Hashtbl.replace allocates (Json.to_str k) ()) l | _ -> ());
   let def_heap = Hashtbl.create 16 in
   (match Json.member "def_heap" req with Json.Assoc kvs -> List.iter (fun (k, v) -> Hashtbl.replace def_heap k (List.map Json.to_str (Json.to_list v))) kvs | _ -> ());
-  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap } in
+  let by_name = Hashtbl.create 64 in
+  List.iter (fun (c : Vc.classinfo) -> if not (Hashtbl.mem by_name c.cname) then Hashtbl.add by_name c.cname c) classes;
+  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap; by_name; hkeys = Hashtbl.create 256 } in
   let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 8000 in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
   if Json.member "mode" req = Json.String "infer" then begin
@@ -484,6 +490,7 @@ let () =
     print_string (Json.to_string (Json.Assoc [ ("results", Json.List res) ]));
     exit 0
   end;
+  phase "setup";
   (* 1. VC generation, sequentially *)
   let results = ref [] and all_jobs = ref [] in
   List.iter
@@ -509,6 +516,7 @@ let () =
       | exception Vc.Fallback why -> results := (key, `Fallback why) :: !results
       | exception Vc.Vc_error (msg, loc) -> results := (key, `Error (msg, loc)) :: !results)
     (Json.to_list (Json.member "tasks" req));
+  phase "vcgen";
   (* 2. solve, in parallel, what the cache has not proved already *)
   let salt = match Json.member "salt" req with Json.String s -> s | _ -> "" in
   let cached = Hashtbl.create 256 in
@@ -530,6 +538,7 @@ let () =
   let jobs_arr = Array.of_list todo in
   let solved = solve_parallel jobs_n jobs_arr in
   Array.iteri (fun i jb -> Hashtbl.replace result_of jb.ob.oid solved.(i)) jobs_arr;
+  phase "solve";
   (* 3. answer *)
   let w = writer () in
   let clause_json = function
@@ -592,4 +601,5 @@ let () =
       !results
   in
   let answer = Json.Assoc [ ("results", Json.List res_json); ("terms", Json.Assoc [ ("sorts", Json.List (List.rev w.sl)); ("terms", Json.List (List.rev w.tl)) ]) ] in
-  print_string (Json.to_string answer)
+  print_string (Json.to_string answer);
+  phase "answer"
