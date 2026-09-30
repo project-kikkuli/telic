@@ -48,8 +48,10 @@ class Driver:
         raise NotImplementedError
 
     def uncovered(self, node: Node) -> tuple[bool, list[tuple[str, str | None]]]:
-        """Hit-test a rendered element from the latest snapshot at its center
-        and corners: (rendered, [(point, what covers it or None)])."""
+        """Hit-test an element from the latest snapshot at its center and
+        corners: (operable, [(point, what covers it or None)]). An element
+        with no size, or behind a modal dialog it is not part of, is not
+        operable, so nothing can cover it."""
         raise NotImplementedError
 
     def leaves(self, node: Node) -> bool:

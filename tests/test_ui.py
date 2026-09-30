@@ -327,3 +327,29 @@ def test_viewports_must_name_at_least_one(tmp_path, viewports, ok):
     else:
         with pytest.raises(ConfigError, match="viewports is empty"):
             load(str(tmp_path / "telic.toml"), str(tmp_path))
+
+
+def test_a_form_is_filled_in_and_sent_as_one_action():
+    form = [Node("textbox", "Email", ref="e", form="Sign in"), Node("textbox", "Password", ref="p", form="Sign in"), Node("button", "Sign in", ref="b")]
+    snap = Snapshot("/login", Node("root", children=form + [Node("searchbox", "Search", ref="s")]))
+    acts = {a.sig: a for a in actions(snap, fill=(("Search", "milk"),))[0]}
+    assert sorted(acts) == ['button "Sign in"', 'fill searchbox "Search"', 'submit form "Sign in"']
+    sent = acts['submit form "Sign in"']
+    assert sent.ref == "b" and json.loads(sent.arg) == [["e", "telic@example.com"], ["p", "Telic-pass-123"]]
+    assert acts['fill searchbox "Search"'].arg == "milk"
+
+
+def test_counts_in_names_are_data():
+    one = Snapshot("/", Node("root", children=[Node("link", "All tasks 5", ref="a")]))
+    two = Snapshot("/", Node("root", children=[Node("link", "All tasks 6", ref="a")]))
+    assert [a.sig for a in actions(one)[0]] == [a.sig for a in actions(two)[0]] == ['link "All tasks #"']
+
+
+def test_screens_abstraction_keeps_only_what_the_lemmas_see():
+    # a wizard on one screen the lemmas do not look into: each step shows other controls
+    steps = "ABCDEFGHIJ"
+    screens = {f"home:{c}": (None, {f"Step {c}": f"home:{steps[min(i + 1, 9)]}"}) for i, c in enumerate(steps)}
+    fine, _ = learn(FakeApp(screens, start="home:A"), [("r", "reachable home")])
+    coarse, got = learn(FakeApp(screens, start="home:A"), [("r", "reachable home")], abstraction="screens")
+    assert len(fine.states) == 10 and len(coarse.states) == 1 and coarse.complete
+    assert got["r"].status == "proved"

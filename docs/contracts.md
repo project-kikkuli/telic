@@ -271,9 +271,22 @@ each screen to the route, the open overlays, the controls and their states,
 and the lemmas' predicates. Returning to a state replays its path from a
 fresh start. Then random walks through the model are replayed in the app;
 a step the model did not predict is added to it and learning resumes. The
-model is judged by the app, never the other way round. Items of a list are
-acted on through the first item only, and the list's length counts as 1 or
-more than 1, so data does not make the model infinite.
+model is judged by the app, never the other way round.
+
+What counts as a different state is chosen so data does not make the model
+infinite: items of a list are acted on through the first item only and the
+list's length counts as 1 or more; numbers in names are blanked; which box is
+checked or which option chosen is data unless a lemma names it; a form's text
+fields are filled in and sent as one action; live regions (toasts, status
+messages) are not part of a state. If telling controls apart still gives more
+than 100 states, a state is just the screen, the open overlays and menus, the
+landmarks and the lemmas' predicates (`abstraction = "screens"`), and each
+route the model promises is replayed with re-planning from wherever the app
+actually is.
+
+An element behind a modal dialog it is not part of cannot be operated, so it
+is neither covered nor counted for `unobscured`; an action on a covered
+element is blocked, as it would be for a person.
 
 **Statuses** say what they rest on:
 
@@ -301,13 +314,15 @@ command = "npm run dev -- --port {port}"   # started on a free port; or:
 # static = "dist"                          # a directory telic serves (with build = "npm run build")
 # url = "https://staging.example.com/"     # an app already running
 viewports = ["390x844", "1280x800"]         # each explored separately
-max_states = 150                            # budgets; hitting one leaves verdicts open
-max_depth = 12
-max_seconds = 300
+max_states = 300                            # budgets; hitting one leaves verdicts open
+max_depth = 30
+max_seconds = 600
 workers = 3                                 # browsers per viewport
+abstraction = "auto"                        # "controls", "screens", or auto: controls unless that exceeds 100 states
 keys = ["Escape"]                           # keys a user may press anywhere
 ignore = ['button "Sign out"']              # actions never fired (regexes)
 text = "telic"                              # what is typed into text fields
+fill = { "Coupon" = "SAVE10" }              # by field name (regex); emails, passwords, dates... are guessed
 seed = false                                # true: an oracle proposes paths from the source first
 ```
 

@@ -11,7 +11,7 @@ import time
 from urllib.parse import urljoin, urlsplit
 
 from .driver import Driver, DriverError
-from .tree import Action, Node, Snapshot, route
+from .tree import TEXT_ENTRY, Action, Node, Snapshot, route
 
 _LINE = re.compile(r"^(?P<indent>\s*)- (?P<body>.*)$")
 _ATTR = re.compile(r"\s*\[(?P<a>[^\]]*)\]")
@@ -39,7 +39,12 @@ _HIT_JS = """
     const t = (h.getAttribute('aria-label') || h.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
     return t ? `${s} "${t}"` : s;
   };
-  return {rendered: true, points: pts.map(([n, x, y]) => {
+  // behind a modal dialog that is not its own: not operable, so not "covered"
+  const MODAL = 'dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]';
+  const top = document.elementFromPoint(pts[0][1], pts[0][2]);
+  const modal = top && !mine(top) && (top.closest(MODAL) || (top.querySelector && top.querySelector(MODAL)));
+  const behind = !!modal && !modal.contains(el);
+  return {rendered: true, behind, points: pts.map(([n, x, y]) => {
     if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return [n, [Math.round(x), Math.round(y)], 'the edge of the viewport (it is cut off)'];
     const h = document.elementFromPoint(x, y);
     return [n, [Math.round(x), Math.round(y)], mine(h) ? null : describe(h)];
@@ -60,6 +65,26 @@ _WATCH_JS = """
   XMLHttpRequest.prototype.send = function (...a) { t.pending++; bump(); this.addEventListener('loadend', () => { t.pending--; bump(); }); return send.apply(this, a); };
   addEventListener('hashchange', bump);
   addEventListener('popstate', bump);
+  // A short timer is work in flight (a debounce, a fake network delay); one
+  // set from inside such a timer is a polling loop, and is not waited for.
+  const st = t.setTimeout = window.setTimeout, ct = window.clearTimeout, live = new Set();
+  let nested = 0;
+  window.setTimeout = function (fn, ms, ...a) {
+    const d = Number(ms) || 0;
+    if (typeof fn !== 'function' || d > 1000 || nested) return st.call(this, fn, ms, ...a);
+    t.pending++;
+    const id = st.call(this, function () {
+      if (live.delete(id)) t.pending--;
+      nested++;
+      try { return fn.apply(this, a); } finally { nested--; bump(); }
+    }, ms);
+    live.add(id);
+    return id;
+  };
+  window.clearTimeout = function (id) {
+    if (live.delete(id)) { t.pending--; bump(); }
+    return ct.call(this, id);
+  };
 })();
 """
 
@@ -73,10 +98,22 @@ _QUIET_JS = """
     const now = performance.now();
     const moving = document.getAnimations().some((a) => a.playState === 'running' && a.effect && a.effect.getTiming().iterations !== Infinity);
     if ((now - Math.max(t.last, start) >= quiet && !t.pending && !moving) || now - start > cap) return done(now - start);
-    setTimeout(tick, 8);
+    ((window.__telic && window.__telic.setTimeout) || setTimeout).call(window, tick, 8);
   };
   tick();
 })
+"""
+
+
+# For a text field in a form: the name of the button that submits it ('' if only Enter does).
+_FORM_JS = """
+(el) => {
+  const f = el.form || el.closest('form');
+  if (!f) return null;
+  const b = [...f.querySelectorAll('button, input[type=submit]')].find((b) => (b.type || 'submit') === 'submit');
+  if (!b) return '';
+  return (b.getAttribute('aria-label') || b.value && b.tagName === 'INPUT' && b.value || b.innerText || '').trim().replace(/\\s+/g, ' ');
+}
 """
 
 
@@ -286,6 +323,14 @@ class WebDriver(Driver):
         except Exception:  # noqa: BLE001 - already handled
             pass
 
+    def _settled(self, shown: str) -> None:
+        """Settle; if nothing visible changed, look once more a little later
+        (a handler that reacts after a frame or a short delay)."""
+        self._settle()
+        if self.text == shown:
+            time.sleep(0.25)
+            self._settle()
+
     def _settle(self) -> None:
         deadline = time.monotonic() + 10
         last = "no snapshot"
@@ -310,7 +355,14 @@ class WebDriver(Driver):
 
     @_confined
     def observe(self) -> Snapshot:
-        return Snapshot(self.screen(), parse_aria(self.text))
+        root = parse_aria(self.text)
+        for n in root.walk():
+            if n.role in TEXT_ENTRY and n.ref is not None:
+                try:
+                    n.form = self._loc(n.ref).evaluate(_FORM_JS, timeout=self.timeout_ms)
+                except Exception:  # noqa: BLE001 - detached since the snapshot: no form
+                    n.form = None
+        return Snapshot(self.screen(), root)
 
     @_confined
     def leaves(self, node: Node) -> bool:
@@ -333,26 +385,47 @@ class WebDriver(Driver):
             got = loc.evaluate(_HIT_JS, "center", timeout=self.timeout_ms)
         return got
 
+    def _submit(self, action: Action) -> None:
+        fields = json.loads(action.arg or "[]")
+        for k, (ref, value) in enumerate(fields):
+            got = self._hit(ref)
+            if not got["rendered"] or got["points"][0][2] is not None:
+                raise DriverError(f"a field of the form is {'covered by ' + got['points'][0][2] if got['rendered'] else 'not rendered'}", moved=k > 0)
+            self._loc(ref).fill(value, timeout=self.timeout_ms)
+        if action.ref is None:
+            self._loc(fields[-1][0]).press("Enter", timeout=self.timeout_ms)
+            return
+        got = self._hit(action.ref)
+        if not got["rendered"] or got["points"][0][2] is not None:
+            raise DriverError(f"its button is {'covered by ' + got['points'][0][2] if got['rendered'] else 'not rendered'}", moved=True)
+        self._loc(action.ref).click(timeout=self.timeout_ms)
+
     @_confined
     def uncovered(self, node: Node) -> tuple[bool, list[tuple[str, str | None]]]:
         try:
             got = self._hit(node.ref or "")
         except Exception as e:  # noqa: BLE001 - detached between snapshot and test
             raise DriverError(f"cannot hit-test {node.label}: {str(e).splitlines()[0]}") from None
-        return got["rendered"], [(f"{n} ({x}, {y})", who) for n, (x, y), who in got["points"]]
+        return got["rendered"] and not got.get("behind"), [(f"{n} ({x}, {y})", who) for n, (x, y), who in got["points"]]
 
     @_confined
     def do(self, action: Action) -> None:
-        before = self.page.url
+        before, shown = self.page.url, self.text
         try:
             if action.kind == "key":
                 self.page.keyboard.press(action.arg or "")
             else:
-                if action.kind in ("click", "select"):
-                    got = self._hit(action.ref or "")
-                    center = got["points"][0][2] if got["points"] else "nothing: it is not rendered"
-                    if center is not None and action.kind == "click":
-                        raise DriverError(f"covered by {center}")
+                if action.kind == "form":
+                    self._submit(action)
+                    self._settled(shown)
+                    return
+                # a user reaches an element by pointing at it (or tapping it) first
+                got = self._hit(action.ref or "")
+                if not got["rendered"]:
+                    raise DriverError("not rendered (no size on screen)")
+                center = got["points"][0][2]
+                if center is not None:
+                    raise DriverError(f"covered by {center}")
                 loc = self._loc(action.ref)
                 if action.kind == "click":
                     loc.click(timeout=self.timeout_ms)
@@ -366,6 +439,6 @@ class WebDriver(Driver):
             raise
         except Exception as e:  # noqa: BLE001 - the user could not do it
             raise DriverError(str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__, moved=True) from None
-        self._settle()
+        self._settled(shown)
         if self.screen().startswith("outside:"):
             raise DriverError(f"leaves the app (to {self.page.url} from {before})", moved=True)

@@ -131,8 +131,9 @@ class App:
 
     def _tail(self) -> str:
         self.out.seek(0)
-        lines = self.out.read().decode(errors="replace").strip().splitlines()
-        return " | ".join(lines[-3:]) or "no output"
+        lines = [x.strip() for x in self.out.read().decode(errors="replace").splitlines() if x.strip()]
+        errors = [x for x in lines if "error" in x.lower()]
+        return (errors[0] if errors else " | ".join(lines[-3:]))[:300] or "no output"
 
     def __exit__(self, *exc) -> None:
         if self.proc is not None and self.proc.poll() is None:

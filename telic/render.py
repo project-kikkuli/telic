@@ -497,8 +497,11 @@ class Renderer:
                     out.append(f"  {p.dim('app')}    {a.url}" + p.dim("  (verdicts cached: nothing the app is built from has changed)" if a.cached else f"  ({a.seconds:.0f}s)"))
                 for m in a.models:
                     out.append(f"  {p.dim('model')}  {model_line(m, p)}")
-                    for note in m.get("notes", []):
+                    notes = m.get("notes", [])
+                    for note in notes[:3]:
                         out.append(f"         {p.dim(note)}")
+                    if len(notes) > 3:
+                        out.append(f"         {p.dim(f'… {len(notes) - 3} more in the model file (.telic/ui-model-*.json)')}")
             nw = max(len(r.lemma.name) for r in results) + 2
             for r in results:
                 lem = r.lemma
@@ -712,7 +715,7 @@ def model_line(m: dict[str, Any], p: Paint) -> str:
     #@ requires "states" in m and "transitions" in m and ("walks" not in m or "walk_length" in m and "agreed" in m)
     """One learned model: size, whether exploration finished, conformance."""
     bits = [f"{m['states']} states", f"{m['transitions']} transitions"]
-    bits.append(p.green("complete") if m.get("complete") else p.yellow(f"incomplete: stopped at the {m.get('stop')}"))
+    bits.append(p.green("complete") if m.get("complete") else p.yellow(f"incomplete: {m.get('stop')}"))
     if m.get("walks"):
         conf = f"conformance: {m['walks']} walks of ≤{m['walk_length']} steps, {m['agreed']} steps as predicted"
         if m.get("disagreed"):

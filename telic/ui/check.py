@@ -120,6 +120,30 @@ class ModelCheck:
                 return None, done, f"step {len(done)} failed: {at.blocked.get(sig, 'blocked')}"
         return w.snap, done, ""
 
+    def reach(self, s: UiState, goals: set[int], goal: Pred, w: Worker, budget: int = 0) -> tuple[bool, str]:
+        """Get to ``s`` in the app, then to a goal state, re-planning on the
+        model from wherever the app actually is after each step (so state the
+        abstraction does not see cannot fake a route)."""
+        snap, _, why = self.replay(s.access, w)
+        if snap is None:
+            return False, why
+        avoid: set[tuple[int, str]] = set()
+        for _ in range(budget or 3 * (len(self.m.states) + 2)):
+            if goal.eval(w.snap, self.m.home):
+                return True, ""
+            at = w.cur
+            if at is None:
+                return False, "the app left the model"
+            route = self.m.path(at.id, goals, avoid=avoid)
+            if not route:
+                return False, f"no route left from {at.describe()}"
+            sig = route[0]
+            if sig not in w.acts or self.ex.fire(w, at, sig) is None:
+                avoid.add((at.id, sig))
+                if w.cur is None:
+                    return False, f"{at.labels.get(sig, sig)} failed in {at.describe()}"
+        return False, "gave up after too many steps"
+
     def trace_of(self, s: UiState) -> list[str]:
         out, cur = [], self.m.states[0]
         for sig in s.access:
@@ -129,7 +153,7 @@ class ModelCheck:
         return out
 
     def _stopped(self) -> str:
-        return f"exploration stopped at the {self.m.stop}" if self.m.stop else ""
+        return f"exploration is incomplete: {self.m.stop}" if self.m.stop else ""
 
     def _size(self) -> str:
         return f"{len(self.m.states)} states" + ("" if self.m.complete else f", {self._stopped()}")
@@ -182,7 +206,6 @@ class ModelCheck:
             return Outcome("open", "learned model", f"every {len(rel)} relevant state can reach it, but {self._stopped()}", relevant=len(rel))
         # Replay the escape routes the model promises.
         todo = [s for s in sorted(rel, key=lambda s: (s.depth, s.id)) if s.id not in goals][: self.witnesses]
-        routes = {s.id: self.m.path(s.id, goals) or [] for s in todo}
         queue = list(reversed(todo))
         failed: list[tuple[UiState, str]] = []
 
@@ -192,10 +215,10 @@ class ModelCheck:
                     if not queue or failed:
                         return
                     s = queue.pop()
-                snap, _, why = self.replay(s.access + routes[s.id], w)
-                if snap is None or not p.goal.eval(snap, self.m.home):
+                ok, why = self.reach(s, goals, p.goal, w)
+                if not ok:
                     with self.ex.lock:
-                        failed.append((s, why or "ended elsewhere"))
+                        failed.append((s, why))
 
         self.ex._pool(work)
         if failed:
@@ -295,21 +318,28 @@ class ModelCheck:
         after = value_of(n2) if n2 is not None else None
         if after is None or after == before:
             return Outcome("open", "tested", f"{what} did not change its value ({before!r})", trace=done + [what], viewport=self.m.viewport)
+        back: list[str] = []
         try:
             self.w.d.reopen()
-            self.ex.look(self.w)
+            snap = self.ex.look(self.w)
             self.w.cur = None
-            for sig in s.access:
-                a = self.w.acts.get(sig)
-                if a is None:
-                    raise DriverError(f"after reopening, '{sig}' is not offered")
-                self.w.d.do(a)
-                self.ex.look(self.w)
+            if not _enabled(t, snap):
+                # the app reopens somewhere the model knows: go on from there; else from the start
+                at = self.ex.known(snap, self.w.d)
+                goals = {c.id for c in cands}
+                route = self.m.path(at.id, goals) if at is not None else None
+                for sig in route if route is not None else s.access:
+                    a = self.w.acts.get(sig)
+                    if a is None:
+                        raise DriverError(f"after reopening, '{sig}' is not offered")
+                    back.append(a.label)
+                    self.w.d.do(a)
+                    self.ex.look(self.w)
         except DriverError as e:
-            return Outcome("open", "tested", f"after reopening the app, could not get back to {t}: {e}", trace=done + [what, "reopen the app"], viewport=self.m.viewport)
+            return Outcome("open", "tested", f"after reopening the app, could not get back to {t}: {e}", trace=done + [what, "reopen the app"] + back, viewport=self.m.viewport)
         n3 = next(iter(t.find(self.w.snap)), None) if self.w.snap is not None else None
         again = value_of(n3) if n3 is not None else None
-        steps = done + [what, "reopen the app"] + done
+        steps = done + [what, "reopen the app"] + back
         if again == after:
             return Outcome("proved", "tested", f"changed it ({before} → {after}), reopened the app: still {after}", trace=steps, viewport=self.m.viewport, relevant=1)
         return Outcome(

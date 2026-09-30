@@ -53,3 +53,23 @@ the loop.
 The learned model is in `.telic/ui-model-<viewport>.json` next to the app:
 every state (route, overlays, controls), how to reach it, what was blocked
 and why, and every transition.
+
+## Examples
+
+`examples/ui/` holds two apps written without telic in mind, with their
+lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
+`npm ci` in each, then `telic check examples/ui`.
+
+- **notes-react** (React, React Router, a sign-in form, onboarding, modals):
+  the `controls` abstraction, about 40 states at 390x844 and 55 at
+  1280x800, exploration complete. Escape from every dialog, settings
+  persistence and unobscured Menu/Close buttons all hold.
+- **tasks-svelte** (Svelte 5, hash routing, a sidebar drawer, a task drawer,
+  confirm dialogs, focus mode, a cookie banner): telling controls apart
+  gives more than 100 states (filters, forms, the banner multiply), so the
+  model is over screens: about 25 and 15 states, complete. telic finds a
+  real defect: at 390x844 the cookie banner covers the sidebar's Settings
+  link, and the trace is one click (`Open sidebar`), replayed.
+
+A first run takes a few minutes per app (both viewports side by side, three
+browsers each); later runs reuse the verdicts until a source file changes.

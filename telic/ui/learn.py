@@ -27,20 +27,24 @@ from typing import Callable
 
 from .driver import Driver, DriverError
 from .spec import Pred
-from .tree import Action, Snapshot, actions, bucket, controls
+from .tree import LANDMARKS, Action, Snapshot, actions, bucket, controls
 
 RESET_COST = 3  # a fresh start costs about as much as this many actions
 
 
 @dataclass
 class Settings:
-    max_states: int = 150
-    max_depth: int = 12
-    max_seconds: float = 300.0
+    max_states: int = 300
+    max_depth: int = 30
+    max_seconds: float = 600.0
     walks: int = 10
     walk_length: int = 0  # 0: two more than the deepest state
     workers: int = 3  # browsers per viewport
     text: str = "telic"
+    fill: tuple[tuple[str, str], ...] = ()  # (name regex, value) tried before the built-in guesses
+    # "controls": a state is the screen, overlays, controls and lists; "screens": only
+    # the screen, overlays, open menus and the lemmas' predicates (smaller, less exact)
+    abstraction: str = "auto"  # auto: controls, or screens when controls exceed a budget
     keys: tuple[str, ...] = ("Escape",)
     ignore: tuple[str, ...] = ()
     seed: int = 0
@@ -60,6 +64,7 @@ class UiState:
     fired: set[str] = field(default_factory=set)
     blocked: dict[str, str] = field(default_factory=dict)
     body: dict = field(default_factory=dict)  # what the key is a hash of
+    history: list[str] = field(default_factory=list)  # the actions that first led here
 
     def describe(self) -> str:
         s = f"screen {self.screen}"
@@ -71,6 +76,7 @@ class UiState:
 @dataclass
 class Model:
     viewport: str
+    abstraction: str = "controls"
     home: str = "/"
     states: list[UiState] = field(default_factory=list)
     trans: dict[int, dict[str, set[int]]] = field(default_factory=dict)
@@ -85,6 +91,7 @@ class Model:
     disagreed: list[str] = field(default_factory=list)
     seeded: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    unreproducible: set[int] = field(default_factory=set)  # seen once, never reached again by any known path
 
     @property
     def transitions(self) -> int:
@@ -99,7 +106,7 @@ class Model:
             for t in ts:
                 yield sig, t
 
-    def path(self, frm: int, goals: set[int], deterministic: bool = False) -> list[str] | None:
+    def path(self, frm: int, goals: set[int], deterministic: bool = False, avoid: set[tuple[int, str]] = frozenset()) -> list[str] | None:
         """Shortest action sequence from ``frm`` to any of ``goals``."""
         if frm in goals:
             return []
@@ -108,7 +115,7 @@ class Model:
         while q:
             s = q.popleft()
             for sig, ts in self.trans.get(s, {}).items():
-                if deterministic and len(ts) > 1:
+                if (deterministic and len(ts) > 1) or (s, sig) in avoid:
                     continue
                 for t in ts:
                     if t in prev:
@@ -169,7 +176,7 @@ class Model:
             **self.summary(),
             "home": self.home,
             "states": [
-                {"id": s.id, "describe": s.describe(), "access": self.labels(s.access), "depth": s.depth, "state": s.body, "blocked": s.blocked, "untried": [a for a in s.actions if a not in s.fired]}
+                {"id": s.id, "describe": s.describe(), "access": self.labels(s.access), "depth": s.depth, "state": s.body, "blocked": s.blocked, "untried": [a for a in s.actions if a not in s.fired], **({"unreproducible": True} if s.id in self.unreproducible else {})}
                 for s in self.states
             ],
             "transitions": [{"from": s, "action": sig, "to": sorted(ts)} for s, m in sorted(self.trans.items()) for sig, ts in sorted(m.items())],
@@ -178,6 +185,7 @@ class Model:
     def summary(self) -> dict:
         return {
             "viewport": self.viewport,
+            "abstraction": self.abstraction,
             "states": len(self.states),
             "transitions": self.transitions,
             "complete": self.complete,
@@ -191,6 +199,7 @@ class Model:
             "disagreed": self.disagreed[:10],
             "nondeterministic": self.nondeterministic,
             "seeded": self.seeded,
+            "unreproducible": len(self.unreproducible),
             "notes": self.notes,
         }
 
@@ -203,6 +212,7 @@ class Worker:
         self.cur: UiState | None = None
         self.snap: Snapshot | None = None
         self.acts: dict[str, Action] = {}
+        self.history: list[str] = []  # everything done since the last fresh start
 
 
 class Explorer:
@@ -221,7 +231,7 @@ class Explorer:
         self.workers = [Worker(d) for d in drivers]
         self.atoms = atoms
         self.s = settings
-        self.model = Model(viewport)
+        self.model = Model(viewport, "screens" if settings.abstraction == "screens" else "controls")
         self.probe = probe
         self.log = log or (lambda _m: None)
         self.by_key: dict[str, UiState] = {}
@@ -235,23 +245,37 @@ class Explorer:
 
     # -- observation ---------------------------------------------------------
 
+    def known(self, snap: Snapshot, d: Driver) -> UiState | None:
+        """The model's state for this observation, if it has one."""
+        with self.lock:
+            return self.by_key.get(self._abstract(snap, d)[0])
+
     def _abstract(self, snap: Snapshot, d: Driver) -> tuple[str, tuple[bool, ...], dict]:
-        acts, groups = actions(snap, text=self.s.text, keys=(), ignore=self.s.ignore, leaves=d.leaves)
+        acts, groups = actions(snap, text=self.s.text, fill=self.s.fill, keys=(), ignore=self.s.ignore, leaves=d.leaves)
         home = self.model.home if self.model.states else snap.screen
         atoms = tuple(p.eval(snap, home) for p in self.atoms)
-        body = {
-            "screen": snap.screen,
-            "overlays": snap.overlays(),
-            "actions": sorted({a.sig for a in acts}),
-            "controls": controls(snap),
-            "groups": {g: bucket(n) for g, n in sorted(groups.items())},
-            "atoms": list(atoms),
-        }
+        if self.s.abstraction == "screens":
+            body = {
+                "screen": snap.screen,
+                "overlays": snap.overlays(),
+                "open": [c for c in controls(snap) if "[expanded]" in c or "[pressed]" in c],
+                "landmarks": sorted({n.label for n in snap.nodes() if n.role in LANDMARKS and n.name}),
+                "atoms": list(atoms),
+            }
+        else:
+            body = {
+                "screen": snap.screen,
+                "overlays": snap.overlays(),
+                "actions": sorted({a.sig for a in acts}),
+                "controls": controls(snap),
+                "groups": {g: bucket(n) for g, n in sorted(groups.items())},
+                "atoms": list(atoms),
+            }
         return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20], atoms, body
 
     def look(self, w: Worker) -> Snapshot:
         snap = w.d.observe()
-        acts, _ = actions(snap, text=self.s.text, keys=self.s.keys, ignore=self.s.ignore, leaves=w.d.leaves)
+        acts, _ = actions(snap, text=self.s.text, fill=self.s.fill, keys=self.s.keys, ignore=self.s.ignore, leaves=w.d.leaves)
         w.snap = snap
         w.acts = {}
         for a in acts:
@@ -266,12 +290,20 @@ class Explorer:
             if st is None:
                 access = (parent.access + [sig]) if parent is not None and sig is not None else []
                 st = UiState(len(self.model.states), key, snap.screen, snap.overlays(), atoms, list(w.acts), {s: a.label for s, a in w.acts.items()}, access, len(access), body=body)
+                # what this worker actually did to get here: the short path can pass
+                # through states that only look the same, so it is the fallback
+                st.history = list(w.history) if parent is not None else []
                 self.model.states.append(st)
                 self.model.trans[st.id] = {}
                 self.by_key[key] = st
                 if st.id == 0:
                     self.model.home = snap.screen
                 new = True
+            else:
+                for sig2, a in w.acts.items():  # a coarse state offers what any visit to it offered
+                    if sig2 not in st.labels:
+                        st.actions.append(sig2)
+                        st.labels[sig2] = a.label
         if new and self.probe is not None:
             self.probe(st, snap, w.d)
         return st
@@ -280,6 +312,7 @@ class Explorer:
 
     def reset(self, w: Worker) -> UiState:
         w.d.reset()
+        w.history = []
         snap = self.look(w)
         st = self._intern(w, snap, None, None)
         with self.lock:
@@ -310,6 +343,7 @@ class Explorer:
             if e.moved:
                 w.cur = None
             return None
+        w.history.append(sig)
         snap = self.look(w)
         t = self._intern(w, snap, s, sig)
         with self.lock:
@@ -335,31 +369,55 @@ class Explorer:
             if p is not None and len(p) < len(target.access) + RESET_COST:
                 if self.follow(w, p) and w.cur is target:
                     return True
-        for _ in range(2):
+        with self.lock:
+            # its own path, twice; then the paths of other transitions into it
+            tries = [target.access, target.history if target.history != target.access else target.access] + [
+                self.model.states[p].access + [sig]
+                for p, m in self.model.trans.items()
+                for sig, ts in m.items()
+                if target.id in ts and self.model.states[p].access + [sig] != target.access
+            ][:3]
+        for path in tries:
             self.reset(w)
-            if self.follow(w, target.access) and w.cur is target:
+            if self.follow(w, path) and w.cur is target:
+                if path is not target.access and len(path) <= len(target.access) + RESET_COST * 3:
+                    with self.lock:
+                        target.access, target.depth = list(path), len(path)
                 return True
         with self.lock:
-            note = f"could not return to {target.describe()} by replaying its path: the app is not deterministic there"
-            if note not in self.model.notes:
-                self.model.notes.append(note)
+            self.model.unreproducible.add(target.id)
         return False
 
     # -- learning --------------------------------------------------------------
 
     def _over(self) -> str:
         if time.monotonic() - self.t0 > self.s.max_seconds:
-            return f"time budget ({self.s.max_seconds:.0f}s)"
+            return f"stopped at the time budget ({self.s.max_seconds:.0f}s)"
         if len(self.model.states) >= self.s.max_states:
-            return f"state budget ({self.s.max_states})"
+            return f"stopped at the state budget ({self.s.max_states})"
         return ""
 
     def _claim(self, w: Worker) -> tuple[UiState, str] | None:
-        """The nearest state with an action nobody has tried or claimed."""
-        todo = [
-            s for s in self.model.states
-            if s.depth < self.s.max_depth and any(a not in s.fired and (s.id, a) not in self.claimed for a in s.actions)
-        ]
+        """A state with an action nobody has tried or claimed: first the
+        first-found variant of each screen (route and open overlays), so a
+        budget buys breadth; among those, the nearest."""
+        def untried(s: UiState) -> str | None:
+            return next((a for a in s.actions if a not in s.fired and (s.id, a) not in self.claimed), None)
+
+        rank: dict[int, int] = {}
+        seen: dict[tuple, int] = {}
+        for x in self.model.states:
+            g = (x.screen, tuple(x.overlays))
+            rank[x.id] = seen.get(g, 0)
+            seen[g] = rank[x.id] + 1
+        # where the worker already is costs nothing, and a state no path reaches again can only be explored from there
+        c = w.cur
+        if c is not None and c.depth < self.s.max_depth and (rank[c.id] == 0 or c.id in self.model.unreproducible):
+            sig = untried(c)
+            if sig is not None:
+                self.claimed.add((c.id, sig))
+                return c, sig
+        todo = [s for s in self.model.states if s.depth < self.s.max_depth and s.id not in self.model.unreproducible and untried(s) is not None]
         if not todo:
             return None
         dist: dict[int, int] = {}
@@ -374,7 +432,7 @@ class Explorer:
                         if t not in dist:
                             dist[t] = dist[x] + 1
                             q.append(t)
-        s = min(todo, key=lambda s: (dist.get(s.id, len(s.access) + RESET_COST), s.depth, s.id))
+        s = min(todo, key=lambda s: (rank[s.id], dist.get(s.id, len(s.access) + RESET_COST), s.depth, s.id))
         sig = next(a for a in s.actions if a not in s.fired and (s.id, a) not in self.claimed)
         self.claimed.add((s.id, sig))
         return s, sig
@@ -401,7 +459,6 @@ class Explorer:
 
     def explore(self) -> None:
         busy = [0]
-        gave_up: set[int] = set()
 
         def work(w: Worker) -> None:
             while True:
@@ -420,15 +477,8 @@ class Explorer:
                     continue
                 s, sig = got
                 try:
-                    if s.id not in gave_up and self.goto(w, s):
+                    if w.cur is s or (s.id not in self.model.unreproducible and self.goto(w, s)):
                         self.fire(w, s, sig)
-                    else:
-                        with self.lock:
-                            gave_up.add(s.id)
-                            for a in s.actions:
-                                if a not in s.fired:
-                                    s.fired.add(a)
-                                    s.blocked[a] = "state could not be reached again"
                 finally:
                     with self.lock:
                         self.claimed.discard((s.id, sig))
@@ -509,9 +559,12 @@ class Explorer:
             self.explore()
             if self.model.stop or not self.s.walks or r == rounds or not self.conform():
                 break
-        pending = sum(1 for s in self.model.states for a in s.actions if a not in s.fired)
+        pending = sum(1 for s in self.model.states if s.id not in self.model.unreproducible for a in s.actions if a not in s.fired)
         if not self.model.stop and pending:
-            self.model.stop = f"depth bound ({self.s.max_depth})"
+            self.model.stop = f"stopped at the depth bound ({self.s.max_depth})"
+        if not self.model.stop and self.model.unreproducible:
+            n = len(self.model.unreproducible)
+            self.model.stop = f"{n} state{'s' * (n != 1)} seen once that no known path reaches again (the app is not deterministic there)"
         self.model.complete = not self.model.stop
         self.model.seconds = time.monotonic() - self.t0
         return self.model

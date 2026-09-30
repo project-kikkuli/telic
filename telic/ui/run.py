@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +21,7 @@ from .driver import DriverError
 from .spec import SKIP_DIRS, SOURCE_EXT, Scan, UiDecl, UiLemma
 
 CACHE = os.path.join(".telic", "ui.json")
+AUTO_STATES = 100
 VERSION = 1
 
 
@@ -225,22 +226,34 @@ def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds,
             d.start()
             d.viewport(w, h)
         occluding = [lem for lem in lems if lem.prop and lem.prop.kind == "unobscured"]
-        occl = {lem.name: Occlusion() for lem in occluding}
-        holder: list[Explorer] = []
 
-        def probe(state, snap, driver):
-            for lem in occluding:
-                p = lem.prop
-                if not p.cond.eval(snap, holder[0].model.home):
-                    continue
-                n, bad = hit_test(driver, p.goal, snap)
-                occl[lem.name].rendered[state.id] = n
-                if n and bad:
-                    occl[lem.name].covered[state.id] = bad
+        def learn(settings):
+            occl = {lem.name: Occlusion() for lem in occluding}
+            holder: list[Explorer] = []
 
-        ex = Explorer(drivers, atoms.preds, cfg.settings, vp, probe, lambda m: log(f"{vp}: {m}"))
-        holder.append(ex)
-        model = ex.learn(seeds)
+            def probe(state, snap, driver):
+                for lem in occluding:
+                    p = lem.prop
+                    if not p.cond.eval(snap, holder[0].model.home):
+                        continue
+                    n, bad = hit_test(driver, p.goal, snap)
+                    occl[lem.name].rendered[state.id] = n
+                    if n and bad:
+                        occl[lem.name].covered[state.id] = bad
+
+            ex = Explorer(drivers, atoms.preds, settings, vp, probe, lambda m: log(f"{vp}: {m}"))
+            holder.append(ex)
+            return ex, ex.learn(seeds), occl
+
+        s = cfg.settings
+        if s.abstraction == "auto":
+            # the exact abstraction when the app is small enough for it; else screens
+            ex, model, occl = learn(replace(s, abstraction="controls", max_states=min(s.max_states, AUTO_STATES)))
+            if "state budget" in model.stop:
+                ex, model, occl = learn(replace(s, abstraction="screens", max_seconds=max(1.0, s.max_seconds - model.seconds)))
+                model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
+        else:
+            ex, model, occl = learn(s)
         dialogs = sum(d.dialogs for d in drivers)
         if dialogs:
             model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
@@ -248,10 +261,7 @@ def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds,
         mc = ModelCheck(ex, atoms, occl, cfg.witnesses)
         got: dict[str, Outcome] = {}
         for lem in lems:
-            if lem.prop.kind != "persists":
-                got[lem.name] = mc.check(lem)
-            elif i == 0:
-                got[lem.name] = mc.persists(lem)
+            got[lem.name] = mc.persists(lem) if lem.prop.kind == "persists" else mc.check(lem)
         return model.summary(), got
     finally:
         for d in drivers:

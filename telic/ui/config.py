@@ -5,8 +5,8 @@
     build = "npm run build"                    #  or: url = "http://..." (already running)
     url = "http://127.0.0.1:{port}/"           # with static: the path to open, e.g. "/app/"
     viewports = ["390x844", "1280x800"]
-    max_states = 150
-    max_depth = 12
+    max_states = 300
+    max_depth = 30
 
 The nearest ``telic.toml`` with a ``[ui]`` section above a lemma's file is
 the app that lemma is about.
@@ -95,7 +95,7 @@ def load(path: str, root: str) -> UiConfig:
         raise ConfigError(f"{os.path.relpath(path, root)} has no [ui] section")
     known = {
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
-        "walk_length", "workers", "text", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms",
+        "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms",
     }
     unknown = sorted(set(ui) - known)
     if unknown:
@@ -114,6 +114,14 @@ def load(path: str, root: str) -> UiConfig:
         s.keys = tuple(str(k) for k in ui["keys"])
     if "ignore" in ui:
         s.ignore = tuple(str(k) for k in ui["ignore"])
+    if "abstraction" in ui:
+        if ui["abstraction"] not in ("auto", "controls", "screens"):
+            raise ConfigError(f"{os.path.relpath(path, root)}: [ui] abstraction is \"auto\" (the default), \"controls\" or \"screens\"")
+        s.abstraction = ui["abstraction"]
+    if "fill" in ui:
+        if not isinstance(ui["fill"], dict):
+            raise ConfigError(f"{os.path.relpath(path, root)}: [ui] fill is a table of field-name regex = value, e.g. fill = {{ Email = \"me@example.com\" }}")
+        s.fill = tuple((str(k), str(v)) for k, v in ui["fill"].items())
     cfg = UiConfig(
         dir=os.path.dirname(os.path.abspath(path)),
         path=os.path.relpath(path, root),

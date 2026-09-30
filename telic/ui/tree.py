@@ -17,8 +17,31 @@ INTERACTIVE = {
 }
 OVERLAYS = {"dialog", "alertdialog", "menu"}
 ITEMS = {"listitem", "row", "article", "treeitem"}
+LANDMARKS = {"banner", "complementary", "contentinfo", "form", "main", "navigation", "region", "search"}
 TEXT_ENTRY = {"textbox", "searchbox"}
+LIVE = {"status", "alert", "log", "marquee", "timer"}  # announcements: transient, not part of the state
+# What a person would type into a field, by its name (checked before the fallback text).
+FILL = (
+    (r"e-?mail", "telic@example.com"),
+    (r"pass(word|phrase|code)?\b|\bpin\b", "Telic-pass-123"),
+    (r"phone|mobile|\btel\b", "5550100"),
+    (r"\burl\b|website|homepage", "https://example.com"),
+    (r"\bdate\b|\bdue\b|birthday|deadline", "2030-01-15"),
+    (r"\btime\b", "09:30"),
+    (r"\bzip\b|postal", "94103"),
+    (r"amount|price|\bqty\b|quantity|\bnumber\b|\bage\b|\bcount\b", "3"),
+)
+
+
+def fill_value(name: str, overrides: tuple[tuple[str, str], ...] = (), default: str = "telic") -> str:
+    for pat, v in tuple(overrides) + FILL:
+        if re.search(pat, name, re.I):
+            return v
+    return default
 STATE_WORDS = ("checked", "mixed", "disabled", "expanded", "selected", "pressed")
+# States that change what the user can do next. Which box is checked or which
+# option is chosen is data (like typed text): a lemma that cares names it.
+STRUCTURAL = ("disabled", "expanded", "pressed")
 
 
 @dataclass
@@ -30,6 +53,7 @@ class Node:
     ref: str | None = None  # the driver's handle, valid for the snapshot it came from
     url: str | None = None
     pointer: bool = False  # a generic element the pointer can click (no role, but a click handler)
+    form: str | None = None  # for a text field in a form: the form's submit control ("" if Enter submits)
     children: list["Node"] = field(default_factory=list)
 
     def walk(self):
@@ -78,13 +102,21 @@ def _q(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
-def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), ignore: tuple[str, ...] = (), leaves=None) -> tuple[list[Action], dict[str, int]]:
+def _data(name: str) -> str:
+    """A name with its numbers blanked: 'All tasks 5' and 'All tasks 6' are one control."""
+    return re.sub(r"\d+", "#", name)
+
+
+def actions(
+    snap: Snapshot, *, text: str = "telic", fill: tuple[tuple[str, str], ...] = (), keys: tuple[str, ...] = (), ignore: tuple[str, ...] = (), leaves=None
+) -> tuple[list[Action], dict[str, int]]:
     """What a user can do in this state, and the repeated item groups seen
     (``list "Notes" › listitem`` -> how many). Only the first item of a group
     is acted on: the rest behave alike, and acting on each would make every
     list length a new state."""
     out: list[Action] = []
     groups: dict[str, int] = {}
+    containers: dict[str, int] = {}  # two unnamed lists are 'list' and 'list #2'
 
     def add(n: Node, sig: str, where: str) -> None:
         name = f" {_q(n.name)}" if n.name else ""
@@ -92,10 +124,11 @@ def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), 
         if any(re.search(p, what) or re.search(p, sig) for p in ignore):
             return
         if n.role in TEXT_ENTRY or (n.role == "combobox" and not any(c.role == "option" for c in n.children)):
-            out.append(Action("fill", "fill " + sig, f"type {_q(text)} into {what}{where}", n.ref, text))
+            v = fill_value(n.name, fill, text)
+            out.append(Action("fill", "fill " + sig, f"type {_q(v)} into {what}{where}", n.ref, v))
         elif n.role == "combobox":
             for o in n.children:
-                if o.role == "option" and "selected" not in o.states and "disabled" not in o.states:
+                if o.role == "option" and "disabled" not in o.states:
                     out.append(Action("select", f"select {sig} = {_q(o.name)}", f"choose {_q(o.name)} in {what}{where}", n.ref, o.name))
         elif n.role in ("slider", "spinbutton"):
             out.append(Action("press", f"increase {sig}", f"increase {what}{where}", n.ref, "ArrowRight" if n.role == "slider" else "ArrowUp"))
@@ -103,7 +136,11 @@ def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), 
             out.append(Action("click", sig, f"click {what}{where}", n.ref))
 
     def visit(n: Node, item: str | None, first: bool, pos: dict[str, int], seen: dict[str, int]) -> None:
+        if n.role in LIVE:
+            return
         interactive = (n.role in INTERACTIVE or n.pointer) and n.ref is not None and n.role != "option"
+        if interactive and n.role in TEXT_ENTRY and n.form is not None:
+            return
         if interactive and "disabled" not in n.states and not (n.url is not None and leaves is not None and leaves(n)):
             role = n.role if not n.pointer or n.role in INTERACTIVE else "clickable"
             shown = n if role != "clickable" else Node("clickable", n.text()[:60], ref=n.ref)
@@ -113,7 +150,7 @@ def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), 
                 if first:
                     add(shown, sig, " in the first " + item.split(" › ")[-1])
             else:
-                sig = f"{role} {_q(shown.name)}" if shown.name else role
+                sig = f"{role} {_q(_data(shown.name))}" if shown.name else role
                 seen[sig] = seen.get(sig, 0) + 1
                 if seen[sig] > 1:
                     sig += f" #{seen[sig]}"
@@ -124,9 +161,14 @@ def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), 
             add(n, sig, "")
             return
         kinds: dict[str, int] = {}
+        here = ""
         for c in n.children:
             if c.role in ITEMS and item is None:
-                gsig = f"{n.label} › {c.role}"
+                if not here:
+                    base = f"{n.role} {_q(_data(n.name))}" if n.name else n.role
+                    containers[base] = containers.get(base, 0) + 1
+                    here = base + (f" #{containers[base]}" if containers[base] > 1 else "")
+                gsig = f"{here} › {c.role}"
                 k = kinds.get(c.role, 0)
                 kinds[c.role] = k + 1
                 groups[gsig] = kinds[c.role]
@@ -134,7 +176,28 @@ def actions(snap: Snapshot, *, text: str = "telic", keys: tuple[str, ...] = (), 
             else:
                 visit(c, item, first, pos, seen)
 
+    forms: dict[str, list[Node]] = {}
+
+    def visit_fields(n: Node, item: bool) -> None:
+        for c in n.children:
+            if c.role in LIVE:
+                continue
+            if c.role in TEXT_ENTRY and c.form is not None and c.ref is not None and "disabled" not in c.states and not item:
+                forms.setdefault(c.form, []).append(c)
+            visit_fields(c, item or c.role in ITEMS)
+
+    visit_fields(snap.root, False)
     visit(snap.root, None, True, {}, {})
+    # A form is filled in and sent as one action: what was typed is data, and
+    # half-filled forms would multiply the states for nothing.
+    for submit, fields in forms.items():
+        names = [f.name or f.role for f in fields]
+        if any(re.search(p, "form " + submit) for p in ignore):
+            continue
+        button = next((n for n in snap.nodes() if n.role == "button" and n.name == submit and n.ref is not None), None) if submit else None
+        values = [[f.ref, fill_value(f.name, fill, text)] for f in fields]
+        how = f"click button {_q(submit)}" if button is not None else "press Enter"
+        out.append(Action("form", f"submit form {_q(submit or names[-1])}", f"fill in {', '.join(names)} and {how}", button.ref if button is not None else None, json.dumps(values)))
     for k in keys:
         out.append(Action("key", f"key {k}", f"press {k}", None, k))
     return out, groups
@@ -146,9 +209,13 @@ def controls(snap: Snapshot) -> list[str]:
     out: list[str] = []
 
     def visit(n: Node, in_item: bool) -> None:
+        if n.role in LIVE:
+            return
         if n.role in INTERACTIVE and not in_item and n.role != "option":
-            st = "".join(f"[{s}]" for s in STATE_WORDS if s in n.states)
-            out.append(n.label + st)
+            st = "".join(f"[{s}]" for s in STRUCTURAL if s in n.states)
+            if n.role in TEXT_ENTRY and n.value and n.form is None:
+                st += "[filled]"  # what was typed is data, whether anything was is state
+            out.append(f"{n.role} {_q(_data(n.name))}{st}" if n.name else n.role + st)
             if n.role != "combobox":
                 return
         for c in n.children:
