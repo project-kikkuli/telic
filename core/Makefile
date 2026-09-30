@@ -12,8 +12,10 @@ endif
 W := $(shell $(OCAMLOPT) -where)
 SRC := json.ml term.ml ir.ml vc.ml smt.ml main.ml
 
+# telic refuses a binary whose source_hash.ml does not match the sources
 telic-core: $(SRC)
-	$(OCAMLOPT) -O3 $(PLATFORM_FLAGS) $(OCAMLFLAGS) -I $(W)/unix $(W)/unix/unix.cmxa $(SRC) -o $@
+	printf 'let value = "%s"\n' "$$(cat $(SRC) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)" > source_hash.ml
+	$(OCAMLOPT) -O3 $(PLATFORM_FLAGS) $(OCAMLFLAGS) -I $(W)/unix $(W)/unix/unix.cmxa source_hash.ml $(SRC) -o $@
 
 clean:
-	rm -f *.cm* *.o telic-core
+	rm -f *.cm* *.o telic-core source_hash.ml

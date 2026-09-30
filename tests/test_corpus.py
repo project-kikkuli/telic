@@ -68,3 +68,40 @@ def test_typescript_corpus():
     assert not [p for m in rep.modules for p in m.problems], [p for m in rep.modules for p in m.problems]
     bad = verdict_table(rep, got, expectations(path))
     assert not bad, "\n".join(bad)
+
+
+SUMS = """
+def total(xs: list[int]) -> int:
+    #@ requires all(x >= 0 for x in xs)
+    #@ ensures result >= 0
+    s = 0
+    for x in xs:
+        s += x
+    return s
+
+
+def halve(n: int) -> int:
+    #@ requires n >= 0
+    #@ ensures result * 2 <= n
+    return n // 2 + 1
+"""
+
+
+def test_verdicts_do_not_depend_on_how_fast_the_solver_runs(tmp_path, monkeypatch):
+    import time
+
+    import z3
+
+    (tmp_path / "sums.py").write_text(SUMS)
+
+    def verdicts():
+        rep = check([str(tmp_path / "sums.py")], CheckOptions(cache_path=None, lean=False, replay=False), root=str(tmp_path))
+        return {f.fn.name: (f.status, sorted((v.ob.id, v.status) for v in f.verdicts)) for f in rep.functions}
+
+    fast = verdicts()
+    assert fast["total"][0] == "proved" and fast["halve"][0] == "refuted"
+    # a loaded machine: stating the problem and solving it both take longer
+    add, check_sat = z3.Solver.add, z3.Solver.check
+    monkeypatch.setattr(z3.Solver, "add", lambda self, *a: (time.sleep(0.1), add(self, *a))[1])
+    monkeypatch.setattr(z3.Solver, "check", lambda self, *a: (time.sleep(1), check_sat(self, *a))[1])
+    assert verdicts() == fast

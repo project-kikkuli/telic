@@ -284,6 +284,37 @@ def test_budgets_make_the_model_incomplete_and_verdicts_open():
     assert {k: o.status for k, o in got.items()} == {"esc": "open", "n": "open", "t": "open", "u": "open"}
 
 
+class JitteryApp(FakeApp):
+    """A FakeApp whose actions take a random while, as a loaded browser's do."""
+
+    def __init__(self, screens, rng, **kw):
+        super().__init__(screens, **kw)
+        self.rng = rng
+
+    def do(self, a):
+        import time
+
+        time.sleep(self.rng.random() / 200)
+        super().do(a)
+
+
+@pytest.mark.parametrize("budget", [100, 12])
+def test_the_model_does_not_depend_on_which_browser_is_quicker(budget):
+    import random
+
+    grid = {f"{r}{c}": (None, {"Right": f"{r}{min(c + 1, 3)}", "Down": f"{min(r + 1, 3)}{c}", "Home": "00"}) for r in range(4) for c in range(4)}
+
+    def run(jitter):
+        rng = random.Random(jitter)
+        apps = [JitteryApp(grid, rng, start="00") for _ in range(3)]
+        m = Explorer(apps, [], Settings(keys=(), workers=3, max_states=budget, walks=6), "fake").learn()
+        return {k: v for k, v in m.dump().items() if k != "seconds"}
+
+    first = run(1)
+    assert len(first["states"]) == 16 if budget > 16 else "state budget" in first["stop"]
+    assert all(run(j) == first for j in (2, 3))
+
+
 # ---------------------------------------------------------------------------
 # The fixture web app in a real browser
 

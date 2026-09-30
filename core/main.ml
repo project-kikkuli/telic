@@ -1,7 +1,7 @@
 (* telic-core: the native verification engine.
 
    stdin:  {"modules": [...], "program": {...}, "theory": {...}, "tasks": [...],
-            "timeout_ms": N, "jobs": N, "salt": S, "cached": [key, ...]}
+            "timeout_ms": N, "rlimit": N, "jobs": N, "salt": S, "cached": [key, ...]}
    stdout: {"results": [...], "terms": {"sorts": [...], "terms": [...]}}
 
    VC generation runs on the main domain; obligations are solved on up to
@@ -102,18 +102,18 @@ let rec wterm w (t : term) =
 
 let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.Int l.end_col ]
 
-type job = { ob : Vc.obligation; neg_goal : term; phases : (Smt.fundef list * Smt.axiom list * int) list; probes : (string * Vc.value) list; state_consts : term list }
+type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; phases : (Smt.fundef list * Smt.axiom list * int) list; probes : (string * Vc.value) list; state_consts : term list }
 
 let solve_job z (jb : job) : Smt.result =
   let t0 = Unix.gettimeofday () in
   let rec go = function
     | [] -> { Smt.status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "no phases" }
-    | (defs, axioms, timeout) :: rest -> (
+    | (defs, axioms, rlimit) :: rest -> (
       let text = Smt.script defs axioms jb.ob.hyps jb.neg_goal in
       (match Sys.getenv_opt "TELIC_CORE_DUMP" with
-       | Some dir -> Out_channel.with_open_text (Filename.concat dir (String.map (fun c -> if c = '/' || c = '>' || c = '#' then '_' else c) jb.ob.oid ^ Printf.sprintf ".%d.smt2" timeout)) (fun oc -> output_string oc text)
+       | Some dir -> Out_channel.with_open_text (Filename.concat dir (String.map (fun c -> if c = '/' || c = '>' || c = '#' then '_' else c) jb.ob.oid ^ Printf.sprintf ".%d.smt2" rlimit)) (fun oc -> output_string oc text)
        | None -> ());
-      let ans, err = try Smt.check z ~timeout_ms:timeout text with Smt.Timeout -> ("unknown", "timeout") in
+      let ans, err = try Smt.check z ~timeout_ms:jb.wall_ms ~rlimit text with Smt.Timeout -> ("unknown", "timeout") in
       match ans with
       | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
       | "sat" ->
@@ -155,12 +155,13 @@ let solve_job z (jb : job) : Smt.result =
   in
   go jb.phases
 
-let make_job th timeout (ob : Vc.obligation) =
+(* [budget]: the wall-clock safety net and the resource limit *)
+let make_job th (wall_ms, rlimit) (ob : Vc.obligation) =
   let terms_ = ob.hyps @ [ ob.goal ] in
   let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
   let phases =
-    if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, timeout) ]
-    else [ (fst without, snd without, max 300 (min 800 (timeout / 10))); (fst with_l, snd with_l, timeout) ]
+    if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, rlimit) ]
+    else [ (fst without, snd without, rlimit / 10); (fst with_l, snd with_l, rlimit) ]
   in
   let input_consts = List.concat_map (fun (_, v) -> Vc.flatten v) ob.inputs in
   let state_consts =
@@ -171,7 +172,7 @@ let make_job th timeout (ob : Vc.obligation) =
            && (match c.node with Const n -> not (String.contains n '!') | _ -> false)
            && match c.sort with Array _ | Rec _ -> false | _ -> true)
   in
-  { ob; neg_goal = not_ ob.goal; phases; probes = ob.inputs; state_consts }
+  { ob; neg_goal = not_ ob.goal; wall_ms; phases; probes = ob.inputs; state_consts }
 
 (* A job's cache key: a structural digest of everything the solver sees
    (definitions, axioms, hypotheses, goal) and [salt] (the toolchain), so it
@@ -263,7 +264,7 @@ type itask = {
 
 let max_rounds = 8
 
-let infer prog th jobs_n timeout (tasks : itask list) =
+let infer prog th jobs_n budget (tasks : itask list) =
   let gen (t : itask) opts = match Vc.run (Vc.make prog t.iinfo opts) with obs -> Ok obs | exception Vc.Vc_error _ -> Error `Vc | exception Vc.Fallback w -> Error (`Fallback w) in
   let fallback t w = t.istatus <- "fallback"; t.why <- w in
   (* 1. Houdini: failing candidates drop out; a function goes round again only if something of it failed *)
@@ -279,7 +280,7 @@ let infer prog th jobs_n timeout (tasks : itask list) =
             | Ok obs -> Some (t, List.filter (fun (o : Vc.obligation) -> (o.kind = "inv.entry" || o.kind = "inv.step") && match o.clause with Some c -> c.inferred | None -> false) obs))
           only
       in
-      let jobs = Array.of_list (List.concat_map (fun (_, obs) -> List.map (make_job th timeout) obs) batch) in
+      let jobs = Array.of_list (List.concat_map (fun (_, obs) -> List.map (make_job th budget) obs) batch) in
       let res = solve_parallel jobs_n jobs in
       let failed = Hashtbl.create 64 in
       Array.iteri (fun i (jb : job) -> if res.(i).status <> "proved" then match jb.ob.clause with Some c -> Hashtbl.replace failed (Obj.repr c) () | None -> ()) jobs;
@@ -319,7 +320,7 @@ let infer prog th jobs_n timeout (tasks : itask list) =
             (sites t))
       tasks;
     let entries = List.rev !entries in
-    let jobs = Array.of_list (List.concat_map (fun (_, _, _, obs) -> match obs with Some obs -> List.map (make_job th timeout) obs | None -> []) entries) in
+    let jobs = Array.of_list (List.concat_map (fun (_, _, _, obs) -> match obs with Some obs -> List.map (make_job th budget) obs | None -> []) entries) in
     let res = solve_parallel jobs_n jobs in
     let pos = ref 0 in
     let decided = Hashtbl.create 16 in
@@ -356,6 +357,7 @@ let t_start = Unix.gettimeofday ()
 let phase name = if debug then Printf.eprintf "phase %s: %.2fs\n%!" name (Unix.gettimeofday () -. t_start)
 
 let () =
+  if Array.length Sys.argv > 1 && Sys.argv.(1) = "--source-hash" then (print_endline Source_hash.value; exit 0);
   let input = In_channel.input_all stdin in
   let req = Json.parse input in
   phase "parse";
@@ -439,7 +441,8 @@ let () =
   let by_name = Hashtbl.create 64 in
   List.iter (fun (c : Vc.classinfo) -> if not (Hashtbl.mem by_name c.cname) then Hashtbl.add by_name c.cname c) classes;
   let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap; by_name; hkeys = Hashtbl.create 256 } in
-  let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 8000 in
+  let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 60000 in
+  let budget = (timeout, match Json.member "rlimit" req with Json.Int r -> r | _ -> 2_000_000) in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
   if Json.member "mode" req = Json.String "infer" then begin
     let by_line f j = match j with Json.Assoc kvs -> List.map (fun (l, xs) -> (int_of_string l, List.map f (Json.to_list xs))) kvs | _ -> [] in
@@ -463,7 +466,7 @@ let () =
     in
     (* remember candidate positions: survivors are reported by index *)
     let original = List.map (fun t -> (t.ikey, t.cands)) tasks in
-    infer prog th jobs_n timeout tasks;
+    infer prog th jobs_n budget tasks;
     let res =
       List.map
         (fun t ->
@@ -511,7 +514,7 @@ let () =
       match Vc.run g with
       | obs ->
         let jobs =
-          List.map (make_job th timeout) obs
+          List.map (make_job th budget) obs
         in
         all_jobs := List.rev_append jobs !all_jobs;
         results := (key, `Ok (g, jobs)) :: !results

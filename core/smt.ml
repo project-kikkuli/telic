@@ -205,7 +205,7 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
       add (Printf.sprintf "(declare-datatypes ((%s 0)) (((%s %s))))" (q_rec n) (q_mk n) fields))
     (List.rev !recs);
   List.iter (fun c -> match c.node with Const n -> add (Printf.sprintf "(declare-const %s %s)" (q_const n) (sort_smt c.sort)) | _ -> ()) (List.rev !consts);
-  Hashtbl.iter (fun sym (args, r) -> add (Printf.sprintf "(declare-fun %s (%s) %s)" sym (String.concat " " (List.map sort_smt args)) (sort_smt r))) ufs;
+  Hashtbl.fold (fun sym sg acc -> (sym, sg) :: acc) ufs [] |> List.sort compare |> List.iter (fun (sym, (args, r)) -> add (Printf.sprintf "(declare-fun %s (%s) %s)" sym (String.concat " " (List.map sort_smt args)) (sort_smt r)));
   let p = { buf = b; names = Hashtbl.create 64 } in
   if defs <> [] then begin
     Buffer.add_string b "(define-funs-rec (";
@@ -339,10 +339,12 @@ let rec value_json (sort : sort) (v : sx) : Json.t =
 
 (* -- a z3 process -------------------------------------------------------------- *)
 
-(* z3 bounds check-sat by :timeout but not the rewriting it does while
-   reading assertions (a recursive definition applied to literals unfolds
-   there forever), so every exchange has a wall-clock deadline: past it the
-   process is killed and replaced, and the exchange raises [Timeout]. *)
+(* The proof budget is z3's :rlimit, so a verdict does not depend on the
+   machine's load. z3 does not bound the rewriting it does while reading
+   assertions by it (a recursive definition applied to literals unfolds there
+   forever), so every exchange also has a wall-clock deadline, a safety net:
+   past it the process is killed and replaced, and the exchange raises
+   [Timeout]. *)
 type z3 = { mutable inp : out_channel; mutable fd : Unix.file_descr; mutable pid : int; pending : Buffer.t; mutable budget_ms : int }
 
 exception Timeout
@@ -397,8 +399,7 @@ let rec input_line_by z deadline =
 let marker = "telic-sync-7f3a"
 
 let exchange z (cmds : string) : string list =
-  (* stating the problem and solving it get [budget_ms] each, so a slow
-     statement never eats into the solver's own timeout *)
+  (* stating the problem and solving it get [budget_ms] each *)
   let deadline = Unix.gettimeofday () +. (2. *. float_of_int z.budget_ms /. 1000.) +. 0.5 in
   send z cmds;
   send z (Printf.sprintf "(echo \"%s\")" marker);
@@ -417,9 +418,11 @@ let close z = (try send z "(exit)" with _ -> ()); (try ignore (Unix.waitpid [] z
 type result = { status : string; seconds : float; model : (string * Json.t) list; state : (string * Json.t) list; reason : string }
 
 (* Check one script; on sat, evaluate [probe] terms (inputs etc.). *)
-let check z ~timeout_ms (text : string) =
+let seed = 0
+
+let check z ~timeout_ms ~rlimit (text : string) =
   z.budget_ms <- timeout_ms;
-  let out = exchange z (Printf.sprintf "(reset)\n(set-option :timeout %d)\n%s\n(check-sat)" timeout_ms text) in
+  let out = exchange z (Printf.sprintf "(reset)\n(set-option :random-seed %d)\n(set-option :rlimit %d)\n%s\n(check-sat)" seed rlimit text) in
   let out = List.filter (fun l -> String.trim l <> "") out in
   let errors = List.filter (fun l -> String.length l > 6 && String.sub (String.trim l) 0 6 = "(error") out in
   (* any error means z3 did not see the whole problem: its answer is void *)
@@ -455,5 +458,12 @@ let term_text (t : term) =
   pr p t;
   Buffer.contents p.buf
 
+let contains s sub =
+  let n = String.length s and m = String.length sub in
+  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+  go 0
+
+(* the wall-clock net raises [Timeout], so a cancel here is the rlimit *)
 let reason_unknown z =
-  match parse_sx (read_answer_lines (exchange z "(get-info :reason-unknown)")) with [ Sx [ _; Str r ] ] -> r | [ Sx [ _; Atom r ] ] -> r | _ -> "unknown"
+  let r = match parse_sx (read_answer_lines (exchange z "(get-info :reason-unknown)")) with [ Sx [ _; Str r ] ] -> r | [ Sx [ _; Atom r ] ] -> r | _ -> "unknown" in
+  if contains r "canceled" || contains r "resource limit" then "resource limit" else r

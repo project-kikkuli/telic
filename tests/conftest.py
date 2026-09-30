@@ -24,7 +24,7 @@ def run_check(tmp_path, files: dict[str, str], **kw):
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
-    opts = CheckOptions(timeout_ms=kw.pop("timeout_ms", 8000), cache_path=None, **kw)
+    opts = CheckOptions(cache_path=None, **kw)
     return check([str(tmp_path / n) for n in files], opts, root=str(tmp_path))
 
 

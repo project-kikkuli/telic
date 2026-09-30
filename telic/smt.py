@@ -29,7 +29,7 @@ class Theory:
         seen_ax: set[str] = set()
         while todo:
             t = todo.pop()
-            for name in L.fns(t):
+            for name in sorted(L.fns(t)):
                 if name in need:
                     continue
                 need.add(name)
@@ -57,8 +57,8 @@ class SmtResult:
 
 
 class Z3Encoder:
-    def __init__(self, theory_defs: list[L.FunDef]):
-        self.ctx = z3.Context()
+    def __init__(self, theory_defs: list[L.FunDef], rlimit: int = 0):
+        self.ctx = z3.Context(rlimit=rlimit)
         self.consts: dict[L.Const, z3.ExprRef] = {}
         self.funcs: dict[str, z3.FuncDeclRef] = {}
         self.datatypes: dict[str, Any] = {}
@@ -480,7 +480,14 @@ def unchecked_json(enc: Z3Encoder, model: z3.ModelRef, t: L.Term, depth: int) ->
     return None
 
 
-def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
+# The proof budget is Z3's resource limit, not time: the same obligation gets
+# the same verdict on a loaded machine. It covers stating the problem, solving
+# it and reading a model; wall-clock time is only a safety net.
+RLIMIT = 2_000_000
+SEED = 0
+
+
+def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int = RLIMIT) -> SmtResult:
     """Two phases. Theory lemmas are consequences of the definitions, so a
     model found without them is a genuine model; but their quantifiers can
     stop Z3 from finding models at all. So: first without them (fast, good
@@ -490,20 +497,20 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
     with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
     if len(with_lemmas[1]) == len(without[1]):
-        return _solve(ob, with_lemmas, timeout_ms, t0)
-    # Phase one only needs long enough to find a model or a quick proof;
+        return _solve(ob, with_lemmas, timeout_ms, rlimit, t0)
+    # Phase one only needs enough to find a model or a quick proof;
     # quantified lemmas are what unlock the rest.
-    first = _solve(ob, without, max(300, min(800, timeout_ms // 10)), t0)
-    if first.status != "unknown":
+    first = _solve(ob, without, timeout_ms, rlimit // 10, t0)
+    if first.status != "unknown" or first.reason.startswith("timeout"):
         return first
-    second = _solve(ob, with_lemmas, timeout_ms, t0)
-    return second
+    return _solve(ob, with_lemmas, timeout_ms, rlimit, t0)
 
 
 class _Deadline:
-    """Interrupts a Z3 context after ``ms``: Z3's rewriter unfolds a recursive
-    definition applied to literals while an assertion is added or a model
-    value is read, and the solver's own timeout covers neither."""
+    """Interrupts a Z3 context after ``ms``: the safety net for a machine too
+    loaded to exhaust the resource limit in time, and for Z3's rewriter, which
+    unfolds a recursive definition applied to literals while an assertion is
+    added without checking the limit."""
 
     def __init__(self, ctx: z3.Context, ms: int):
         self.fired = False
@@ -524,12 +531,13 @@ class _Deadline:
         return self.fired and isinstance(exc, Exception)  # whatever the interrupt cut short
 
 
-def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
+def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> SmtResult:
     terms = list(ob.hyps) + [ob.goal]
     defs, axioms = closure
-    enc = Z3Encoder(defs)
+    enc = Z3Encoder(defs, rlimit)
     s = z3.Solver(ctx=enc.ctx)
-    # Stating the problem has its own budget, so the solver keeps all of its own.
+    s.set("random_seed", SEED)
+    # Each stage gets the whole net, so a slow statement never eats into solving.
     try:
         with _Deadline(enc.ctx, timeout_ms) as d:
             for ax in axioms:
@@ -539,10 +547,13 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
             s.add(z3.Not(enc.term(ob.goal)))
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
-        s.set("timeout", timeout_ms)
-        r = s.check()
+        with _Deadline(enc.ctx, timeout_ms) as d:
+            r = s.check()
+        if d.fired:
+            return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
     except z3.Z3Exception as e:
-        return SmtResult("unknown", time.perf_counter() - t0, reason=f"z3 error: {e}")
+        why = _unknown_reason(str(e))
+        return SmtResult("unknown", time.perf_counter() - t0, reason=why if why == "resource limit" else f"z3 error: {e}")
     dt = time.perf_counter() - t0
     if r == z3.unsat:
         return SmtResult("proved", dt)
@@ -552,7 +563,12 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout reading the model")
         return res
-    return SmtResult("unknown", dt, reason=s.reason_unknown() or "unknown")
+    return SmtResult("unknown", dt, reason=_unknown_reason(s.reason_unknown()))
+
+
+def _unknown_reason(why: str) -> str:
+    # our own interrupt is reported as a timeout, so a cancel here is the limit
+    return "resource limit" if "canceled" in why or "resource limit" in why else why or "unknown"
 
 
 def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Term], dt: float) -> SmtResult:

@@ -11,6 +11,7 @@ as "fallback" and are checked by the Python core.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -32,13 +33,30 @@ CORE_DIR = Path(__file__).resolve().parent.parent / "core"
 
 
 def binary() -> str | None:
+    """The engine, refused if it was built from other sources than core/'s."""
     env = os.environ.get("TELIC_CORE")
-    if env and os.path.exists(env):
-        return env
     local = CORE_DIR / "telic-core"
-    if local.exists():
-        return str(local)
-    return shutil.which("telic-core")
+    exe = env if env and os.path.exists(env) else str(local) if local.exists() else shutil.which("telic-core")
+    if exe is not None and exe not in _FRESH:
+        want = source_hash()
+        if want is not None:
+            got = subprocess.run([exe, "--source-hash"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
+            if got != want:
+                raise RuntimeError(f"{exe} is stale: it was built from other sources than {CORE_DIR}; rebuild it with 'make -C {CORE_DIR}'")
+        _FRESH.add(exe)
+    return exe
+
+
+_FRESH: set[str] = set()
+
+
+def source_hash() -> str | None:
+    """Hash of the engine's sources, as the Makefile computes it into the binary."""
+    mk = CORE_DIR / "Makefile"
+    if not mk.exists():
+        return None
+    names = next(line for line in mk.read_text().splitlines() if line.startswith("SRC :=")).split(":=")[1].split()
+    return hashlib.sha256(b"".join((CORE_DIR / n).read_bytes() for n in names)).hexdigest()[:16]
 
 
 def _calls(fn: ir.Function, extra: list[ir.Clause]) -> set[str]:
@@ -63,9 +81,9 @@ def _calls(fn: ir.Function, extra: list[ir.Clause]) -> set[str]:
     return names
 
 
-def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, jobs: int | None) -> tuple[dict[str, Any], irjson.TermWriter]:
+def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, rlimit: int, jobs: int | None) -> tuple[dict[str, Any], irjson.TermWriter]:
     extra_by_key = {ref.key: [c for cs in opts.extra_invariants.values() for c in cs] for ref, opts in tasks}
-    req, tw = _base(program, theory, extra_by_key, timeout_ms, jobs)
+    req, tw = _base(program, theory, extra_by_key, timeout_ms, rlimit, jobs)
     req["tasks"] = [
         {
             "key": ref.key,
@@ -80,7 +98,7 @@ def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], time
     return req, tw
 
 
-def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], timeout_ms: int, jobs: int | None) -> tuple[dict[str, Any], irjson.TermWriter]:
+def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], timeout_ms: int, rlimit: int, jobs: int | None) -> tuple[dict[str, Any], irjson.TermWriter]:
     """The program, what the Python side knows about it, and the theory."""
     tw = irjson.TermWriter()
     fundefs = []
@@ -151,6 +169,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
         "def_heap": {k: program.def_heap_keys(k) for k in program.definitional},
         "theory": {**tw.dump(), "fundefs": fundefs, "axioms": axioms},
         "timeout_ms": timeout_ms,
+        "rlimit": rlimit,
         "jobs": jobs or 0,
     }
     return req, tw
@@ -169,7 +188,7 @@ def _call(req: dict[str, Any]) -> dict[str, Any]:
     return json.loads(p.stdout)
 
 
-def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, jobs: int | None) -> dict[str, Any]:
+def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, rlimit: int, jobs: int | None) -> dict[str, Any]:
     """Houdini invariants and loop variants for ``refs``,
     from the same candidates ``telic.infer`` proposes. Returns key ->
     Inferred, or None where the engine could not decide (the caller infers
@@ -188,7 +207,7 @@ def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, jobs: 
         meas: list[ir.Expr] = []  # recursion measures: telic.infer.infer_measures, per recursion group
         cands[ref.key] = (inv, var, meas)
     extra = {k: [c for cs in inv.values() for c in cs] for k, (inv, _, _) in cands.items()}
-    req, _ = _base(program, theory, extra, timeout_ms, jobs)
+    req, _ = _base(program, theory, extra, timeout_ms, rlimit, jobs)
     req["mode"] = "infer"
     req["tasks"] = [
         {
@@ -233,14 +252,14 @@ def _value(v: Any) -> Any:
     return v
 
 
-def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, jobs: int | None, cached: list[str] = (), salt: str = "") -> dict[str, dict[str, Any]] | None:
+def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, rlimit: int, jobs: int | None, cached: list[str] = (), salt: str = "") -> dict[str, dict[str, Any]] | None:
     """``cached``: engine keys of obligations proved before (skipped, and
     answered 'proved' by 'cache'); every obligation comes back with its key.
     ``salt`` binds the keys to the toolchain."""
     exe = binary()
     if exe is None or not tasks:
         return None
-    req, _ = request(program, theory, tasks, timeout_ms, jobs)
+    req, _ = request(program, theory, tasks, timeout_ms, rlimit, jobs)
     req["cached"], req["salt"] = list(cached), salt
     ans = _call(req)
     reader = irjson.TermReader(ans["terms"])
@@ -290,7 +309,7 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
             entry = {"ob": ob, "key": o["key"], "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}}
             if o["status"] == "refuted" and not plain:
                 # Objects/optionals in the model: decode them with the Python backend.
-                res = solve(ob, theory, timeout_ms)
+                res = solve(ob, theory, timeout_ms, rlimit)
                 entry.update(status=res.status, model=res.model, state=res.state, reason=res.reason)
             obs.append(entry)
         out[key] = {"status": "ok", "obligations": obs, "assumptions": [(ir.Loc(line), text) for line, text in r["assumptions"]], "deps": set(r["deps"]), "loop_notes": [tuple(x) for x in r["loop_notes"]]}

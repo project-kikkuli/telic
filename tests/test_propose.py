@@ -42,7 +42,7 @@ def pick(items: list[str], i: int) -> str:
 
 
 def opts():
-    return CheckOptions(cache_path=None, lean=False, timeout_ms=4000)
+    return CheckOptions(cache_path=None, lean=False)
 
 
 def test_facts_and_fixes(tmp_path):

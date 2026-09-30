@@ -21,6 +21,7 @@ from typing import Any
 
 from . import __version__
 from .checker import CheckOptions, Report, check
+from .smt import RLIMIT
 
 
 def _cache_path(root: str) -> str:
@@ -29,6 +30,7 @@ def _cache_path(root: str) -> str:
 
 def _options(args: argparse.Namespace, root: str) -> CheckOptions:
     return CheckOptions(
+        rlimit=args.rlimit,
         timeout_ms=int(args.timeout * 1000),
         replay=not args.no_replay,
         lean=not args.no_lean,
@@ -42,7 +44,8 @@ def _options(args: argparse.Namespace, root: str) -> CheckOptions:
 
 def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("paths", nargs="*", default=["."], help="files or directories (default: .)")
-    ap.add_argument("--timeout", type=float, default=8.0, help="solver timeout per obligation, seconds (default 8)")
+    ap.add_argument("--rlimit", type=int, default=RLIMIT, help=f"proof budget per obligation, in Z3 resource units (default {RLIMIT}): the same verdict on any machine")
+    ap.add_argument("--timeout", type=float, default=60.0, help="wall-clock safety net per solver stage, seconds (default 60); hitting it reports 'unknown (timeout)'")
     ap.add_argument("--no-replay", action="store_true", help="do not execute counterexamples")
     ap.add_argument("--no-lean", action="store_true", help="do not escalate unknown obligations to Lean")
     ap.add_argument("--no-cache", action="store_true", help="ignore and do not write .telic/cache.json")

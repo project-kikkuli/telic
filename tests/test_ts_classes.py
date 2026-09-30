@@ -138,7 +138,7 @@ def test_typescript_classes_match_node(tmp_path):
                     f"  {_body(e)}\n}}\n"
                 )
     (tmp_path / "m.ts").write_text("\n".join(lines))
-    rep = check([str(tmp_path / "m.ts")], CheckOptions(cache_path=None, lean=False, timeout_ms=8000), root=str(tmp_path))
+    rep = check([str(tmp_path / "m.ts")], CheckOptions(cache_path=None, lean=False), root=str(tmp_path))
     assert not [p for m in rep.modules for p in m.problems], [p for m in rep.modules for p in m.problems]
     got = {f.fn.name: f for f in rep.functions}
     # a wrong value is refuted; when Node is too slow to confirm it in time it stays unconfirmed, never proved

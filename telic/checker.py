@@ -12,12 +12,12 @@ from typing import Any, Callable
 
 from . import ir, irjson
 from . import logic as L
-from .infer import Inferred, cached_measures, infer, infer_measures
+from .infer import Inferred, cached_measures, infer, infer_measures, infer_rlimit
 from .jobs import exit_with_parent
 from .jobs import take as take_jobs
 from .program import ANY, FuncRef, Program
 from .render_expr import render
-from .smt import SmtResult, Theory, solve
+from .smt import RLIMIT, SmtResult, Theory, solve
 from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,7 @@ class Replay:
     fuzz_witness: str | None = None  # a real failing call found by random testing
     fuzz_summary: str | None = None
     fuzz_desc: str | None = None
+    timed_out: bool = False  # cut short by the wall-clock safety net: decided nothing
 
 
 @dataclass
@@ -220,6 +221,11 @@ class FunctionReport:
 
     def count(self, status: str) -> int:
         return sum(1 for v in self.verdicts if v.status == status)
+
+    @property
+    def timed_out(self) -> bool:
+        """A solver or a replay hit a wall-clock safety net, so this run decided nothing about it."""
+        return any((v.status == "unknown" and v.reason.startswith("timeout")) or (v.replay is not None and v.replay.timed_out) for v in self.verdicts)
 
 
 from .aim import AimReport  # noqa: E402  (re-exported)
@@ -356,7 +362,7 @@ def sidecar_proof_hash(ref: FuncRef, oid: str, root: str | None) -> str | None:
     return _phash(sp.proof) if sp is not None else None
 
 
-def inference_key(program: Program, key: str) -> str:
+def inference_key(program: Program, key: str, rlimit: int) -> str:
     """Inference results depend on a function and everything it calls."""
     from . import __version__
 
@@ -368,7 +374,7 @@ def inference_key(program: Program, key: str) -> str:
             continue
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
-    h = hashlib.sha256(f"infer {__version__} {toolchain_id()} {key}".encode())
+    h = hashlib.sha256(f"infer {__version__} {toolchain_id()} {key} {rlimit}".encode())
     for k in sorted(seen):
         if k not in program.funcs:
             h.update(f"{k}\n{program.units[k][3] if k in program.units else ''}".encode())
@@ -427,11 +433,11 @@ def _classes(program: Program) -> str:
     return memo[""]
 
 
-def function_key(program: Program, key: str, root: str | None) -> str:
+def function_key(program: Program, key: str, root: str | None, rlimit: int) -> str:
     """A function's verdict depends on its own source, everything it calls
     (contracts, and bodies of pure callees used as definitions), the records
     and class invariants it uses, the module constants it reads, its Lean
-    sidecar proofs, and the toolchain. Nothing else."""
+    sidecar proofs, the toolchain and the solver's resource limit. Nothing else."""
     seen: set[str] = set()
     todo = [key]
     while todo:
@@ -440,7 +446,7 @@ def function_key(program: Program, key: str, root: str | None) -> str:
             continue
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
-    h = hashlib.sha256(f"fn {toolchain_id()} {key}".encode())
+    h = hashlib.sha256(f"fn {toolchain_id()} {key} {rlimit}".encode())
     h.update(_classes(program).encode())
     for k in sorted(seen):
         if k not in program.funcs:
@@ -487,9 +493,9 @@ def code_value_calls(program: Program, rep: "FunctionReport") -> None:
             rep.problems.append((f"termination not proved: '{label}' {how}; no '@decreases' bounds recursion through a function value, so call it directly", loc))
 
 
-def obligation_key(ob: Obligation, theory: Theory) -> str:
+def obligation_key(ob: Obligation, theory: Theory, rlimit: int) -> str:
     defs, axioms = theory.closure(list(ob.hyps) + [ob.goal], ob.exclude_axioms)
-    h = hashlib.sha256(toolchain_id().encode())
+    h = hashlib.sha256(f"{toolchain_id()} {rlimit}".encode())
     h.update(L.canonical(ob.formula()).encode())
     for d in defs:
         h.update(f"def {d.name}({' '.join(L.canonical(p) for p in d.params)})={L.canonical(d.body) if d.body else '?'}".encode())
@@ -503,7 +509,8 @@ def obligation_key(ob: Obligation, theory: Theory) -> str:
 
 @dataclass
 class CheckOptions:
-    timeout_ms: int = 8000
+    rlimit: int = RLIMIT  # the proof budget, in Z3 resource units: the same on every machine
+    timeout_ms: int = 60000  # a wall-clock safety net per solver stage; hitting it is "unknown (timeout)"
     replay: bool = True
     lean: bool = True
     infer: bool = True
@@ -548,21 +555,21 @@ def run_parallel(fn: Callable[[Any], Any], items: list[Any], jobs: int | None) -
 
 
 def _pool_solve(ob: Obligation) -> SmtResult:
-    return solve(ob, _POOL["theory"], _POOL["timeout"])
+    return solve(ob, _POOL["theory"], _POOL["timeout"], _POOL["rlimit"])
 
 
-def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, jobs: int | None) -> list[SmtResult]:
+def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, rlimit: int, jobs: int | None) -> list[SmtResult]:
     """Solve independent obligations on the run's worker slots. Worker
     processes (fork) sidestep the GIL, which the Python half of each solve
     holds; threads are the fallback where fork is unavailable."""
     with take_jobs(jobs, len(obs)) as workers:
         if workers == 1 or len(obs) < 4:
-            return [solve(ob, theory, timeout_ms) for ob in obs]
+            return [solve(ob, theory, timeout_ms, rlimit) for ob in obs]
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
         if "fork" in mp.get_all_start_methods():
-            _POOL["theory"], _POOL["timeout"] = theory, timeout_ms
+            _POOL["theory"], _POOL["timeout"], _POOL["rlimit"] = theory, timeout_ms, rlimit
             try:
                 with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork"), initializer=exit_with_parent) as pool:
                     return list(pool.map(_pool_solve, obs, chunksize=max(1, len(obs) // (workers * 4))))
@@ -571,7 +578,7 @@ def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, jobs: int 
             finally:
                 _POOL.clear()
         with ThreadPoolExecutor(max_workers=workers) as tp:
-            return list(tp.map(lambda ob: solve(ob, theory, timeout_ms), obs))
+            return list(tp.map(lambda ob: solve(ob, theory, timeout_ms, rlimit), obs))
 
 
 class Vacuity:
@@ -620,10 +627,10 @@ class Vacuity:
 
 
 def _unsat(ob: Obligation, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> bool:
-    key = "sat:" + obligation_key(ob, theory)
+    key = "sat:" + obligation_key(ob, theory, opts.rlimit)
     hit = cache.get(key)
     if hit is None:
-        res = solve(ob, theory, opts.timeout_ms)
+        res = solve(ob, theory, opts.timeout_ms, opts.rlimit)
         hit = {"method": {"proved": "unsat", "refuted": "sat"}.get(res.status, "unknown")}
         if hit["method"] != "unknown":
             cache.put(key, hit)
@@ -646,14 +653,14 @@ def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
     return Obligation(id=f"{gen.fn.name}/vacuity", func=gen.ref.key, kind="vacuity", loc=gen.fn.loc, site=None, message="the entry state is satisfiable", hyps=list(facts), goal=L.FALSE, exclude_axioms=excl)
 
 
-def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache") -> Vacuity:
+def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache", rlimit: int) -> Vacuity:
     v = Vacuity()
     for rep, gen in entries:
         lemmas = _body_lemmas(gen)
         if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract or lemmas):
             continue
         ob = _unsat_probe(gen, gen.entry_facts + lemmas)
-        key = "sat:" + obligation_key(ob, theory)
+        key = "sat:" + obligation_key(ob, theory, rlimit)
         hit = cache.get(key)
         if hit is None:
             v.todo.append(((rep, gen), ob, key))
@@ -728,9 +735,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     def infer_one(item):
         key, ref = item
-        ikey = inference_key(program, key)
+        ikey = inference_key(program, key, opts.rlimit)
         try:
-            return key, ikey, infer(program, ref, theory, timeout_ms=min(opts.timeout_ms, 1000), cached=cache.get(ikey))
+            return key, ikey, infer(program, ref, theory, opts.timeout_ms, infer_rlimit(opts.rlimit), cached=cache.get(ikey))
         except VCError:
             return key, None, Inferred()
 
@@ -742,9 +749,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if use_engine:
         # Cached inferences are rebuilt locally; the rest run in the engine,
         # and whatever it cannot decide falls back to Python.
-        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference" and not program.python_only(k)]
-        by_engine = _engine.infer(program, theory, [r for _, r in fresh], min(opts.timeout_ms, 1000), opts.jobs)
-        inf_results = [(k, inference_key(program, k), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
+        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k, opts.rlimit)) or {}).get("method") != "inference" and not program.python_only(k)]
+        by_engine = _engine.infer(program, theory, [r for _, r in fresh], opts.timeout_ms, infer_rlimit(opts.rlimit), opts.jobs)
+        inf_results = [(k, inference_key(program, k, opts.rlimit), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
         done = {k for k, _, _ in inf_results}
         inf_results += run_parallel(infer_one, [x for x in todo_inf if x[0] not in done], opts.jobs)
     else:
@@ -774,7 +781,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     def measure_one(keys: list[str]) -> tuple[list[str], dict[str, ir.Expr], int]:
         calls = inferred[keys[0]].solver_calls
-        found = infer_measures(program, keys, theory, inferred, timeout_ms=min(opts.timeout_ms, 1000))
+        found = infer_measures(program, keys, theory, inferred, opts.timeout_ms, infer_rlimit(opts.rlimit))
         spent = inferred[keys[0]].solver_calls - calls
         inferred[keys[0]].solver_calls = calls
         return keys, found, spent
@@ -830,14 +837,12 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 # without a contract telic only looks for crashes)
                 rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
         for ob in obs:
-            key_ = obligation_key(ob, theory)
+            key_ = obligation_key(ob, theory, opts.rlimit)
             hit = cache.get(key_)
             if hit is not None and hit.get("method") == "unknown":
-                if hit.get("timeout", 0) >= opts.timeout_ms:
-                    hits += 1
-                    rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'timeout')} (cached)"))
-                    continue
-                hit = None
+                hits += 1
+                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'unknown')} (cached)"))
+                continue
             if hit is not None and hit.get("method") == "lean:proof" and hit.get("proof_hash") != sidecar_proof_hash(ref, ob.id, root):
                 # The sidecar proof was edited or removed: Z3 already failed
                 # on this exact formula, so go straight back to Lean.
@@ -888,7 +893,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             continue
         inf = inferred.get(key) or Inferred()
         rep.inferred = inf
-        fkey = function_key(program, key, root) if opts.receipts else None
+        fkey = function_key(program, key, root, opts.rlimit) if opts.receipts else None
         receipt = cache.get(fkey) if fkey else None
         if receipt is not None and receipt.get("method") == "function":
             restore_receipt(rep, receipt)
@@ -910,7 +915,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     # ones it does not model yet go through the Python core.
     if engine_tasks:
         cached = [k[len(ENGINE_KEY) :] for k, v in cache.data.items() if k.startswith(ENGINE_KEY) and v.get("method") == "z3"]
-        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.jobs, cached, toolchain_id()) or {}
+        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.rlimit, opts.jobs, cached, f"{toolchain_id()} {opts.rlimit}") or {}
         for rep, ref, inf, fkey, ft in engine_tasks:
             a = answers.get(ref.key)
             if a is None or a["status"] != "ok":
@@ -940,23 +945,23 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 rep.verdicts.append(v)
                 if o["status"] == "proved":
                     cache.put(ENGINE_KEY + o["key"], {"method": "z3"})
-                    cache.put(obligation_key(ob, theory), {"method": "z3"})
+                    cache.put(obligation_key(ob, theory, opts.rlimit), {"method": "z3"})
             staged.append((rep, fkey, ft))
 
     # Solve everything pending at once: each obligation gets its own Z3
     # context, and Z3 releases the GIL while it works, so threads use every
     # core.
-    vacuity = vacuity_checks(entry_checks, theory, cache)
+    vacuity = vacuity_checks(entry_checks, theory, cache, opts.rlimit)
     if pending or vacuity.todo:
-        results = solve_all([v.ob for v, _ in pending] + [ob for _, ob, _ in vacuity.todo], theory, opts.timeout_ms, opts.jobs)
+        results = solve_all([v.ob for v, _ in pending] + [ob for _, ob, _ in vacuity.todo], theory, opts.timeout_ms, opts.rlimit, opts.jobs)
         vacuity.record(results[len(pending) :], cache)
         results = results[: len(pending)]
         for (v, key_), res in zip(pending, results):
             v.status, v.seconds, v.model, v.state, v.reason = res.status, res.seconds, res.model, res.state, res.reason
             if res.status == "proved":
                 cache.put(key_, {"method": "z3"})
-            elif res.status == "unknown":
-                cache.put(key_, {"method": "unknown", "timeout": opts.timeout_ms, "reason": res.reason})
+            elif res.status == "unknown" and not res.reason.startswith("timeout"):
+                cache.put(key_, {"method": "unknown", "reason": res.reason})
 
     # Escalate: counterexamples get executed (each replay is a subprocess,
     # so they run side by side), unknowns go to Lean.
@@ -975,7 +980,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if opts.lean and any(v.status == "unknown" for v in rep.verdicts):
             from .lean import escalate
 
-            escalate(program, theory, rep, cache, obligation_key, root=root)
+            escalate(program, theory, rep, cache, lambda ob, th: obligation_key(ob, th, opts.rlimit), root=root)
         if any(v.status == "refuted" for v in rep.verdicts):
             rep.status = "refuted"
         elif ref.key in vacuous:
@@ -1019,7 +1024,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     from . import history
 
     gens = {r.ref.key: g for r, g in entry_checks}
-    lifecycles = history.check(program, reports, gens, lambda obs: solve_all(obs, theory, opts.timeout_ms, opts.jobs), cache, lambda ob: obligation_key(ob, theory))
+    lifecycles = history.check(program, reports, gens, lambda obs: solve_all(obs, theory, opts.timeout_ms, opts.rlimit, opts.jobs), cache, lambda ob: obligation_key(ob, theory, opts.rlimit))
 
     mirrors = []
     if any(f.mirrors for m in modules for f in m.functions.values()):

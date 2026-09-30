@@ -10,7 +10,8 @@ import pytest
 from telic import engine
 from telic.checker import CheckOptions, build_theory, check, load_modules
 from telic.program import Program
-from telic.smt import solve
+from telic.infer import infer_rlimit
+from telic.smt import RLIMIT, solve
 from telic.vcgen import Options, VCError, VCGen
 
 from conftest import HAS_NODE
@@ -25,7 +26,7 @@ def _differential(path: Path):
     p = Program.build(mods)
     th, _ = build_theory(p, {})
     tasks = [(r, Options()) for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
-    res = engine.run(p, th, tasks, 8000, None)
+    res = engine.run(p, th, tasks, 60000, RLIMIT, None)
     assert res is not None
     diffs, compared = [], 0
     for ref, _ in tasks:
@@ -37,7 +38,7 @@ def _differential(path: Path):
         except VCError:
             diffs.append(f"{ref.key}: engine generated VCs the Python core rejects")
             continue
-        py = {o.id: solve(o, th, 8000).status for o in obs}
+        py = {o.id: solve(o, th).status for o in obs}
         ox = {o["ob"].id: o["status"] for o in r["obligations"]}
         if set(py) != set(ox):
             diffs.append(f"{ref.key}: obligations differ {sorted(set(py) ^ set(ox))}")
@@ -84,7 +85,7 @@ def test_engine_models_everything_in_the_corpora():
         p = Program.build(load_modules([str(path)], str(path.parent)))
         th, _ = build_theory(p, {})
         tasks = [(r, Options()) for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
-        res = engine.run(p, th, tasks, 4000, None) or {}
+        res = engine.run(p, th, tasks, 60000, RLIMIT, None) or {}
         fell = [f"{k}: {r.get('reason')}" for k, r in res.items() if r["status"] == "fallback"]
         assert not fell, f"{name}: {fell}"
 
@@ -101,7 +102,7 @@ def test_engine_proves_no_exploit():
                 import tree_sitter_swift  # noqa: F401
             except ImportError:
                 continue
-        rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000, engine="ox"), root=str(DIR))
+        rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, engine="ox"), root=str(DIR))
         proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
         bad += [f"{name}:{n}" for n in proved - TRUE_HELPERS.get(name, set())]
     assert not bad, f"exploits proved by the engine: {bad}"
@@ -117,14 +118,14 @@ def test_engine_infers_what_python_infers(name):
     p = Program.build(load_modules([str(path)], str(path.parent)))
     th, _ = build_theory(p, {})
     refs = [r for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
-    ox = engine.infer(p, th, refs, 1000, None)
+    ox = engine.infer(p, th, refs, 60000, infer_rlimit(RLIMIT), None)
     diffs = []
     for r in refs:
         mine = ox.get(r.key)
         if mine is None:
             diffs.append(f"{r.key}: engine fell back")
-        elif mine.summary() != infer(p, r, th, 1000).summary():
-            diffs.append(f"{r.key}: {mine.summary()} vs {infer(p, r, th, 1000).summary()}")
+        elif mine.summary() != infer(p, r, th).summary():
+            diffs.append(f"{r.key}: {mine.summary()} vs {infer(p, r, th).summary()}")
     assert not diffs, "\n".join(diffs)
 
 
@@ -149,3 +150,10 @@ def test_a_field_telic_cannot_model_fails_only_what_touches_it():
         by[eng] = {f.fn.name: f.status for f in rep.functions}
     assert by["python"] == by["ox"]
     assert by["ox"]["Log.bump"] == "proved" and by["ox"]["Log.__init__"] == "error"
+
+
+def test_a_binary_built_from_other_sources_is_refused(monkeypatch):
+    monkeypatch.setattr(engine, "_FRESH", set())
+    monkeypatch.setattr(engine, "source_hash", lambda: "not-these-sources")
+    with pytest.raises(RuntimeError, match="stale.*make -C"):
+        engine.binary()

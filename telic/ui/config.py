@@ -114,6 +114,7 @@ def load(path: str, root: str) -> UiConfig:
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
         "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms", "wait",
         "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
+        "walk_seed",
     }
     unknown = sorted(set(ui) - known)
     if unknown:
@@ -132,6 +133,8 @@ def load(path: str, root: str) -> UiConfig:
     for k in ("max_states", "max_depth", "walks", "walk_length", "workers"):
         if k in ui:
             setattr(s, k, int(ui[k]))
+    if "walk_seed" in ui:
+        s.seed = int(ui["walk_seed"])
     if "max_seconds" in ui:
         s.max_seconds = float(ui["max_seconds"])
     if "text" in ui:

@@ -275,3 +275,23 @@ def test_init_installs_what_the_project_needs(tmp_path, files, has, lacks):
         (tmp_path / name).write_text(text)
     w = workflow(str(tmp_path))
     assert all(h in w for h in has) and not any(x in w for x in lacks)
+
+
+def test_a_timeout_is_never_a_verdict_change(tmp_path, monkeypatch):
+    import time
+
+    import z3
+
+    from telic.checker import CheckOptions, check
+    from telic.ledger import compare, merge, snapshot
+
+    (tmp_path / "cap.py").write_text(SRC)
+    run = lambda **kw: snapshot(check([str(tmp_path / "cap.py")], CheckOptions(cache_path=None, lean=False, **kw), root=str(tmp_path)))  # noqa: E731
+    old = run()
+    check_sat = z3.Solver.check
+    monkeypatch.setattr(z3.Solver, "check", lambda self, *a: (time.sleep(0.3), check_sat(self, *a))[1])
+    new = run(timeout_ms=50)
+    assert all(f.get("timeout") for f in new["functions"].values()) and new["aims"]["CAP"].get("timeout")
+    assert compare(old, new, None) == []
+    kept = merge(old, new, None)
+    assert kept["functions"] == old["functions"] and kept["aims"] == old["aims"]

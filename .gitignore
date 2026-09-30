@@ -6,3 +6,4 @@ node_modules
 /build
 /dist
 .venv
+core/source_hash.ml

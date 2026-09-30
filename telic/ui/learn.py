@@ -47,7 +47,7 @@ class Settings:
     abstraction: str = "auto"  # auto: controls, or screens when controls exceed a budget
     keys: tuple[str, ...] = ("Escape",)
     ignore: tuple[str, ...] = ()
-    seed: int = 0
+    seed: int = 0  # of the random walks: the same seed, the same walks
 
 
 @dataclass
@@ -114,10 +114,10 @@ class Model:
         q = deque([frm])
         while q:
             s = q.popleft()
-            for sig, ts in self.trans.get(s, {}).items():
+            for sig, ts in sorted(self.trans.get(s, {}).items()):
                 if (deterministic and len(ts) > 1) or (s, sig) in avoid:
                     continue
-                for t in ts:
+                for t in sorted(ts):
                     if t in prev:
                         continue
                     prev[t] = (s, sig)
@@ -227,11 +227,14 @@ class Worker:
         self.snap: Snapshot | None = None
         self.acts: dict[str, Action] = {}
         self.history: list[str] = []  # everything done since the last fresh start
+        self.turn: int | None = None  # its job's place in the current round
 
 
 class Explorer:
     """Learns one model with several workers side by side: each claims an
-    untried action of some state, gets there and fires it."""
+    untried action of some state, gets there and fires it. Work goes in
+    rounds and new states are numbered in job order, so the model is the
+    same whichever browser is quicker."""
 
     def __init__(
         self,
@@ -251,6 +254,9 @@ class Explorer:
         self.by_key: dict[str, UiState] = {}
         self.lock = threading.RLock()
         self.claimed: set[tuple[int, str]] = set()
+        self.running: set[int] = set()  # turns of the round's unfinished jobs
+        self.turns = threading.Condition(self.lock)
+        self.rounds = 0
         self.t0 = time.monotonic()
 
     @property
@@ -300,6 +306,10 @@ class Explorer:
         with self.lock:
             key, atoms, body = self._abstract(snap, w.d)
             st = self.by_key.get(key)
+            if st is None and w.turn is not None:
+                # the jobs before this one number their new states first
+                self.turns.wait_for(lambda: not any(t < w.turn for t in self.running))
+                st = self.by_key.get(key)
             if st is None:
                 access = (parent.access + [sig]) if parent is not None and sig is not None else []
                 st = UiState(len(self.model.states), key, snap.screen, snap.overlays(), atoms, list(w.acts), {s: a.label for s, a in w.acts.items()}, access, len(access), body=body)
@@ -450,9 +460,10 @@ class Explorer:
         self.claimed.add((s.id, sig))
         return s, sig
 
-    def _pool(self, job: Callable[[Worker], None]) -> None:
-        if len(self.workers) == 1:
-            job(self.workers[0])
+    def _pool(self, job: Callable[[Worker], None], workers: list[Worker] | None = None) -> None:
+        workers = self.workers if workers is None else workers
+        if len(workers) == 1:
+            job(workers[0])
             return
         errors: list[BaseException] = []
 
@@ -462,7 +473,7 @@ class Explorer:
             except BaseException as e:  # noqa: BLE001 - re-raised in the caller
                 errors.append(e)
 
-        ts = [threading.Thread(target=run, args=(w,), daemon=True) for w in self.workers]
+        ts = [threading.Thread(target=run, args=(w,), daemon=True) for w in workers]
         for t in ts:
             t.start()
         for t in ts:
@@ -470,75 +481,94 @@ class Explorer:
         if errors:
             raise errors[0]
 
-    def explore(self) -> None:
-        busy = [0]
+    def _begin(self, w: Worker, turn: int) -> None:
+        with self.lock:
+            w.turn = turn
+            self.running.add(turn)
 
-        def work(w: Worker) -> None:
-            while True:
-                with self.lock:
-                    stop = self._over()
-                    if stop:
-                        self.model.stop = stop
-                        return
+    def _end(self, w: Worker) -> None:
+        with self.lock:
+            self.running.discard(w.turn)
+            w.turn = None
+            self.turns.notify_all()
+
+    def explore(self) -> None:
+        while True:
+            with self.lock:
+                stop = self._over()
+                if stop:
+                    self.model.stop = stop
+                    return
+                jobs: dict[int, tuple[UiState, str]] = {}
+                for i, w in enumerate(self.workers):
                     got = self._claim(w)
-                    if got is None and busy[0] == 0:
-                        return
                     if got is not None:
-                        busy[0] += 1
-                if got is None:
-                    time.sleep(0.02)
-                    continue
-                s, sig = got
+                        jobs[i] = got
+                        self._begin(w, i)
+            if not jobs:
+                return
+
+            def work(w: Worker) -> None:
+                s, sig = jobs[self.workers.index(w)]
                 try:
                     if w.cur is s or (s.id not in self.model.unreproducible and self.goto(w, s)):
                         self.fire(w, s, sig)
                 finally:
+                    self._end(w)
                     with self.lock:
                         self.claimed.discard((s.id, sig))
-                        busy[0] -= 1
-                        if self.model.fired % 25 == 0:
-                            self.log(f"{len(self.model.states)} states, {self.model.fired} actions")
 
-        self._pool(work)
+            self._pool(work, [self.workers[i] for i in sorted(jobs)])
+            self.log(f"{len(self.model.states)} states, {self.model.fired} actions")
 
     def conform(self) -> bool:
         """Random walks through the model, replayed in the app. True if the
         app did something the model did not predict."""
         length = self.s.walk_length or (max(s.depth for s in self.model.states) + 2)
-        todo = list(range(self.s.walks))
+        todo = deque(range(self.s.walks))  # in order: a walk only waits on walks already started
         surprised = [False]
+        disagreed: dict[int, list[str]] = {}
+        self.rounds += 1
 
         def work(w: Worker) -> None:
             while True:
                 with self.lock:
                     if not todo or self._over():
                         return
-                    n = todo.pop()
+                    n = todo.popleft()
                     self.model.walks += 1
-                rng = random.Random(self.s.seed * 7919 + n + 1000 * self.model.resets)
-                s = self.reset(w)
-                for _ in range(length):
-                    with self.lock:
-                        options = sorted(sig for sig in s.actions if self.model.trans[s.id].get(sig))
-                        if not options:
-                            break
-                        sig = rng.choice(options)
-                        predicted = set(self.model.trans[s.id][sig])
-                    t = self.fire(w, s, sig)
-                    with self.lock:
-                        if t is None:
-                            self.model.disagreed.append(f"{s.labels.get(sig, sig)} in {s.describe()}: now blocked ({s.blocked.get(sig)})")
-                            surprised[0] = True
-                        elif t.id not in predicted:
-                            self.model.disagreed.append(f"{s.labels.get(sig, sig)} in {s.describe()}: reached {t.describe()}, not what the model predicted")
-                            surprised[0] = True
-                        else:
-                            self.model.agreed += 1
-                    if t is None:
+                    self._begin(w, n)
+                try:
+                    walk(w, n)
+                finally:
+                    self._end(w)
+
+        def walk(w: Worker, n: int) -> None:
+            rng = random.Random(self.s.seed * 7919 + n + 1000 * self.rounds)
+            s = self.reset(w)
+            for _ in range(length):
+                with self.lock:
+                    options = sorted(sig for sig in s.actions if self.model.trans[s.id].get(sig))
+                    if not options:
                         break
-                    s = t
+                    sig = rng.choice(options)
+                    predicted = set(self.model.trans[s.id][sig])
+                t = self.fire(w, s, sig)
+                with self.lock:
+                    if t is None:
+                        disagreed.setdefault(n, []).append(f"{s.labels.get(sig, sig)} in {s.describe()}: now blocked ({s.blocked.get(sig)})")
+                        surprised[0] = True
+                    elif t.id not in predicted:
+                        disagreed.setdefault(n, []).append(f"{s.labels.get(sig, sig)} in {s.describe()}: reached {t.describe()}, not what the model predicted")
+                        surprised[0] = True
+                    else:
+                        self.model.agreed += 1
+                if t is None:
+                    break
+                s = t
 
         self._pool(work)
+        self.model.disagreed += [x for n in sorted(disagreed) for x in disagreed[n]]
         self.model.walk_length = max(self.model.walk_length, length)
         return surprised[0]
 

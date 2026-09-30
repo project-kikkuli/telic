@@ -19,7 +19,7 @@ from typing import Any
 
 from .. import ir
 
-TIMEOUT_S = 10.0
+TIMEOUT_S = 60.0  # a safety net: see replay.TIMEOUT_S
 COMPILE_TIMEOUT_S = 600.0
 
 PRELUDE = r'''

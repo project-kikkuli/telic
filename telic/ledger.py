@@ -48,8 +48,12 @@ RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "vacuou
 
 
 def snapshot(rep: Report) -> dict[str, Any]:
+    """Entries a wall-clock timeout could have changed are marked ``timeout``:
+    they are never a change, and the ledger keeps what it had for them."""
     aims: dict[str, Any] = {}
     by_key = {f.ref.key: f for f in rep.functions}
+    timed_out = {f.ref.key for f in rep.functions if f.timed_out}
+    undecided = timed_out | {f.ref.key for f in rep.functions if f.open_deps & timed_out}
     for i in rep.aims:
         clauses = [f"ui {x.name}: {x.text}" for x in i.lemmas if x.kind == "ui"]
         for key in i.functions:
@@ -64,11 +68,12 @@ def snapshot(rep: Report) -> dict[str, Any]:
             "clauses": sorted(set(clauses)),
             **({"links": sorted(i.pointers)} if i.pointers else {}),
             **({"declared": i.loc[0]} if i.loc else {}),
+            **({"timeout": True} if undecided & set(i.functions + i.assumes) else {}),
         }
     functions = {}
     for f in rep.functions:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))
-        functions[f.ref.key] = {"status": f.status, "obligations": len(f.verdicts), **({"lean": lean} if lean else {})}
+        functions[f.ref.key] = {"status": f.status, "obligations": len(f.verdicts), **({"lean": lean} if lean else {}), **({"timeout": True} if f.ref.key in undecided else {})}
     mirrors = {f"{m.a.key} ~ {m.b.key}": m.status for m in rep.mirrors}
     ui = {f"{r.lemma.path}::{r.lemma.name}": r.status for r in rep.ui.results} if rep.ui is not None else {}
     from . import __version__
@@ -87,7 +92,13 @@ def read_ledger(path: str) -> dict[str, Any] | None:
 
 
 def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> dict[str, Any]:
-    """Entries for files outside the checked scope are carried over."""
+    """Entries for files outside the checked scope, and entries a timeout
+    left undecided, are carried over."""
+    if old is not None:
+        new = dict(new)
+        for part in ("aims", "functions"):
+            had = old.get(part, {})
+            new[part] = {k: had[k] if v.get("timeout") and k in had else v for k, v in new[part].items()}
     if files is None or old is None:
         return new
     out = {"telic": new["telic"], "aims": {}, "functions": {}, "mirrors": {}, "ui": {}}
@@ -137,6 +148,8 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
 
     for iid, o in old.get("aims", {}).items():
         n = new["aims"].get(iid)
+        if n is not None and n.get("timeout"):
+            continue
         if n is None:
             if files is None or any(scoped(f) for f in o.get("functions", []) + [o.get("declared", "")]):
                 out.append(Change(iid, "regression", f"aim {iid} was removed (it was {o['status']})"))
@@ -155,6 +168,8 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
         if not scoped(key):
             continue
         n = new["functions"].get(key)
+        if n is not None and n.get("timeout"):
+            continue
         if n is None:
             out.append(Change(key, "removed", f"{key} no longer exists", key.split("::")[0]))
             continue

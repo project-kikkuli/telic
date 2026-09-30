@@ -114,7 +114,7 @@ def test_no_exploit_is_proved(name):
         pytest.importorskip("tree_sitter_rust")
     if name.endswith(".swift"):
         pytest.importorskip("tree_sitter_swift")
-    rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
+    rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False), root=str(DIR))
     proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
     unexpected = proved - TRUE_HELPERS.get(name, set())
     assert not unexpected, f"{name}: exploits proved: {sorted(unexpected)}"
@@ -175,7 +175,7 @@ def vacuity_reports():
                 import tree_sitter_rust  # noqa: F401
             except ImportError:
                 continue
-        out[name] = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
+        out[name] = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False), root=str(DIR))
     return out
 
 
@@ -193,7 +193,7 @@ def test_aim_backed_only_by_a_vacuous_lemma_is_not_backed(vacuity_reports):
 
 
 def test_vacuity_verdict_survives_the_cache(tmp_path):
-    opts = CheckOptions(cache_path=str(tmp_path / "cache.json"), lean=False, timeout_ms=4000)
+    opts = CheckOptions(cache_path=str(tmp_path / "cache.json"), lean=False)
     for _ in range(2):
         rep = check([str(DIR / "t24.py")], opts, root=str(DIR))
         status = {f.fn.name: f.status for f in rep.functions}
@@ -234,7 +234,7 @@ def test_the_timeout_bounds_unfolding_a_diverging_definition(tmp_path, engine):
 
 
 def test_non_terminating_recursion_backs_no_aim():
-    rep = check([str(DIR / "t31.py")], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
+    rep = check([str(DIR / "t31.py")], CheckOptions(cache_path=None, lean=False), root=str(DIR))
     status = {f.fn.name: f.status for f in rep.functions}
     assert status["spin"] != "proved" and status["ping"] != "proved"
     assert [i.status for i in rep.aims] == ["partial"]

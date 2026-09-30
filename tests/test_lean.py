@@ -71,7 +71,7 @@ def test_theory_lemmas_are_proved_in_lean():
 
 def _sidecar(tmp_path, proof):
     (tmp_path / "hard.py.proof.lean").write_text("")
-    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False)
     v = next(v for f in rep.functions for v in f.verdicts if v.status != "proved")
     from telic.checker import build_theory
     from telic.lean import build_context, statement_hash, theorem_name, write_sidecar
@@ -85,7 +85,7 @@ def _sidecar(tmp_path, proof):
 @needs_lean
 def test_sidecar_proof_is_checked_and_used(tmp_path):
     oid = _sidecar(tmp_path, PROOF)
-    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False)
     f = next(f for f in rep.functions if f.fn.name == "pow2_add")
     assert f.status == "proved", [(v.ob.id, v.status, v.lean and v.lean.summary) for v in f.verdicts]
     assert any(v.method == "lean:proof" for v in f.verdicts)
@@ -95,7 +95,7 @@ def test_sidecar_proof_is_checked_and_used(tmp_path):
 @needs_lean
 def test_sorry_is_rejected(tmp_path):
     _sidecar(tmp_path, "sorry")
-    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False)
     f = next(f for f in rep.functions if f.fn.name == "pow2_add")
     assert f.status == "open"
     v = next(v for v in f.verdicts if v.status != "proved")
@@ -105,7 +105,7 @@ def test_sorry_is_rejected(tmp_path):
 @needs_lean
 def test_smuggled_axiom_is_rejected(tmp_path):
     _sidecar(tmp_path, "exact cheat\naxiom cheat : False")
-    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False)
     f = next(f for f in rep.functions if f.fn.name == "pow2_add")
     assert f.status == "open"
 
@@ -114,7 +114,7 @@ def test_smuggled_axiom_is_rejected(tmp_path):
 def test_changed_code_makes_exactly_that_proof_stale(tmp_path):
     _sidecar(tmp_path, PROOF)
     changed = POW.replace("pow2(a + b) == pow2(a) * pow2(b)", "pow2(b + a) == pow2(a) * pow2(b)")
-    rep = run_check(tmp_path, {"hard.py": changed}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": changed}, replay=False)
     f = next(f for f in rep.functions if f.fn.name == "pow2_add")
     v = next(v for v in f.verdicts if v.status != "proved")
     assert v.lean.status == "stale"
@@ -129,7 +129,7 @@ def square_sum(a: int, b: int) -> int:
     #@ ensures result >= a * b
     return a * a + b * b
 """
-    rep = run_check(tmp_path, {"sq.py": src}, replay=False, timeout_ms=1000)
+    rep = run_check(tmp_path, {"sq.py": src}, replay=False)
     f = rep.functions[0]
     assert f.status == "proved"
 
@@ -196,7 +196,7 @@ def test_prove_saves_what_the_prover_found(tmp_path, prover):
         capture_output=True, text=True, cwd=tmp_path, env=env,
     )
     assert out.returncode == 0, out.stdout + out.stderr
-    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False)
     assert next(f for f in rep.functions if f.fn.name == "pow2_add").status == "proved"
 
 

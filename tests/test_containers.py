@@ -15,7 +15,7 @@ CASES = Path(__file__).parent / "cases" / "containers"
 
 @pytest.fixture(scope="module")
 def report():
-    return check([str(CASES / "locks.ts")], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(CASES))
+    return check([str(CASES / "locks.ts")], CheckOptions(cache_path=None, lean=False), root=str(CASES))
 
 
 @needs_node

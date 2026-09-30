@@ -24,7 +24,11 @@ from typing import Any
 from . import ir
 from .program import Program
 
-TIMEOUT_S = 5.0
+# Wall-clock limits on execution are safety nets: a run cut short decides
+# nothing, and the ledger does not count it. A variant's model is expected
+# not to terminate, and its verdict does not rest on the run.
+TIMEOUT_S = 60.0
+VARIANT_TIMEOUT_S = 5.0
 PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
@@ -313,7 +317,7 @@ def fuzz(path: str, fn: ir.Function, lang: str, n: int = FUZZ_INPUTS, module: ir
     if lang == "typescript":
         extra["contracts"] = ts_contracts(module)
     runner = run_python if lang == "python" else run_typescript
-    return runner(path, fn.name, [], TIMEOUT_S * 3, extra)
+    return runner(path, fn.name, [], TIMEOUT_S, extra)
 
 
 EXPECTED = {
@@ -421,7 +425,7 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
     runtime = {"typescript": "node", "rust": "rustc", "swift": "swiftc"}.get(lang, "python")
     if out.get("timeout"):
         if ob.kind == "variant":
-            return False, f"{runtime}: still running after {TIMEOUT_S:.0f}s (consistent with non-termination, not proof of it)", None
+            return False, f"{runtime}: still running after {VARIANT_TIMEOUT_S:.0f}s (consistent with non-termination, not proof of it)", None
         return False, f"{runtime}: timed out after {TIMEOUT_S:.0f}s", None
     if "harness_error" in out:
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
@@ -492,6 +496,8 @@ def replay_verdicts(program: Program, rep) -> None:
         if race:
             v.replay = Replay(False, False, f"another task may change these objects during the await at line {', '.join(race)}; a single run cannot reproduce a race", violation="race")
             continue
+        limit = VARIANT_TIMEOUT_S if v.ob.kind == "variant" else TIMEOUT_S
+        cut_short = lambda out: bool(out.get("timeout")) and v.ob.kind != "variant"  # noqa: E731
         if lang == "rust":
             from .frontend.rust_replay import run_rust
 
@@ -499,7 +505,7 @@ def replay_verdicts(program: Program, rep) -> None:
             if out is None:
                 continue  # not executable here (no toolchain, or a type the harness cannot build)
             confirmed, summary, violation = classify(v.ob, out, fn, lang)
-            v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="rustc")
+            v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="rustc", timed_out=cut_short(out))
             continue
         if lang == "swift":
             from .frontend.swift_replay import run_swift
@@ -508,14 +514,14 @@ def replay_verdicts(program: Program, rep) -> None:
             if out is None:
                 continue  # not executable here (no toolchain, or a value the harness cannot build)
             confirmed, summary, violation = classify(v.ob, out, fn, lang)
-            v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="swiftc")
+            v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="swiftc", timed_out=cut_short(out))
             continue
         args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
         try:
             if lang == "python":
-                out = run_python(full, fn.name, args)
+                out = run_python(full, fn.name, args, limit)
             else:
-                out = run_typescript(full, fn.name, args, extra={"contracts": ts_contracts(rep.ref.module), "types": [type_desc(p.ty, rep.ref.module.classes) for p in fn.params]})
+                out = run_typescript(full, fn.name, args, limit, extra={"contracts": ts_contracts(rep.ref.module), "types": [type_desc(p.ty, rep.ref.module.classes) for p in fn.params]})
         except Exception as e:  # pragma: no cover - defensive
             v.replay = Replay(False, False, f"could not replay: {e}")
             continue
@@ -527,6 +533,7 @@ def replay_verdicts(program: Program, rep) -> None:
             returned=out.get("returned_repr"),
             violation=violation,
             runtime="node" if lang == "typescript" else "python",
+            timed_out=cut_short(out),
         )
     # The solver's state was unreachable? Search for a real failing input.
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
@@ -568,6 +575,7 @@ def replay_verdicts(program: Program, rep) -> None:
         else:
             for v in pending:
                 v.replay.fuzz_summary = f"{out.get('tried', 0)} random inputs found no failure"  # type: ignore[attr-defined]
+                v.replay.timed_out = v.replay.timed_out or bool(out.get("timeout"))
     # A model the real program cannot reproduce is not a refutation; nor is
     # one for termination, which no finite run can witness, nor one telic
     # models only in part (unchecked values, trusted predicates) unless a

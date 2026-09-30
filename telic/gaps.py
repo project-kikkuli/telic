@@ -577,7 +577,7 @@ def clause_statuses(tmp: str, tag: str, root: str, mod: ir.Module, source: str, 
         return {}
     if m.problems or fn_name not in m.functions or m.functions[fn_name].unsupported:
         return {}
-    rep = check_modules(others + [m], CheckOptions(timeout_ms=opts.timeout_ms, replay=False, lean=False, cache_path=opts.cache_path, only={fn_name}), root=root)
+    rep = check_modules(others + [m], CheckOptions(rlimit=opts.rlimit, timeout_ms=opts.timeout_ms, replay=False, lean=False, cache_path=opts.cache_path, only={fn_name}), root=root)
     f = next((f for f in rep.functions if f.ref.module is m and f.fn.name == fn_name), None)
     if f is None or f.status in ("unsupported", "error"):
         return {}
@@ -656,7 +656,7 @@ def attempt(tmp: str, tag: str, mu: Mutant, fn: ir.Function, mod: ir.Module, oth
         return "invalid", None
     if mmod.problems or fn.name not in mmod.functions or mmod.functions[fn.name].unsupported:
         return "invalid", mmod
-    mrep = check_modules(others + [mmod], CheckOptions(timeout_ms=opts.timeout_ms, replay=False, lean=False, cache_path=opts.cache_path, only={fn.name}), root=root)
+    mrep = check_modules(others + [mmod], CheckOptions(rlimit=opts.rlimit, timeout_ms=opts.timeout_ms, replay=False, lean=False, cache_path=opts.cache_path, only={fn.name}), root=root)
     mf = next((f for f in mrep.functions if f.ref.module is mmod and f.fn.name == fn.name), None)
     return ("survived" if mf is not None and mf.status == "proved" else "killed"), mmod
 
@@ -747,7 +747,7 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
     from .equiv import check_pair
     from .checker import build_theory
 
-    base_opts = CheckOptions(timeout_ms=opts.timeout_ms, replay=False, lean=opts.lean, infer=True, cache_path=opts.cache_path, only=opts.only)  # lean: saved proofs count
+    base_opts = CheckOptions(rlimit=opts.rlimit, timeout_ms=opts.timeout_ms, replay=False, lean=opts.lean, infer=True, cache_path=opts.cache_path, only=opts.only)  # lean: saved proofs count
     modules = load_modules(paths, root)
     report = check_modules(modules, base_opts, root=root)
     in_specs = _used_in_specs(report.program)
@@ -799,7 +799,7 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
                 theory, _ = build_theory(program, {})
                 a = next(r for r in program.funcs.values() if r.fn is afn)
                 b = next(r for r in program.funcs.values() if r.fn is bfn)
-                pr = check_pair(program, theory, a, b, root, fn.loc, opts.timeout_ms, n_tests=200)
+                pr = check_pair(program, theory, a, b, root, fn.loc, opts.timeout_ms, opts.rlimit, n_tests=200)
                 if pr.witness and not pr.witness["replay"]["ran"]:
                     fg.invalid += 1  # does not run (it does not compile, say): not a program the contract accepts
                     fg.total -= 1

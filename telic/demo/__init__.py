@@ -126,7 +126,7 @@ ACTS: list[Step] = [
         telic says so honestly instead of guessing:
         """,
         show=("server/referrals.py", 6, 20),
-        run=["check", "server/referrals.py", "--no-lean", "--timeout", "2"],
+        run=["check", "server/referrals.py", "--no-lean"],
     ),
     Step(
         say="""
@@ -134,7 +134,7 @@ ACTS: list[Step] = [
         translated into Lean definitions, an unfolding lemma per definition, and
         callee contracts as explicit hypotheses:
         """,
-        run=["lean", "chained_bonus_is_product/ensures@20>21", "server/referrals.py", "--timeout", "2"],
+        run=["lean", "chained_bonus_is_product/ensures@20>21", "server/referrals.py"],
     ),
     Step(
         say="""
@@ -143,7 +143,7 @@ ACTS: list[Step] = [
         kernel checks it and #print axioms shows nothing beyond Lean's standard
         three: no sorry, no native_decide, no smuggled axioms.
         """,
-        run=["check", "server/referrals.py", "--timeout", "2"],
+        run=["check", "server/referrals.py"],
     ),
     Step(
         say="""
@@ -152,7 +152,7 @@ ACTS: list[Step] = [
         that proof. Nothing is silently trusted:
         """,
         edits=[("server/referrals.py", "return level_bonus(a + b) == level_bonus(a) * level_bonus(b)", "return level_bonus(b + a) == level_bonus(a) * level_bonus(b)")],
-        run=["check", "server/referrals.py", "--timeout", "2"],
+        run=["check", "server/referrals.py"],
     ),
     Step(
         title="the whole shop",
@@ -163,7 +163,7 @@ ACTS: list[Step] = [
         empty function satisfies it.
         """,
         edits=[("server/referrals.py", "return level_bonus(b + a) == level_bonus(a) * level_bonus(b)", "return level_bonus(a + b) == level_bonus(a) * level_bonus(b)")],
-        run=["check", ".", "--timeout", "2"],
+        run=["check", "."],
     ),
 ]
 

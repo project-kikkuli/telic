@@ -49,7 +49,7 @@ def reports():
         if name.endswith(".ts") and not HAS_NODE:
             continue
         root = CASES / name if (CASES / name).is_dir() else CASES
-        out[name] = check([str(CASES / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(root))
+        out[name] = check([str(CASES / name)], CheckOptions(cache_path=None, lean=False), root=str(root))
     return out
 
 

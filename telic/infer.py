@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from . import ir
 from .program import FuncRef, Program
 from .render_expr import render
-from .smt import Theory, solve
+from .smt import RLIMIT, Theory, solve
 from .vcgen import Options, VCError, VCGen
 
 MAX_ROUNDS = 8
@@ -375,10 +375,15 @@ class Inferred:
         }
 
 
-def _all_proved(obs, theory: Theory, timeout_ms: int, inf: Inferred) -> bool:
+def infer_rlimit(rlimit: int) -> int:
+    """Each candidate gets a slice of the proof budget: there are many of them."""
+    return rlimit // 8
+
+
+def _all_proved(obs, theory: Theory, timeout_ms: int, rlimit: int, inf: Inferred) -> bool:
     for ob in obs:
         inf.solver_calls += 1
-        if solve(ob, theory, timeout_ms).status != "proved":
+        if solve(ob, theory, timeout_ms, rlimit).status != "proved":
             return False
     return True
 
@@ -404,7 +409,7 @@ def from_cache(fn: ir.Function, ref: FuncRef, sites: list[LoopSite], cached: dic
     return inf
 
 
-def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000, cached: dict | None = None) -> Inferred:
+def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 60000, rlimit: int = infer_rlimit(RLIMIT), cached: dict | None = None) -> Inferred:
     fn = ref.fn
     sites = loop_sites(fn.body)
     if cached is not None and cached.get("method") == "inference":
@@ -431,7 +436,7 @@ def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000
                     if id(ob.clause) in failed:
                         continue
                     inf.solver_calls += 1
-                    if solve(ob, theory, timeout_ms).status != "proved":
+                    if solve(ob, theory, timeout_ms, rlimit).status != "proved":
                         failed.add(id(ob.clause))
             if not failed:
                 break
@@ -452,7 +457,7 @@ def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000
             except VCError:
                 break
             vobs = [o for o in obs if o.kind == "variant" and o.loc.line == s.loc.line]
-            if vobs and _all_proved(vobs, theory, timeout_ms, inf):
+            if vobs and _all_proved(vobs, theory, timeout_ms, rlimit, inf):
                 inf.options.variants[s.loc.line] = cand
                 inf.variants[s.loc.line] = render(cand)
                 break
@@ -464,7 +469,7 @@ def _recursion_obs(obs) -> list:
     return [o for o in obs if o.kind == "variant" and o.site is None and "recurs" in o.message]
 
 
-def infer_measures(program: Program, keys: list[str], theory: Theory, inferred: dict[str, Inferred], timeout_ms: int = 3000) -> dict[str, ir.Expr]:
+def infer_measures(program: Program, keys: list[str], theory: Theory, inferred: dict[str, Inferred], timeout_ms: int = 60000, rlimit: int = infer_rlimit(RLIMIT)) -> dict[str, ir.Expr]:
     """Termination measures for one recursion group (``keys``, none with
     '@decreases'): the first candidate whose obligations all prove, trying in
     order one shape of single measure in every function, that shape ranked
@@ -490,7 +495,7 @@ def infer_measures(program: Program, keys: list[str], theory: Theory, inferred: 
                 return None
             for o in obs:
                 first.solver_calls += 1
-                ok = solve(o, theory, timeout_ms).status == "proved"
+                ok = solve(o, theory, timeout_ms, rlimit).status == "proved"
                 out.append((k, o, ok))
                 if not ok and not every:
                     return out
