@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from fractions import Fraction
@@ -102,7 +103,7 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     """``names`` maps object references already shown to how to refer to
     them, so aliasing and cycles are visible: ``f(a=<Box v=0 next=a>, b=a)``."""
     if v is None:
-        return "None" if lang == "python" else "null"
+        return "None" if lang == "python" else "nil" if lang == "swift" else "null"
     if isinstance(v, dict) and "__object__" in v:
         names = {} if names is None else names
         key = (v["__object__"], v["ref"])
@@ -155,6 +156,9 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
 def call_text(fn: ir.Function, model: dict[str, Any], lang: str, names: bool = True) -> str:
     params = fn.params
     head = fn.name
+    if lang == "swift":  # 'Version.init(_:_:)' is how telic keys it; Swift spells it 'Version'
+        head = re.sub(r"\$default$", "", re.sub(r"\([^()]*\)(#\d+)?$", "", head))
+        head = head[: -len(".init")] if head.endswith(".init") else head
     shown: dict = {}  # object reference -> how it is referred to
 
     def fmt(p: ir.Param) -> str:
