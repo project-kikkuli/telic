@@ -732,3 +732,27 @@ func interpolate(_ n: Int) -> String {
     //@ ensures result == "n = \(n)"
     return "n = \(n)"
 }
+
+// MARK: remainder and custom equality
+
+// expect: refuted
+func remainder(_ a: Int, _ b: Int) -> Int {
+    //@ requires b != 0
+    return a % b
+}
+
+struct Money: Equatable {
+    var cents: Int
+    var currency: String
+
+    static func == (lhs: Money, rhs: Money) -> Bool {
+        return lhs.cents == rhs.cents
+    }
+}
+
+// expect: proved
+func sameCents(_ a: Money, _ b: Money) -> Bool {
+    //@ requires a.cents == b.cents
+    //@ ensures result
+    return a == b
+}

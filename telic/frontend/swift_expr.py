@@ -375,6 +375,10 @@ class ExprLowerer:
                 return ir.Binary(ir.REAL, loc, BINOPS[op], a, b)
             name = {"+": "add", "-": "sub", "*": "mul", "/": "tdiv", "%": "tmod"}[op]
             k = self.kind_of(a) or self.kind_of(b) or kind or "Int"
+            if op == "%" and not self.spec and INT_KINDS[k][0]:
+                # min % -1 traps like min / -1 does
+                a, b = self.kinded(self.hoist_var(a), k), self.kinded(self.hoist_var(b), k)
+                self.pre.append(ir.ExprStmt(loc, self.checked(ir.Binary(ir.INT, loc, "tdiv", a, b), k)))
             return self.checked(ir.Binary(ir.INT, loc, name, a, b), k)
         if op in ("&+", "&-", "&*"):
             if a.ty != ir.INT or b.ty != ir.INT:

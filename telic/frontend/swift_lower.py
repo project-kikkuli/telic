@@ -246,7 +246,9 @@ class FunctionLowerer:
         if info.kind == "field-getter":
             loc = fn.loc
             self_v = ir.Var(info.params[0].ty, loc, "self")
-            fn.body = [ir.Return(loc, ir.Field(info.ret, loc, self_v, info.field_name or ""))]
+            el = ExprLowerer(self)
+            v = el.copy_value(ir.Field(info.ret, loc, self_v, info.field_name or ""))  # the caller gets a value of its own
+            fn.body = list(el.pre) + [ir.Return(loc, v)]
             fn.locals = dict(self.env)
             return fn
         if fn.trusted and (info.body is None or info.kind == "requirement"):

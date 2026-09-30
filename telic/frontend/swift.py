@@ -865,7 +865,7 @@ class Project:
                 kinds[pname] = k
             nxt = children[i + 2] if i + 2 < len(children) and i + 1 < len(children) and children[i + 1].type == "=" else None
             defaults.append(nxt)
-            labels.append(None if label == "_" else label)
+            labels.append(None if label == "_" or not re.fullmatch(r"\w+", name) else label)  # operators take no labels
             params.append(ir.Param(pname, ty))
         throws = any(c.type == "throws" or text(c) in ("throws", "rethrows") for c in f.children if c.type in ("throws", "rethrows") or not c.is_named and text(c) in ("throws", "rethrows"))
         body_n = f.child_by_field_name("body")

@@ -37,6 +37,8 @@ jobs:
         run: opam exec -- make -C core
       - name: Use every core
         run: echo "TELIC_JOBS=$(nproc)" >> "$GITHUB_ENV" && echo "TELIC_MAX_JOBS=$(nproc)" >> "$GITHUB_ENV"
+      - name: Swift toolchain (the runner image ships one; replay tests skip without it)
+        run: swiftc --version || echo "no swiftc on this runner"
       - name: Test
         run: pytest -q -rs
       - name: Demo
