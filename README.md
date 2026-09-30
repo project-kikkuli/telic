@@ -2,7 +2,7 @@
 
 **Write what your code promises in a comment. telic proves it, or shows you the input that breaks it, after running your code on that input.**
 
-Python, TypeScript and Rust. The contracts are comments, so production code pays nothing for them.
+Python, TypeScript, Rust and Swift. The contracts are comments, so production code pays nothing for them.
 
 ```python
 def discount(total: int, code: str | None, codes: dict[str, int]) -> int:
@@ -33,17 +33,26 @@ Nobody wrote a test. telic took the counterexample from the solver, ran the real
 ## Use it
 
 ```bash
-pip install -e .        # Python ≥ 3.10. TypeScript also needs Node ≥ 18;
-                        # Rust needs pip install -e '.[rust]' (and rustc to replay)
+pip install -e .        # Python ≥ 3.10
 telic demo              # 20-second walkthrough on a small shop
 telic check src/        # check a project
 ```
+
+| language | contract lines | counterexamples run in | also needs |
+|---|---|---|---|
+| Python | `#@` | CPython | |
+| TypeScript | `//@` | Node | Node ≥ 18 |
+| Rust | `//@` | a debug build from `rustc` | `pip install -e '.[rust]'` |
+| Swift | `//@` | a debug build from `swiftc` | `pip install -e '.[swift]'` |
+
+Replay needs the language's toolchain on `PATH`; without it, a
+counterexample is reported but not run.
 
 Then follow this loop, or have your coding agent follow it:
 
 1. **Say what a function promises.** Add `#@ requires` (what callers guarantee) and
    `#@ ensures` (what it returns; `result` is the return value, `old(x)` is x at
-   entry). In TypeScript and Rust, write `//@`.
+   entry). In TypeScript, Rust and Swift, write `//@`.
 2. **Run `telic check`.** Each promise, and each place the code could crash, is
    either proved or comes back with a counterexample telic has actually executed.
 3. **Fix the code or the contract.** telic says which one disagrees and where.
@@ -163,9 +172,11 @@ cores / 2) and `TELIC_UI_SLOTS` browsers (default 2), and queue for them.
 
 ## What you are trusting
 
-- **Language semantics.** Python ints are exact; Rust integers are their fixed
-  width, and overflow is a panic (debug semantics). Floats and JavaScript
-  numbers are exact rationals: no rounding, NaN or Infinity.
+- **Language semantics.** Python ints are exact; Rust and Swift integers are
+  their fixed width, and overflow is a panic or a trap (debug semantics).
+  Floats and JavaScript numbers are exact rationals: no rounding, NaN or
+  Infinity. Swift `String` equality is Unicode canonical equivalence, which
+  telic treats as an uninterpreted function.
 - **Z3 and the Lean kernel.**
 - **The theory lemmas about sums and counts.** They are proved in
   [Theory.lean](telic/lean/Theory.lean).

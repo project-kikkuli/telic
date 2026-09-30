@@ -12,6 +12,7 @@ from .swift_syntax import Unsupported, X, norm, text
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
 SCALARS = (ir.TInt, ir.TReal, ir.TBool, ir.TEnum)
+STRING_TO_STRING = {"lowercased", "uppercased", "capitalized", "trimmingCharacters", "replacingOccurrences", "appending", "padding", "description", "debugDescription"}
 INT_MAX = (1 << 63) - 1
 
 
@@ -686,6 +687,8 @@ class ExprLowerer:
         if isinstance(target, (ir.TClass,)) or target in (ir.INT, ir.REAL):
             tn = target.name if isinstance(target, ir.TClass) else ("Int" if target == ir.INT else "Double")
             return self.static_member(TypeRef(tn, self.pj.types.get(tn)), x.name, x, expect)
+        if not self.spec and (target is None or isinstance(target, ir.TOpaque)):
+            return self.opaque(f"implicit.{x.name}", [], ir.TOpaque(x.name), loc)  # a member of a type telic does not know
         raise self.err(f"'.{x.name}' needs a known enum type here", x)
 
     def x_member(self, x: X, expect: Any, kind: Any) -> Any:
@@ -802,16 +805,15 @@ class ExprLowerer:
         raise self.err(f"'.{name}' of {t} is not supported", x)
 
     def str_opaque(self, name: str, args: list[ir.Expr], x: Any, expect: Any) -> ir.Expr:
-        """A String operation telic does not interpret: deterministic, unknown."""
+        """A String operation telic does not interpret: deterministic, unknown
+        (or, when its result type is not known, unchecked)."""
         loc = self.loc(x)
         ok = all(a.ty in (ir.STR, ir.INT, ir.BOOL) for a in args)
-        if not ok:
+        ty = ir.BOOL if name.startswith(("has", "is", "contains", "starts", "ends")) else ir.STR if name in STRING_TO_STRING else None
+        if not ok or ty is None:
             if self.spec:
                 raise self.err(f"String.{name} in a specification", x)
-            return self.extern(f"String.{name}", args, expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, x)
-        ty = expect if expect in (ir.STR, ir.BOOL) else ir.STR
-        if name.startswith(("has", "is", "contains", "starts", "ends")):
-            ty = ir.BOOL
+            return self.maybe_throw_extern(f"String.{name}", args, expect, loc, x)
         return ir.Builtin(ty, loc, "str_fn", (ir.Lit(ir.STR, loc, f"String.{name}"), *args))
 
     def static_member(self, tr: TypeRef, name: str, x: X, expect: Any) -> ir.Expr:
@@ -996,6 +998,8 @@ class ExprLowerer:
             base = callee.base
             while base.kind == "paren":
                 base = base.e
+            if base.kind == "self" and callee.name == "init" and self.fl.init_fields is not None and not self.fl.materialized:
+                return self.delegate(args, x)
             tr = self._type_ref(base) if base.kind in ("name", "member") else None
             if tr is not None:
                 if callee.name == "init":
@@ -1039,6 +1043,31 @@ class ExprLowerer:
             raise self.err("unsupported call in a specification", x)
         f = self.expr(callee, None)
         return self.extern("closure call", [f] + [self.expr(a, None) for _, a in args], expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, x)
+
+    def delegate(self, args: list[tuple[str | None, X]], x: X) -> ir.Expr:
+        """``self.init(...)`` in an initializer: the other initializer builds self."""
+        loc = self.loc(x)
+        fl = self.fl
+        t = fl.t
+        assert t is not None
+        if not fl.top_level:
+            raise self.err("'self.init' inside a branch or loop is not supported", x)
+        fi = self.pj.lookup_fn(f"{t.name}.init", [lbl for lbl, _ in args])
+        if fi is None:
+            raise self.err(f"no initializer of {t.name} matches this 'self.init'", x)
+        v = self.call(fi, None, args, x, None)
+        obj = v
+        if fi.failable:
+            if not fl.info.failable:
+                raise self.err("a non-failable initializer delegating to a failable one", x)
+            self.pre.append(ir.If(loc, ir.Builtin(ir.BOOL, loc, "is_none", (v,)), (ir.Return(loc, ir.Lit(fl.info.ret, loc, None)),), ()))
+            obj = ir.Builtin(ir.TClass(t.name), loc, "unwrap", (v,))
+        fl.env["self"] = ir.TClass(t.name)
+        fl.scopes[0]["self"] = "self"
+        fl.used.add("self")
+        self.pre.append(ir.Assign(loc, "self", obj))
+        fl.materialized = True
+        return ir.Lit(ir.NONE, loc, None)
 
     def _closure_call(self, name: str, args: list[tuple[str | None, X]], x: X, expect: Any) -> ir.Expr:
         f = self.expr(X("name", x.at, id=name), None)
@@ -1845,7 +1874,19 @@ class ExprLowerer:
         if lx.kind == "self":
             # self = T(...) in a mutating method: every field replaced
             if fl.init_fields is not None and not fl.materialized:
-                raise self.err("assigning 'self' in an initializer is not supported", lx)
+                t = fl.t
+                assert t is not None
+                if not fl.top_level or t.kind != "struct":
+                    raise self.err("assigning 'self' in an initializer is supported for structs, outside branches and loops", lx)
+                v = self.copy_value(fl.coerce(value, ir.TClass(t.name)))
+                if v.ty != ir.TClass(t.name):
+                    raise self.err(f"assigning {v.ty} to self", lx)
+                fl.env["self"] = ir.TClass(t.name)
+                fl.scopes[0]["self"] = "self"
+                fl.used.add("self")
+                self.pre.append(ir.Assign(loc, "self", v))
+                fl.materialized = True
+                return
             sv = self.expr(lx, None)
             if not self.is_struct(sv.ty):
                 raise self.err("assigning 'self' is supported in mutating methods of structs", lx)

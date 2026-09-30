@@ -264,7 +264,7 @@ class FunctionLowerer:
             self._init_prologue(stmts)
         body = info.body
         if body is not None and body.type == "statements":
-            self.block(body, stmts, tail=info.ret != ir.NONE)
+            self.block(body, stmts, tail=info.ret != ir.NONE and info.kind != "init")
         if info.kind == "init":
             self._init_epilogue(stmts)
         fn.body = stmts

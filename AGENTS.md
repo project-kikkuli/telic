@@ -1,6 +1,6 @@
 # Working on telic
 
-telic is a static verifier: frontends lower Python/TypeScript/Rust plus
+telic is a static verifier: frontends lower Python/TypeScript/Rust/Swift plus
 `@`-comment contracts into one IR; `vcgen.py` (or the OxCaml engine in
 `core/`) turns each function into proof obligations; Z3 and Lean discharge
 them; counterexamples are replayed in the real runtime. Read
@@ -13,12 +13,12 @@ for the known gaps.
 |---|---|
 | `telic/ir.py` | the IR. Language differences are distinct operators, never shared names |
 | `telic/contracts.py` | `@`-comment grammar shared by all frontends |
-| `telic/frontend/python.py`, `telic/frontend/ts/lower.mjs`, `telic/frontend/rust.py` | lowering; what can't be modelled exactly becomes opaque (with its assumption recorded) or `Unsupported(reason)` |
+| `telic/frontend/python.py`, `telic/frontend/ts/lower.mjs`, `telic/frontend/rust.py`, `telic/frontend/swift*.py` | lowering; what can't be modelled exactly becomes opaque (with its assumption recorded) or `Unsupported(reason)` |
 | `telic/logic.py` | VC terms, smart constructors, theory definitions and lemmas |
 | `telic/vcgen.py` | symbolic execution → `Obligation`s; pure functions → definitions |
 | `telic/infer.py` | Houdini invariants, loop variants, recursion measures |
 | `telic/smt.py`, `telic/lean.py` | backends; Lean sidecars, agent loop, axiom audit |
-| `telic/replay.py`, `telic/replay_harness.py`, `telic/frontend/ts/harness.mjs`, `telic/frontend/rust_replay.py` | executing counterexamples, fuzzing, shrinking |
+| `telic/replay.py`, `telic/replay_harness.py`, `telic/frontend/ts/harness.mjs`, `telic/frontend/rust_replay.py`, `telic/frontend/swift_replay.py` | executing counterexamples, fuzzing, shrinking |
 | `telic/equiv.py`, `telic/gaps.py` | `@mirrors` and spec-gap mutation |
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
@@ -42,7 +42,7 @@ for the known gaps.
 - **New theory lemmas need Lean proofs** in `telic/lean/Theory.lean` under the
   same name (`tests/test_lean.py` enforces this).
 - **Verdict changes go through the corpora.** `tests/cases/corpus.py`,
-  `corpus.ts` and `corpus.rs` pin the expected verdict of every function; add a
+  `corpus.ts`, `corpus.rs` and `corpus.swift` pin the expected verdict of every function; add a
   case for every bug you fix.
 - **Models only through `oracle.py`.** Ask typed questions (noul / choice /
   score) with a builtin rule as the fallback; `text` questions are optional

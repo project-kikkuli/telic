@@ -1,7 +1,7 @@
 # Contract reference
 
 A contract line is a line comment starting with `#@` (Python) or `//@`
-(TypeScript, Rust), followed by a keyword. The payload is an expression in the host
+(TypeScript, Rust, Swift), followed by a keyword. The payload is an expression in the host
 language. A line whose first word is not a keyword continues the previous clause:
 
 ```python
@@ -55,6 +55,9 @@ reachable when `C` holds, and the function must not return normally when `C`
 holds. In a function with a contract, a reachable `raise` without `@raises` is
 an error; without any contract, raising is simply what the function does (a
 handler rejecting a request). A Rust `panic!` is always a crash to rule out.
+In Swift, `@raises C` says when a `throws` function throws; a call with `try`
+throws when the callee's `@raises` holds, never when the callee has a
+contract without one, and possibly when it has no contract.
 
 **`assert P`** is proved statically, then assumed. Native `assert` statements are
 treated the same way, except an `assert` about values from unchecked code (a
@@ -386,22 +389,22 @@ running the app; cached verdicts still show. The web driver needs
 
 Everything the code can say, plus:
 
-| | Python | TypeScript | Rust |
-|---|---|---|---|
-| return value | `result` | `result` | `result` |
-| entry value | `old(e)` | `old(e)` | `old(e)` |
-| implication | `implies(a, b)` | `implies(a, b)` | `implies(a, b)` |
-| for all / exists over a list | `all(p(x) for x in xs)`, `any(...)` | `xs.every(x => p(x))`, `xs.some(...)`, `xs.every((x, i) => ...)` | `xs.iter().all(\|x\| p(x))`, `.any(...)` |
-| over an integer range | `all(p(i) for i in range(lo, hi))` | `range(lo, hi).every(i => p(i))` | `(lo..hi).all(\|i\| p(i))` |
-| with index | `all(p(i, x) for i, x in enumerate(xs))` | `xs.every((x, i) => p(i, x))` | `(0..xs.len()).all(\|i\| p(i, xs[i]))` |
-| filter | `all(p(x) for x in xs if q(x))` | `xs.every(x => !q(x) \|\| p(x))` | `xs.iter().all(\|x\| !q(x) \|\| p(x))` |
-| sum / count | `sum(xs)`, `sum(xs[a:b])`, `xs.count(v)` | `sum(xs)`, `count(xs, v)`, `xs.reduce((a, b) => a + b, 0)` | `xs.iter().sum::<u64>()`, `.filter(...).count()` |
-| membership | `v in xs` | `xs.includes(v)` | `xs.contains(&v)` |
-| slices | `xs[a:b]`, `xs[-1]` | `xs.slice(a, b)`, `xs.at(-1)` | `xs[a..b]` |
-| pure helpers | any loop-free, mutation-free function in the program, e.g. `ensures result == fib(n)` | same | same |
+| | Python | TypeScript | Rust | Swift |
+|---|---|---|---|---|
+| return value | `result` | `result` | `result` | `result` |
+| entry value | `old(e)` | `old(e)` | `old(e)` | `old(e)` |
+| implication | `implies(a, b)` | `implies(a, b)` | `implies(a, b)` | `implies(a, b)` |
+| for all / exists over a list | `all(p(x) for x in xs)`, `any(...)` | `xs.every(x => p(x))`, `xs.some(...)`, `xs.every((x, i) => ...)` | `xs.iter().all(\|x\| p(x))`, `.any(...)` | `xs.allSatisfy { p($0) }`, `xs.contains { p($0) }` |
+| over an integer range | `all(p(i) for i in range(lo, hi))` | `range(lo, hi).every(i => p(i))` | `(lo..hi).all(\|i\| p(i))` | `(lo..<hi).allSatisfy { i in p(i) }` |
+| with index | `all(p(i, x) for i, x in enumerate(xs))` | `xs.every((x, i) => p(i, x))` | `(0..xs.len()).all(\|i\| p(i, xs[i]))` | `(0..<xs.count).allSatisfy { i in p(i, xs[i]) }` |
+| filter | `all(p(x) for x in xs if q(x))` | `xs.every(x => !q(x) \|\| p(x))` | `xs.iter().all(\|x\| !q(x) \|\| p(x))` | `xs.allSatisfy { !q($0) \|\| p($0) }` |
+| sum / count | `sum(xs)`, `sum(xs[a:b])`, `xs.count(v)` | `sum(xs)`, `count(xs, v)`, `xs.reduce((a, b) => a + b, 0)` | `xs.iter().sum::<u64>()`, `.filter(...).count()` | `xs.reduce(0, +)`, `xs.filter { q($0) }.count` |
+| membership | `v in xs` | `xs.includes(v)` | `xs.contains(&v)` | `xs.contains(v)` |
+| slices | `xs[a:b]`, `xs[-1]` | `xs.slice(a, b)`, `xs.at(-1)` | `xs[a..b]` | `xs[a..<b]` |
+| pure helpers | any loop-free, mutation-free function in the program, e.g. `ensures result == fib(n)` | same | same | same |
 
-In Rust specs, arithmetic is mathematical (a spec never overflows) and
-references dereference themselves (`x <= result` where `x: &i32`).
+In Rust and Swift specs, arithmetic is mathematical (a spec never overflows).
+In Rust specs, references dereference themselves (`x <= result` where `x: &i32`).
 
 Spec expressions must themselves be well-defined: an index inside a spec is
 checked like one in code.
@@ -497,3 +500,47 @@ replayed by compiling the file with `rustc` (overflow checks on) and calling the
 function on the counterexample. Not yet modelled: data-carrying enums, tuple
 structs, traits and generics (their values are opaque), and modules in other
 files.
+
+**Swift.** All Swift files of a run are lowered together, as one module: a
+file sees every other file's declarations without imports. Integers are
+their fixed width (`Int` is 64 bits): `+ - *`, unary `-`, `/` (including
+`Int.min / -1`), `Int8(x)`-style conversions and `reduce(0, +)` (at every
+running total) must not overflow; `&+ &- &*` wrap; `/` and `%` truncate.
+Indexing, `!`, `try!`, `removeLast()` and friends, `fatalError`, `precondition`
+and `assert` are traps to rule out. Operators are grouped by Swift's
+precedence groups: telic refolds what its parser (tree-sitter-swift) groups
+wrongly.
+
+A class is an object (references alias). A struct is an object too, but it
+is copied wherever it is stored (a binding, a field, an element, a
+returned value, an argument read through another object), so no two places
+share one: `var b = a; b.x = 1` leaves `a` alone, and changing an element
+of an array of structs copies the element, changes it and stores it back.
+Synthesized `==` compares fields. `//@ invariant` in a struct or class body
+works as for classes (initializers establish it; `mutating` methods and
+methods of classes preserve it). An enum without payloads is an enum (with
+`rawValue`); one with payloads is a value whose case is matched by `switch`,
+`if case` and `==`. Optionals, `if let`, `guard let`, `while let`, `?.`, `??`
+and `!` are modelled. `do`/`catch` runs a catch clause from the state where
+the error was thrown; which clause matches is left open.
+
+A protocol is a base class of its conformers: a call through it is checked
+against the requirement's contract, and every conformer's implementation
+(or the protocol extension's default) is checked against that contract. A
+protocol is opaque (its values and calls unchecked) when telic cannot see
+every conformer: a `public` protocol, or one an enum or a type it does not
+model conforms to. A mutating requirement called through a protocol that
+structs conform to is not modelled. A generic parameter is opaque, or its
+protocol when one checked protocol constrains it.
+
+`String` equality is Unicode canonical equivalence (`"\u{212A}" == "K"`):
+telic compares uninterpreted normal forms, so it proves `s == s` but never
+decides two different literals; the same goes for `String` dictionary keys.
+Only `+`, `isEmpty` and `== ""` are exact. Refutations are replayed by
+compiling the file with `swiftc` together with a generated harness, which
+builds the counterexample's values (struct and class fields directly), calls
+the function, and checks its `@ensures` and its type's invariants. Not yet
+modelled (reported unsupported, or opaque): class inheritance (calls
+through a base that has subclasses are unsupported), `defer`, labelled
+statements, `inout` scalars, subscripts, key paths, `Set`, tuples, string
+indices, `async let` and actors.

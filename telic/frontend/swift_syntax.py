@@ -378,17 +378,21 @@ def _suffixed(target: Any, make: Any, whole: Any, as_seq: bool = False) -> Any:
     sequence's last operand."""
     if target.type in BINARY or _leads_sequence(target):
         seq = flatten(target)
-        if not isinstance(seq[-1], X):
+    else:
+        r = norm(target, as_seq=True)  # a chain whose own target was a sequence
+        if not isinstance(r, list):
+            return _postfix(r, make)
+        seq = r
+    if not isinstance(seq[-1], X):
+        raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
+    if seq[-1].kind == "prefixop":
+        probe = make(X("name", whole, id="_"))
+        if probe.kind != "call" or len(probe.args) != 1 or probe.args[0][0] is not None or probe.trailing:
             raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
-        if seq[-1].kind == "prefixop":
-            probe = make(X("name", whole, id="_"))
-            if probe.kind != "call" or len(probe.args) != 1 or probe.args[0][0] is not None or probe.trailing:
-                raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
-            seq[-1] = X("prefix", whole, op=seq[-1].op, e=X("paren", whole, e=probe.args[0][1]))
-        else:
-            seq[-1] = _postfix(seq[-1], make)
-        return seq if as_seq else _span(fold(seq), whole)
-    return _postfix(norm(target), make)
+        seq[-1] = X("prefix", whole, op=seq[-1].op, e=X("paren", whole, e=probe.args[0][1]))
+    else:
+        seq[-1] = _postfix(seq[-1], make)
+    return seq if as_seq else _span(fold(seq), whole)
 
 
 def _postfix(base: X, make: Any) -> X:
