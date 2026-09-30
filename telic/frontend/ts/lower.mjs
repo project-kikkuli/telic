@@ -38,7 +38,27 @@ const tyEq = (a, b) => tyKey(a) === tyKey(b);
 const isNum = (t) => t && (t.k === "int" || t.k === "real");
 const hasOpaque = (t) => t.k === "opaque" || (t.k === "list" && hasOpaque(t.elem)) || (t.k === "option" && hasOpaque(t.inner)) || (t.k === "dict" && (hasOpaque(t.key) || hasOpaque(t.val)));
 const tyStr = (t) => (t.k === "list" ? `${tyStr(t.elem)}[]` : t.k === "record" || t.k === "class" || t.k === "enum" ? t.name : t.k === "real" ? "number" : t.k === "int" ? "int" : t.k === "option" ? `${tyStr(t.inner)} | undefined` : t.k === "dict" ? `Map<${tyStr(t.key)}, ${tyStr(t.val)}>` : t.k);
-const GLOBALS = new Set(["Date", "JSON", "Math", "Number", "String", "Object", "Array", "Promise", "fetch", "console", "process", "window", "document", "crypto", "setTimeout", "clearTimeout", "setInterval", "parseInt", "parseFloat", "isNaN", "isFinite", "Symbol", "BigInt", "Error", "Intl", "URL", "URLSearchParams", "localStorage", "sessionStorage", "navigator", "location", "globalThis", "undefined", "NaN", "Infinity", "structuredClone", "encodeURIComponent", "decodeURIComponent", "require", "module", "exports", "__dirname", "__filename", "Buffer", "Set", "WeakMap", "WeakSet", "Reflect", "Proxy", "queueMicrotask", "alert", "performance"]);
+const KNOWN_GLOBALS = new Set(["Date", "JSON", "Math", "Number", "String", "Object", "Array", "Promise", "fetch", "console", "process", "window", "document", "crypto", "setTimeout", "clearTimeout", "setInterval", "parseInt", "parseFloat", "isNaN", "isFinite", "Symbol", "BigInt", "Error", "Intl", "URL", "URLSearchParams", "localStorage", "sessionStorage", "navigator", "location", "globalThis", "undefined", "NaN", "Infinity", "structuredClone", "encodeURIComponent", "decodeURIComponent", "require", "module", "exports", "__dirname", "__filename", "Buffer", "Set", "WeakMap", "WeakSet", "Reflect", "Proxy", "queueMicrotask", "alert", "performance"]);
+
+// Values the host declares: TypeScript's own lib files (DOM, ES, workers),
+// read once on the first name that is not in KNOWN_GLOBALS.
+let libGlobals = null;
+function libGlobal(name) {
+  if (libGlobals === null) {
+    libGlobals = new Set();
+    const dir = path.dirname(require.resolve("typescript/lib/lib.d.ts"));
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^lib\..*\.d\.ts$/.test(f)) continue;
+      const sf = ts.createSourceFile(f, fs.readFileSync(path.join(dir, f), "utf8"), ts.ScriptTarget.Latest, false);
+      for (const st of sf.statements) {
+        if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) libGlobals.add(d.name.text);
+        if (ts.isFunctionDeclaration(st) && st.name) libGlobals.add(st.name.text);
+      }
+    }
+  }
+  return libGlobals.has(name);
+}
+const GLOBALS = { has: (name) => KNOWN_GLOBALS.has(name) || libGlobal(name) };
 
 class LowerError extends Error {
   constructor(msg, line) {

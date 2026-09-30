@@ -94,7 +94,10 @@ class _Scope:
 
 
 def _may_change(program: Program, ref: FuncRef, family: set[str]) -> bool:
+    """Can a call change objects of these classes? Never across languages:
+    each runs in its own runtime."""
     fn = ref.fn
+    family = {c for c in family if program.class_module[c].language == ref.module.language}
     if any(isinstance(p.ty, ir.TClass) and p.ty.name in family for p in fn.params):
         return True
     if any(fn.name.startswith(f"{c}.") for c in family):

@@ -100,3 +100,9 @@ def test_json_lists_lifecycles():
     rows = {x["text"]: x for x in out["lifecycles"]}
     assert rows["once self.sealed"]["status"] == "vacuous"
     assert rows["mode: 0 -> 1 -> 2, 1 -> 0"]["steps"][2] == {"step": "1 -> 0", "by": [], "unknown": False}
+
+
+def test_unchecked_code_changes_objects_only_in_its_own_language():
+    rep = check([str(CASES / "crosslang")], CheckOptions(cache_path=None, lean=False, replay=False), root=str(CASES / "crosslang"))
+    got = {lc.module.language: lc.status for lc in rep.lifecycles}
+    assert got == {"python": "proved", "typescript": "open"}
