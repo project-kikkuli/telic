@@ -123,7 +123,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         paint = Paint(True if args.color == "always" else False if args.color == "never" else None)
         print(Renderer(rep, paint, verbose=args.verbose).render())
     if args.strict:
-        return 0 if rep.ok and all(f.status in ("proved", "trusted") for f in rep.functions) else 1
+        return 0 if rep.ok and all(f.status in ("proved", "trusted") for f in rep.functions) and all(m.status == "proved" for m in rep.mirrors) else 1
     return 0 if rep.ok else 1
 
 

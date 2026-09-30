@@ -271,7 +271,7 @@ def function_panel(f: FunctionReport) -> str:
 
 def mirror_card(m) -> str:
     parts = [
-        f'<div class="pair">{pill(m.status, "equivalent" if m.status == "proved" else "diverges" if m.status == "refuted" else "not proved")}'
+        f'<div class="pair">{pill(m.status, "equivalent" if m.status == "proved" else "diverges" if m.status == "refuted" else "vacuous" if m.status == "vacuous" else "not proved")}'
         f"<span>{e(m.a.module.path)}::{e(m.a.fn.name)}</span><span class=\"muted\">≡</span><span>{e(m.b.module.path)}::{e(m.b.fn.name)}</span></div>"
     ]
     if m.status == "proved":

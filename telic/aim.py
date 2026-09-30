@@ -188,7 +188,7 @@ def build(rep: Any) -> list[AimReport]:
             for c in clauses:
                 r.lemmas.append(Lemma(f.ref.key, f.fn.name, f.ref.module.path, c.loc.line, c.kind, c.text, _clause_status(f, c)))
         for mr in mirrors.get(iid, []):
-            st = {"proved": "proved", "refuted": "refuted"}.get(mr.status, "open")
+            st = {"proved": "proved", "refuted": "refuted", "vacuous": "vacuous"}.get(mr.status, "open")
             r.lemmas.append(Lemma(mr.a.key, f"{mr.a.fn.name} ≡ {mr.b.fn.name}", mr.a.module.path, mr.a.fn.loc.line, "mirror", "agree on every input", st))
         for res in uis.get(iid, []):
             r.lemmas.append(_ui_lemma(rep, res, r))

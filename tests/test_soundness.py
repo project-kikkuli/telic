@@ -119,3 +119,9 @@ def test_vacuity_verdict_survives_the_cache(tmp_path):
         rep = check([str(DIR / "t24.py")], opts, root=str(DIR))
         status = {f.fn.name: f.status for f in rep.functions}
         assert status["contradictory"] == "vacuous" and status["fine"] == "proved"
+
+
+def test_mirror_with_disjoint_preconditions_is_vacuous():
+    rep = check([str(DIR / "mirvac")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mirvac"))
+    assert [m.status for m in rep.mirrors] == ["vacuous"]
+    assert [i.status for i in rep.aims if i.id == "SAME"] == ["vacuous"]

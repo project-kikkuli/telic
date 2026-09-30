@@ -35,7 +35,7 @@ class MirrorReport:
     b: FuncRef
     loc: ir.Loc
     aims: list[str]
-    status: str  # proved | refuted | open
+    status: str  # proved | refuted | vacuous | open
     method: str = ""  # smt | testing
     witness: dict[str, Any] | None = None
     reason: str = ""
@@ -261,6 +261,11 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
             rep.method = "smt"
             if res.status == "proved":
                 rep.status = "proved"
+                if hyps:
+                    probe = Obligation(id=f"{ob.id}/vacuity", func=a.key, kind="vacuity", loc=loc, site=None, message="some input satisfies both", hyps=hyps, goal=L.FALSE)
+                    if solve(probe, theory, timeout_ms).status == "proved":
+                        rep.status = "vacuous"
+                        rep.reason = f"no input satisfies the @requires of both {a.fn.name} and {b.fn.name}, so they never run on the same input; align the preconditions"
                 return rep
             if res.status == "refuted":
                 args_a = [encode_value(res.model.get(p.name), p.ty) for p in a.fn.params]

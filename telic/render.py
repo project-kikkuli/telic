@@ -249,7 +249,7 @@ class Renderer:
         p = self.p
         r = self.r
         refuted = [f for f in r.functions if f.status == "refuted"] + [m for m in r.mirrors if m.status == "refuted"]
-        vacuous = [f for f in r.functions if f.status == "vacuous"]
+        vacuous = [f for f in r.functions if f.status == "vacuous"] + [m for m in r.mirrors if m.status == "vacuous"]
         open_ = [f for f in r.functions if f.status in ("open", "error")] + [m for m in r.mirrors if m.status == "open"]
         proved = [f for f in r.functions if f.status == "proved" and not _empty(f)]
         empty = [f for f in r.functions if _empty(f)]
@@ -442,6 +442,8 @@ class Renderer:
             tag = p.bgreen("✓ EQUIVALENT")
         elif mr.status == "refuted":
             tag = p.bred("✗ DIVERGES")
+        elif mr.status == "vacuous":
+            tag = p.bred("∅ VACUOUS")
         else:
             tag = p.byellow("? UNKNOWN")
         out.append(self.rule(f"{tag} {p.bold(a.fn.name)} {p.dim('≡')} {p.bold(b.fn.name)}", f"{a.module.path} ⇄ {b.module.path}"))
