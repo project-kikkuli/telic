@@ -614,6 +614,27 @@ let rec ev g ctx (e : Ir.expr) : value =
     let arr = ref base.arr in
     List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) elems;
     L { arr = !arr; off = zero; len = int_ (List.length elems); lty = e.ty }
+  | Quant q when (not ctx.spec) && effectful g q.body ->
+    (* an unknown truth value; the body's obligations and effects for every element *)
+    let n = next g in
+    (match q.seq with
+     | Some ({ ty = TDict (kty, _); _ } as s) -> (
+       match (ev g ctx s, q.elem) with
+       | D d, Some el ->
+         let k = const (Printf.sprintf "%s!%d" el n) (sort_of kty) in
+         run_each g ctx loc (Some s) (select d.has k) [ (el, T k) ] q.body None
+       | _ -> raise (Vc_error ("quantifier over a non-dict", loc)))
+     | _ ->
+       let lo = tm (ev g ctx q.lo) and hi = tm (ev g ctx q.hi) in
+       let base = match String.index_opt q.idx '$' with Some k -> String.sub q.idx 0 k | None -> q.idx in
+       let i = const (Printf.sprintf "%s!%d" base n) Int in
+       let binds =
+         match (q.seq, q.elem) with
+         | Some s, Some el -> ( match ev g ctx s with L l -> [ (el, T (at (l.arr, l.off) i)) ] | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
+         | _ -> []
+       in
+       run_each g ctx loc q.seq (and_ [ le lo i; lt i hi ]) ((q.idx, T i) :: binds) q.body None);
+    T (const (Printf.sprintf "%s@%d" q.kind n) Bool)
   | Quant q when (match q.seq with Some { ty = TDict _; _ } -> true | _ -> false) -> (
     (* over a dict's keys: every k it holds *)
     match (q.seq, q.elem) with
@@ -709,6 +730,22 @@ and builtin g ctx (e : Ir.expr) name args =
   let assume_ t = assume ctx t in
   match name with
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
+  | "each" ->
+    let seq = match ev g ctx (List.hd args) with L l -> l | _ -> raise (Vc_error ("comprehension over a non-list", loc)) in
+    each_element g ctx e seq;
+    (match e.ty with
+     | TNone -> NoneV
+     | t ->
+       let r = fresh g "comprehension" t () in
+       (match r with L l -> assume ctx (le zero l.len) | _ -> ());
+       r)
+  | "range_list" ->
+    let lo, hi = match args with [ a; b ] -> (tm (ev g ctx a), tm (ev g ctx b)) | _ -> raise (Vc_error ("range_list takes two bounds", loc)) in
+    let n = next g in
+    let arr = const (Printf.sprintf "range@%d.arr" n) (sort_of e.ty) and k = const (Printf.sprintf "k!%d" n) Int in
+    let ln = ite (lt lo hi) (Term.sub hi lo) zero in
+    assume ctx (quant "forall" [ k ] (implies (and_ [ le zero k; lt k ln ]) (eq (select arr k) (add lo k))) [ [| select arr k |] ]);
+    L { arr; off = zero; len = ln; lty = e.ty }
   | "threw" -> threw g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
     D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
@@ -927,6 +964,172 @@ and pure g (e : Ir.expr) =
     e;
   !ok
 
+and each_element g ctx (e : Ir.expr) seq =
+  let src, names, body, cond =
+    match e.e with
+    | Builtin (_, [ src; { e = Lit (LStr el); _ }; body ]) -> (src, el, body, None)
+    | Builtin (_, [ src; { e = Lit (LStr el); _ }; body; cond ]) -> (src, el, body, Some cond)
+    | _ -> raise (Fallback "comprehension shape")
+  in
+  (* "x" or "x,i": the element and its index *)
+  let elem, idx = match String.index_opt names ',' with Some k -> (String.sub names 0 k, Some (String.sub names (k + 1) (String.length names - k - 1))) | None -> (names, None) in
+  let i = const (Printf.sprintf "%s!%d" elem (next g)) Int in
+  let binds = (elem, T (at (seq.arr, seq.off) i)) :: (match idx with Some x -> [ (x, T i) ] | None -> []) in
+  run_each g ctx e.loc (Some src) (and_ [ le zero i; lt i seq.len ]) binds body cond
+
+(* A comprehension's body run on an arbitrary element (binds, within rng),
+   from any state the earlier elements may have left: its obligations hold
+   for every element, and what it may change is unknown afterwards. *)
+and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
+  let parts = match cond with Some c -> [ c; body ] | None -> [ body ] in
+  let names, appends = modified g (List.map (fun x -> Ir.ExprStmt (loc, x)) parts) in
+  let calls_out = List.exists (fun x -> let hit = ref false in Ir.walk_expr (fun (y : Ir.expr) -> match y.e with Extern _ -> hit := true | _ -> ()) x; !hit) parts in
+  let names = if calls_out then names @ List.filter (fun v -> Hashtbl.mem g.info.fn.locals v && not (List.mem v names)) g.info.fn.escaped else names in
+  Option.iter
+    (Ir.walk_expr (fun (x : Ir.expr) ->
+         match x.e with
+         | Var n when List.mem n names -> raise (Vc_error (Printf.sprintf "the comprehension changes '%s' while iterating over it" n, loc))
+         | _ -> ()))
+    src;
+  let havoc_here () =
+    match ctx.state with
+    | Some st ->
+      let n0 = Dynarray.length st.facts in
+      let h = havoc g st names appends in
+      for k = n0 to Dynarray.length h.facts - 1 do assume ctx (Dynarray.get h.facts k) done;
+      st.env <- h.env
+    | None -> ()
+  in
+  havoc_here ();
+  let sub = sub_ctx ~cond:rng ctx in
+  let sub = { sub with bound = List.fold_left (fun m (k, v) -> SM.add k v m) sub.bound binds } in
+  let sub = match cond with Some c -> sub_ctx ~cond:(term_of loc (ev g sub c)) sub | None -> sub in
+  ignore (ev g sub body);
+  havoc_here ()
+
+and modified g body =
+  (* sets kept as lists (their order names the havocked constants) plus a
+     table for membership: a program with many classes has thousands of heap
+     keys, and list membership made this quadratic *)
+  let names = ref (Ir.assigned_names body) and appends = ref [] in
+  let seen_n = Hashtbl.create 64 and seen_a = Hashtbl.create 16 in
+  List.iter (fun n -> Hashtbl.replace seen_n n ()) !names;
+  let addn n = if not (Hashtbl.mem seen_n n) then (Hashtbl.add seen_n n (); names := n :: !names) in
+  let adda n = if not (Hashtbl.mem seen_a n) then (Hashtbl.add seen_a n (); appends := n :: !appends) in
+  let add_writes key =
+    List.iter
+      (fun (cf, _) ->
+        let k = String.index cf '.' in
+        List.iter (fun (hk, _) -> addn hk) (heap_keys g (String.sub cf 0 k) (String.sub cf (k + 1) (String.length cf - k - 1))))
+      (try Hashtbl.find g.prog.heap_writes key with Not_found -> [])
+  in
+  Ir.walk_stmts
+    (fun s ->
+      (match s with
+       | Append (_, n, _) -> adda n
+       | Assign (_, n, _) -> ( match Hashtbl.find_opt g.info.fn.locals n with Some (TList _) -> adda n | _ -> ())
+       | FieldAssign (_, _, cls, f, _) ->
+         List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f);
+         if has_invariants g cls then addn (written_key cls)
+       | _ -> ());
+      List.iter
+        (fun e ->
+          Ir.walk_expr
+            (fun (x : Ir.expr) ->
+              if suspends x then begin
+                addn segment;
+                List.iter addn (all_heap_keys g)
+              end;
+              match x.e with
+              | New (cls, _) -> (
+                addn "@alloc";
+                match class_of g cls with
+                | Some c -> (
+                  match c.init with
+                  | Some k -> add_writes k
+                  | None ->
+                    List.iter (fun (f, _) -> List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f)) c.cfields;
+                    Option.iter add_writes c.post_init)
+                | None -> ())
+              | Extern (_, args) ->
+                List.iter (fun (a : Ir.expr) -> match (a.e, a.ty) with Var n, (TList _ | TDict _) -> addn n; adda n | _ -> ()) args;
+                if extern_touches_heap g args then begin
+                  addn "@alloc";
+                  List.iter addn (all_heap_keys g)
+                end
+              | Call (f, args) -> (
+                match resolve g g.info.modpath f with
+                | Some tgt ->
+                  if Hashtbl.mem g.prog.allocates tgt.key then addn "@alloc";
+                  add_writes tgt.key;
+                  List.iter
+                    (fun ((p, _), (a : Ir.expr)) ->
+                      match a.e with
+                      | Var n when List.mem p tgt.mutated -> addn n; if List.mem p tgt.appends then adda n
+                      | _ -> ())
+                    (zip tgt.fn.params args)
+                | None -> ())
+              | _ -> ())
+            e)
+        (Ir.stmt_exprs s))
+    body;
+  (!names, !appends)
+
+and havoc g (st : state) names appends : state =
+  let h = copy_state st in
+  List.iter
+    (fun name ->
+      match SM.find_opt name h.env with
+      | _ when name = segment ->
+        SM.iter
+          (fun k v ->
+            match v with
+            | T o when is_segment k -> h.env <- SM.add k (T (const (Printf.sprintf "%s@%d" (String.sub k 1 (String.length k - 1)) (next g)) o.sort)) h.env
+            | _ -> ())
+          h.env
+      | None -> ()
+      | Some (T o) when is_written_key name -> h.env <- SM.add name (T (const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort)) h.env
+      | Some old when is_heap name -> (
+        match old with
+        | T o ->
+          let nw = const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort in
+          h.env <- SM.add name (T nw) h.env;
+          if name = "@alloc" then begin
+            let r = const (Printf.sprintf "r!%d" (next g)) Int in
+            Dynarray.add_last h.facts (monotone_alloc o nw r)
+          end
+        | _ -> ())
+      | Some old -> (
+        match Hashtbl.find_opt g.info.fn.locals name with
+        | None -> ()
+        | Some ty -> (
+          match old with
+          | L o ->
+            let keep = if List.mem name appends then None else Some o.len in
+            let nv = match fresh g name ty ?len:keep () with L l -> l | _ -> assert false in
+            let nv = match keep with None -> Dynarray.add_last h.facts (le zero nv.len); nv | Some k -> { nv with off = o.off; len = k } in
+            h.env <- SM.add name (L nv) h.env
+          | _ -> h.env <- SM.add name (fresh g name ty ()) h.env)))
+    (List.sort compare names);
+  h
+
+(* a loop that suspends splits its stretches at its head: each part keeps the
+   lifecycles (checked on the way in and after each iteration), and the part
+   after the head starts from the head's heap *)
+and cut g ?(at_head = false) names (st : state) (site : Ir.loc) =
+  if List.mem segment names then if at_head then resume st else check_lifecycles g st.facts st.env site
+
+and effectful g (e : Ir.expr) =
+  let hit = ref false in
+  Ir.walk_expr
+    (fun (x : Ir.expr) ->
+      match x.e with
+      | Extern _ | New _ | Builtin (("await" | "each"), _) -> hit := true
+      | Call (f, _) -> ( match resolve g g.info.modpath f with Some t when t.definitional -> () | _ -> hit := true)
+      | _ -> ())
+    e;
+  !hit
+
 and comprehension g ctx (e : Ir.expr) seq =
   let loc = e.loc in
   let seq = match seq with L l -> l | _ -> raise (Vc_error ("comprehension over a non-list", loc)) in
@@ -949,19 +1152,22 @@ and comprehension g ctx (e : Ir.expr) seq =
   in
   let i = const (Printf.sprintf "%s!%d" elem n) Int in
   let rng = and_ [ le zero i; lt i seq.len ] in
-  let sub = sub_ctx ~cond:rng { ctx with spec = true; quiet = ctx.quiet || not is_pure } in
+  let sub = sub_ctx ~cond:rng { ctx with spec = true } in
   let sub = { sub with bound = SM.add elem (T (at (seq.arr, seq.off) i)) sub.bound } in
   let result = L { arr; off = zero; len = ln; lty = e.ty } in
   if not is_pure then begin
-    (match ctx.state with Some _ -> havoc_heap g ctx | None -> ());
+    (* values unknown; obligations and effects as for any element *)
+    each_element g ctx e seq;
     result
   end
   else begin
-    let b = term_of loc (ev g sub body) in
     (match cond with
-     | None -> assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) b)) [ [| select arr i |] ])
+     | None ->
+       let b = term_of loc (ev g sub body) in
+       assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) b)) [ [| select arr i |] ])
      | Some c ->
-       ignore (ev g sub c);
+       let cv = term_of loc (ev g sub c) in
+       ignore (ev g (sub_ctx ~cond:cv sub) body);
        let k = const (Printf.sprintf "k!%d" n) Int and j = const (Printf.sprintf "j!%d" n) Int in
        let sub_j = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) j)) ctx.bound } in
        let bj = term_of loc (ev g sub_j body) and cj = term_of loc (ev g sub_j c) in
@@ -1588,118 +1794,6 @@ and merge _g (states : state list) : state =
     { env; facts; alive = true }
 
 (* -- loops ---------------------------------------------------------------- *)
-
-and modified g body =
-  (* sets kept as lists (their order names the havocked constants) plus a
-     table for membership: a program with many classes has thousands of heap
-     keys, and list membership made this quadratic *)
-  let names = ref (Ir.assigned_names body) and appends = ref [] in
-  let seen_n = Hashtbl.create 64 and seen_a = Hashtbl.create 16 in
-  List.iter (fun n -> Hashtbl.replace seen_n n ()) !names;
-  let addn n = if not (Hashtbl.mem seen_n n) then (Hashtbl.add seen_n n (); names := n :: !names) in
-  let adda n = if not (Hashtbl.mem seen_a n) then (Hashtbl.add seen_a n (); appends := n :: !appends) in
-  let add_writes key =
-    List.iter
-      (fun (cf, _) ->
-        let k = String.index cf '.' in
-        List.iter (fun (hk, _) -> addn hk) (heap_keys g (String.sub cf 0 k) (String.sub cf (k + 1) (String.length cf - k - 1))))
-      (try Hashtbl.find g.prog.heap_writes key with Not_found -> [])
-  in
-  Ir.walk_stmts
-    (fun s ->
-      (match s with
-       | Append (_, n, _) -> adda n
-       | Assign (_, n, _) -> ( match Hashtbl.find_opt g.info.fn.locals n with Some (TList _) -> adda n | _ -> ())
-       | FieldAssign (_, _, cls, f, _) ->
-         List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f);
-         if has_invariants g cls then addn (written_key cls)
-       | _ -> ());
-      List.iter
-        (fun e ->
-          Ir.walk_expr
-            (fun (x : Ir.expr) ->
-              if suspends x then begin
-                addn segment;
-                List.iter addn (all_heap_keys g)
-              end;
-              match x.e with
-              | New (cls, _) -> (
-                addn "@alloc";
-                match class_of g cls with
-                | Some c -> (
-                  match c.init with
-                  | Some k -> add_writes k
-                  | None ->
-                    List.iter (fun (f, _) -> List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f)) c.cfields;
-                    Option.iter add_writes c.post_init)
-                | None -> ())
-              | Extern (_, args) ->
-                List.iter (fun (a : Ir.expr) -> match (a.e, a.ty) with Var n, (TList _ | TDict _) -> addn n; adda n | _ -> ()) args;
-                if extern_touches_heap g args then begin
-                  addn "@alloc";
-                  List.iter addn (all_heap_keys g)
-                end
-              | Call (f, args) -> (
-                match resolve g g.info.modpath f with
-                | Some tgt ->
-                  if Hashtbl.mem g.prog.allocates tgt.key then addn "@alloc";
-                  add_writes tgt.key;
-                  List.iter
-                    (fun ((p, _), (a : Ir.expr)) ->
-                      match a.e with
-                      | Var n when List.mem p tgt.mutated -> addn n; if List.mem p tgt.appends then adda n
-                      | _ -> ())
-                    (zip tgt.fn.params args)
-                | None -> ())
-              | _ -> ())
-            e)
-        (Ir.stmt_exprs s))
-    body;
-  (!names, !appends)
-
-and havoc g (st : state) names appends : state =
-  let h = copy_state st in
-  List.iter
-    (fun name ->
-      match SM.find_opt name h.env with
-      | _ when name = segment ->
-        SM.iter
-          (fun k v ->
-            match v with
-            | T o when is_segment k -> h.env <- SM.add k (T (const (Printf.sprintf "%s@%d" (String.sub k 1 (String.length k - 1)) (next g)) o.sort)) h.env
-            | _ -> ())
-          h.env
-      | None -> ()
-      | Some (T o) when is_written_key name -> h.env <- SM.add name (T (const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort)) h.env
-      | Some old when is_heap name -> (
-        match old with
-        | T o ->
-          let nw = const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort in
-          h.env <- SM.add name (T nw) h.env;
-          if name = "@alloc" then begin
-            let r = const (Printf.sprintf "r!%d" (next g)) Int in
-            Dynarray.add_last h.facts (monotone_alloc o nw r)
-          end
-        | _ -> ())
-      | Some old -> (
-        match Hashtbl.find_opt g.info.fn.locals name with
-        | None -> ()
-        | Some ty -> (
-          match old with
-          | L o ->
-            let keep = if List.mem name appends then None else Some o.len in
-            let nv = match fresh g name ty ?len:keep () with L l -> l | _ -> assert false in
-            let nv = match keep with None -> Dynarray.add_last h.facts (le zero nv.len); nv | Some k -> { nv with off = o.off; len = k } in
-            h.env <- SM.add name (L nv) h.env
-          | _ -> h.env <- SM.add name (fresh g name ty ()) h.env)))
-    (List.sort compare names);
-  h
-
-(* a loop that suspends splits its stretches at its head: each part keeps the
-   lifecycles (checked on the way in and after each iteration), and the part
-   after the head starts from the head's heap *)
-and cut g ?(at_head = false) names (st : state) (site : Ir.loc) =
-  if List.mem segment names then if at_head then resume st else check_lifecycles g st.facts st.env site
 
 and invariants_for g line (user : Ir.clause list) = user @ (try List.assoc line g.opts.extra_invariants with Not_found -> [])
 

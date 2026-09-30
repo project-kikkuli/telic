@@ -460,3 +460,51 @@ export function unpublish(p: Post): void {
   // a published post goes back to draft: the harness checks every object parameter
   if (p.stage === Stage.Published) p.stage = Stage.Draft;
 }
+
+// Array-method callbacks: each element's obligations, under a filter's test.
+function posNum(x: number): number {
+  //@ requires x > 0
+  //@ ensures result === x
+  return x;
+}
+
+// expect: proved
+export function findGuarded(xs: number[]): number {
+  //@ ensures result === 0
+  const y = xs.find((x) => x > 0 && posNum(x) > 1);
+  return 0;
+}
+
+// expect: refuted
+export function findUnguarded(xs: number[]): number {
+  //@ ensures result === 0
+  const y = xs.find((x) => posNum(x) > 1);
+  return 0;
+}
+
+// expect: proved
+export function filterByIndex(xs: number[]): number {
+  //@ ensures result === 0
+  const y = xs.filter((x, i) => posNum(i + 1) > 1);
+  return 0;
+}
+
+// expect: proved
+export function mapStatementsGuarded(xs: number[]): number {
+  //@ ensures result === 0
+  const ys = xs.filter((x) => {
+    if (x <= 0) return false;
+    return posNum(x) > 2;
+  });
+  return 0;
+}
+
+// expect: refuted
+export function mapStatementsUnguarded(xs: number[]): number {
+  //@ ensures result === 0
+  const ys = xs.map((x) => {
+    const y = x - 1;
+    return posNum(y);
+  });
+  return 0;
+}

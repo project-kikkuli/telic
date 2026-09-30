@@ -90,6 +90,8 @@ TRUE_HELPERS = {
     "json_mutate.rs": {"clear"},
     "t31.rs": {"f", "f@two", "Ctr.reset", "E2.from", "Five.w", "Loose.eq", "Tr.w@default", "fails", "wrap"},
     "t32.rs": {"set"},
+    "t43.py": {"pos", "grow", "Counter.__init__", "Counter.bump"},
+    "t43.ts": {"pos", "Counter.__init__", "Counter.bump"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.

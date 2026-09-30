@@ -1879,6 +1879,7 @@ class ExprLowerer:
         self.line_offset = line_offset
         self.col_offset = col_offset
         self.bound: dict[str, ir.Type] = {}
+        self.aliases: dict[str, ir.Expr] = {}  # comprehension targets that stand for an expression
         self.allow_old = False
 
     def loc(self, node: ast.AST) -> ir.Loc:
@@ -1966,6 +1967,8 @@ class ExprLowerer:
                 return ir.Lit(expect if isinstance(expect, ir.TOption) else ir.NONE, loc, None)
             raise self.err(f"unsupported constant {v!r}", n)
         if isinstance(n, ast.Name):
+            if n.id in self.aliases:
+                return self.aliases[n.id]
             if self.spec and n.id == "result" and self.result_ty is not None and n.id not in self.bound:
                 if self.result_ty == ir.NONE:
                     raise self.err("'result' used but the function returns nothing", n)
@@ -2146,10 +2149,10 @@ class ExprLowerer:
                     raise self.err(f"dict entries must be {dt.key}: {dt.val}", n)
                 args += [k2, v2]
             return ir.Builtin(dt, loc, "dict_lit", tuple(args))
-        if isinstance(n, (ast.GeneratorExp, ast.ListComp)):
+        if isinstance(n, (ast.GeneratorExp, ast.ListComp)) or (isinstance(n, (ast.DictComp, ast.SetComp)) and not self.spec):
             return self.comprehension(n, loc)
-        if isinstance(n, (ast.DictComp, ast.SetComp, ast.Lambda)) and not self.spec:
-            return self.opaque(type(n).__name__.lower(), [], ir.TOpaque(""), loc)
+        if isinstance(n, ast.Lambda) and not self.spec:
+            return self.opaque("lambda", [], ir.TOpaque(""), loc)
         raise self.err(f"unsupported expression: {type(n).__name__}", n)
 
     def binop(self, n: ast.BinOp, loc: ir.Loc) -> ir.Expr:
@@ -2792,31 +2795,97 @@ class ExprLowerer:
         res = {"pop": obj.ty.val, "setdefault": obj.ty.val}.get(attr)
         return self.extern(f"dict.{attr}", [obj], n, loc, res or ir.TOpaque(""))
 
-    def comprehension(self, n: ast.GeneratorExp | ast.ListComp, loc: ir.Loc) -> ir.Expr:
-        """``[f(x) for x in xs if c(x)]``: a new list. Precise when the body
-        is pure (element i is f(xs[i]), same length without a filter)."""
-        if len(n.generators) != 1 or n.generators[0].is_async:
-            return self.opaque("comprehension", [], ir.TOpaque(""), loc)
-        gen = n.generators[0]
-        seq = self.expr(gen.iter)
+    def comprehension(self, n: ast.GeneratorExp | ast.ListComp | ast.SetComp | ast.DictComp, loc: ir.Loc) -> ir.Expr:
+        """``[f(x) for x in xs if c(x)]``: a new list, precise for one 'for'
+        and a scalar element (element i is f(xs[i]) when the body is pure).
+        Other shapes are an unknown value whose every element still carries
+        its obligations and effects."""
+        saved, saved_aliases = dict(self.bound), dict(self.aliases)
+        try:
+            gens: list[tuple[ir.Expr, str, ir.Expr | None]] = []
+            for gen in n.generators:
+                if gen.is_async:
+                    raise self.err("async comprehensions are not modelled", n)
+                seq, elem = self.comp_source(gen, loc)
+                cond: ir.Expr | None = None
+                for c in gen.ifs:
+                    cc = self.cond(c)
+                    cond = cc if cond is None else ir.Binary(ir.BOOL, loc, "and", cond, cc)
+                gens.append((seq, elem, cond))
+            if isinstance(n, ast.DictComp):
+                body = self.opaque("entry", [self.expr(n.key), self.expr(n.value)], ir.TOpaque(""), loc)
+            else:
+                body = self.expr(n.elt)
+        finally:
+            self.bound, self.aliases = saved, saved_aliases
+        if len(gens) == 1 and isinstance(n, (ast.GeneratorExp, ast.ListComp)) and not isinstance(body.ty, (ir.TList, ir.TDict)):
+            seq, elem, cond = gens[0]
+            return ir.Builtin(ir.TList(body.ty), loc, "comp", (seq, ir.Lit(ir.STR, loc, elem), body) + ((cond,) if cond is not None else ()))
+        out = body
+        for seq, elem, cond in reversed(gens):
+            out = ir.Builtin(ir.TOpaque(""), loc, "each", (seq, ir.Lit(ir.STR, loc, elem), out) + ((cond,) if cond is not None else ()))
+        return out
+
+    def comp_source(self, gen: ast.comprehension, loc: ir.Loc) -> tuple[ir.Expr, str]:
+        """What one 'for' clause iterates, as a list, and the name bound to
+        its element; other target names become aliases for expressions
+        over that element."""
+        it, tgt = gen.iter, gen.target
+        names = [t.id for t in tgt.elts] if isinstance(tgt, ast.Tuple) and all(isinstance(t, ast.Name) for t in tgt.elts) else None  # type: ignore[attr-defined]
+        if not isinstance(tgt, ast.Name) and names is None:
+            raise self.err("comprehension targets must be a name or a tuple of names", gen.target)
+        builtin = isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id not in self.fl.fe.bound and it.func.id not in self.fl.env and not it.keywords
+        if builtin and it.func.id == "range" and isinstance(tgt, ast.Name):  # type: ignore[union-attr]
+            bounds = [self.need(self.expr(a)) for a in it.args]  # type: ignore[union-attr]
+            if len(bounds) not in (1, 2) or any(b.ty != ir.INT for b in bounds):
+                raise self.err("range() in a comprehension needs one or two int bounds", it)
+            lo, hi = (ir.Lit(ir.INT, loc, 0), bounds[0]) if len(bounds) == 1 else bounds
+            self.bind(tgt.id, ir.INT)
+            return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (lo, hi)), tgt.id
+        if builtin and it.func.id == "enumerate" and names is not None and len(names) == 2 and len(it.args) == 1:  # type: ignore[union-attr]
+            xs = self.expr(it.args[0])  # type: ignore[union-attr]
+            # the list is read again for each element: only when that reads the same list
+            if isinstance(xs.ty, ir.TList) and not any(isinstance(x, (ir.Extern, ir.Call, ir.New)) for x in ir.walk_expr(xs)):
+                i, x = names
+                self.bind(i, ir.INT)
+                self.aliases[x] = ir.Index(xs.ty.elem, loc, xs, ir.Var(ir.INT, loc, i), wrap=False)
+                return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "len", (xs,)))), i
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items" and not it.args and names is not None and len(names) == 2:
+            d = self.expr(it.func.value)
+            if isinstance(d.ty, ir.TDict) and isinstance(d, ir.Var):
+                k, v = names
+                self.bind(k, d.ty.key)
+                self.aliases[v] = ir.Index(d.ty.val, loc, d, ir.Var(d.ty.key, loc, k), wrap=False)
+                return ir.Builtin(ir.TList(d.ty.key), loc, "dict_keys", (d,)), k
+        seq = self.expr(it)
+        if isinstance(seq.ty, ir.TDict):
+            seq = ir.Builtin(ir.TList(seq.ty.key), loc, "dict_keys", (seq,))
+        elif isinstance(seq.ty, ir.TStr):
+            seq = self.opaque("iter", [seq], ir.TOpaque(""), loc)
         if isinstance(seq.ty, ir.TOpaque):
             seq = self.fl.coerce(seq, ir.TList(ir.TOpaque("")))
-        if not isinstance(seq.ty, ir.TList) or not isinstance(gen.target, ast.Name):
-            return self.opaque("comprehension", [seq] if not isinstance(seq.ty, ir.TList) else [], ir.TOpaque(""), loc)
-        saved = dict(self.bound)
-        try:
-            elem = gen.target.id
-            self.bound[elem] = seq.ty.elem
-            body = self.expr(n.elt)
-            conds = [self.cond(c) for c in gen.ifs]
-        finally:
-            self.bound = saved
-        cond: ir.Expr | None = None
-        for c in conds:
-            cond = c if cond is None else ir.Binary(ir.BOOL, loc, "and", cond, c)
-        if isinstance(body.ty, (ir.TList, ir.TDict)):
-            return self.opaque("comprehension", [], ir.TOpaque(""), loc)
-        return ir.Builtin(ir.TList(body.ty), loc, "comp", (seq, ir.Lit(ir.STR, loc, elem), body) + ((cond,) if cond is not None else ()))
+        if not isinstance(seq.ty, ir.TList):
+            raise self.err(f"a comprehension over a {seq.ty} is not modelled", it)
+        if isinstance(tgt, ast.Name):
+            self.bind(tgt.id, seq.ty.elem)
+            return seq, tgt.id
+        assert names is not None
+        if not isinstance(seq.ty.elem, ir.TOpaque):
+            raise self.err(f"unpacking a {seq.ty.elem} is not supported", tgt)
+        # for a, b in pairs: the elements are opaque; a list or tuple's items are its [k]
+        elem = self.fl.fresh("tuple")
+        self.bind(elem, seq.ty.elem)
+        at = lambda node: ast.copy_location(node, tgt)  # noqa: E731
+        seqlike = self.cond(at(ast.Call(at(ast.Name("isinstance", ast.Load())), [at(ast.Name(elem, ast.Load())), at(ast.Tuple([at(ast.Name("list", ast.Load())), at(ast.Name("tuple", ast.Load()))], ast.Load()))], [])))
+        for k, name in enumerate(names):
+            item = self.expr(at(ast.Subscript(at(ast.Name(elem, ast.Load())), at(ast.Constant(k)), ast.Load())))
+            other = self.opaque(f"item{k}", [ir.Var(seq.ty.elem, loc, elem)], item.ty, loc)
+            self.aliases[name] = ir.Ite(item.ty, loc, seqlike, item, other)
+        return seq, elem
+
+    def bind(self, name: str, ty: ir.Type) -> None:
+        self.bound[name] = ty
+        self.aliases.pop(name, None)
 
     def quant(self, n: ast.Call, loc: ir.Loc, kind: str) -> ir.Expr:
         if len(n.args) != 1 or not isinstance(n.args[0], (ast.GeneratorExp, ast.ListComp)):
@@ -2826,7 +2895,7 @@ class ExprLowerer:
             raise self.err("all()/any() support a single 'for' clause", n)
         gen = g.generators[0]
         it = gen.iter
-        saved = dict(self.bound)
+        saved, saved_aliases = dict(self.bound), dict(self.aliases)
         try:
             elem = seq = None
             if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
@@ -2840,7 +2909,7 @@ class ExprLowerer:
                 else:
                     raise self.err("range() with a step is not supported", n)
                 idx = gen.target.id
-                self.bound[idx] = ir.INT
+                self.bind(idx, ir.INT)
             else:
                 if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "enumerate":
                     if not (isinstance(gen.target, ast.Tuple) and len(gen.target.elts) == 2 and all(isinstance(t, ast.Name) for t in gen.target.elts)):
@@ -2856,7 +2925,7 @@ class ExprLowerer:
                     seq = self.expr(it)
                 if isinstance(seq.ty, ir.TDict) and elem is not None and idx == f"{elem}$idx":
                     # all(p(k) for k in d): over the keys d holds
-                    self.bound[elem] = seq.ty.key
+                    self.bind(elem, seq.ty.key)
                     body = self.cond(g.elt)
                     for cond in gen.ifs:
                         body = ir.Binary(ir.BOOL, loc, "implies" if kind == "forall" else "and", self.cond(cond), body)
@@ -2868,15 +2937,15 @@ class ExprLowerer:
                     raise self.err("generator must range over range(...), a list or a dict", n)
                 lo = ir.Lit(ir.INT, loc, 0)
                 hi = ir.Builtin(ir.INT, loc, "len", (seq,))
-                self.bound[idx] = ir.INT
-                self.bound[elem] = seq.ty.elem
+                self.bind(idx, ir.INT)
+                self.bind(elem, seq.ty.elem)
             body = self.cond(g.elt)
             for cond in gen.ifs:
                 c = self.cond(cond)
                 body = ir.Binary(ir.BOOL, loc, "implies" if kind == "forall" else "and", c, body)
             return ir.Quant(ir.BOOL, loc, kind, idx, lo, hi, body, elem, seq)
         finally:
-            self.bound = saved
+            self.bound, self.aliases = saved, saved_aliases
 
 
 def lower_python(path: str, source: str) -> ir.Module:

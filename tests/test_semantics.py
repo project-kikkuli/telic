@@ -167,6 +167,9 @@ VALUE_IDIOMS = [
     "len(range(b, a))",
     "len(list(range(a, 4)))",
     "len([x * 2 for x in range(b, a)])",
+    "len([i for i in range(a, b)])",
+    "len([i * 2 for i in range(b)])",
+    "len([i + x for i, x in enumerate([a, b, a])])",
 ]
 
 

@@ -25,12 +25,14 @@ done looks like. Soundness items come first: they can make telic say
   recursion group; deeper contradictions are caught in each function
   whose proof unfolds that deep (its unfoldings are checked together,
   `_body_lemmas` in `telic/checker.py`), never in the predicate itself.
-- **Calls inside impure comprehensions are not checked.** When a
-  comprehension's body calls a function that is not definitional
-  (`[pos(x) for x in xs]` where `pos` prints), `VCGen.comprehension`
-  havocs and skips the body, so the callee's `@requires` is never an
-  obligation. Done: evaluate the body under the element binding for its
-  obligations even when its value stays unknown.
+- **Functions handed to unchecked code are not checked.** A lambda or a
+  checked function passed as a value (`sorted(xs, key=lambda x: 10 // x)`,
+  `map(pos, xs)`, a TypeScript closure given to `.then()` or a JSX
+  handler) runs under the trusted "unchecked calls do not raise"
+  assumption; a callee `@requires` inside it is never an obligation.
+  Comprehensions, `all`/`any` and array-method callbacks are checked per
+  element (`VCGen.run_each`); a callback of `.sort()`, `.some()` or
+  `.find()` with statements in its body is unsupported.
 
 ## Dogfooding (task 15)
 

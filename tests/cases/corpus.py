@@ -742,3 +742,77 @@ def alternating(n: int) -> list[int]:
     #@ requires n >= 1
     #@ ensures all(x == 0 for x in result)
     return [0, 1] * n
+
+
+# Comprehensions: one 'for' over a list, range, enumerate or dict items is
+# modelled; every shape keeps each element's obligations, under its 'if'.
+def pos_int(x: int) -> int:
+    #@ requires x > 0
+    #@ ensures result == x
+    return x
+
+
+# expect: proved
+def comp_range_index(xs: list[int]) -> list[int]:
+    #@ ensures len(result) == len(xs)
+    #@ ensures all(result[i] == xs[i] + 1 for i in range(len(xs)))
+    return [xs[i] + 1 for i in range(len(xs))]
+
+
+# expect: proved
+def comp_guarded_div(xs: list[int]) -> list[int]:
+    #@ ensures len(result) <= len(xs)
+    return [10 // x for x in xs if x != 0]
+
+
+# expect: proved
+def comp_guarded_call(xs: list[int]) -> list[int]:
+    #@ ensures len(result) <= len(xs)
+    return [pos_int(x) for x in xs if x > 0]
+
+
+# expect: refuted
+def comp_unguarded_call(xs: list[int]) -> list[int]:
+    #@ ensures len(result) == len(xs)
+    return [pos_int(x) for x in xs]
+
+
+# expect: proved
+def comp_items(d: dict[str, int]) -> int:
+    #@ ensures result == 0
+    _ = {k: v + 1 for k, v in d.items()}
+    return 0
+
+
+# expect: proved
+def comp_enumerate(xs: list[int]) -> list[int]:
+    #@ ensures len(result) == len(xs)
+    return [x + i for i, x in enumerate(xs)]
+
+
+# expect: proved
+def comp_nested_guarded(xs: list[int], ys: list[int]) -> int:
+    #@ ensures result == 0
+    _ = [a // b for a in xs for b in ys if b > 0]
+    return 0
+
+
+# expect: refuted
+def comp_nested_div(xs: list[int], ys: list[int]) -> int:
+    #@ ensures result == 0
+    _ = [a // b for a in xs for b in ys]
+    return 0
+
+
+# expect: proved
+def gen_guarded_sum(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = sum(10 // x for x in xs if x > 0)
+    return 0
+
+
+# expect: proved
+def set_guarded_call(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = {pos_int(x) for x in xs if x >= 1}
+    return 0

@@ -1611,6 +1611,8 @@ class VCGen:
         return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
+        if not ctx.spec and self._effectful(e.body):
+            return self.quant_each(e, ctx)
         if e.seq is not None and isinstance(e.seq.ty, ir.TDict):
             # over a dict's keys: every k it holds
             d = self.ev(e.seq, ctx)
@@ -1645,6 +1647,10 @@ class VCGen:
         name = e.name
         if name == "comp":
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
+        if name == "each":
+            return self.ev_each(e, ctx)
+        if name == "range_list":
+            return self.ev_range_list(e, ctx)
         if name == "threw":
             return self.ev_threw(e, ctx)
         if name == "await" and ctx.state is not None and not ctx.spec:
@@ -1990,20 +1996,22 @@ class VCGen:
         else:
             ln, _ = self.defined_symbol(ctx, f"comp@{n}.len", L.INT, pure)
             assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
+        if not pure:
+            # Values unknown; obligations and effects as for any element.
+            self.each_element(e, seq, ctx)
+            return ListVal(arr, L.ZERO, ln, e.ty)
         i = L.Const(f"{elem}!{n}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
-        sub = ctx.sub(rng, spec=True) if pure else ctx.sub(rng, spec=True, quiet=True)
+        sub = ctx.sub(rng, spec=True)
         sub.bound[elem] = seq.at(i)
-        if not pure:
-            # Effects of the body: whatever its calls may write is unknown now.
-            if ctx.state is not None:
-                self.havoc_heap(ctx)
-            return ListVal(arr, L.ZERO, ln, e.ty)
-        b = self.ev(body, sub)
+        if not ctx.spec and any(isinstance(x, ir.Builtin) and x.name == "opaque_op" for p in (body, cond) if p is not None for x in ir.walk_expr(p)):
+            self.note(e.loc, "operations on values from unchecked code do not raise")
         if cond is None:
+            b = self.ev(body, sub)
             assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
         else:
             c = self.ev(cond, sub)
+            self.ev(body, sub.sub(c))  # type: ignore[arg-type]
             k = L.Const(f"k!{n}", L.INT)
             j = L.Const(f"j!{n}", L.INT)
             sub_j = ctx.sub(None, spec=True, quiet=True)
@@ -2012,7 +2020,6 @@ class VCGen:
             cj = self.ev(cond, sub_j)
             # every element comes from some accepted source element
             assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
-            del c
         return ListVal(arr, L.ZERO, ln, e.ty)
 
     def defined_symbol(self, ctx: Ctx, name: str, srt: L.Sort, pure: bool = True):
@@ -2022,6 +2029,101 @@ class VCGen:
         if ctx.binders and pure:
             return L.Fn(name, ctx.binders, srt), ctx.assume_for_all_binders
         return L.Const(name, srt), ctx.assume
+
+    def each_element(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> None:
+        assert isinstance(seq, ListVal)
+        elem_lit = e.args[1]
+        assert isinstance(elem_lit, ir.Lit)
+        elem, _, idx = str(elem_lit.value).partition(",")  # "x" or "x,i": the element and its index
+        i = L.Const(f"{elem}!{next(self.counter)}", L.INT)
+        rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
+        binds: dict[str, Val] = {elem: seq.at(i)}
+        if idx:
+            binds[idx] = i
+        self.run_each(e.loc, e.args[0], rng, binds, e.args[2], e.args[3] if len(e.args) > 3 else None, ctx)
+
+    def run_each(self, loc: ir.Loc, src: ir.Expr | None, rng: L.Term, binds: dict[str, Val], body: ir.Expr, cond: ir.Expr | None, ctx: Ctx) -> None:
+        """A comprehension's body run on an arbitrary element (``binds``,
+        within ``rng``), from any state the earlier elements may have left:
+        its obligations hold for every element, and what it may change is
+        unknown afterwards."""
+        parts = [x for x in (cond, body) if x is not None]
+        names, appends = self.modified([ir.ExprStmt(loc, x) for x in parts])
+        if any(isinstance(sub, ir.Extern) for x in parts for sub in ir.walk_expr(x)):
+            names |= {v for v in self.fn.escaped if v in self.fn.locals}
+        read = {sub.name for sub in ir.walk_expr(src) if isinstance(sub, ir.Var)} if src is not None else set()
+        if read & names:
+            raise VCError(f"the comprehension changes '{sorted(read & names)[0]}' while iterating over it", loc)
+        if ctx.state is not None:
+            self.havoc_here(ctx, names, appends)
+        sub = ctx.sub(rng)
+        sub.bound.update(binds)
+        if cond is not None:
+            c = self.ev(cond, sub)
+            sub = sub.sub(c)  # type: ignore[arg-type]
+        self.ev(body, sub)
+        if ctx.state is not None:
+            self.havoc_here(ctx, names, appends)
+
+    def havoc_here(self, ctx: Ctx, names: set[str], appends: set[str]) -> None:
+        assert ctx.state is not None
+        h = self.havoc(ctx.state, names, appends)
+        for fact in h.facts[len(ctx.state.facts) :]:
+            ctx.assume(fact)
+        ctx.state.env.update(h.env)
+
+    def quant_each(self, e: ir.Quant, ctx: Ctx) -> Val:
+        """``all``/``any`` in code over a body with effects: an unknown truth
+        value, and the body's obligations and effects for every element."""
+        n = next(self.counter)
+        if e.seq is not None and isinstance(e.seq.ty, ir.TDict):
+            d = self.ev(e.seq, ctx)
+            assert isinstance(d, DictVal) and e.elem is not None
+            k = L.Const(f"{e.elem}!{n}", sort_of(e.seq.ty.key))
+            self.run_each(e.loc, e.seq, L.select(d.has, k), {e.elem: k}, e.body, None, ctx)
+        else:
+            lo, hi = self.ev(e.lo, ctx), self.ev(e.hi, ctx)
+            i = L.Const(f"{e.idx.split('$')[0]}!{n}", L.INT)
+            binds: dict[str, Val] = {e.idx: i}
+            if e.seq is not None and e.elem is not None:
+                seq = self.ev(e.seq, ctx)
+                assert isinstance(seq, ListVal)
+                binds[e.elem] = seq.at(i)
+            self.run_each(e.loc, e.seq, L.and_(L.le(lo, i), L.lt(i, hi)), binds, e.body, None, ctx)  # type: ignore[arg-type]
+        return L.Const(f"{e.kind}@{n}", L.BOOL)
+
+    def ev_each(self, e: ir.Builtin, ctx: Ctx) -> Val:
+        """A comprehension telic does not model: an unknown value, but every
+        element's obligations and effects."""
+        seq = self.ev(e.args[0], ctx)
+        self.each_element(e, seq, ctx)
+        if e.ty == ir.NONE:
+            return NONE_V
+        r = self.fresh("comprehension", e.ty)
+        if isinstance(r, ListVal):
+            ctx.assume(L.le(L.ZERO, r.len))
+        return r
+
+    def ev_range_list(self, e: ir.Builtin, ctx: Ctx) -> Val:
+        """``range(lo, hi)`` as the list it iterates."""
+        lo, hi = (self.ev(a, ctx) for a in e.args)
+        n = next(self.counter)
+        arr = L.Const(f"range@{n}.arr", sort_of(e.ty))
+        k = L.Const(f"k!{n}", L.INT)
+        ln = L.ite(L.lt(lo, hi), L.sub(hi, lo), L.ZERO)  # type: ignore[arg-type]
+        ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.eq(L.select(arr, k), L.add(lo, k))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
+        return ListVal(arr, L.ZERO, ln, e.ty)  # type: ignore[arg-type]
+
+    def _effectful(self, e: ir.Expr) -> bool:
+        """Runs code that may change state or raise beyond its obligations."""
+        for sub in ir.walk_expr(e):
+            if isinstance(sub, (ir.Extern, ir.New)) or (isinstance(sub, ir.Builtin) and sub.name in ("await", "each")):
+                return True
+            if isinstance(sub, ir.Call):
+                tgt = self.program.resolve(self.module, sub.func)
+                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates):
+                    return True
+        return False
 
     def _pure(self, e: ir.Expr) -> bool:
         for sub in ir.walk_expr(e):

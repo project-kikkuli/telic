@@ -1352,7 +1352,8 @@ class FunctionLowerer {
 
   stmt(s) {
     try {
-      return this._stmt(s);
+      const loop = this.callbackLoop(s);
+      return loop ? [...loop, ...this._stmt(s)] : this._stmt(s);
     } catch (e) {
       if (!(e instanceof LowerError)) throw e;
       const line = e.line || this.ml.line(s);
@@ -1727,6 +1728,24 @@ class FunctionLowerer {
   }
 
   // xs.forEach((x, i) => { ... })  ==>  a for-of loop (return = continue)
+  // `const ys = xs.map((x) => { ... })` (or the call as the statement, or
+  // returned): a callback with statements runs once per element, in order,
+  // before anything else the statement does, so it is checked as a loop
+  // ahead of the statement.
+  callbackLoop(s) {
+    let e = null;
+    if (ts.isVariableStatement(s) && s.declarationList.declarations.length === 1) e = s.declarationList.declarations[0].initializer;
+    else if (ts.isExpressionStatement(s)) e = ts.isBinaryExpression(s.expression) && s.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(s.expression.left) ? s.expression.right : s.expression;
+    else if (ts.isReturnStatement(s) && !this.callbackDepth) e = s.expression;
+    if (!e || !ts.isCallExpression(e) || e.arguments.length !== 1 || !ts.isPropertyAccessExpression(e.expression) || !ts.isIdentifier(e.expression.expression)) return null;
+    const f = e.arguments[0];
+    if (!["map", "filter", "flatMap"].includes(e.expression.name.text) || !(ts.isArrowFunction(f) || ts.isFunctionExpression(f)) || !ts.isBlock(f.body)) return null;
+    if (f.body.statements.length === 1 && ts.isReturnStatement(f.body.statements[0]) && f.body.statements[0].expression) return null;
+    const loop = this.forEachLoop(e.expression.expression, f, s);
+    if (loop) (this.loopedCallbacks ||= new Set()).add(f);
+    return loop;
+  }
+
   forEachLoop(seqNode, fnNode, node) {
     const seq = this.unwrap(this.expr(seqNode));
     if (seq.ty.k !== "list" || fnNode.parameters.length > 2 || !fnNode.parameters.every((p) => ts.isIdentifier(p.name))) return null;
@@ -1877,7 +1896,7 @@ class FunctionLowerer {
     }
     if (ts.isClassDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) return [];
     if (ts.isForInStatement(s)) return this.scoped(() => this.forIn(s, loc));
-    if (ts.isReturnStatement(s) && this.callbackDepth) return [{ s: "Continue", loc }]; // return inside a forEach callback
+    if (ts.isReturnStatement(s) && this.callbackDepth) return [...(s.expression ? [{ s: "ExprStmt", loc, expr: this.expr(s.expression) }] : []), { s: "Continue", loc }]; // return inside a forEach callback
     if (ts.isEmptyStatement(s)) return [];
     if (ts.isBlock(s)) return this.scoped(() => this.blockBody(s));
     if (ts.isVariableStatement(s)) return this.varDecls(s.declarationList, s, loc);
@@ -2902,6 +2921,33 @@ class FunctionLowerer {
     return this.extern(`Map.${m}`, [d, ...args.map((a) => this.argValue(a))], expect, loc);
   }
 
+  // A callback an array method runs on every element: its body, checked on
+  // an arbitrary element (and index), in place of the function value.
+  callbackEach(xs, m, f, loc) {
+    const t = xs.ty;
+    const lit = (v) => ({ e: "Lit", ty: STR, loc, value: v });
+    const each = (names, body) => ({ e: "Builtin", ty: opaque(""), loc, name: "each", args: [xs, lit(names), body] });
+    if (ts.isIdentifier(f)) {
+      const sig = this.resolve(f.text) === null && !(this.bound && f.text in this.bound) ? this.ml.sigs[f.text] : null;
+      if (!sig || sig.cls) return null;
+      if (sig.params.length !== 1) throw this.err(`'.${m}(${f.text})' also passes the index and the array; write the callback out`, this.nline(f));
+      const x = `_cb${++this.tmp}`;
+      return each(x, { e: "Call", ty: sig.ret, loc, func: f.text, args: [this.coerce({ e: "Var", ty: t.elem, loc, name: x }, sig.params[0].ty)] });
+    }
+    if (!(ts.isArrowFunction(f) || ts.isFunctionExpression(f)) || this.loopedCallbacks?.has(f)) return null;
+    const sort = m === "sort" || m === "toSorted";
+    let lam;
+    try {
+      lam = this.lambda(f, sort ? [{ ty: t.elem }, { ty: t.elem }] : [{ ty: t.elem }, { ty: INT }]);
+    } catch (e) {
+      if (e instanceof LowerError) throw this.err(`the callback to .${m}() is not modelled: ${e.message}`, this.nline(f));
+      throw e;
+    }
+    const [a, b] = [lam.names[0] || `_cb${++this.tmp}`, lam.names[1]];
+    if (sort) return each(a, { e: "Builtin", ty: opaque(""), loc, name: "each", args: [xs, lit(b || `_cb${++this.tmp}`), lam.body] });
+    return each(b ? `${a},${b}` : a, lam.body);
+  }
+
   listMethod(xs, m, n, loc, expect) {
     const args = n.arguments;
     const t = xs.ty;
@@ -2931,7 +2977,8 @@ class FunctionLowerer {
     const mentions = (a) => xs.e === "Var" && (() => { let hit = false; const v = (x) => { if (ts.isIdentifier(x) && this.resolve(x.text) === xs.name) hit = true; ts.forEachChild(x, v); }; v(a); return hit; })();
     const pure = !["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && !args.some(mentions);
     const recv = pure && xs.e === "Var" ? this.coerce(xs, opaque("")) : xs;
-    const call = this.extern(`Array.${m}`, [recv, ...args.map((a) => this.argValue(a))], res || expect, loc);
+    const cb = CALLBACK_METHODS.includes(m) && args.length ? this.callbackEach(xs, m, args[0], loc) : null;
+    const call = this.extern(`Array.${m}`, [recv, ...args.map((a, i) => (i === 0 && cb ? cb : this.argValue(a)))], res || expect, loc);
     // whatever the callback does, map returns one element per element
     if (m === "map" && call.ty.k === "list") return { e: "Builtin", ty: call.ty, loc, name: "same_len", args: [xs, call] };
     return call;
@@ -2940,6 +2987,8 @@ class FunctionLowerer {
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+const CALLBACK_METHODS = ["map", "filter", "forEach", "some", "every", "find", "findIndex", "findLast", "findLastIndex", "flatMap", "sort", "toSorted"];
 
 // A value of type t, for a field a union variant does not have (never read).
 function zeroOf(t, loc) {
