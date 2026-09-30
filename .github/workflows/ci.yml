@@ -8,6 +8,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: ui
+            tests: tests/test_ui.py
+          - group: engine
+            tests: tests/test_engine.py
+          - group: corpus
+            tests: tests/test_corpus.py tests/test_cli.py tests/test_cache.py
+          - group: frontends
+            tests: tests/test_rust.py tests/test_swift.py tests/test_ts_classes.py tests/test_ts_untyped.py tests/test_semantics.py tests/test_fidelity.py tests/test_frontend.py tests/test_containers.py tests/test_objects.py tests/test_json_contracts.py
+          - group: core
+            tests: >-
+              tests --ignore=tests/test_ui.py --ignore=tests/test_engine.py --ignore=tests/test_corpus.py --ignore=tests/test_cli.py --ignore=tests/test_cache.py
+              --ignore=tests/test_rust.py --ignore=tests/test_swift.py --ignore=tests/test_ts_classes.py --ignore=tests/test_ts_untyped.py --ignore=tests/test_semantics.py
+              --ignore=tests/test_fidelity.py --ignore=tests/test_frontend.py --ignore=tests/test_containers.py --ignore=tests/test_objects.py --ignore=tests/test_json_contracts.py
+    name: test (${{ matrix.group }})
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,8 +69,9 @@ jobs:
       - name: Swift toolchain (the runner image ships one; replay tests skip without it)
         run: swiftc --version || echo "no swiftc on this runner"
       - name: Test
-        run: pytest -q -rs
+        run: pytest -q -rs --durations=25 ${{ matrix.tests }}
         env:
           TELIC_UI_SLOTS: "2"
       - name: Demo
+        if: matrix.group == 'core'
         run: telic demo --no-pause --color never
