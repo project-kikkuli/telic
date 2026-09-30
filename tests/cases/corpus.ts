@@ -455,8 +455,8 @@ export function edit(p: Post): void {
   }
 }
 
-// expect: open
+// expect: refuted
 export function unpublish(p: Post): void {
-  // refuted by the solver; the harness checks lifecycles only on method receivers
+  // a published post goes back to draft: the harness checks every object parameter
   if (p.stage === Stage.Published) p.stage = Stage.Draft;
 }

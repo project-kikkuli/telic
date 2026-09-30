@@ -312,6 +312,7 @@ let is_init g = let n = g.info.fn.name in String.length n >= 9 && String.sub n (
 let fresh_self g = is_init g || (let n = g.info.fn.name in String.length n >= 14 && String.sub n (String.length n - 14) 14 = ".__post_init__")
 
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
+let ends_with x s = String.length s >= String.length x && String.sub s (String.length s - String.length x) (String.length x) = x
 let is_heap k = String.length k > 0 && k.[0] = '@'
 let heap_env env = SM.filter (fun k _ -> is_heap k) env
 
@@ -446,6 +447,12 @@ let fresh_expr (e : Ir.expr option) = match e with Some { e = ListLit _ | Call _
    heap: callees and other tasks do not add to it) *)
 let written_key cls = "%written." ^ cls
 let is_written_key k = String.length k > 9 && String.sub k 0 9 = "%written."
+
+(* the heap when this run of the function last resumed (entry, or the latest
+   await or yield): lifecycles bind each stretch that runs without suspending *)
+let segment = "%segment"
+let is_segment k = starts_with segment k
+let suspends (x : Ir.expr) = match x.e with Builtin ("await", _) | Extern ("yield", _) -> true | _ -> false
 let no_writes = const_array (Array (Int, Bool)) ff
 let any_writes = const_array (Array (Int, Bool)) tt
 
@@ -772,7 +779,7 @@ and builtin g ctx (e : Ir.expr) name args =
       assume_ (le zero (depth x));
       T (depth x)
     | "await", x :: _ ->
-      (match ctx.state with Some _ when not ctx.spec -> await_havoc g ctx loc | _ -> ());
+      (match ctx.state with Some _ when not ctx.spec -> suspend g ctx loc | _ -> ());
       x
     | ("enum_name" | "enum_value"), [ x ] ->
       let x = tm x in
@@ -1017,7 +1024,11 @@ and extern g ctx (e : Ir.expr) name args =
      recursion_check g callee (List.fold_left (fun m ((p, _), a) -> SM.add p a m) SM.empty (zip callee.fn.params vals)) ctx loc
    | _ -> ());
   if not (starts_with "caught exception" name || starts_with "default of" name) then note_assumed g loc ("call:" ^ name);
-  (match ctx.state with Some st when name = "yield" -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the yield" | _ -> ());
+  (match ctx.state with
+   | Some st when name = "yield" ->
+     check_objects g ~guard:ctx.guard st.facts st.env loc "at the yield";
+     suspend g ctx loc
+   | _ -> ());
   let fn = g.info.fn in
   (match ctx.state with
    | Some st ->
@@ -1201,7 +1212,7 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
   List.iteri
     (fun i ((_, pty), a) ->
       match (pty, a) with
-      | Ir.TClass c, T r when not (new_self && i = 0) -> List.iter (fun (_, t) -> assume ctx t) (class_lifecycles g c r heap_pre st.env ctx.base)
+      | Ir.TClass c, T r when not (i = 0 && (ends_with ".__init__" fn.name || ends_with ".__post_init__" fn.name)) -> List.iter (fun (_, t) -> assume ctx t) (class_lifecycles g c r heap_pre st.env ctx.base)
       | _ -> ())
     (zip fn.params args);
   SM.union (fun _ _ b -> Some b) !post (heap_env st.env)
@@ -1308,9 +1319,10 @@ and written_claims g cls env base =
 (* objects that existed at entry changed only as their lifecycles allow when control
    leaves: the parameters, and every object of a class written here (quantified: a
    write's path condition inside a loop says nothing about the state after it) *)
-and check_lifecycles g facts env (site : Ir.loc) =
-  let alloc0 = alloc_of g.entry in
-  let lctx = spec_ctx g ~quiet:false ~base:facts ~env () in
+and check_lifecycles g ?(guard = []) facts env (site : Ir.loc) =
+  let pre = SM.fold (fun k v m -> if is_segment k then SM.add (String.sub k 8 (String.length k - 8)) v m else m) env g.entry in
+  let alloc0 = alloc_of pre in
+  let lctx = spec_ctx g ~quiet:false ~guard ~base:facts ~env () in
   List.iter
     (fun (p, (ty : Ir.ty)) ->
       match (ty, SM.find_opt p g.entry) with
@@ -1318,7 +1330,7 @@ and check_lifecycles g facts env (site : Ir.loc) =
         List.iter
           (fun ((cl : Ir.clause), t) ->
             oblige g ~site ~clause:cl "lifecycle" lctx t cl.cloc (Printf.sprintf "'%s' changes only as the lifecycle of %s allows ('%s')" p c cl.text))
-          (class_lifecycles g c r g.entry env facts)
+          (class_lifecycles g c r pre env facts)
       | _ -> ())
     g.info.fn.params;
   List.iter
@@ -1328,8 +1340,22 @@ and check_lifecycles g facts env (site : Ir.loc) =
         (fun ((cl : Ir.clause), t) ->
           oblige g ~site ~clause:cl "lifecycle" lctx (forall [ r ] (implies (select alloc0 r) t)) cl.cloc
             (Printf.sprintf "every %s written here changes only as its lifecycle allows ('%s')" cls cl.text))
-        (class_lifecycles g cls r g.entry env facts))
+        (class_lifecycles g cls r pre env facts))
     (List.rev g.lc_written)
+
+(* a new stretch without suspension begins in this heap *)
+and resume (st : state) = SM.iter (fun k v -> if is_heap k then st.env <- SM.add (segment ^ k) v st.env) st.env
+
+(* other code runs while this function is suspended (other tasks, or a
+   generator's consumer): the stretch so far keeps the lifecycles, the heap
+   changes, and the next stretch starts from what it finds *)
+and suspend g ctx loc =
+  match ctx.state with
+  | None -> ()
+  | Some st ->
+    check_lifecycles g ~guard:ctx.guard st.facts st.env loc;
+    await_havoc g ctx loc;
+    resume st
 
 and check_objects g ?(guard = []) facts env (site : Ir.loc) when_ =
   let ctx = spec_ctx g ~quiet:false ~guard ~base:facts ~env () in
@@ -1585,6 +1611,10 @@ and modified g body =
         (fun e ->
           Ir.walk_expr
             (fun (x : Ir.expr) ->
+              if suspends x then begin
+                addn segment;
+                List.iter addn (all_heap_keys g)
+              end;
               match x.e with
               | New (cls, _) -> (
                 addn "@alloc";
@@ -1625,6 +1655,13 @@ and havoc g (st : state) names appends : state =
   List.iter
     (fun name ->
       match SM.find_opt name h.env with
+      | _ when name = segment ->
+        SM.iter
+          (fun k v ->
+            match v with
+            | T o when is_segment k -> h.env <- SM.add k (T (const (Printf.sprintf "%s@%d" (String.sub k 1 (String.length k - 1)) (next g)) o.sort)) h.env
+            | _ -> ())
+          h.env
       | None -> ()
       | Some (T o) when is_written_key name -> h.env <- SM.add name (T (const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort)) h.env
       | Some old when is_heap name -> (
@@ -1650,6 +1687,12 @@ and havoc g (st : state) names appends : state =
           | _ -> h.env <- SM.add name (fresh g name ty ()) h.env)))
     (List.sort compare names);
   h
+
+(* a loop that suspends splits its stretches at its head: each part keeps the
+   lifecycles (checked on the way in and after each iteration), and the part
+   after the head starts from the head's heap *)
+and cut g ?(at_head = false) names (st : state) (site : Ir.loc) =
+  if List.mem segment names then if at_head then resume st else check_lifecycles g st.facts st.env site
 
 and invariants_for g line (user : Ir.clause list) = user @ (try List.assoc line g.opts.extra_invariants with Not_found -> [])
 
@@ -1714,7 +1757,9 @@ and loop_while g (w : Ir.stmt) (st : state) : state =
   let names, appends = modified g (body @ step @ [ Ir.ExprStmt (loc, cond) ]) in
   let wrote = written_in g names in
   check_written g wrote st loc ~entry:true;
+  cut g names st loc;
   let head = havoc g st names appends in
+  cut g names head loc ~at_head:true;
   assume_invs g invs head [];
   assume_written g wrote head;
   let c = term_of loc (ev g (state_ctx g head) cond) in
@@ -1741,6 +1786,7 @@ and loop_while g (w : Ir.stmt) (st : state) : state =
         if it_end.alive then begin
           check_invs g invs it_end "inv.step" loc [];
           check_written g wrote it_end loc ~entry:false;
+          cut g names it_end loc;
           match (v0, variant) with
           | Some v0, Some v ->
             let vctx = state_ctx g ~spec:true it_end in
@@ -1765,8 +1811,10 @@ and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bi
   let names = if List.mem counter names then names else counter :: names in
   let wrote = written_in g names in
   check_written g wrote entry loc ~entry:true;
+  cut g names entry loc;
   if not (Hashtbl.mem g.info.fn.locals counter) then Hashtbl.replace g.info.fn.locals counter TInt;
   let head = havoc g entry names appends in
+  cut g names head loc ~at_head:true;
   let k = match SM.find_opt counter head.env with Some (T k) -> k | _ -> assert false in
   Dynarray.add_last head.facts (le lo_v k);
   Dynarray.add_last head.facts (le k (max_ lo_v hi_v));
@@ -1783,7 +1831,8 @@ and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bi
         let k1 = add k one in
         it_end.env <- SM.add counter (T k1) it_end.env;
         check_invs g invs it_end "inv.step" loc [ (idx, T k1) ];
-        check_written g wrote it_end loc ~entry:false
+        check_written g wrote it_end loc ~entry:false;
+        cut g names it_end loc
       end)
     (end_ :: List.rev frame.continues);
   let out = copy_state head in
@@ -1913,6 +1962,9 @@ let run g =
       List.iter (Dynarray.add_last st.facts) (alloc_facts g v ty st.env))
     fn.params;
   g.entry <- st.env;
+  let suspending = ref false in
+  Ir.walk_stmts (fun s -> List.iter (Ir.walk_expr (fun x -> if suspends x then suspending := true)) (Ir.stmt_exprs s)) fn.body;
+  if !suspending then resume st;
   (* callers establish the invariants of the objects they pass (a constructor's own self is still being built) *)
   List.iter
     (fun (p, (ty : Ir.ty)) ->

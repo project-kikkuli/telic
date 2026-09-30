@@ -95,6 +95,13 @@ NONE_V = L.Const("None", L.Sort("None"))
 WRITTEN = "%written."
 NO_WRITES = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
 ANY_WRITES = L.const_array(L.ARRAY(L.BOOL), L.TRUE)
+# the heap when this run of the function last resumed (entry, or the latest
+# await or yield): lifecycles bind each stretch that runs without suspending
+SEGMENT = "%segment"
+
+
+def suspends(e: ir.Expr) -> bool:
+    return (isinstance(e, ir.Builtin) and e.name == "await") or (isinstance(e, ir.Extern) and e.name == "yield")
 
 
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
@@ -695,6 +702,8 @@ class VCGen:
                 facts.append(L.le(L.ZERO, v.len))
             facts.extend(self.alloc_facts(v, p.ty, env))
         self.entry = dict(env)
+        if any(suspends(x) for st_ in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st_) for x in ir.walk_expr(e)):
+            self.resume(env)
         st = State(env, facts)
         # Callers establish the invariants of the objects they pass in (a
         # constructor's own 'self' is still being built).
@@ -831,14 +840,16 @@ class VCGen:
                     clause=fn.raises[0],
                 )
 
-    def check_lifecycles(self, env: dict[str, Val], facts: list[L.Term], site: ir.Loc, probe: bool = True) -> None:
+    def check_lifecycles(self, env: dict[str, Val], facts: list[L.Term], site: ir.Loc, probe: bool = True, guard: tuple[L.Term, ...] = ()) -> None:
         """Objects that existed at entry changed only as their lifecycles
         allow when control leaves: the parameters, and every object of a
         class written here (quantified: a write's path condition inside a
-        loop says nothing about the state after it)."""
+        loop says nothing about the state after it). Control also leaves at
+        an await or a yield; each stretch between two is checked on its own."""
         fn = self.fn
-        alloc0 = self.entry["@alloc"]
-        ctx = Ctx(base=facts, env=env, module=self.module, spec=True)
+        pre = {**self.entry, **{k[len(SEGMENT) :]: v for k, v in env.items() if k.startswith(SEGMENT)}}
+        alloc0 = pre["@alloc"]
+        ctx = Ctx(base=facts, env=env, module=self.module, guard=guard, spec=True)
         for p in fn.params:
             if isinstance(p.ty, ir.TClass):
                 ref = self.entry[p.name]
@@ -847,7 +858,7 @@ class VCGen:
                     self.lc_sites.append((list(facts), L.TRUE, ref, p.ty.name, dict(env), created))  # type: ignore[arg-type]
                 if created:
                     continue
-                for lc, t in self.class_lifecycles(p.ty.name, ref, self.entry, env, facts):  # type: ignore[arg-type]
+                for lc, t in self.class_lifecycles(p.ty.name, ref, pre, env, facts):  # type: ignore[arg-type]
                     self.oblige("lifecycle", ctx, t, lc.clause.loc, f"'{p.name}' changes only as the lifecycle of {p.ty.name} allows ('{lc.clause.text}')", site=site, clause=lc.clause)
         for cls in self.lc_written:
             if not self.program.lifecycles_for(cls, never=True):
@@ -856,9 +867,23 @@ class VCGen:
                 some = L.Const(f"{cls}@some{next(self.counter)}", L.INT)
                 self.lc_sites.append((list(facts), L.select(alloc0, some), some, cls, dict(env), False))  # type: ignore[arg-type]
             r = L.Const(f"r!{next(self.counter)}", L.INT)
-            for lc, t in self.class_lifecycles(cls, r, self.entry, env, facts):
+            for lc, t in self.class_lifecycles(cls, r, pre, env, facts):
                 goal = L.forall([r], L.implies(L.select(alloc0, r), t))  # type: ignore[arg-type]
                 self.oblige("lifecycle", ctx, goal, lc.clause.loc, f"every {cls} written here changes only as its lifecycle allows ('{lc.clause.text}')", site=site, clause=lc.clause)
+
+    def resume(self, env: dict[str, Val]) -> None:
+        """A new stretch without suspension begins in this heap."""
+        for k, v in self.heap_env(env).items():
+            env[SEGMENT + k] = v
+
+    def suspend(self, ctx: Ctx, loc: ir.Loc) -> None:
+        """Other code runs while this function is suspended (other tasks, or a
+        generator's consumer): the stretch so far keeps the lifecycles, the
+        heap changes, and the next stretch starts from what it finds."""
+        assert ctx.state is not None
+        self.check_lifecycles(ctx.state.env, ctx.state.facts, loc, probe=False, guard=ctx.guard)
+        self.await_havoc(ctx, loc)
+        self.resume(ctx.state.env)
 
     # -- statements -------------------------------------------------------
 
@@ -1069,6 +1094,9 @@ class VCGen:
                             for cls_field in self.program.heap_writes.get(post.key if post else "", {}):
                                 c, f = cls_field.split(".", 1)
                                 names.update(k for k, _ in self.heap_keys(c, f))
+                    if suspends(sub):
+                        names.add(SEGMENT)
+                        names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Extern):
                         for a in sub.args:
                             if isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
@@ -1100,6 +1128,10 @@ class VCGen:
     def havoc(self, st: State, names: set[str], appends: set[str]) -> State:
         h = st.copy()
         for name in sorted(names):
+            if name == SEGMENT:
+                for k in sorted(k for k in h.env if k.startswith(SEGMENT)):
+                    h.env[k] = L.Const(f"{k[1:]}@{next(self.counter)}", h.env[k].sort)  # type: ignore[union-attr]
+                continue
             if name not in h.env:
                 continue
             old = h.env[name]
@@ -1130,6 +1162,17 @@ class VCGen:
             else:
                 h.env[name] = self.fresh(name, ty)
         return h
+
+    def cut(self, names: set[str], st: State, site: ir.Loc, at_head: bool = False) -> None:
+        """A loop that suspends splits its stretches at its head: each part
+        keeps the lifecycles (checked on the way in and after each
+        iteration), and the part after the head starts from the head's heap."""
+        if SEGMENT not in names:
+            return
+        if at_head:
+            self.resume(st.env)
+        else:
+            self.check_lifecycles(st.env, st.facts, site, probe=False)
 
     def invariants_for(self, line: int, user: tuple[ir.Clause, ...]) -> list[ir.Clause]:
         return list(user) + list(self.opts.extra_invariants.get(line, []))
@@ -1167,7 +1210,9 @@ class VCGen:
         names, appends = self.modified(list(s.body) + list(s.step) + [ir.ExprStmt(s.loc, s.cond)])
         wrote = self.written_in(names)
         self.check_written(wrote, st, s.loc, entry=True)
+        self.cut(names, st, s.loc)
         head = self.havoc(st, names, appends)
+        self.cut(names, head, s.loc, at_head=True)
         self.assume_invs(invs, head)
         self.assume_written(wrote, head)
         c = self.ev(s.cond, self.ctx(head))
@@ -1195,6 +1240,7 @@ class VCGen:
                 continue
             self.check_invs(invs, it_end, "inv.step", s.loc)
             self.check_written(wrote, it_end, s.loc, entry=False)
+            self.cut(names, it_end, s.loc)
             if v0 is not None:
                 vctx = self.ctx(it_end, spec=True)
                 v1 = self.ev(variant, vctx)  # type: ignore[arg-type]
@@ -1229,8 +1275,10 @@ class VCGen:
         names = set(names) | {counter}
         wrote = self.written_in(names)
         self.check_written(wrote, entry, s.loc, entry=True)
+        self.cut(names, entry, s.loc)
         self.fn.locals.setdefault(counter, ir.INT)
         head = self.havoc(entry, names, appends)
+        self.cut(names, head, s.loc, at_head=True)
         k = head.env[counter]
         assert not isinstance(k, ListVal)
         # By construction the counter stays within [lo, max(lo, hi)].
@@ -1251,6 +1299,7 @@ class VCGen:
             it_end.env[counter] = k1
             self.check_invs(invs, it_end, "inv.step", s.loc, {idx: k1})
             self.check_written(wrote, it_end, s.loc, entry=False)
+            self.cut(names, it_end, s.loc)
         out = head.copy()
         out.facts.append(L.not_(c))
         return self.merge([out] + frame.breaks)
@@ -1664,7 +1713,7 @@ class VCGen:
             return self.string_op(name, args, e, ctx)
         if name == "await":
             if ctx.state is not None and not ctx.spec:
-                self.await_havoc(ctx, e.loc)
+                self.suspend(ctx, e.loc)
             return args[0]
         if name == "enum_name" or name == "enum_value":
             (x,) = args
@@ -1964,6 +2013,7 @@ class VCGen:
             self.note(e.loc, f"call:{e.name}")
         if e.name == "yield" and ctx.state is not None:
             self.check_objects(ctx.state, e.loc, "at the yield", ctx.guard)
+            self.suspend(ctx, e.loc)
         if ctx.state is not None:
             env = ctx.state.env
             # It may change any list/dict variable passed to it, and, if it
@@ -2159,8 +2209,9 @@ class VCGen:
             if isinstance(p.ty, ir.TClass) and (returned or not (new_self and i == 0)):
                 for _, t in self.class_invariants(p.ty.name, args[i], env, ctx.base):  # type: ignore[arg-type]
                     ctx.assume(t)
-            # ... changed only as their lifecycles allow
-            if isinstance(p.ty, ir.TClass) and not (new_self and i == 0):
+            # ... changed only as their lifecycles allow (an initializer
+            # rebuilds its object, whether or not it is new: no lifecycle binds it)
+            if isinstance(p.ty, ir.TClass) and not (i == 0 and fn.name.endswith((".__init__", ".__post_init__"))):
                 for _, t in self.class_lifecycles(p.ty.name, args[i], heap_pre, env, ctx.base):  # type: ignore[arg-type]
                     ctx.assume(t)
         return post

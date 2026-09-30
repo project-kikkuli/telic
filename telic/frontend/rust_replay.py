@@ -219,16 +219,13 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
             continue
         cond = re.sub(r"\bresult\b", "__v", c.text)
         checks.append(f"if !({cond}) {{ println!(\"TELIC_VIOLATION ensures {i}\"); }}")
-    # the receiver changes only as its lifecycles allow
-    lcs = []
-    if any(p.name == "self" for p in fn.params):
-        from ..runtime import _lifecycles
+    # objects passed in change only as their lifecycles allow
+    from ..runtime import _lifecycles
 
-        lcs = _lifecycles(fe.module.classes, info.owner or "")
+    lcs = [(p, lc) for p in fn.params if isinstance(p.ty, ir.TClass) for _, lc in _lifecycles(fe.module.classes, p.ty.name)]
     snaps: list[str] = []
-    lcs = [lc for _, lc in lcs]
-    for i, lc in enumerate(lcs):
-        cond, olds = _extract_old(re.sub(r"\bself\b", "__self", lc.code))
+    for i, (p, lc) in enumerate(lcs):
+        cond, olds = _extract_old(re.sub(r"\bself\b", "__self" if p.name == "self" else p.name, lc.code))
         for k, o in enumerate(olds):
             snaps.append(f"let __o{i}_{k} = ({o}).clone();")
             cond = cond.replace(f"__OLD{k}__", f"__o{i}_{k}")
@@ -259,7 +256,7 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
                 c = fn.ensures[int(line.split()[-1])]
                 return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip()}
             if line.startswith("TELIC_VIOLATION lifecycle "):
-                return {"violation": "lifecycle", "func": ir.source_name(fn.name), "text": lcs[int(line.split()[-1])].clause.text}
+                return {"violation": "lifecycle", "func": ir.source_name(fn.name), "text": lcs[int(line.split()[-1])][1].clause.text}
         return out
     return _compile_error(err)
 

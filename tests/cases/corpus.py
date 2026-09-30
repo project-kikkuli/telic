@@ -670,6 +670,12 @@ def rewind_version(t: Ticket) -> None:
     t.version = t.version - 1
 
 
+# expect: refuted
+def restart_ticket(t: Ticket) -> None:
+    # the initializer rebuilds the live ticket it runs on
+    t.__init__()
+
+
 # expect: proved
 def advance_all(t: Ticket, u: Ticket) -> None:
     # callees keep the lifecycle, so their composition does

@@ -1450,7 +1450,17 @@ class ExprLowerer:
                 return
             raise self.err("assignment through an index needs a Vec variable or field", left)
         if left.type == "unary_expression" and _text(left.children[0]) == "*":
-            return self._store(left.named_children[0], value, n)
+            target = left.named_children[0]
+            obj = self.expr(target) if target.type == "identifier" else None
+            if obj is not None and isinstance(obj.ty, ir.TClass):
+                # the struct behind the reference is overwritten in place, field by field
+                tmp = self.fl.fresh("whole", obj.ty)
+                self.pre.append(ir.Assign(loc, tmp, self.fl.coerce(value, obj.ty)))
+                src = ir.Var(obj.ty, loc, tmp)
+                for f, t in self.fe.module.classes[obj.ty.name].fields:
+                    self.pre.append(ir.FieldAssign(loc, obj, obj.ty.name, f, ir.Field(t, loc, src, f)))
+                return
+            return self._store(target, value, n)
         raise self.err(f"unsupported assignment target: {_text(left)}", left)
 
     def x_field_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:

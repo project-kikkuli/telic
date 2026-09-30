@@ -328,3 +328,9 @@ impl Game {
         }
     }
 }
+
+// expect: refuted
+pub fn restart_game(g: &mut Game) {
+    // overwrites the caller's game, won or not
+    *g = Game { phase: Phase::Open, moves: 0, mines: g.mines };
+}

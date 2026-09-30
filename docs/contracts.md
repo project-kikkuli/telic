@@ -178,8 +178,11 @@ States are expressions in the host language (`Status.PAID`, `Status::Paid`,
 
 **What is proved.** Every function that may change an object keeps each
 lifecycle from its entry to its return: for its object parameters, and for
-every object of a class it writes. A call to a checked function is assumed
-to keep them too. On top of that, once per class, telic proves that each
+every object of a class it writes. An `await` or `yield` splits the call:
+other code runs there and sees the object, so each stretch between two of
+them keeps the lifecycles on its own. A call to a checked function is
+assumed to keep them too, except an initializer (`__init__`,
+`__post_init__`) run on an existing object, which rebuilds it. On top of that, once per class, telic proves that each
 relation is reflexive and transitive (every form above is, by
 construction; a general relation must be) and that each `never` follows from
 the others. Together these make the lifecycle hold across any sequence of

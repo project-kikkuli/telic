@@ -258,7 +258,6 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
     from .runtime import _lifecycles
 
     for f in module.functions.values():
-        recv = f.params[0].ty if f.params and f.params[0].name == "self" and not f.name.endswith(".__init__") else None
         out[ir.source_name(f.name)] = {
             "params": [p.name for p in f.params],
             "lists": [i for i, p in enumerate(f.params) if isinstance(p.ty, ir.TList)],
@@ -267,7 +266,14 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
             # class invariants: of the objects passed in, and of every object it changes
             "invs": [[p.name, invs(p.ty.name)] for p in f.params if isinstance(p.ty, ir.TClass) and invs(p.ty.name)],
             "classes": classes if classes and any(isinstance(s, ir.FieldAssign) for s in ir.walk_stmts(f.body)) else {},
-            "lifecycles": [[lc.clause.text, f"!(this instanceof {ir.source_name(owner)}) || ({lc.code})"] for owner, lc in _lifecycles(module.classes, recv.name)] if isinstance(recv, ir.TClass) else [],
+            # objects passed in (a constructor's own object excepted) change only as their lifecycles allow
+            "lifecycles": [
+                [lc.clause.text, f"!({o} instanceof {ir.source_name(owner)}) || (" + re.sub(r"\bthis\b", o, lc.code) + ")"]
+                for i, p in enumerate(f.params)
+                if isinstance(p.ty, ir.TClass) and not (i == 0 and p.name == "self" and f.name.endswith(".__init__"))
+                for o in ["this" if p.name == "self" else p.name]
+                for owner, lc in _lifecycles(module.classes, p.ty.name)
+            ],
         }
     out["__classes__"] = classes
     return out

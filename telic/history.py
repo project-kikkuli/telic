@@ -207,7 +207,7 @@ def check(program: Program, functions: list[Any], gens: dict[str, VCGen], solve,
                 elif bad is not None and r.status != "refuted":
                     r.status = "open"
                     r.problems.append(f"{name} is not proved to keep {what}")
-            elif f.status in ("unsupported", "error") and _may_change(program, f.ref, family):
+            elif f.status in ("unsupported", "error", "trusted") and _may_change(program, f.ref, family):
                 if r.status == "proved":
                     r.status = "open"
                 r.problems.append(f"{ir.source_name(f.fn.name)} may change {ir.source_name(r.cls)} objects but is not checked ({f.status})")
