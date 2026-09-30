@@ -1035,7 +1035,7 @@ PURE_EXTERNS = frozenset(
     "get keys values items entries copy count index find rfind startswith endswith startsWith endsWith lower upper "
     "toLowerCase toUpperCase strip lstrip rstrip trim split rsplit splitlines join format replace encode decode "
     "isdigit isalpha isalnum isspace print log warn error str repr String Number Boolean len int float bool "
-    "isinstance type id hash sorted list dict tuple set frozenset dumps stringify abs min max sum any all round "
+    "isinstance type id hash sorted list dict tuple set frozenset dumps stringify abs min max sum any all round reduce "
     "isArray isInteger isNaN parseInt parseFloat slice concat indexOf lastIndexOf includes at toString "
     "hasOwnProperty charAt charCodeAt substring padStart padEnd repeat getattr hasattr chr ord from_bytes".split()
 )

@@ -177,6 +177,7 @@ class ModuleLowerer {
     this.memberLists = {}; // interface / object type alias -> its members
     this.unions = new Map(); // union type node -> its record type (null: not a discriminated union)
     this.globalsBound = new Set(); // module-level names that are not modelled
+    this.handed = []; // [function, loc, by whom]: a checked function used as a value
   }
 
   run() {
@@ -188,6 +189,22 @@ class ModuleLowerer {
 
   line(node) {
     return this.sf.getLineAndCharacterOfPosition(node.getStart(this.sf)).line + 1;
+  }
+
+  // A checked function used as a value may be called by code telic does not
+  // see, with any arguments its types allow: its precondition is an
+  // obligation there, carried by a unit that calls it so (and the function
+  // that hands it on rests on that unit).
+  handedOn() {
+    for (const [name, loc, owner] of this.handed) {
+      const tgt = this.module.functions.find((f) => f.name === name);
+      const uid = `<${name}:${loc[0]}:${loc[1]}>`;
+      if (!tgt || !tgt.requires.length || this.module.functions.some((f) => f.name === uid)) continue;
+      const call = { e: "Call", ty: tgt.ret, loc, func: name, args: tgt.params.map(([p, ty]) => ({ e: "Var", ty, loc, name: p })) };
+      const body = [tgt.ret.k === "none" ? { s: "ExprStmt", loc, expr: call } : { s: "Return", loc, value: call }];
+      this.module.functions.push({ name: uid, loc, end_line: loc[0], params: tgt.params, ret: tgt.ret, requires: [], ensures: [], decreases: null, raises: [], body, aims: [], mirrors: [], unsupported: [], trusted: false, exported: false, is_async: false, source: name, locals: Object.fromEntries(tgt.params), escaped: [], unit: `'${name}' handed on as a value at line ${loc[0]}` });
+      this.module.code.calls.push([owner, loc[0], loc[1], name, [uid]]);
+    }
   }
   loc(node) {
     const s = this.sf.getLineAndCharacterOfPosition(node.getStart(this.sf));
@@ -343,6 +360,7 @@ class ModuleLowerer {
       imports[`${local}.*`] = [mod.rel, "*"];
     }
     this.module.code = codeGraph(this.sf, new Set([...this.module.functions.map((f) => f.name), ...Object.keys(this.sigs)]), imports, namespaces);
+    this.handedOn();
     for (const cl of this.contracts) {
       if (cl.consumed) continue;
       if (cl.keyword === "aim") {
@@ -1778,6 +1796,7 @@ class FunctionLowerer {
       if (!ts.isIdentifier(d.name)) throw this.err("unsupported declaration", node);
       const src = d.name.text;
       if (d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))) {
+        this.unit(d.initializer);
         const name = this.bindLocal(src, opaque("closure"), node);
         this.consts.add(name);
         out.push({ s: "Assign", loc, name, value: this.opaqueOp("closure", [{ e: "Lit", ty: STR, loc, value: src }], opaque("closure"), loc) });
@@ -2261,6 +2280,7 @@ class FunctionLowerer {
         if (n.text in this.ml.constants) return this.expr(this.ml.constants[n.text], expect);
         if (this.ml.enums[n.text] || this.ml.classes[n.text] || this.ml.sigs[n.text] || this.ml.globalsBound.has(n.text) || GLOBALS.has(n.text) || this.ml.imported[n.text] || this.ml.namespaces[n.text]) {
           if (this.spec) throw this.err(`'${n.text}' is not a value a specification can use`, this.nline(n));
+          if (this.ml.sigs[n.text] && !this.ml.sigs[n.text].cls && !this.probe) this.ml.handed.push([n.text, loc, this.f.name]);
           return this.extern(n.text, [], null, loc); // a module-level value: read fresh each time
         }
       }
@@ -2306,6 +2326,7 @@ class FunctionLowerer {
     }
     if (ts.isArrowFunction(n) || ts.isFunctionExpression(n)) {
       if (this.spec) throw this.err("functions are not values in specifications", this.nline(n));
+      this.unit(n);
       return this.opaqueOp("closure", [], opaque("closure"), loc);
     }
     if (ts.isNewExpression(n)) return this.newExpr(n, loc, expect);
@@ -2764,7 +2785,13 @@ class FunctionLowerer {
       if (obj.ty.k !== "list") return this.methodCall(obj, m, n, loc, expect);
       if (obj.ty.k === "list") {
         if (m === "every" || m === "some") {
-          const lam = this.lambda(args[0], [{ ty: obj.ty.elem }, { ty: INT }]);
+          let lam;
+          try {
+            lam = this.lambda(args[0], [{ ty: obj.ty.elem }, { ty: INT }]);
+          } catch (e) {
+            if (!(e instanceof LowerError) || this.spec) throw e;
+            return this.listMethod(obj, m, n, loc, expect); // runs the callback on each element, in place or on its own
+          }
           const elem = lam.names[0] || `_e${++this.tmp}`;
           const idx = lam.names[1] || `${elem}$idx`;
           return { e: "Quant", ty: BOOL, loc, kind: m === "every" ? "forall" : "exists", idx, lo: { e: "Lit", ty: INT, loc, value: 0 }, hi: { e: "Builtin", ty: INT, loc, name: "len", args: [obj] }, body: this.truthy(lam.body, args[0]), elem, seq: obj };
@@ -2781,23 +2808,15 @@ class FunctionLowerer {
           return { e: "Builtin", ty: obj.ty, loc, name: "slice", args: [obj, lo, hi] };
         }
         if (m === "at") return { e: "Index", ty: obj.ty.elem, loc, seq: obj, idx: this.index(args[0]), wrap: true };
-        if (m === "reduce" && args.length === 2 && isNum(obj.ty.elem)) {
+        if (m === "reduce" && args.length === 2 && isNum(obj.ty.elem) && (ts.isArrowFunction(args[0]) || ts.isFunctionExpression(args[0])) && sumOf(args[0])) {
           // xs.reduce((a, b) => a + b, 0)  ==>  sum(xs)
-          const f = args[0];
-          if ((ts.isArrowFunction(f) || ts.isFunctionExpression(f)) && f.parameters.length === 2 && ts.isIdentifier(f.parameters[0].name) && ts.isIdentifier(f.parameters[1].name)) {
-            const a = f.parameters[0].name.text, b = f.parameters[1].name.text;
-            let body = f.body;
-            if (ts.isParenthesizedExpression(body)) body = body.expression;
-            if (ts.isBinaryExpression(body) && body.operatorToken.kind === ts.SyntaxKind.PlusToken && ts.isIdentifier(body.left) && ts.isIdentifier(body.right) && ((body.left.text === a && body.right.text === b) || (body.left.text === b && body.right.text === a))) {
-              const init = this.expr(args[1]);
-              const s = { e: "Builtin", ty: obj.ty.elem, loc, name: "sum", args: [obj] };
-              if (init.e === "Lit" && init.value === 0) return s;
-              const [x, y, t] = this.numPair(init, s, n);
-              return { e: "Binary", ty: t, loc, op: "add", left: x, right: y };
-            }
-          }
-          throw this.err("only xs.reduce((a, b) => a + b, init) is supported", this.nline(n));
+          const init = this.expr(args[1]);
+          const s = { e: "Builtin", ty: obj.ty.elem, loc, name: "sum", args: [obj] };
+          if (init.e === "Lit" && init.value === 0) return s;
+          const [x, y, t] = this.numPair(init, s, n);
+          return { e: "Binary", ty: t, loc, op: "add", left: x, right: y };
         }
+        if (m === "reduce" && args.length >= 1 && args.length <= 2 && !this.spec) return this.reduce(obj, args, n, loc, expect);
         return this.listMethod(obj, m, n, loc, expect);
       }
       throw this.err(`unsupported method call .${m}()`, this.nline(n));
@@ -2893,6 +2912,12 @@ class FunctionLowerer {
   methodCall(obj, m, n, loc, expect) {
     const args = n.arguments;
     const t = obj.ty;
+    if (["then", "catch", "finally"].includes(m) && !(t.k === "class" && this.ml.memberKey(t.name, m)) && !this.spec) {
+      // a promise (typed as what it resolves to): the callbacks run later, on its value or its error
+      const types = m === "then" ? [[t], [opaque("a rejection")]] : m === "catch" ? [[opaque("a rejection")]] : [[]];
+      const cbs = args.map((a, i) => (ts.isArrowFunction(a) || ts.isFunctionExpression(a) ? (this.unit(a, types[i] || [], true), this.opaqueOp("closure", [], opaque("closure"), loc)) : this.argValue(a)));
+      return this.extern(`Promise.${m}`, [this.coerce(obj, opaque("")), ...cbs], expect, loc);
+    }
     if (t.k === "class") {
       const key = this.ml.memberKey(t.name, m);
       const sig = key && this.ml.sigs[key];
@@ -2939,6 +2964,90 @@ class FunctionLowerer {
     return this.extern(`Map.${m}`, [d, ...args.map((a) => this.argValue(a))], expect, loc);
   }
 
+  // A function handed on as a value: code telic does not see may call it
+  // with anything, whenever it likes, so its body is checked as a function
+  // of its own, over every argument and every value of what it captures.
+  // Named as the code graph names it, so a proof that hands it to unchecked
+  // code rests on it. `types`: what a library passes its parameters.
+  unit(fnNode, types = [], rejects = false) {
+    if (this.probe) return;
+    const ml = this.ml;
+    const [line, col] = ml.loc(fnNode);
+    const kind = fnNode.name && ts.isIdentifier(fnNode.name) ? fnNode.name.text : ts.isArrowFunction(fnNode) ? "arrow" : "function";
+    const uid = `<${kind}:${line}:${col}>`;
+    const label = fnNode.name && ts.isIdentifier(fnNode.name) ? `'${kind}' at line ${line}` : `the ${ts.isArrowFunction(fnNode) ? "arrow function" : "function"} at line ${line}`;
+    if (ml.module.functions.some((fn) => fn.name === uid)) return;
+    const own = new Set();
+    const declared = (n) => {
+      if ((ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n) || ts.isFunctionDeclaration(n)) && n.name) {
+        const names = (b) => (ts.isIdentifier(b) ? own.add(b.text) : ts.forEachChild(b, names));
+        names(n.name);
+      }
+      ts.forEachChild(n, declared);
+    };
+    declared(fnNode);
+    const caps = [];
+    let usesThis = false;
+    const free = (n) => {
+      if (n.kind === ts.SyntaxKind.ThisKeyword) usesThis = true;
+      if (ts.isIdentifier(n) && !own.has(n.text) && !caps.some(([s]) => s === n.text) && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
+        const irn = this.bound && n.text in this.bound ? null : this.resolve(n.text);
+        if (this.bound && n.text in this.bound) caps.push([n.text, this.bound[n.text]]);
+        else if (irn !== null && irn !== "self" && this.env[irn]) caps.push([n.text, this.env[irn]]);
+      }
+      ts.forEachChild(n, free);
+    };
+    free(fnNode.body);
+    const f = { name: uid, node: fnNode, exported: false };
+    let sig;
+    try {
+      sig = ml.signature(f);
+    } catch (e) {
+      if (!(e instanceof LowerError)) throw e;
+      ml.module.functions.push({ name: uid, loc: ml.loc(fnNode), end_line: ml.line(fnNode), params: [], ret: NONE, requires: [], ensures: [], decreases: null, raises: [], body: [], aims: [], mirrors: [], unsupported: [[e.message, e.line || line]], trusted: false, exported: false, is_async: false, source: fnNode.getText(ml.sf), locals: {}, escaped: [], unit: label });
+      return;
+    }
+    sig.params = sig.params.map((p, i) => (types[i] && p.ty.k === "opaque" ? { ...p, ty: types[i] } : p));
+    const self = usesThis && this.selfTy() && ts.isArrowFunction(fnNode) ? [{ name: "self", ty: this.selfTy() }] : [];
+    sig.params = [...self, ...sig.params, ...caps.filter(([n]) => !sig.params.some((p) => p.name === n)).map(([name, ty]) => ({ name, ty }))];
+    sig.contracts = []; // what a library passes is not something a comment can promise
+    ml.sigs[uid] = sig;
+    if (self.length) {
+      f.cls = this.f.cls;
+      sig.cls = this.f.cls;
+    }
+    const fn = new FunctionLowerer(ml, f).lower();
+    fn.unit = label;
+    fn.rejects = rejects;
+    ml.module.functions.push(fn);
+  }
+
+  // xs.reduce(f, init): f runs on each element, with an accumulator that
+  // holds whatever the earlier elements left (any value of its type).
+  reduce(xs, args, n, loc, expect) {
+    const f = args[0];
+    const init = args[1] ? this.expr(args[1]) : null;
+    const start = init ? init.ty : xs.ty.elem;
+    const acc = start.k === "int" ? REAL : start; // a number the callback returns need not stay an integer
+    const recv = xs.e === "Var" ? this.coerce(xs, opaque("")) : xs;
+    const rest = init ? [init] : [];
+    if (!(ts.isArrowFunction(f) || ts.isFunctionExpression(f))) return this.extern("Array.reduce", [recv, this.argValue(f), ...rest], expect, loc);
+    let lam;
+    try {
+      lam = this.lambda(f, [{ ty: acc }, { ty: xs.ty.elem }, { ty: INT }]);
+      if (!tyEq(this.coerce(lam.body, acc).ty, acc)) throw this.err("the callback returns another type than it accumulates", this.nline(f));
+    } catch (e) {
+      if (!(e instanceof LowerError)) throw e;
+      this.unit(f, [opaque("an accumulator"), xs.ty.elem, INT, xs.ty]);
+      return this.extern("Array.reduce", [recv, this.opaqueOp("closure", [], opaque("closure"), loc), ...rest], expect, loc);
+    }
+    const [a, x, i] = [lam.names[0] || `_acc${++this.tmp}`, lam.names[1] || `_cb${++this.tmp}`, lam.names[2]];
+    const held = this.opaqueOp(`reduce accumulator ${loc[0]}:${loc[1]}`, [], acc, loc);
+    const body = substVar(lam.body, a, held);
+    const each = { e: "Builtin", ty: opaque(""), loc, name: "each", args: [xs, { e: "Lit", ty: STR, loc, value: i ? `${x},${i}` : x }, body] };
+    return this.extern("Array.reduce", [recv, each, ...rest], expect, loc);
+  }
+
   // A callback an array method runs on every element: its body, checked on
   // an arbitrary element (and index), in place of the function value.
   callbackEach(xs, m, f, loc) {
@@ -2954,12 +3063,15 @@ class FunctionLowerer {
     }
     if (!(ts.isArrowFunction(f) || ts.isFunctionExpression(f)) || this.loopedCallbacks?.has(f)) return null;
     const sort = m === "sort" || m === "toSorted";
+    const types = sort ? [t.elem, t.elem] : [t.elem, INT, t];
     let lam;
     try {
-      lam = this.lambda(f, sort ? [{ ty: t.elem }, { ty: t.elem }] : [{ ty: t.elem }, { ty: INT }]);
+      lam = this.lambda(f, types.map((ty) => ({ ty })));
     } catch (e) {
-      if (e instanceof LowerError) throw this.err(`the callback to .${m}() is not modelled: ${e.message}`, this.nline(f));
-      throw e;
+      if (!(e instanceof LowerError)) throw e;
+      // a body telic cannot lower in place: checked on its own, for any element
+      this.unit(f, types);
+      return this.opaqueOp("closure", [], opaque("closure"), loc);
     }
     const [a, b] = [lam.names[0] || `_cb${++this.tmp}`, lam.names[1]];
     if (sort) return each(a, { e: "Builtin", ty: opaque(""), loc, name: "each", args: [xs, lit(b || `_cb${++this.tmp}`), lam.body] });
@@ -2989,7 +3101,7 @@ class FunctionLowerer {
       }
     }
     if (this.spec) throw this.err(`array method .${m}() is not supported in specifications`, this.nline(n));
-    const res = { find: optionOf(t.elem), pop: optionOf(t.elem), shift: optionOf(t.elem), indexOf: INT, findIndex: INT, lastIndexOf: INT, join: STR, concat: t, map: listOf(opaque("")), filter: t, flatMap: listOf(opaque("")), push: REAL, unshift: REAL, toString: STR }[m];
+    const res = { some: BOOL, every: BOOL, find: optionOf(t.elem), pop: optionOf(t.elem), shift: optionOf(t.elem), indexOf: INT, findIndex: INT, lastIndexOf: INT, join: STR, concat: t, map: listOf(opaque("")), filter: t, flatMap: listOf(opaque("")), push: REAL, unshift: REAL, toString: STR }[m];
     if (["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && xs.e !== "Var" && !this.freshList(xs)) throw this.err(`'.${m}()' on an array that is not a variable is not tracked`, this.nline(n));
     // a non-mutating method leaves the array alone unless a callback mentions it
     const mentions = (a) => xs.e === "Var" && (() => { let hit = false; const v = (x) => { if (ts.isIdentifier(x) && this.resolve(x.text) === xs.name) hit = true; ts.forEachChild(x, v); }; v(a); return hit; })();
@@ -3005,6 +3117,25 @@ class FunctionLowerer {
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+// (a, b) => a + b
+function sumOf(f) {
+  if (f.parameters.length !== 2 || !ts.isIdentifier(f.parameters[0].name) || !ts.isIdentifier(f.parameters[1].name)) return false;
+  const a = f.parameters[0].name.text, b = f.parameters[1].name.text;
+  let body = f.body;
+  while (ts.isParenthesizedExpression(body)) body = body.expression;
+  return ts.isBinaryExpression(body) && body.operatorToken.kind === ts.SyntaxKind.PlusToken && ts.isIdentifier(body.left) && ts.isIdentifier(body.right) && ((body.left.text === a && body.right.text === b) || (body.left.text === b && body.right.text === a));
+}
+
+// e with every read of variable `name` replaced by `v`
+function substVar(e, name, v) {
+  if (Array.isArray(e)) return e.map((x) => substVar(x, name, v));
+  if (!e || typeof e !== "object") return e;
+  if (e.e === "Var" && e.name === name) return v;
+  const out = {};
+  for (const [k, x] of Object.entries(e)) out[k] = k === "ty" || k === "loc" ? x : substVar(x, name, v);
+  return out;
+}
 
 const CALLBACK_METHODS = ["map", "filter", "forEach", "some", "every", "find", "findIndex", "findLast", "findLastIndex", "flatMap", "sort", "toSorted"];
 

@@ -1069,7 +1069,10 @@ class VCGen:
                 self.oblige("raise", ctx, cond, s.loc, f"raise {s.what} outside '@raises {self.fn.raises[0].text}'")
             elif self.fn.requires or self.fn.ensures:
                 self.oblige("raise", ctx, L.FALSE, s.loc, f"raise {s.what} is reachable (add '@raises <condition>' if intended)")
-            # (without a contract, an explicit raise is what the function does, not a failure)
+            elif self.fn.unit and not self.fn.rejects:
+                self.oblige("raise", ctx, L.FALSE, s.loc, f"raise {s.what} is reachable, and no code telic sees catches it")
+            # (without a contract, an explicit raise is what the function does, not a failure;
+            # a unit's caller is code telic does not see)
             if not self.is_init:  # (an object whose initializer raises never reaches the caller)
                 self.check_objects(st, s.loc, "when it raises")
                 self.check_lifecycles(st.env, st.facts, s.loc, probe=False)

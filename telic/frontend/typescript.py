@@ -329,6 +329,8 @@ def _function(d: dict[str, Any]) -> ir.Function:
         source=d.get("source", ""),
         locals={n: _type(t) for n, t in (d.get("locals") or {}).items()},
         escaped=set(d.get("escaped") or []),
+        unit=d.get("unit", ""),
+        rejects=bool(d.get("rejects")),
     )
 
 

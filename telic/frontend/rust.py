@@ -157,9 +157,13 @@ class FnInfo:
     trait_method: str | None = None  # key of the trait method this implements: its contract applies
     decl: bool = False  # a trait's method declaration: callers through the trait use its contract
     lens: dict[str, int] = field(default_factory=dict)  # [T; N] parameters -> N
+    unit: str = ""  # a closure checked on its own (see ir.Function.unit)
 
 
 RESULT_TAG = ir.TEnum("Result$tag", ("Ok", "Err"))
+# std methods that call a closure on each element of a list (one at a time, or two to compare)
+ONE_ELEMENT = ("for_each", "map", "filter", "any", "all", "find", "position", "retain", "sort_by_key", "sort_unstable_by_key", "max_by_key", "min_by_key", "filter_map", "flat_map", "take_while", "skip_while", "inspect", "partition")
+TWO_ELEMENTS = ("sort_by", "sort_unstable_by", "max_by", "min_by", "dedup_by")
 
 
 def _slot(variant: str, fname: str) -> str:
@@ -1006,6 +1010,7 @@ class FunctionLowerer:
         self.range_after: list[ir.Stmt] = []
         self.escaped: set[str] = set()
         self.refmut: set[str] = set()  # names bound into a value matched through &mut
+        self.closure_hints: dict[int, list[tuple[ir.Type, str | None]]] = {}  # closure (start byte) -> what a library passes it
 
     # -- entry ----------------------------------------------------------
 
@@ -1022,7 +1027,10 @@ class FunctionLowerer:
             source=_text(n),
             exported=_text(n).lstrip().startswith("pub"),
         )
-        for cl in _header_contracts(self.node, self.fe.lines, self.fe.contract_lines):
+        self.fn.unit = info.unit
+        if info.unit:
+            self.fn.exported = False
+        for cl in _header_contracts(self.node, self.fe.lines, self.fe.contract_lines) if not info.unit else []:
             cl.consumed = True
             try:
                 self._function_contract(cl)
@@ -1048,7 +1056,12 @@ class FunctionLowerer:
             if p.name in info.lens:
                 size = ir.Lit(ir.INT, self.fn.loc, info.lens[p.name])
                 stmts.append(ir.ExprStmt(self.fn.loc, ir.Builtin(ir.INT, self.fn.loc, "in_range", (ir.Builtin(ir.INT, self.fn.loc, "len", (ir.Var(p.ty, self.fn.loc, p.name),)), size, size))))
-        out = self.block_value(body, stmts, info.ret, info.ret_kind)
+        if body.type == "block":
+            out = self.block_value(body, stmts, info.ret, info.ret_kind)
+        else:  # a closure's expression body
+            el = ExprLowerer(self)
+            out = el.expr(body, info.ret, info.ret_kind)
+            stmts.extend(el.pre)
         if out is not None and info.ret != ir.NONE:
             stmts.append(ir.Return(out.loc, self.coerce(out, info.ret)))
         elif out is not None:
@@ -2645,7 +2658,84 @@ class ExprLowerer:
         body = n.child_by_field_name("body")
         if body is not None:
             names(body)
+        self.closure_unit(n)
         return self.opaque("closure", [ir.Lit(ir.STR, self.loc(n), _text(n)[:40])], ir.TOpaque("closure"), self.loc(n))
+
+    def element_hints(self, recv_n: Any, m: str, argn: list[Any]) -> None:
+        """What std passes the closures it is handed: the elements of a list
+        (``xs.iter().for_each(|x| ..)``, ``xs.sort_by_key(|x| ..)``)."""
+        at = {**dict.fromkeys(ONE_ELEMENT, (0, 1)), **dict.fromkeys(TWO_ELEMENTS, (0, 2)), "fold": (1, 2)}.get(m)
+        if at is None or len(argn) <= at[0]:
+            return
+        base = recv_n
+        while base.type == "call_expression" and base.child_by_field_name("function").type == "field_expression" and _text(base.child_by_field_name("function").child_by_field_name("field")) in ("iter", "iter_mut", "into_iter", "copied", "cloned"):
+            base = base.child_by_field_name("function").child_by_field_name("value")
+        if base.type != "identifier":
+            return
+        r = self.fl.resolve(_text(base))
+        t = self.fl.env.get(r)
+        if not isinstance(t, ir.TList):
+            return
+        elem = (t.elem, self.fl.elem_kinds.get(r))
+        self.fl.closure_hints[argn[at[0]].start_byte] = [(ir.TOpaque("an accumulator"), None), elem] if m == "fold" else [elem] * at[1]
+
+    def closure_unit(self, n: Any) -> None:
+        """A closure handed on as a value: code telic does not see may call it
+        with anything, whenever it likes, so its body is checked as a
+        function of its own, over every argument its parameter types allow
+        and every value of what it captures."""
+        fl, fe = self.fl, self.fe
+        line, col = n.start_point[0] + 1, n.start_point[1]
+        key, label = f"<closure:{line}:{col}>", f"the closure at line {line}"
+        if key in fe.module.functions:
+            return
+        params: list[ir.Param] = []
+        kinds: dict[str, str] = {}
+        problem = ""
+        ps = n.child_by_field_name("parameters")
+        for p in ps.named_children if ps is not None else []:
+            pat, tn = (p.child_by_field_name("pattern"), p.child_by_field_name("type")) if p.type == "parameter" else (p, None)
+            while pat is not None and pat.type in ("mut_pattern", "reference_pattern"):
+                pat = pat.named_children[-1]
+            if pat is None or pat.type != "identifier":
+                problem = f"closure parameter '{_text(p)}' is not modelled"
+                break
+            hint = fl.closure_hints.get(n.start_byte, [])
+            ty, k = fe.ty(tn) if tn is not None else hint[len(params)] if len(params) < len(hint) else (ir.TOpaque("an argument"), None)
+            params.append(ir.Param(_text(pat), ty))
+            if k:
+                kinds[_text(pat)] = k
+        own = {p.name for p in params}
+
+        def free(x: Any) -> None:
+            name = "self" if x.type == "self" else _text(x) if x.type == "identifier" else None
+            if name is not None and name not in own and name not in {p.name for p in params}:
+                r = name if name in self.bound else fl.resolve(name)
+                ty = self.bound.get(name) or fl.env.get(r)
+                if ty is not None:
+                    params.append(ir.Param(name, ty))
+                    if fl.kinds.get(r):
+                        kinds[name] = fl.kinds[r]
+            for c in x.children:
+                free(c)
+
+        body = n.child_by_field_name("body")
+        if body is not None:
+            free(body)
+        ret = ir.TOpaque("")
+        info = FnInfo(key, n, params, ret, None, kinds, None, None, set(), mod=fl.info.mod, file=fl.info.file, generics=fl.info.generics, unit=label)
+        saved = (fe.cur_mod, fe.cur_generics, fe.cur_self, fe.cur_subst)
+        try:
+            if problem:
+                raise LowerError(problem, line)
+            fn = FunctionLowerer(fe, info).lower()
+        except LowerError as e:
+            fn = fe._stub(info, str(e), e.line)
+            fn.unit, fn.exported = label, False
+        finally:
+            fe.cur_mod, fe.cur_generics, fe.cur_self, fe.cur_subst = saved
+        fe.module.functions[key] = fn
+        fe.module.code.calls.append((fl.info.key, ir.Loc(line, col), "a closure", (key,)))
 
     def x_tuple_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         parts = [self.expr(c) for c in n.named_children]
@@ -2897,6 +2987,7 @@ class ExprLowerer:
 
     def method(self, recv_n: Any, m: str, argn: list[Any], n: Any, expect: Any, kind: Any) -> ir.Expr:
         loc = self.loc(n)
+        self.element_hints(recv_n, m, argn)
         chain = self.iter_chain(recv_n, m, argn, n, expect)
         if chain is not None:
             return chain

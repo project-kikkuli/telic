@@ -29,7 +29,7 @@ TRUE_HELPERS = {
     "t18.py": {"inc2"},
     "t17.py": {"P.__post_init__"},
     "t19.py": {"Box.__init__", "weird", "decorated"},
-    "t20.ts": {"Box.__init__"},
+    "t20.ts": {"Box.__init__", "<arrow:22:10>", "<arrow:31:15>"},
     "t22.py": {"Bag.__init__", "moved_ok"},
     "t23.rs": {"Counter.bump", "set_through"},
     "t21.py": {"B.__init__", "B.value", "C.value", "B.shrink", "other_task"},
@@ -56,7 +56,7 @@ TRUE_HELPERS = {
     "t37.py": {"Loop.__post_init__"},
     "t38.py": {"knot"},
     "t39.py": {"knot"},
-    "t40.py": {"knot"},
+    "t40.py": {"knot", "<lambda:23:50>"},
     "t41.py": {"knot", "Loop.nxt"},
     "t42.py": {"wraps_deco", "plain_deco"},
     "t42.ts": {"wrap"},
@@ -78,7 +78,7 @@ TRUE_HELPERS = {
     "swift1.swift": {"Box.init", "mayThrow", "runIt", "Ten.size", "Three.size", "Five.value", "Six.value"},
     "swift2.swift": {"One.value", "Base.init", "Base.v", "ViaAlias.v", "throughAlias", "check", "Span.init"},  # throughAlias: proved only assuming Negative.value, which is refuted
     "t34.py": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__"},
-    "t34.ts": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__"},
+    "t34.ts": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__", "<arrow:24:20>"},
     "t35.py": {"Acct.__init__", "Checked.__init__"},
     "t35.ts": {"Acct.__init__", "Checked.__init__"},
     "t36.py": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift", "first_v"},
@@ -88,11 +88,18 @@ TRUE_HELPERS = {
     "lc2.py": {"Tab.__init__", "Tab.pay", "Gauge.__init__", "Latch.__init__", "Latch.close", "Meter.__init__", "Meter.tick"},
     "lc2.rs": {"Tally.bump"},
     "json_mutate.py": {"put"},
-    "json_mutate.rs": {"clear"},
+    "json_mutate.rs": {"clear", "<closure:8:28>"},
     "t31.rs": {"f", "f@two", "Ctr.reset", "E2.from", "Five.w", "Loose.eq", "Tr.w@default", "fails", "wrap"},
     "t32.rs": {"set"},
     "t43.py": {"pos", "grow", "Counter.__init__", "Counter.bump"},
-    "t43.ts": {"pos", "Counter.__init__", "Counter.bump"},
+    "t43.ts": {"pos", "Counter.__init__", "Counter.bump", "<arrow:116:20>"},
+    # a scheduled callback (timer, listener, promise, JSX handler) runs on a stack
+    # of its own: the function that schedules it is proved; the callback is not
+    "cb1.py": {"pos"},
+    "cb1.ts": {"pos", "timerThrows", "listenerNeedsPos", "thenNeedsPos"},
+    "cb1.tsx": {"pos", "Counter", "Thrower"},
+    "cb1.rs": {"pos"},
+    "cb1.swift": {"pos"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.
@@ -101,12 +108,12 @@ TRUE_LIFECYCLES = {
     "lc1.ts": {"stage: 0 -> 1 -> 2"},
 }
 
-FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs", ".swift"))
+FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".tsx", ".rs", ".swift"))
 
 
 @pytest.mark.parametrize("name", FILES)
 def test_no_exploit_is_proved(name):
-    if name.endswith(".ts"):
+    if name.endswith((".ts", ".tsx")):
         import shutil
 
         if shutil.which("node") is None:

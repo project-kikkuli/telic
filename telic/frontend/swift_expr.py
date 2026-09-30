@@ -611,7 +611,58 @@ class ExprLowerer:
                 names(c)
 
         names(x.at)
+        self.closure_unit(x)
         return self.opaque("closure", [ir.Lit(ir.STR, self.loc(x), x.src[:40])], ir.TOpaque("closure"), self.loc(x))
+
+    def closure_unit(self, x: X) -> None:
+        """A closure handed on as a value: code telic does not see may call it
+        with anything, whenever it likes, so its body is checked as a
+        function of its own, over every argument and every value of what it
+        captures."""
+        from .swift_lower import FunctionLowerer
+
+        fl, pj = self.fl, self.pj
+        n = x.at
+        line, col = n.start_point[0] + 1, n.start_point[1]
+        key, label = f"<closure:{line}:{col}>", f"the closure at line {line}"
+        module = pj.files[fl.info.path].module
+        if key in module.functions:
+            return
+        idents: list[str] = []
+
+        def walk(k: Any) -> None:
+            if k.type == "simple_identifier" and text(k) not in idents:
+                idents.append(text(k))
+            for c in k.children:
+                walk(c)
+
+        if x.body is not None:
+            walk(x.body)
+        names = list(x.params) if x.params is not None else [f"${i}" for i in range(1 + max([int(v[1:]) for v in idents if re.fullmatch(r"\$\d+", v)], default=-1))]
+        hint = fl.closure_hints.get(n.start_byte, [])
+        params = [ir.Param(v, hint[i][0] if i < len(hint) else ir.TOpaque("an argument")) for i, v in enumerate(names)]
+        kinds: dict[str, str] = {v: hint[i][1] for i, v in enumerate(names) if i < len(hint) and hint[i][1]}
+        for v in idents:
+            r = fl.resolve(v)
+            if v not in names and r is not None and r in fl.env and r != "self":
+                params.append(ir.Param(v, fl.env[r]))
+                if fl.kinds.get(r):
+                    kinds[v] = fl.kinds[r]
+        owner = fl.info.owner if "self" in fl.env else None
+        if owner is not None:
+            params.insert(0, ir.Param("self", fl.env["self"]))
+        items = [c for c in x.body.children if c.is_named and c.type != "comment"] if x.body is not None else []
+        valued = len(items) == 1 or re.search(r"\breturn\s+[^\s}]", x.src) is not None
+        info = FnInfo(key, key, n, fl.info.path, owner, False, False, params, [None] * len(params), [None] * len(params), ir.TOpaque("") if valued else ir.NONE, None, kinds, {}, set(), "try" in x.src or "throw" in x.src, body=x.body, exported=False, generics=dict(fl.info.generics))
+        low = FunctionLowerer(pj, info)
+        info.fn = low._blank()
+        try:
+            fn = low.lower()
+        except (LowerError, Unsupported) as e:
+            fn = pj._stub(info, str(e), getattr(e, "line", 0) or line)
+        fn.unit, fn.exported, fn.rejects = label, False, info.throws  # a throwing closure's errors reach whoever calls it
+        module.functions[key] = fn
+        module.code.calls.append((fl.info.key, ir.Loc(line, col), "a closure", (key,)))
 
     def x_tuple(self, x: X, expect: Any, kind: Any) -> ir.Expr:
         if self.spec:
@@ -1586,6 +1637,11 @@ class ExprLowerer:
         assert isinstance(t, ir.TList)
         ek = self.kind_of_elems(b)
         labels = [lbl for lbl, _ in args]
+        # what std passes the closures it is handed: the elements (one at a time, or two to compare)
+        per = 2 if m in ("sorted", "sort", "min", "max", "elementsEqual") else 1 if m in ONE_ELEMENT else 0
+        for i, (_, a) in enumerate(args):
+            if a.kind == "closure" and (per or m == "reduce" and i == 1):
+                self.fl.closure_hints[a.at.start_byte] = [(ir.TOpaque("an accumulator"), None), (t.elem, ek)] if m == "reduce" else [(t.elem, ek)] * per
         if m == "contains" and labels == [None] and args[0][1].kind != "closure":
             v = self.expr(args[0][1], t.elem, ek)
             if isinstance(t.elem, (ir.TInt, ir.TReal, ir.TBool, ir.TEnum)):
@@ -2297,6 +2353,10 @@ def _fresh(e: ir.Expr) -> bool:
     """Built just now, or returned by a checked function: nothing else holds it."""
     return isinstance(e, (ir.New, ir.Call))
 
+
+
+# Array methods that call a closure on each element
+ONE_ELEMENT = ("map", "filter", "compactMap", "flatMap", "first", "firstIndex", "last", "lastIndex", "forEach", "contains", "allSatisfy", "removeAll", "drop", "prefix", "partition")
 
 def _is_plus_closure(c: X) -> bool:
     if c.kind != "closure" or c.body is None:

@@ -25,14 +25,15 @@ done looks like. Soundness items come first: they can make telic say
   recursion group; deeper contradictions are caught in each function
   whose proof unfolds that deep (its unfoldings are checked together,
   `_body_lemmas` in `telic/checker.py`), never in the predicate itself.
-- **Functions handed to unchecked code are not checked.** A lambda or a
-  checked function passed as a value (`sorted(xs, key=lambda x: 10 // x)`,
-  `map(pos, xs)`, a TypeScript closure given to `.then()` or a JSX
-  handler) runs under the trusted "unchecked calls do not raise"
-  assumption; a callee `@requires` inside it is never an obligation.
-  Comprehensions, `all`/`any` and array-method callbacks are checked per
-  element (`VCGen.run_each`); a callback of `.sort()`, `.some()` or
-  `.find()` with statements in its body is unsupported.
+- **Callbacks checked on their own lose what the caller knows.** A unit
+  (`lambda_unit` in `telic/frontend/python.py`, `unit` in
+  `telic/frontend/ts/lower.mjs`, `closure_unit` in `rust.py` and
+  `swift_expr.py`) is checked for every argument its types allow. So a Rust
+  or Swift closure given to `sort_by_key`/`forEach`, or a statement-bodied TS
+  callback, does not see a `@requires` fact about the list's elements. Done
+  looks like running those bodies per element in place, as the
+  expression-bodied Python and TypeScript callbacks already are. Still
+  unchecked: nested `def`s, and a bound method (`self.f`) used as a value.
 
 ## Dogfooding (task 15)
 

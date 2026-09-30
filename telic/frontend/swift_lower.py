@@ -34,6 +34,7 @@ class FunctionLowerer:
         self.lo, self.hi = _line(n), n.end_point[0] + 1
         self.local_contracts = [cl for cl in self.file.contracts if self.lo <= cl.line <= self.hi]
         self.escaped: set[str] = set()
+        self.closure_hints: dict[int, list[tuple[ir.Type, str | None]]] = {}  # closure (start byte) -> what a library passes it
         self.fresh_vars: set[str] = set()  # temporaries holding a struct nothing else holds
         self.do_depth = 0
         self.loop_depth = 0

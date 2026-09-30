@@ -533,6 +533,10 @@ class Function:
     locals: dict[str, "Type"] = field(default_factory=dict)  # every variable's type
     # locals captured by closures that escape: any unchecked call may change them
     escaped: set[str] = field(default_factory=set)
+    # code handed on as a value (a lambda, a closure, an event handler), as a
+    # reader knows it: checked on its own, for every argument its type allows
+    unit: str = ""
+    rejects: bool = False  # a unit whose raise its runner turns into a value (a promise's rejection)
 
     @property
     def has_contract(self) -> bool:

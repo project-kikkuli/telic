@@ -261,7 +261,7 @@ def propose(paths: list[str], root: str, opts: Any, only: set[str] | None = None
     program = Program.build(modules)
     base_opts = _quiet(opts)
     targets: list[tuple[ir.Module, ir.Function]] = [
-        (m, fn) for m in modules if not m.context for fn in m.functions.values() if not (only and fn.name not in only) and not fn.trusted
+        (m, fn) for m in modules if not m.context for fn in m.functions.values() if not (only and fn.name not in only) and not fn.trusted and not fn.unit
     ]
     props: dict[tuple[str, str], Proposal] = {}
     for m, fn in targets:

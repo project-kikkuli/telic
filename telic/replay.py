@@ -487,6 +487,13 @@ def replay_verdicts(program: Program, rep) -> None:
     path = rep.ref.module.path
     root = getattr(program, "root", None)
     full = os.path.join(root, path) if root and not os.path.isabs(path) else path
+    if fn.unit:
+        # no name to call it by, and only the code it is handed to decides its arguments
+        for v in rep.verdicts:
+            if v.status == "refuted":
+                v.replay = Replay(False, False, f"not run: {fn.unit} runs only when the code it is handed to calls it")
+                v.status = "unconfirmed"
+        return
     for v in rep.verdicts:
         if v.status != "refuted" or not v.model and fn.params:
             continue

@@ -530,3 +530,21 @@ export function parseFloatWrong(s: string): number {
   //@ ensures result === 6
   return parseFloat(s)
 }
+
+
+// -- library functions that run a callback on each element --------------------
+
+// expect: proved
+export function reduceGuarded(xs: number[]): number {
+  //@ requires xs.every((x) => x > 0)
+  //@ ensures result === 0
+  const t = xs.reduce((acc, x) => acc + posNum(x), 0);
+  return 0;
+}
+
+// expect: refuted
+export function reduceUnguarded(xs: number[]): number {
+  //@ ensures result === 0
+  const t = xs.reduce((acc, x) => acc + posNum(x), 0);
+  return 0;
+}

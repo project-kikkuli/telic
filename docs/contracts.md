@@ -687,6 +687,27 @@ doesn't check (a library, a decorated function, a local closure). Such a call:
 
 Every such assumption is listed under *trusted base* in the report.
 
+**Callbacks.** A function handed to other code runs where telic may not see
+the call:
+
+- `map`, `filter`, `sorted`/`min`/`max`/`list.sort` by `key`,
+  `functools.reduce`, `all`/`any` and the array methods (`map`, `filter`,
+  `some`, `every`, `find`, `sort`, `reduce`, ...) run it on each element. Its
+  obligations are checked for every element, where the call is, and its
+  effects are the call's. A reduce's accumulator is any value of its type.
+- Anything else checks it on its own, as a unit named by where it is written
+  (`<lambda:12:20>`, `<arrow:9:4>`, `<closure:7:12>`), over every argument its
+  types allow and every value of what it captures. Examples are a callback
+  given to a library, a timer, `.then()`, `addEventListener`, a JSX `on*`
+  handler, a Rust or Swift closure, or a statement-bodied callback telic cannot
+  run in place. An explicit raise in a unit is a failure, since nothing telic
+  sees catches it. A promise callback's raise rejects the promise and is not
+  a failure. A function that hands a unit to unchecked code rests on it.
+- A checked function used as a value (`register(f)`) gets the same treatment:
+  its `@requires` must hold for every argument its types allow.
+
+A unit has no name to call it by, so its counterexamples are not replayed.
+
 **Aliasing rules.** Lists and dicts are modelled as values. Binding a name to an
 existing one (`ys = xs`) is rejected unless `xs` is never used again (a move);
 otherwise copy it with `xs[:]` / `.slice()`. The same goes for storing one in a

@@ -580,11 +580,30 @@ def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> 
         return SmtResult("proved", dt)
     if r == z3.sat:
         with _Deadline(enc.ctx, timeout_ms) as d:
+            _small_lists(ob, enc, s)
             res = _refutation(ob, enc, s, terms, dt)
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout reading the model")
         return res
     return SmtResult("unknown", dt, reason=_unknown_reason(s.reason_unknown()))
+
+
+SMALL_LIST = 8
+
+
+def _small_lists(ob: Obligation, enc: "Z3Encoder", s: z3.Solver) -> None:
+    """Leave the solver at a model whose input lists are short, if one
+    exists: a counterexample is only confirmed by running it."""
+    lens = [enc.term(v.len) for _, v in ob.inputs if isinstance(v, ListVal)]
+    m = s.model()
+    if not any(m.eval(n, model_completion=True).as_long() > SMALL_LIST for n in lens):
+        return
+    s.push()
+    s.add(*[n <= SMALL_LIST for n in lens])
+    if s.check() == z3.sat:
+        return  # the frame stays: the model is read before the solver is dropped
+    s.pop()
+    s.check()
 
 
 def _unknown_reason(why: str) -> str:

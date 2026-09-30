@@ -229,7 +229,7 @@ def test_python_unchecked_comparisons_match_cpython(e, same):
                 assert got == [want], (e, x, b, got)
 
 
-LIST_IDIOMS = ["([a, b] * 3)[4]", "([7] * a)[a - 1]", "[i * i for i in range(b, 9)][2]", "list(range(a, b + 12))[3]", "(b * [a, 5])[b + 1]"]
+LIST_IDIOMS = ["([a, b] * 3)[4]", "([7] * a)[a - 1]", "[i * i for i in range(b, 9)][2]", "list(range(a, b + 12))[3]", "(b * [a, 5])[b + 1]", "list(map(lambda x: x * 3 - a, range(b, 9)))[2]", "list(map(lambda x: x // 2, [a, b, 5]))[1]"]
 
 
 @pytest.mark.parametrize("e", LIST_IDIOMS)

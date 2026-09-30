@@ -76,6 +76,7 @@ type func = {
   faims : string list;
   unsupported : (string * int) list;
   trusted : bool;
+  unit : bool;  (** code handed on as a value whose raise nothing telic sees catches *)
   locals : (string, ty) Hashtbl.t;
   escaped : string list;
 }
@@ -230,6 +231,7 @@ let func_of j =
     faims = List.map to_str (to_list (member "aims" j));
     unsupported = List.map (function List [ String m; l ] -> (m, to_int l) | _ -> ("?", 0)) (to_list (member "unsupported" j));
     trusted = to_bool (member "trusted" j);
+    unit = (match member "unit" j with Bool b -> b | _ -> false);
     locals;
     escaped = List.map to_str (to_list (member "escaped" j));
   }

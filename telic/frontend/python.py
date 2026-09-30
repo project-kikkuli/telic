@@ -109,6 +109,7 @@ class PythonFrontend:
         self._own: dict[str, tuple[bool, bool, dict[str, ast.expr], bool]] = {}  # cls -> (dataclass, has __init__, defaults, pydantic)
         self._flat: set[str] = set()
         self.generators: set[str] = set()  # functions containing yield: their body runs later, driven by the consumer
+        self.handed: list[tuple[str, ir.Loc, str]] = []  # (function, where, by whom): a checked function used as a value
         # every checked class in the project (name -> owner), for types that
         # reach a module through fields without being imported there
         self.project: dict[str, "PythonFrontend"] = {}
@@ -462,6 +463,7 @@ class PythonFrontend:
         imports = {local: (other.path, name) for local, (other, name) in self.linked_functions.items()}
         imports.update({f"{alias}.*": (other.path, "*") for alias, other in self.module_aliases.items()})
         self.module.code = code_graph(tree, set(self.module.functions) | set(self.signatures), set(self.wrapped), TRANSPARENT_DECORATORS | {"setter"}, imports, set(self.module_aliases), self.nested_imports)
+        handed_on(self.module, self.handed)
 
         # Module-level aim declarations (anything not consumed by a function).
         for cl in self.contract_lines:
@@ -859,18 +861,19 @@ class PythonFrontend:
 
 
 class FunctionLowerer:
-    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef, cls: str | None = None, key: str | None = None):
+    def __init__(self, fe: PythonFrontend, node: ast.FunctionDef, cls: str | None = None, key: str | None = None, unit: str = ""):
         self.fe = fe
         self.node = node
         self.cls = cls
         self.key = key or (f"{cls}.{node.name}" if cls else node.name)
+        self.unit = unit  # a lambda checked on its own: the comments round it belong to its enclosing function
         self.env: dict[str, ir.Type] = {}
         self.fn: ir.Function
         self.tmp = 0
         # contract lines inside this function's line span, not yet consumed
         self.local_contracts = [
             cl for cl in fe.contract_lines if node.lineno <= cl.line <= (node.end_lineno or node.lineno)
-        ]
+        ] if not unit else []
         self.current_aims: list[str] = []
         self.try_depth = 0
         self.stored_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {a.arg for a in node.args.args + node.args.kwonlyargs}
@@ -924,8 +927,11 @@ class FunctionLowerer:
         )
         for p in params:
             self.env[p.name] = p.ty
+        self.fn.unit = self.unit
+        if self.unit:
+            self.fn.exported = False
 
-        for cl in self._header_contracts():
+        for cl in self._header_contracts() if not self.unit else []:
             cl.consumed = True
             try:
                 self._function_contract(cl)
@@ -1788,6 +1794,28 @@ def _is_generator(fn: ast.AST) -> bool:
     return any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in _own_nodes(fn))
 
 
+def handed_on(module: ir.Module, uses: list[tuple[str, ir.Loc, str]]) -> None:
+    """A checked function used as a value may be called by code telic does
+    not see, with any arguments its types allow: its precondition is an
+    obligation there, carried by a unit that calls it so (and the function
+    that hands it on rests on that unit)."""
+    for name, loc, owner in uses:
+        tgt = module.functions.get(name)
+        if tgt is None or not tgt.requires:
+            continue
+        uid = f"<{name}:{loc.line}:{loc.col}>"
+        params = [ir.Param(p.name, p.ty) for p in tgt.params]
+        call = ir.Call(tgt.ret, loc, name, tuple(ir.Var(p.ty, loc, p.name) for p in params))
+        body: list[ir.Stmt] = [ir.Return(loc, call) if tgt.ret != ir.NONE else ir.ExprStmt(loc, call)]
+        module.functions[uid] = ir.Function(uid, loc, loc.line, params, tgt.ret, body=body, exported=False, source=name, locals={p.name: p.ty for p in params}, unit=f"'{ir.source_name(name)}' handed on as a value at line {loc.line}")
+        module.code.calls.append((owner, loc, name, (uid,)))
+
+
+def _located(node: ast.AST, at: ast.AST) -> ast.AST:
+    """A node telic builds, placed where ``at`` is in the source."""
+    return ast.fix_missing_locations(ast.copy_location(node, at))
+
+
 def _own_nodes(fn: ast.AST):
     """Nodes of a function body, not descending into nested defs/classes."""
     stack = list(ast.iter_child_nodes(fn))
@@ -1978,6 +2006,8 @@ class ExprLowerer:
                 if n.id in fe.constants:
                     return self.expr(fe.constants[n.id], expect)
                 if n.id in fe.bound or n.id in PY_GLOBALS:
+                    if n.id in fe.signatures and n.id not in fe.class_names and not self.spec:
+                        fe.handed.append((n.id, loc, self.fl.key))
                     # a module global or import: read fresh each time (it may change)
                     return ir.Extern(ir.TOpaque(n.id), loc, n.id, ())
             return ir.Var(self.lookup(n.id, n), loc, n.id)
@@ -2154,8 +2184,41 @@ class ExprLowerer:
         if isinstance(n, (ast.GeneratorExp, ast.ListComp)) or (isinstance(n, (ast.DictComp, ast.SetComp)) and not self.spec):
             return self.comprehension(n, loc)
         if isinstance(n, ast.Lambda) and not self.spec:
+            self.lambda_unit(n)
             return self.opaque("lambda", [], ir.TOpaque(""), loc)
         raise self.err(f"unsupported expression: {type(n).__name__}", n)
+
+    def lambda_unit(self, lam: ast.Lambda) -> None:
+        """A lambda handed on as a value: code telic does not see may call it
+        with anything, whenever it likes, so its body is checked as a
+        function of its own, over every argument and every value of what it
+        captures. Named as the code graph names it, so a proof that hands
+        it to unchecked code rests on it."""
+        fe = self.fl.fe
+        uid = f"<lambda:{lam.lineno}:{lam.col_offset}>"
+        a = lam.args
+        own = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs] + [x.arg for x in (a.vararg, a.kwarg) if x]
+        caps: dict[str, ir.Type] = {}
+        for x in ast.walk(lam.body):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own and x.id not in caps:
+                if x.id in self.bound:
+                    caps[x.id] = self.bound[x.id]
+                elif x.id in self.aliases:
+                    caps[x.id] = self.aliases[x.id].ty
+                elif x.id in self.fl.env:
+                    caps[x.id] = self.fl.env[x.id]
+        params = [ir.Param(p, ir.TOpaque("an argument")) for p in own] + [ir.Param(c, t) for c, t in caps.items()]
+        body = ast.copy_location(ast.Return(lam.body), lam.body)
+        node = ast.copy_location(ast.FunctionDef(uid, ast.arguments([], [ast.arg(p.name) for p in params], None, [], [], None, []), [body], []), lam)
+        node.end_lineno = lam.end_lineno
+        fe.signatures[uid] = (params, ir.TOpaque(""))
+        try:
+            fn = FunctionLowerer(fe, node, key=uid, unit=f"the lambda at line {lam.lineno}").lower()
+        except LowerError as e:
+            fn = ir.Function(uid, ir.Loc(lam.lineno, lam.col_offset), lam.end_lineno or lam.lineno, params, ir.TOpaque(""), exported=False, unit=f"the lambda at line {lam.lineno}")
+            fn.unsupported.append((str(e), ir.Loc(e.line or lam.lineno)))
+        fn.source = ast.get_source_segment(fe.source, lam) or ""
+        fe.module.functions[uid] = fn
 
     def binop(self, n: ast.BinOp, loc: ir.Loc) -> ir.Expr:
         a = self.expr(n.left)
@@ -2353,6 +2416,15 @@ class ExprLowerer:
     def call(self, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
         f = n.func
         fe = self.fl.fe
+        if not self.spec:
+            saved = dict(self.aliases)
+            try:
+                hof = self.higher_order(n, loc, expect)
+            except LowerError:
+                hof = None  # a body telic cannot lower in place is checked as a lambda of its own
+                self.aliases = saved
+            if hof is not None:
+                return hof
         # Functions of another checked module imported as a whole.
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.module_aliases and f.value.id not in self.fl.env:
             other = fe.module_aliases[f.value.id]
@@ -2572,6 +2644,96 @@ class ExprLowerer:
         if not self.spec:
             return self.extern(name, [], n, loc, expect)
         return self.user_call(n, loc, name)
+
+    def higher_order(self, n: ast.Call, loc: ir.Loc, expect: ir.Type | None) -> ir.Expr | None:
+        """Library functions that call what they are handed on the elements
+        of an iterable (``map``, ``filter``, ``sorted``/``min``/``max`` and
+        ``list.sort`` by ``key``, ``functools.reduce``): the callback's body
+        runs on each element, so its obligations are checked for every
+        element, where it is called, and its effects are this call's."""
+        fe, f = self.fl.fe, n.func
+        free = lambda name: name not in fe.bound and name not in self.fl.env and name not in self.bound  # noqa: E731
+        kw = {k.arg: k.value for k in n.keywords}
+        name = f.id if isinstance(f, ast.Name) else ""
+        if name in ("map", "filter") and free(name) and len(n.args) == 2 and not n.keywords:
+            got = self.element_body(n.args[0], 1)
+            if got is None:
+                return None
+            (p,), body = got
+            gen = ast.comprehension(ast.Name(p, ast.Store()), n.args[1], [body] if name == "filter" else [], 0)
+            elt = body if name == "map" else ast.Name(p, ast.Load())
+            return self.comprehension(_located(ast.GeneratorExp(elt, [gen]), n), loc)
+        if name in ("sorted", "min", "max") and free(name) and len(n.args) == 1 and "key" in kw and None not in kw:
+            got = self.element_body(kw["key"], 1)
+            if got is None:
+                return None
+            rest = [self.expr(v) for k, v in kw.items() if k != "key"]
+            return self.extern_with(name, [self.read_only(self.expr(n.args[0])), self.each_of(got, n.args[0], n, loc), *rest], loc, expect)
+        if isinstance(f, ast.Attribute) and f.attr == "sort" and not n.args and "key" in kw and None not in kw:
+            obj = self.expr(f.value)
+            got = self.element_body(kw["key"], 1)
+            if not isinstance(obj, ir.Var) or not isinstance(obj.ty, ir.TList) or got is None:
+                return None
+            rest = [self.expr(v) for k, v in kw.items() if k != "key"]
+            return ir.Extern(ir.TOpaque(""), loc, "list.sort", (obj, self.each_of(got, f.value, n, loc), *rest))
+        reduce = (name == "reduce" and any(m == "functools" and a == "reduce" and (al or a) == name for m, _, a, al in fe.imports) and name not in self.fl.env) or (
+            isinstance(f, ast.Attribute) and f.attr == "reduce" and isinstance(f.value, ast.Name) and f.value.id == "functools" and f.value.id in fe.modules and f.value.id not in self.fl.env)
+        if reduce and len(n.args) in (2, 3) and not n.keywords:
+            got = self.element_body(n.args[0], 2)
+            if got is None:
+                return None
+            (acc, p), body = got
+            xs = self.expr(n.args[1])
+            init = self.expr(n.args[2]) if len(n.args) == 3 else None
+            aty = init.ty if init is not None else xs.ty.elem if isinstance(xs.ty, ir.TList) else ir.TOpaque("")
+            if not isinstance(aty, (ir.TInt, ir.TReal, ir.TBool, ir.TStr)):
+                aty = ir.TOpaque("")
+            while True:
+                # what the earlier elements left: any value of the accumulator's type
+                self.aliases[acc] = ir.Builtin(aty, loc, "opaque_op", (ir.Lit(ir.STR, loc, f"reduce accumulator {loc.line}:{loc.col}"),))
+                try:
+                    check = self.each_of(((p,), body), n.args[1], n, loc)
+                finally:
+                    self.aliases.pop(acc, None)
+                assert isinstance(check, ir.Builtin)
+                returns = check.ty.elem if isinstance(check.ty, ir.TList) else check.args[2].ty
+                if isinstance(aty, ir.TOpaque) or returns == aty:
+                    break
+                aty = ir.TOpaque("")  # the callback returns another type than it started from
+            return self.extern_with("functools.reduce", [self.read_only(xs), check] + ([init] if init is not None else []), loc, expect)
+        return None
+
+    def element_body(self, cb: ast.expr, k: int) -> tuple[tuple[str, ...], ast.expr] | None:
+        """A callback of ``k`` positional arguments as (parameter names,
+        body): a lambda, or a checked function of this module named as a
+        value (its call then carries its precondition)."""
+        fe = self.fl.fe
+        if isinstance(cb, ast.Lambda):
+            a = cb.args
+            if len(a.args) != k or a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg or a.defaults:
+                return None
+            return tuple(x.arg for x in a.args), cb.body
+        if isinstance(cb, ast.Name) and cb.id in fe.signatures and cb.id not in self.fl.env and cb.id not in self.bound and cb.id not in fe.wrapped and cb.id not in fe.class_names:
+            params = fe.signatures[cb.id][0]
+            if len(params) != k or any(fe.varargs.get(cb.id, ())):
+                return None
+            names = tuple(self.fl.fresh("arg") for _ in range(k))
+            return names, _located(ast.Call(ast.Name(cb.id, ast.Load()), [ast.Name(x, ast.Load()) for x in names], []), cb)
+        return None
+
+    def each_of(self, got: tuple[tuple[str, ...], ast.expr], xs: ast.expr, n: ast.AST, loc: ir.Loc) -> ir.Expr:
+        """A callback's body run on every element of ``xs``."""
+        (p, *_), body = got
+        return self.comprehension(_located(ast.GeneratorExp(body, [ast.comprehension(ast.Name(p, ast.Store()), xs, [], 0)]), n), loc)
+
+    def read_only(self, x: ir.Expr) -> ir.Expr:
+        """A list the library only reads: handed over as a value, so the
+        call leaves the variable alone."""
+        return self.fl.coerce(x, ir.TOpaque("")) if isinstance(x, ir.Var) and isinstance(x.ty, ir.TList) else x
+
+    def extern_with(self, name: str, args: list[ir.Expr], loc: ir.Loc, expect: ir.Type | None) -> ir.Expr:
+        ty = expect if expect is not None and not isinstance(expect, ir.TOpaque) else ir.TOpaque(f"result of {name}")
+        return ir.Extern(ty, loc, name, tuple(args))
 
     def user_call(self, n: ast.Call, loc: ir.Loc, name: str) -> ir.Expr:
         sig = self.fl.fe.signatures.get(name)

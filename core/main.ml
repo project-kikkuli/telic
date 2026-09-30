@@ -104,6 +104,20 @@ let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.In
 
 type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; phases : (Smt.fundef list * Smt.axiom list * int * bool) list; probes : (string * Vc.value) list; state_consts : term list }
 
+(* Leave z3 at a model whose input lists are short, if one exists: a
+   counterexample is only confirmed by running it. *)
+let small_list = 8
+
+let small_lists z (jb : job) =
+  let lens = List.filter_map (fun (_, v) -> match v with Vc.L l -> Some (Smt.term_text l.len) | _ -> None) jb.probes in
+  let long = List.exists (fun v -> match Smt.value_json Int v with Json.Int n -> n > small_list | _ -> false) (Smt.get_values_raw z lens) in
+  if long then begin
+    let bound = String.concat " " (List.map (fun l -> Printf.sprintf "(<= %s %d)" l small_list) lens) in
+    match List.rev (List.map String.trim (Smt.exchange z (Printf.sprintf "(push)\n(assert (and true %s))\n(check-sat)" bound))) with
+    | "sat" :: _ -> ()
+    | _ -> ignore (Smt.exchange z "(pop)\n(check-sat)")
+  end
+
 let solve_job z (jb : job) : Smt.result =
   let t0 = Unix.gettimeofday () in
   let rec go = function
@@ -120,6 +134,7 @@ let solve_job z (jb : job) : Smt.result =
       | "sat" when prove_only -> { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "unknown" }
       | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
       | "sat" ->
+        small_lists z jb;
         (* inputs: scalars first, then list lengths, then list elements *)
         let too_big = ref false in
         let model =

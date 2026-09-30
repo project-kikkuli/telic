@@ -2,6 +2,7 @@
 the verdict telic must reach. 'refuted' means a counterexample confirmed by
 running the code."""
 
+import functools
 from dataclasses import dataclass
 from typing import Union
 
@@ -920,3 +921,78 @@ def items_from_json(body: dict, n: int) -> list[Item]:
         price = int(e["price"])
         out.append(Item(price, n))
     return out
+
+
+
+# -- library functions that run a callback on each element --------------------
+
+
+# expect: proved
+def keyed_guarded(xs: list[int]) -> int:
+    #@ requires all(x > 0 for x in xs)
+    #@ ensures result == 0
+    _ = sorted(xs, key=lambda x: 10 // x)
+    _ = max(xs, key=lambda x: 10 // x) if xs else 0
+    xs.sort(key=lambda x: 10 // x)
+    return 0
+
+
+# expect: refuted
+def sorted_key_div(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = sorted(xs, key=lambda x: 10 // x)
+    return 0
+
+
+# expect: refuted
+def min_key_div(xs: list[int]) -> int:
+    #@ requires len(xs) > 0
+    #@ ensures result == 0
+    _ = min(xs, key=lambda x: 10 // x)
+    return 0
+
+
+# expect: refuted
+def list_sort_key_div(xs: list[int]) -> int:
+    #@ ensures result == 0
+    xs.sort(key=lambda x: 10 // x)
+    return 0
+
+
+# expect: proved
+def map_filter_guarded(xs: list[int]) -> int:
+    #@ requires all(x >= 1 for x in xs)
+    #@ ensures result == 0
+    _ = list(map(pos_int, xs))
+    _ = list(filter(lambda x: 10 // x > 1, xs))
+    _ = list(map(lambda x: pos_int(x) + 1, xs))
+    return 0
+
+
+# expect: refuted
+def map_named_unguarded(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = list(map(pos_int, xs))
+    return 0
+
+
+# expect: refuted
+def filter_div(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = list(filter(lambda x: 10 // x > 1, xs))
+    return 0
+
+
+# expect: proved
+def reduce_guarded(xs: list[int]) -> int:
+    #@ requires all(x > 0 for x in xs)
+    #@ ensures result == 0
+    _ = functools.reduce(lambda acc, x: acc + 10 // x, xs, 0)
+    return 0
+
+
+# expect: refuted
+def reduce_div(xs: list[int]) -> int:
+    #@ ensures result == 0
+    _ = functools.reduce(lambda acc, x: acc + 10 // x, xs, 0)
+    return 0

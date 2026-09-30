@@ -160,6 +160,7 @@ def function(f: ir.Function) -> dict[str, Any]:
         "aims": list(f.aims),
         "unsupported": [[m, l.line] for m, l in f.unsupported],
         "trusted": f.trusted,
+        "unit": bool(f.unit) and not f.rejects,
         "locals": {n: ty(t) for n, t in f.locals.items()},
         "escaped": sorted(f.escaped),
     }

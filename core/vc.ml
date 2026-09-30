@@ -2008,7 +2008,9 @@ and stmt g (s : Ir.stmt) (st : state) : state =
        end
        else if g.info.fn.requires <> [] || g.info.fn.ensures <> [] then
          oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable (add '@raises <condition>' if intended)" what)
-       (* without a contract, an explicit raise is what the function does, not a failure *));
+       else if g.info.fn.unit then oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable, and no code telic sees catches it" what)
+       (* without a contract, an explicit raise is what the function does, not a failure;
+          a unit's caller is code telic does not see *));
       (* (an object whose initializer raises never reaches the caller) *)
       if not (is_init g) then begin
         check_objects g st.facts st.env loc "when it raises";
