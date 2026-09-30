@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import needs_node, run_check
+
 pytest.importorskip("tree_sitter_swift")
 
 from telic import logic as L  # noqa: E402
@@ -184,3 +186,38 @@ def test_swift_integer_semantics_match_swiftc(tmp_path):
         assert got == want, f"{exprs[i]} at a={a}, b={b}: model {got}, swiftc {want}"
         checked += 1
     assert checked > 250
+
+
+# ---------------------------------------------------------------------------
+# @mirrors across languages
+
+FEE_TS = """export function fee(amount: number, percent: number): number {
+  //@ requires Number.isInteger(amount) && Number.isInteger(percent)
+  //@ requires amount >= 0 && amount <= 1000000 && 0 <= percent && percent <= 100
+  return Math.trunc((amount * percent) / 100);
+}
+"""
+
+FEE_SWIFT = """func fee(_ amount: Int, _ percent: Int) -> Int {
+    //@ requires amount >= 0 && amount <= 1000000 && percent >= 0 && percent <= 100
+    //@ mirrors ../web/fee.ts::fee
+    return amount * percent / 100
+}
+"""
+
+
+@needs_node
+def test_swift_mirror_of_typescript_is_proved(tmp_path):
+    rep = run_check(tmp_path, {"web/fee.ts": FEE_TS, "app/fee.swift": FEE_SWIFT})
+    (m,) = rep.mirrors
+    assert m.status == "proved" and m.method == "smt", m.reason
+
+
+@needs_node
+@needs_swiftc
+def test_swift_mirror_divergence_is_replayed_in_both_runtimes(tmp_path):
+    rounded = FEE_TS.replace("Math.trunc(", "Math.round(")
+    rep = run_check(tmp_path, {"web/fee.ts": rounded, "app/fee.swift": FEE_SWIFT})
+    (m,) = rep.mirrors
+    assert m.status == "refuted", m.reason
+    assert m.witness["replay"]["confirmed"], m.witness

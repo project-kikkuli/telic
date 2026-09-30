@@ -12,6 +12,9 @@ from typing import Any
 from . import ir
 
 
+_LANGS = {"typescript": "TypeScript", "swift": "Swift", "python": "Python", "rust": "Rust"}
+
+
 @dataclass
 class FuncRef:
     module: ir.Module
@@ -204,6 +207,7 @@ class Program:
                         for a in self.mro(c):
                             where = f"{sub} ({m.path}:{loc.line}) extends {b}, which telic does not check" if sub else f"{b} is used as a value at {m.path}:{loc.line}, so it may be subclassed where telic does not look"
                             opened.setdefault(a, f"{where}; a call to a method of {ir.source_name(a)} may run an override it never checked")
+                            opened.setdefault(a, f"{sub} ({m.path}:{loc.line}) extends {b}, and telic does not model {_LANGS.get(m.language, m.language)} inheritance, so a call to a method of {ir.source_name(a)} may run an override it never checked")
         if not opened:
             return
         methods = {k: opened[c] for k, r in self.funcs.items() for c in opened if r.fn.name.startswith(c + ".") and not r.fn.name.endswith(".__init__")}
