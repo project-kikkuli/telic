@@ -30,6 +30,8 @@ def language_of(path: str) -> str | None:
         return "typescript"
     if path.endswith(".rs"):
         return "rust"
+    if path.endswith(".swift"):
+        return "swift"
     return None
 
 
@@ -103,9 +105,17 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
         if os.path.normpath(os.path.abspath(f)) in context:
             py_mods[f].context = True
             mods.append(py_mods[f])
+    swift_files = [f for f in files if language_of(f) == "swift"]
+    swift_mods: dict[str, ir.Module] = {}
+    if swift_files:
+        from .frontend.swift import lower_swift_files
+
+        swift_mods = lower_swift_files(swift_files, root)
     for f in files:
         lang = language_of(f)
-        if lang == "python":
+        if lang == "swift":
+            mods.append(swift_mods[f])
+        elif lang == "python":
             mods.append(py_mods[f])
         elif lang == "typescript":
             mods.append(ts_mods[f])

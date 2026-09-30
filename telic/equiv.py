@@ -137,13 +137,43 @@ def _full(root: str, path: str) -> str:
 
 def run_one(ref: FuncRef, root: str, args: list[Any]) -> dict[str, Any]:
     path = _full(root, ref.module.path)
+    if ref.module.language == "swift":
+        from .frontend.swift_replay import run_swift_batch
+
+        (out,) = run_swift_batch(path, ref.fn, [_model(ref.fn, args)])
+        return _swift_result(out)
     if ref.module.language == "python":
         return run_python(path, ref.fn.name, args)
     return run_typescript(path, ref.fn.name, args, extra={"contracts": ts_contracts(ref.module)})
 
 
+def _model(fn: ir.Function, args: list[Any]) -> dict[str, Any]:
+    """Encoded arguments as a model (what the Swift harness reads)."""
+    return {p.name: _decode_arg(a) for p, a in zip(fn.params, args)}
+
+
+def _decode_arg(a: Any) -> Any:
+    if isinstance(a, dict) and "__real__" in a:
+        return Fraction(*a["__real__"])
+    if isinstance(a, list):
+        return [_decode_arg(x) for x in a]
+    return a
+
+
+def _swift_result(out: dict[str, Any]) -> dict[str, Any]:
+    if out.get("rejected"):
+        return {"rejected": True}
+    if "value" in out and "violation" not in out:
+        return {"ok": True, "value": out["value"], "returned_repr": out.get("returned_repr", "")}
+    return {**out, "ok": False}
+
+
 def run_batch(ref: FuncRef, root: str, batch: list[list[Any]]) -> list[dict[str, Any]]:
     path = _full(root, ref.module.path)
+    if ref.module.language == "swift":
+        from .frontend.swift_replay import run_swift_batch
+
+        return [_swift_result(o) for o in run_swift_batch(path, ref.fn, [_model(ref.fn, a) for a in batch])]
     extra = {"batch": batch}
     if ref.module.language == "python":
         out = run_python(path, ref.fn.name, [], timeout=30, extra=extra)
