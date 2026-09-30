@@ -484,6 +484,9 @@ def _check_one(lean: str, defs_text: str, at: Attempt) -> AttemptResult:
             r.axioms = re.findall(r"[\w.]+", m.text.split(":", 1)[1])
         elif f"'{at.name}' does not depend on any axioms" in m.text:
             audited = True
+    if r.ok and not run.ok:
+        r.ok = False
+        r.errors.append("Lean exited abnormally")
     if r.ok and not audited:
         r.ok = False
         r.errors.append("could not audit the axioms of the proved theorem")

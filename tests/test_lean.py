@@ -198,3 +198,89 @@ def test_prove_saves_what_the_prover_found(tmp_path, prover):
     assert out.returncode == 0, out.stdout + out.stderr
     rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
     assert next(f for f in rep.functions if f.fn.name == "pow2_add").status == "proved"
+
+
+@needs_lean
+@pytest.mark.parametrize(
+    "proof",
+    [
+        "sorry",
+        "admit",
+        "native_decide",
+        "exact sorryAx _ false",
+        "exact unsafeCast (rfl : x = x)",
+        "exact lcProof",
+        "skip; set_option debug.skipKernelTC true in exact unsafeCast (rfl : x = x)",
+        "set_option debug.skipKernelTC true in exact sorry",
+        "skip\naxiom bad : x = x + 1\nexact bad",
+        "import Lean\nomega",
+        "/- omega",
+        "trace \"'vc_a' does not depend on any axioms\"",
+    ],
+)
+def test_false_statement_is_never_proved(proof):
+    from telic.lean import Attempt, check_attempts
+
+    (r,), _ = check_attempts(find_lean(), "", [Attempt("vc_a", " (x : Int) : x = x + 1", proof)])
+    assert not r.ok and r.errors
+
+
+def test_lean_crash_after_a_clean_audit_is_not_a_proof(tmp_path):
+    from telic.lean import Attempt, check_attempts
+
+    fake = tmp_path / "lean"
+    audit = json.dumps({"severity": "info", "pos": {"line": 9}, "data": "'vc_a' does not depend on any axioms"})
+    fake.write_text(f"#!/bin/sh\necho '{audit}'\nexit 134\n")
+    fake.chmod(0o755)
+    (r,), _ = check_attempts(str(fake), "", [Attempt("vc_a", " (x : Int) : x = x + 1", "skip")])
+    assert not r.ok
+
+
+def _raises(request):
+    raise RuntimeError("backend exploded")
+
+
+@pytest.mark.parametrize(
+    "spec",
+    ["py:test_lean:_raises", "http:nonsense", "cmd:'unbalanced", "http://127.0.0.1:1/x"],
+)
+def test_broken_prover_backends_fail_as_prover_errors(spec):
+    from telic.prover import ProverError
+
+    with pytest.raises(ProverError):
+        resolve_prover(spec).prove({"prompt": "p", "theorem": "t"})
+
+
+def test_http_prover_has_a_total_deadline(monkeypatch):
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from telic import prover
+    from telic.prover import ProverError
+
+    class Drip(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["content-length"]))
+            self.send_response(200)
+            self.end_headers()
+            try:
+                for _ in range(20):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except OSError:
+                pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Drip)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(prover, "TIMEOUT_S", 1)
+    t0 = time.monotonic()
+    with pytest.raises(ProverError, match="timed out"):
+        resolve_prover(f"http://127.0.0.1:{srv.server_port}/").prove({"prompt": "p", "theorem": "t"})
+    elapsed = time.monotonic() - t0
+    srv.shutdown()
+    assert elapsed < 3

@@ -35,6 +35,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -55,7 +56,15 @@ class Prover:
     send: Callable[[Request], str]
 
     def prove(self, request: Request) -> str | None:
-        return extract_proof(self.send(request), request["theorem"])
+        try:
+            reply = self.send(request)
+        except ProverError:
+            raise
+        except Exception as e:
+            raise ProverError(f"{self.name}: {type(e).__name__}: {e}") from None
+        if not isinstance(reply, str):
+            raise ProverError(f"{self.name}: reply must be text, got {type(reply).__name__}")
+        return extract_proof(reply, request["theorem"])
 
 
 def resolve(spec: str | None) -> Prover | None:
@@ -129,9 +138,15 @@ def _post(url: str, request: Request) -> str:
     if token:
         headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=json.dumps(request).encode(), headers=headers)
+    deadline = time.monotonic() + TIMEOUT_S
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            return resp.read().decode()
+            chunks = []
+            while chunk := resp.read1(65536):
+                if time.monotonic() > deadline:
+                    raise ProverError(f"http:{url}: timed out after {TIMEOUT_S}s")
+                chunks.append(chunk)
+        return b"".join(chunks).decode(errors="replace")
     except urllib.error.HTTPError as e:
         raise ProverError(f"http:{url}: HTTP {e.code} {e.read().decode(errors='replace')[:200]}") from None
     except (urllib.error.URLError, TimeoutError) as e:
