@@ -1697,7 +1697,8 @@ class VCGen:
                 return pack(ty, list(x.args))  # the same object, seen at its own type again
             comps = [L.Fn(f"unbox.{tag}.{suffix}", tuple(flatten(x)), srt) for suffix, srt in components(ty)]
             v = pack(ty, comps)
-            self.box_facts(x, v, ty, ctx, known=False)  # type: ignore[arg-type]
+            if isinstance(x, L.Term):  # a list[opaque] seen at list[T] is no box
+                self.box_facts(x, v, ty, ctx, known=False)
             if isinstance(v, ListVal):
                 ctx.assume(L.le(L.ZERO, v.len))
             if ctx.state is not None:
@@ -2051,9 +2052,10 @@ class VCGen:
         names, appends = self.modified([ir.ExprStmt(loc, x) for x in parts])
         if any(isinstance(sub, ir.Extern) for x in parts for sub in ir.walk_expr(x)):
             names |= {v for v in self.fn.escaped if v in self.fn.locals}
-        read = {sub.name for sub in ir.walk_expr(src) if isinstance(sub, ir.Var)} if src is not None else set()
-        if read & names:
-            raise VCError(f"the comprehension changes '{sorted(read & names)[0]}' while iterating over it", loc)
+        while isinstance(src, ir.Builtin) and src.name in ("dict_keys", "from_opaque"):
+            src = src.args[0]
+        if isinstance(src, ir.Var) and isinstance(src.ty, (ir.TList, ir.TDict)) and src.name in names:
+            raise VCError(f"the comprehension changes '{src.name}' while iterating over it", loc)
         if ctx.state is not None:
             self.havoc_here(ctx, names, appends)
         sub = ctx.sub(rng)
@@ -2292,6 +2294,8 @@ class VCGen:
 
     def call(self, callee: FuncRef, args: list[Val], arg_exprs: list[ir.Expr | None], ctx: Ctx, loc: ir.Loc, new_self: bool = False) -> Val:
         fn = callee.fn
+        # a comprehension's element is no variable of the state, whatever it shadows
+        arg_exprs = [None if isinstance(a, ir.Var) and a.name in ctx.bound else a for a in arg_exprs]
         # A list argument is a reference: a later argument that mutates the
         # same list changes what the callee sees. Re-read list variables.
         if ctx.state is not None:
@@ -2413,7 +2417,7 @@ class VCGen:
         if ctx.state is not None and not ctx.spec:
             args = [coerce(self.ev(a, ctx), p.ty) for a, p in zip(c.args, callee.fn.params)]
             self.deps.add(callee.key)
-            exprs: list[ir.Expr | None] = list(c.args)
+            exprs: list[ir.Expr | None] = [None if isinstance(a, ir.Var) and a.name in ctx.bound else a for a in c.args]
             self.call_effects(callee, args, exprs, ctx, new_self=callee.fn.name.endswith(".__init__"), returned=False)
         return NONE_V
 

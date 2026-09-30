@@ -985,12 +985,10 @@ and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
   let names, appends = modified g (List.map (fun x -> Ir.ExprStmt (loc, x)) parts) in
   let calls_out = List.exists (fun x -> let hit = ref false in Ir.walk_expr (fun (y : Ir.expr) -> match y.e with Extern _ -> hit := true | _ -> ()) x; !hit) parts in
   let names = if calls_out then names @ List.filter (fun v -> Hashtbl.mem g.info.fn.locals v && not (List.mem v names)) g.info.fn.escaped else names in
-  Option.iter
-    (Ir.walk_expr (fun (x : Ir.expr) ->
-         match x.e with
-         | Var n when List.mem n names -> raise (Vc_error (Printf.sprintf "the comprehension changes '%s' while iterating over it" n, loc))
-         | _ -> ()))
-    src;
+  let rec container (x : Ir.expr) = match x.e with Builtin (("dict_keys" | "from_opaque"), [ a ]) -> container a | _ -> x in
+  (match Option.map container src with
+   | Some { e = Var n; ty = TList _ | TDict _; _ } when List.mem n names -> raise (Vc_error (Printf.sprintf "the comprehension changes '%s' while iterating over it" n, loc))
+   | _ -> ());
   let havoc_here () =
     match ctx.state with
     | Some st ->
@@ -1322,6 +1320,8 @@ and new_object g ctx loc cls args =
 
 and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs : Ir.expr option list) ctx loc : value =
   let fn = callee.fn in
+  (* a comprehension's element is no variable of the state, whatever it shadows *)
+  let arg_exprs = List.map (function Some { Ir.e = Var n; _ } when SM.mem n ctx.bound -> None | a -> a) arg_exprs in
   (* a list/dict argument is a reference: a later argument's mutation shows *)
   let args =
     match ctx.state with

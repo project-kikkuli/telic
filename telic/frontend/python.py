@@ -2306,6 +2306,9 @@ class ExprLowerer:
                     l2, r2 = self.need(left), self.need(right)
                 if ir.is_numeric(l2.ty) and ir.is_numeric(r2.ty):
                     l2, r2, _ = self.numeric_pair(l2, r2, n)
+                elif l2.ty != r2.ty and name in ("eq", "ne") and isinstance(l2.ty, ir.TList) and isinstance(r2.ty, ir.TList) and (_has_opaque(l2.ty) or _has_opaque(r2.ty)):
+                    # a list of unchecked values, compared with a checked list
+                    l2, r2 = (self.fl.coerce(l2, r2.ty), r2) if _has_opaque(l2.ty) else (l2, self.fl.coerce(r2, l2.ty))
                 elif l2.ty != r2.ty:
                     raise self.err(f"comparing {left.ty} with {right.ty}", n)
                 elif name not in ("eq", "ne") and not ir.is_numeric(l2.ty):
@@ -2835,13 +2838,11 @@ class ExprLowerer:
         if not isinstance(tgt, ast.Name) and names is None:
             raise self.err("comprehension targets must be a name or a tuple of names", gen.target)
         builtin = isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id not in self.fl.fe.bound and it.func.id not in self.fl.env and not it.keywords
-        if builtin and it.func.id == "range" and isinstance(tgt, ast.Name):  # type: ignore[union-attr]
-            bounds = [self.need(self.expr(a)) for a in it.args]  # type: ignore[union-attr]
-            if len(bounds) not in (1, 2) or any(b.ty != ir.INT for b in bounds):
-                raise self.err("range() in a comprehension needs one or two int bounds", it)
+        bounds = [self.need(self.expr(a)) for a in it.args] if builtin and it.func.id == "range" and isinstance(tgt, ast.Name) else []  # type: ignore[union-attr]
+        if len(bounds) in (1, 2) and all(b.ty == ir.INT for b in bounds):
             lo, hi = (ir.Lit(ir.INT, loc, 0), bounds[0]) if len(bounds) == 1 else bounds
-            self.bind(tgt.id, ir.INT)
-            return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (lo, hi)), tgt.id
+            self.bind(tgt.id, ir.INT)  # type: ignore[union-attr]
+            return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (lo, hi)), tgt.id  # type: ignore[union-attr]
         if builtin and it.func.id == "enumerate" and names is not None and len(names) == 2 and len(it.args) == 1:  # type: ignore[union-attr]
             xs = self.expr(it.args[0])  # type: ignore[union-attr]
             # the list is read again for each element: only when that reads the same list
@@ -2852,20 +2853,21 @@ class ExprLowerer:
                 return ir.Builtin(ir.TList(ir.INT), loc, "range_list", (ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "len", (xs,)))), i
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items" and not it.args and names is not None and len(names) == 2:
             d = self.expr(it.func.value)
-            if isinstance(d.ty, ir.TDict) and isinstance(d, ir.Var):
+            # the dict is read again for each element: only when that reads the same dict
+            if isinstance(d.ty, ir.TDict) and ir.NONE not in (d.ty.key, d.ty.val) and not any(isinstance(x, (ir.Extern, ir.Call, ir.New)) for x in ir.walk_expr(d)):
                 k, v = names
                 self.bind(k, d.ty.key)
                 self.aliases[v] = ir.Index(d.ty.val, loc, d, ir.Var(d.ty.key, loc, k), wrap=False)
                 return ir.Builtin(ir.TList(d.ty.key), loc, "dict_keys", (d,)), k
-        seq = self.expr(it)
+            seq = self.opaque("items", [d], ir.TOpaque(""), loc) if isinstance(d.ty, ir.TDict) else self.expr(it)
+        else:
+            seq = self.expr(it)
         if isinstance(seq.ty, ir.TDict):
             seq = ir.Builtin(ir.TList(seq.ty.key), loc, "dict_keys", (seq,))
-        elif isinstance(seq.ty, ir.TStr):
-            seq = self.opaque("iter", [seq], ir.TOpaque(""), loc)
-        if isinstance(seq.ty, ir.TOpaque):
+        elif not isinstance(seq.ty, (ir.TList, ir.TOpaque)):
+            seq = self.opaque("iter", [seq], ir.TOpaque(""), loc)  # a string, a generator, ...: unknown elements
+        if isinstance(seq.ty, ir.TOpaque) or (isinstance(seq.ty, ir.TList) and seq.ty.elem == ir.NONE):
             seq = self.fl.coerce(seq, ir.TList(ir.TOpaque("")))
-        if not isinstance(seq.ty, ir.TList):
-            raise self.err(f"a comprehension over a {seq.ty} is not modelled", it)
         if isinstance(tgt, ast.Name):
             self.bind(tgt.id, seq.ty.elem)
             return seq, tgt.id
