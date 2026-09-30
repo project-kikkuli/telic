@@ -339,30 +339,71 @@ let rec value_json (sort : sort) (v : sx) : Json.t =
 
 (* -- a z3 process -------------------------------------------------------------- *)
 
-type z3 = { inp : out_channel; out : in_channel; pid : int }
+(* z3 bounds check-sat by :timeout but not the rewriting it does while
+   reading assertions (a recursive definition applied to literals unfolds
+   there forever), so every exchange has a wall-clock deadline: past it the
+   process is killed and replaced, and the exchange raises [Timeout]. *)
+type z3 = { mutable inp : out_channel; mutable fd : Unix.file_descr; mutable pid : int; pending : Buffer.t; mutable budget_ms : int }
+
+exception Timeout
 
 let z3_path () = match Sys.getenv_opt "TELIC_Z3" with Some p -> p | None -> "z3"
 
-let spawn () =
+let start () =
   let r0, w0 = Unix.pipe ~cloexec:true () and r1, w1 = Unix.pipe ~cloexec:true () in
   let pid = Unix.create_process (z3_path ()) [| z3_path (); "-in"; "-smt2" |] r0 w1 Unix.stderr in
   Unix.close r0;
   Unix.close w1;
-  { inp = Unix.out_channel_of_descr w0; out = Unix.in_channel_of_descr r1; pid }
+  (Unix.out_channel_of_descr w0, r1, pid)
+
+let spawn () =
+  let inp, fd, pid = start () in
+  { inp; fd; pid; pending = Buffer.create 4096; budget_ms = 60_000 }
+
+let restart z =
+  (try Unix.kill z.pid Sys.sigkill with _ -> ());
+  (try ignore (Unix.waitpid [] z.pid) with _ -> ());
+  (try close_out z.inp with _ -> ());
+  (try Unix.close z.fd with _ -> ());
+  let inp, fd, pid = start () in
+  z.inp <- inp;
+  z.fd <- fd;
+  z.pid <- pid;
+  Buffer.clear z.pending
 
 let send z s = output_string z.inp s; output_char z.inp '\n'; flush z.inp
+
+let rec input_line_by z deadline =
+  let s = Buffer.contents z.pending in
+  match String.index_opt s '\n' with
+  | Some i ->
+    Buffer.clear z.pending;
+    Buffer.add_string z.pending (String.sub s (i + 1) (String.length s - i - 1));
+    String.sub s 0 i
+  | None ->
+    let left = deadline -. Unix.gettimeofday () in
+    if left <= 0. then (restart z; raise Timeout);
+    (match Unix.select [ z.fd ] [] [] left with
+     | [], _, _ -> restart z; raise Timeout
+     | _ ->
+       let chunk = Bytes.create 65536 in
+       let n = Unix.read z.fd chunk 0 (Bytes.length chunk) in
+       if n = 0 then raise End_of_file;
+       Buffer.add_subbytes z.pending chunk 0 n);
+    input_line_by z deadline
 
 (* Send commands and read everything z3 prints for them, up to a marker:
    error lines can never leave the stream out of step. *)
 let marker = "telic-sync-7f3a"
 
 let exchange z (cmds : string) : string list =
+  let deadline = Unix.gettimeofday () +. (float_of_int z.budget_ms /. 1000.) +. 0.5 in
   send z cmds;
   send z (Printf.sprintf "(echo \"%s\")" marker);
   let lines = ref [] in
   let fin = ref false in
   while not !fin do
-    let line = input_line z.out in
+    let line = input_line_by z deadline in
     if String.trim line = marker then fin := true else lines := line :: !lines
   done;
   List.rev !lines
@@ -375,6 +416,7 @@ type result = { status : string; seconds : float; model : (string * Json.t) list
 
 (* Check one script; on sat, evaluate [probe] terms (inputs etc.). *)
 let check z ~timeout_ms (text : string) =
+  z.budget_ms <- timeout_ms;
   let out = exchange z (Printf.sprintf "(reset)\n(set-option :timeout %d)\n%s\n(check-sat)" timeout_ms text) in
   let out = List.filter (fun l -> String.trim l <> "") out in
   let errors = List.filter (fun l -> String.length l > 6 && String.sub (String.trim l) 0 6 = "(error") out in

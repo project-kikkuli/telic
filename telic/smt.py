@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -383,17 +384,34 @@ def _solve(ob: Obligation, closure, timeout_ms: int, t0: float) -> SmtResult:
     terms = list(ob.hyps) + [ob.goal]
     defs, axioms = closure
     enc = Z3Encoder(defs)
-    s = z3.Solver(ctx=enc.ctx)
-    s.set("timeout", timeout_ms)
+    # Z3's rewriter unfolds a recursive definition applied to literals while
+    # asserting, outside the solver's timeout; only an interrupt stops that.
+    deadline = threading.Timer(timeout_ms / 1000, enc.ctx.interrupt)
+    deadline.start()
     try:
-        for ax in axioms:
-            s.add(enc.term(ax.formula))
-        for h in ob.hyps:
-            s.add(enc.term(h))
-        s.add(z3.Not(enc.term(ob.goal)))
-        r = s.check()
-    except z3.Z3Exception as e:  # pragma: no cover - defensive
-        return SmtResult("unknown", time.perf_counter() - t0, reason=f"z3 error: {e}")
+        return _run(ob, enc, axioms, terms, timeout_ms, t0)
+    except z3.Z3Exception as e:
+        if deadline.finished.is_set():
+            return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
+        return SmtResult("unknown", time.perf_counter() - t0, reason=f"z3 error: {e}")  # pragma: no cover - defensive
+    finally:
+        deadline.cancel()
+        deadline.join()  # no thread may outlive the call: the checker forks workers
+
+
+def _run(ob: Obligation, enc: "Z3Encoder", axioms, terms, timeout_ms: int, t0: float) -> SmtResult:
+    start = time.perf_counter()
+    s = z3.Solver(ctx=enc.ctx)
+    for ax in axioms:
+        s.add(enc.term(ax.formula))
+    for h in ob.hyps:
+        s.add(enc.term(h))
+    s.add(z3.Not(enc.term(ob.goal)))
+    left = timeout_ms - int((time.perf_counter() - start) * 1000)
+    if left <= 0:
+        return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
+    s.set("timeout", left)
+    r = s.check()
     dt = time.perf_counter() - t0
     if r == z3.unsat:
         return SmtResult("proved", dt)

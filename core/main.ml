@@ -113,7 +113,7 @@ let solve_job z (jb : job) : Smt.result =
       (match Sys.getenv_opt "TELIC_CORE_DUMP" with
        | Some dir -> Out_channel.with_open_text (Filename.concat dir (String.map (fun c -> if c = '/' || c = '>' || c = '#' then '_' else c) jb.ob.oid ^ Printf.sprintf ".%d.smt2" timeout)) (fun oc -> output_string oc text)
        | None -> ());
-      let ans, err = Smt.check z ~timeout_ms:timeout text in
+      let ans, err = try Smt.check z ~timeout_ms:timeout text with Smt.Timeout -> ("unknown", "timeout") in
       match ans with
       | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
       | "sat" ->
@@ -231,7 +231,7 @@ and solve_parallel_ jobs_n (jobs_arr : job array) : Smt.result array =
     let rec loop () =
       let i = Atomic.fetch_and_add next 1 in
       if i < n then begin
-        out.(i) <- Some (try solve_job z jobs_arr.(i) with e -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "engine: " ^ Printexc.to_string e });
+        out.(i) <- Some (try solve_job z jobs_arr.(i) with Smt.Timeout -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "timeout" } | e -> { Smt.status = "unknown"; seconds = 0.; model = []; state = []; reason = "engine: " ^ Printexc.to_string e });
         loop ()
       end
     in
