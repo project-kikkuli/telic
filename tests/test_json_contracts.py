@@ -30,7 +30,7 @@ EXPECTED = [
     ("config.py", "section_name", "open"),
     ("config.py", "grandchildren", "open"),
     ("tree.ts", "leaves", "proved"),
-    ("tree.ts", "overclaims", "open"),
+    ("tree.ts", "overclaims", "refuted"),
     ("rebuilt.py", "present_is_not_null", "refuted"),
     ("rebuilt.py", "contains", "refuted"),
     ("rebuilt.py", "adds", "refuted"),
