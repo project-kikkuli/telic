@@ -127,3 +127,13 @@ def test_engine_reuses_the_obligation_cache(tmp_path, monkeypatch, name):
     assert proved(first) and proved(first) == proved(second)
     assert {f.fn.name: f.status for f in first.functions} == {f.fn.name: f.status for f in second.functions}
     assert second.cache_hits >= len(proved(first))
+
+
+def test_a_field_telic_cannot_model_fails_only_what_touches_it():
+    path = CASES / "unmodelled.py"
+    by = {}
+    for eng in ("python", "ox"):
+        rep = check([str(path)], CheckOptions(cache_path=None, lean=False, replay=False, engine=eng), root=str(path.parent))
+        by[eng] = {f.fn.name: f.status for f in rep.functions}
+    assert by["python"] == by["ox"]
+    assert by["ox"]["Log.bump"] == "proved" and by["ox"]["Log.__init__"] == "error"

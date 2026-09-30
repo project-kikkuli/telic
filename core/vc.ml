@@ -313,9 +313,13 @@ let field_type g cls fname =
 (* subclasses keep inherited fields where the base class does *)
 let field_owner g cls fname = match class_of g cls with Some c -> (match List.assoc_opt fname c.owner with Some o -> o | None -> cls) | None -> cls
 
-let heap_keys g cls fname =
+(* A field telic cannot model has no maps: only code that reads or writes it
+   ([strict]) fails. *)
+let heap_keys ?(strict = false) g cls fname =
   let owner = field_owner g cls fname in
-  List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" owner fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) (components (field_type g cls fname))
+  match components (field_type g cls fname) with
+  | comps -> List.map (fun (suffix, srt) -> (Printf.sprintf "@%s.%s%s" owner fname (if suffix = "" then "" else "." ^ suffix), Array (Int, srt))) comps
+  | exception Vc_error _ when not strict -> []
 
 let mro g cls =
   let out = ref [] in
@@ -326,10 +330,10 @@ let mro g cls =
 let in_hierarchy g cls = (match class_of g cls with Some c -> c.cbases <> [] | None -> false) || List.exists (fun c -> List.mem cls c.cbases) g.prog.classes
 
 let heap_read g env cls fname r =
-  pack (field_type g cls fname) (List.map (fun (k, _) -> match SM.find_opt k env with Some (T m) -> select m r | _ -> raise (Vc_error ("heap map " ^ k ^ " missing", Ir.noloc))) (heap_keys g cls fname))
+  pack (field_type g cls fname) (List.map (fun (k, _) -> match SM.find_opt k env with Some (T m) -> select m r | _ -> raise (Vc_error ("heap map " ^ k ^ " missing", Ir.noloc))) (heap_keys ~strict:true g cls fname))
 
 let heap_write g (env : value SM.t) cls fname r v =
-  List.fold_left2 (fun env (k, _) comp -> match SM.find_opt k env with Some (T m) -> SM.add k (T (store m r comp)) env | _ -> env) env (heap_keys g cls fname) (flatten v)
+  List.fold_left2 (fun env (k, _) comp -> match SM.find_opt k env with Some (T m) -> SM.add k (T (store m r comp)) env | _ -> env) env (heap_keys ~strict:true g cls fname) (flatten v)
 
 let all_heap_keys g = List.concat_map (fun c -> List.concat_map (fun (f, _) -> List.map fst (heap_keys g c.cname f)) c.cfields) g.prog.classes
 let same_scc g a b = a = b || List.mem b (finfo_of g a).scc
