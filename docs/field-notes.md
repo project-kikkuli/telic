@@ -50,6 +50,7 @@ A few were soundness bugs, now fixed:
 | `16f1cf5` | 6 | 92 | 144 | 254 | 239 | 4 |
 | `e4c60a2` (48 files: `telic/ui/` added) | 11 | 102 | 162 | 306 | 278 | 6 |
 | `45d034a` | 7 | 70 | 182 | 323 | 279 | 6 |
+| `4ef8dc7` (every recursion needs a termination proof again) | 7 | 107 | 163 | 313 | 282 | 6 |
 
 The 17 refuted functions were triaged:
 
