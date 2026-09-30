@@ -92,11 +92,21 @@ def answers(url: str) -> bool:
         return False
 
 
+OUTPUT = {"dist", "build", "target", "coverage"}  # build output where the app's top level has it; elsewhere, sources
+
+
 def build_digest(cfg: UiConfig) -> str:
     """What the app is built from: every file under its directory (or the
     configured ``inputs``), except dependencies, caches and build output
-    (unless the build output is what telic serves)."""
+    (unless the build output is what telic serves). An app telic does not
+    start is also what its page serves now."""
     h = hashlib.sha256()
+    if cfg.url and not cfg.command and not cfg.static:
+        try:
+            with urllib.request.urlopen(cfg.url, timeout=5) as r:
+                h.update(r.read())
+        except (OSError, ValueError) as e:
+            h.update(f"unreachable: {e}".encode())
     roots = [os.path.join(cfg.dir, p) for p in cfg.inputs] if cfg.inputs else [cfg.dir]
     if cfg.static and not cfg.build and not cfg.inputs:
         roots.append(os.path.join(cfg.dir, cfg.static))
@@ -106,7 +116,7 @@ def build_digest(cfg: UiConfig) -> str:
             files.append(top)
             continue
         for dirpath, dirnames, filenames in os.walk(top):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and (d not in SKIP_DIRS or (d in OUTPUT and dirpath != cfg.dir)))
             files += [os.path.join(dirpath, f) for f in sorted(filenames)]
     for f in files:
         try:

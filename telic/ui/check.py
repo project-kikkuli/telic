@@ -41,10 +41,23 @@ class Outcome:
 
 @dataclass
 class Occlusion:
-    """Hit-test results gathered while exploring, per state."""
+    """Hit-test results gathered at every visit to a state, while exploring,
+    testing the model and replaying routes."""
 
     rendered: dict[int, int] = field(default_factory=dict)
     covered: dict[int, list[str]] = field(default_factory=dict)
+    paths: dict[int, list[list[str]]] = field(default_factory=dict)  # ways a covered visit got there, shortest first
+    tests: int = 0
+
+    def record(self, sid: int, n: int, bad: list[str], paths: list[list[str]]) -> None:
+        self.tests += 1
+        self.rendered[sid] = max(n, self.rendered.get(sid, 0))
+        if n and bad:
+            self.covered.setdefault(sid, bad)
+            known = self.paths.setdefault(sid, [])
+            known += [p for p in paths if p not in known]
+            known.sort(key=len)
+            del known[4:]
 
 
 def hit_test(driver, t: Target, snap: Snapshot) -> tuple[int, list[str]]:
@@ -120,11 +133,11 @@ class ModelCheck:
                 return None, done, f"step {len(done)} failed: {at.blocked.get(sig, 'blocked')}"
         return w.snap, done, ""
 
-    def reach(self, s: UiState, goals: set[int], goal: Pred, w: Worker, budget: int = 0) -> tuple[bool, str]:
-        """Get to ``s`` in the app, then to a goal state, re-planning on the
-        model from wherever the app actually is after each step (so state the
-        abstraction does not see cannot fake a route)."""
-        snap, _, why = self.replay(s.access, w)
+    def reach(self, path: list[str], goals: set[int], goal: Pred, w: Worker, budget: int = 0) -> tuple[bool, str]:
+        """Follow ``path`` in the app, then get to a goal state, re-planning on
+        the model from wherever the app actually is after each step (so state
+        the abstraction does not see cannot fake a route)."""
+        snap, _, why = self.replay(path, w)
         if snap is None:
             return False, why
         avoid: set[tuple[int, str]] = set()
@@ -138,7 +151,8 @@ class ModelCheck:
             if not route:
                 return False, f"no route left from {at.describe()}"
             sig = route[0]
-            if sig not in w.acts or self.ex.fire(w, at, sig) is None:
+            # a step that fails, or leaves the app where it was, is not tried there again
+            if sig not in w.acts or self.ex.fire(w, at, sig) is None or w.cur is at:
                 avoid.add((at.id, sig))
                 if w.cur is None:
                     return False, f"{at.labels.get(sig, sig)} failed in {at.describe()}"
@@ -154,6 +168,12 @@ class ModelCheck:
 
     def _stopped(self) -> str:
         return f"exploration is incomplete: {self.m.stop}" if self.m.stop else ""
+
+    def _nothing(self, method: str, what: str) -> Outcome:
+        """Nothing relevant found: vacuous only if exploration found everything there is."""
+        if self.m.complete:
+            return Outcome("vacuous", method, f"{what} ({self._size()})")
+        return Outcome("open", method, f"{what} in the {len(self.m.states)} states found, but {self._stopped()}")
 
     def _size(self) -> str:
         return f"{len(self.m.states)} states" + ("" if self.m.complete else f", {self._stopped()}")
@@ -181,7 +201,7 @@ class ModelCheck:
         goals = {s.id for s in self._states(p.goal)}
         rel = self._states(p.cond)
         if not rel:
-            return Outcome("vacuous", "learned model", f"no reachable state has {_phrase(p.cond)} ({self._size()})")
+            return self._nothing("learned model", f"no reachable state has {_phrase(p.cond)}")
         can = self.m.reaching(goals)
         bad = sorted((s for s in rel if s.id not in can), key=lambda s: (s.depth, s.id))
         if bad:
@@ -202,29 +222,51 @@ class ModelCheck:
                 replay={"confirmed": True, "summary": f"reached {s.describe()}"},
                 relevant=len(rel),
             )
+        forced = self.m.forcing(goals)
+        chancy = sorted((s for s in rel if s.id not in forced), key=lambda s: (s.depth, s.id))
+        if chancy:
+            s = chancy[0]
+            return Outcome(
+                "open",
+                "learned model",
+                f"every route from {s.describe()} to {_phrase(p.goal)} takes a step with more than one observed outcome "
+                f"({self.m.nondeterministic} such transitions: the app has state the abstraction does not see)",
+                trace=self.trace_of(s),
+                relevant=len(rel),
+            )
         if not self.m.complete:
             return Outcome("open", "learned model", f"every {len(rel)} relevant state can reach it, but {self._stopped()}", relevant=len(rel))
-        # Replay the escape routes the model promises.
-        todo = [s for s in sorted(rel, key=lambda s: (s.depth, s.id)) if s.id not in goals][: self.witnesses]
-        queue = list(reversed(todo))
-        failed: list[tuple[UiState, str]] = []
+        # Replay the escape routes the model promises: from every way into each
+        # state seen, since one state of the model can be several in the app.
+        todo = [s for s in sorted(rel, key=lambda s: (s.depth, s.id)) if s.id not in goals]
+        picked = todo[: self.witnesses]
+        paths = [(s, s.access) for s in picked]
+        for s in picked:
+            seen = {tuple(s.access)}
+            for alt in [s.history] + [self.m.states[q].access + [sig] for q, m in sorted(self.m.trans.items()) for sig, ts in sorted(m.items()) if s.id in ts and q != s.id]:
+                if alt and tuple(alt) not in seen:
+                    seen.add(tuple(alt))
+                    paths.append((s, alt))
+        paths = paths[: 3 * self.witnesses]
+        queue = list(reversed(paths))
+        failed: list[tuple[UiState, list[str], str]] = []
 
         def work(w: Worker) -> None:
             while True:
                 with self.ex.lock:
                     if not queue or failed:
                         return
-                    s = queue.pop()
-                ok, why = self.reach(s, goals, p.goal, w)
+                    s, path = queue.pop()
+                ok, why = self.reach(path, goals, p.goal, w)
                 if not ok:
                     with self.ex.lock:
-                        failed.append((s, why))
+                        failed.append((s, path, why))
 
         self.ex._pool(work)
         if failed:
-            s, why = failed[0]
-            return Outcome("open", "learned model", f"the model's route from {s.describe()} to {_phrase(p.goal)} did not replay in the app ({why})", trace=self.trace_of(s), relevant=len(rel))
-        extra = f"; routes replayed from {len(todo)}/{len(todo)} states" if todo else ""
+            s, path, why = failed[0]
+            return Outcome("open", "learned model", f"the model's route from {s.describe()} to {_phrase(p.goal)} did not replay in the app ({why})", trace=self.m.labels(path), relevant=len(rel))
+        extra = f"; routes replayed along {len(paths)} path{'s' * (len(paths) != 1)} into {len(picked)}/{len(todo)} states" if todo else ""
         return Outcome("proved", "learned model", f"{len(rel)} relevant of {self._size()}{extra}", relevant=len(rel))
 
     def reachable(self, p: Prop, lem: UiLemma) -> Outcome:
@@ -244,7 +286,7 @@ class ModelCheck:
         assert isinstance(p.goal, Pred)
         rel = self._states(p.cond)
         if not rel:
-            return Outcome("vacuous", "learned model", f"no reachable state has {_phrase(p.cond)} ({self._size()})")
+            return self._nothing("learned model", f"no reachable state has {_phrase(p.cond)}")
         good = (lambda s: self.atoms.holds(p.goal, s)) if p.kind == "always" else (lambda s: not self.atoms.holds(p.goal, s))
         bad = sorted((s for s in rel if not good(s)), key=lambda s: (s.depth, s.id))
         if bad:
@@ -265,12 +307,16 @@ class ModelCheck:
         o = self.occl.get(lem.name) or Occlusion()
         rendered = [self.m.states[i] for i, n in o.rendered.items() if n]
         if not rendered:
-            return Outcome("vacuous", "hit-tested", f"{t} never renders{'' if p.cond is TRUE else ' while ' + _phrase(p.cond)} ({self._size()})")
+            return self._nothing("hit-tested", f"{t} never renders{'' if p.cond is TRUE else ' while ' + _phrase(p.cond)}")
         bad = sorted((self.m.states[i] for i in o.covered), key=lambda s: (s.depth, s.id))
+        tests = f" ({o.tests} hit-tests)"
         if bad:
             s = bad[0]
-            snap, done, why = self.replay(s.access)
-            again = hit_test(self.w.d, t, snap)[1] if snap is not None else []
+            for path in [s.access] + [alt for alt in o.paths.get(s.id, []) if alt != s.access]:
+                snap, done, why = self.replay(path)
+                again = hit_test(self.w.d, t, snap)[1] if snap is not None else []
+                if again:
+                    break
             if again:
                 return Outcome(
                     "refuted",
@@ -280,10 +326,10 @@ class ModelCheck:
                     replay={"confirmed": True, "summary": again[0]},
                     relevant=len(rendered),
                 )
-            return Outcome("open", "hit-tested", f"covered at {s.describe()} while exploring ({o.covered[s.id][0]}), but not when replayed ({why or 'uncovered'})", trace=self.trace_of(s), relevant=len(rendered))
+            return Outcome("open", "hit-tested", f"covered at {s.describe()} while exploring ({o.covered[s.id][0]}), but not when replayed ({why or 'uncovered'})", trace=self.m.labels((o.paths.get(s.id) or [s.access])[0]), relevant=len(rendered))
         if not self.m.complete:
-            return Outcome("open", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states found where it renders, but {self._stopped()}", relevant=len(rendered))
-        return Outcome("proved", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states where it renders", relevant=len(rendered))
+            return Outcome("open", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states found where it renders{tests}, but {self._stopped()}", relevant=len(rendered))
+        return Outcome("proved", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states where it renders{tests}", relevant=len(rendered))
 
     # -- persistence -----------------------------------------------------------
 
@@ -294,7 +340,9 @@ class ModelCheck:
         enabled = Pred("is", (t, "enabled"))
         cands = sorted(self._states(enabled), key=lambda s: (s.depth, s.id))
         if not cands:
-            return Outcome("vacuous", "tested", f"{t} is never shown enabled ({self._size()})", viewport=self.m.viewport)
+            out = self._nothing("tested", f"{t} is never shown enabled")
+            out.viewport = self.m.viewport
+            return out
         s = cands[0]
         snap, done, why = self.replay(s.access)
         if snap is None:

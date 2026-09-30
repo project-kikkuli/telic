@@ -62,6 +62,7 @@ class UiConfig:
     scheme: str | None = None
     devices: list[str] = field(default_factory=list)  # ios: device types; empty: the newest plain iPhone
     launch_args: list[str] = field(default_factory=list)
+    wait: float = 5.0  # seconds: a timer the app sets for up to this long is waited for, like any action
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.raw, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -111,7 +112,7 @@ def load(path: str, root: str) -> UiConfig:
         raise ConfigError(f"{os.path.relpath(path, root)} has no [ui] section")
     known = {
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
-        "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms",
+        "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms", "wait",
         "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
     }
     unknown = sorted(set(ui) - known)
@@ -169,6 +170,7 @@ def load(path: str, root: str) -> UiConfig:
         scheme=ui.get("scheme"),
         devices=[str(d) for d in ui.get("devices", [])],
         launch_args=[str(a) for a in ui.get("launch_args", [])],
+        wait=float(ui.get("wait", 5)),
     )
     if "viewports" in ui:
         cfg.viewports = [_size(v) for v in ui["viewports"]]

@@ -18,8 +18,23 @@ _ATTR = re.compile(r"\s*\[(?P<a>[^\]]*)\]")
 _ROLE = re.compile(r"[a-zA-Z]+")
 
 _HIT_JS = """
-(el, block) => {
+(el, [block, visual]) => {
+  // a person scrolls only what scrolls: a container with overflow hidden or clip keeps its offset
+  const kept = [];
+  const locked = (v) => v === 'hidden' || v === 'clip';
+  const root = document.scrollingElement || document.documentElement;
+  const rs = getComputedStyle(document.documentElement), bs = document.body ? getComputedStyle(document.body) : rs;
+  const page = (a) => locked(rs[a]) || (rs[a] === 'visible' && locked(bs[a]));
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const cs = getComputedStyle(p);
+    const box = p === root ? page : (a) => locked(cs[a]);
+    if (p !== document.body) kept.push([p, box('overflowY') && p.scrollTop, box('overflowX') && p.scrollLeft]);
+  }
   el.scrollIntoView({block, inline: 'nearest', behavior: 'instant'});
+  for (const [p, top, left] of kept) {
+    if (top !== false) p.scrollTop = top;
+    if (left !== false) p.scrollLeft = left;
+  }
   const r = el.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return {rendered: false, points: []};
   const d = Math.max(1, Math.min(3, r.width / 4, r.height / 4));
@@ -39,15 +54,40 @@ _HIT_JS = """
     const t = (h.getAttribute('aria-label') || h.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
     return t ? `${s} "${t}"` : s;
   };
-  // behind a modal dialog that is not its own: not operable, so not "covered"
-  const MODAL = 'dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]';
+  // behind a modal dialog that is not its own: not operable, so not "covered". A dialog
+  // not marked modal counts only when it or its backdrop spans the viewport.
+  const DIALOG = 'dialog[open], [role=dialog], [role=alertdialog]';
+  const spans = (x) => { const b = x.getBoundingClientRect(); return b.left <= 1 && b.top <= 1 && b.right >= innerWidth - 1 && b.bottom >= innerHeight - 1; };
+  const modal = (x) => x && (x.matches('dialog:modal, [aria-modal=true]') || spans(x));
   const top = document.elementFromPoint(pts[0][1], pts[0][2]);
-  const modal = top && !mine(top) && (top.closest(MODAL) || (top.querySelector && top.querySelector(MODAL)));
-  const behind = !!modal && !modal.contains(el);
+  let blocker = null;
+  if (top && !mine(top)) {
+    const up = top.closest(DIALOG), down = top.querySelector && top.querySelector(DIALOG);
+    blocker = modal(up) ? up : down && (modal(down) || spans(top)) ? down : null;
+  }
+  const behind = !!blocker && !blocker.contains(el);
+  // painted over the point but letting the pointer through (pointer-events: none) still hides it
+  const veil = (x, y) => {
+    const st = document.createElement('style');
+    st.textContent = '* { pointer-events: auto !important; }';
+    document.documentElement.appendChild(st);
+    const v = document.elementFromPoint(x, y);
+    st.remove();
+    if (!v || mine(v) || v.contains(el)) return null;
+    for (let a = v; a && a.nodeType === 1; a = a.parentElement) {
+      const cs = getComputedStyle(a);
+      if (Number(cs.opacity) < 0.1 || cs.visibility !== 'visible') return null;
+    }
+    const cs = getComputedStyle(v);
+    const alpha = (c) => { const m = c.match(/rgba?\\(([^)]*)\\)/); if (!m) return c === 'transparent' ? 0 : 1; const p = m[1].split(/[ ,\\/]+/).filter(Boolean); return p.length > 3 ? parseFloat(p[3]) : 1; };
+    const paints = alpha(cs.backgroundColor) >= 0.1 || cs.backgroundImage !== 'none' || /^(IMG|VIDEO|CANVAS|svg|IFRAME)$/.test(v.tagName)
+      || [...v.childNodes].some((c) => c.nodeType === 3 && c.textContent.trim());
+    return paints ? describe(v) + ' (it lets clicks through, but it is painted over it)' : null;
+  };
   return {rendered: true, behind, points: pts.map(([n, x, y]) => {
     if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return [n, [Math.round(x), Math.round(y)], 'the edge of the viewport (it is cut off)'];
     const h = document.elementFromPoint(x, y);
-    return [n, [Math.round(x), Math.round(y)], mine(h) ? null : describe(h)];
+    return [n, [Math.round(x), Math.round(y)], mine(h) ? (visual ? veil(x, y) : null) : describe(h)];
   })};
 }
 """
@@ -67,10 +107,16 @@ _WATCH_JS = """
   addEventListener('popstate', bump);
   // A short timer is work in flight (a debounce, a fake network delay); one
   // set from inside such a timer is a polling loop, and is not waited for.
-  const st = t.setTimeout = window.setTimeout, ct = window.clearTimeout, live = new Set();
+  // A longer one changes the app later by itself: when it is due is kept, so it can be waited for.
+  const st = t.setTimeout = window.setTimeout, ct = window.clearTimeout, live = new Set(), later = t.later = new Map();
   let nested = 0;
   window.setTimeout = function (fn, ms, ...a) {
     const d = Number(ms) || 0;
+    if (typeof fn === 'function' && d > 1000 && !nested) {
+      const id = st.call(this, function () { later.delete(id); return fn.apply(this, a); }, ms);
+      later.set(id, performance.now() + d);
+      return id;
+    }
     if (typeof fn !== 'function' || d > 1000 || nested) return st.call(this, fn, ms, ...a);
     t.pending++;
     const id = st.call(this, function () {
@@ -82,6 +128,7 @@ _WATCH_JS = """
     return id;
   };
   window.clearTimeout = function (id) {
+    later.delete(id);
     if (live.delete(id)) { t.pending--; bump(); }
     return ct.call(this, id);
   };
@@ -102,6 +149,16 @@ _QUIET_JS = """
   };
   tick();
 })
+"""
+
+
+# Milliseconds until the next timer the app set to change itself later, or null.
+_LATER_JS = """
+() => {
+  const t = window.__telic;
+  if (!t || !t.later || !t.later.size) return null;
+  return Math.max(0, Math.min(...t.later.values()) - performance.now());
+}
 """
 
 
@@ -248,10 +305,11 @@ def _confined(fn):
 class WebDriver(Driver):
     name = "web"
 
-    def __init__(self, url: str, *, settle_ms: int = 50, timeout_ms: int = 3000, headless: bool = True):
+    def __init__(self, url: str, *, settle_ms: int = 50, timeout_ms: int = 3000, headless: bool = True, wait_ms: int = 5000):
         self.url = url
         self.origin = "{0.scheme}://{0.netloc}".format(urlsplit(url))
         self.settle_ms = settle_ms
+        self.wait_ms = wait_ms
         self.timeout_ms = timeout_ms
         self.headless = headless
         self.size = (1280, 800)
@@ -362,7 +420,11 @@ class WebDriver(Driver):
                     n.form = self._loc(n.ref).evaluate(_FORM_JS, timeout=self.timeout_ms)
                 except Exception:  # noqa: BLE001 - detached since the snapshot: no form
                     n.form = None
-        return Snapshot(self.screen(), root)
+        try:
+            later = self.page.evaluate(_LATER_JS) if self.wait_ms else None
+        except Exception:  # noqa: BLE001 - navigating: nothing pending in the new document yet
+            later = None
+        return Snapshot(self.screen(), root, int(later) + 1 if later is not None and later <= self.wait_ms else None)
 
     @_confined
     def leaves(self, node: Node) -> bool:
@@ -378,11 +440,12 @@ class WebDriver(Driver):
             raise DriverError("no element")
         return self.page.locator(f"aria-ref={ref}")
 
-    def _hit(self, ref: str) -> dict:
+    def _hit(self, ref: str, visual: bool = False) -> dict:
+        """Where a pointer lands on it; ``visual``: also what is painted over it without taking the pointer."""
         loc = self._loc(ref)
-        got = loc.evaluate(_HIT_JS, "nearest", timeout=self.timeout_ms)
+        got = loc.evaluate(_HIT_JS, ["nearest", visual], timeout=self.timeout_ms)
         if got["rendered"] and any(p[2] for p in got["points"]):
-            got = loc.evaluate(_HIT_JS, "center", timeout=self.timeout_ms)
+            got = loc.evaluate(_HIT_JS, ["center", visual], timeout=self.timeout_ms)
         return got
 
     def _submit(self, action: Action) -> None:
@@ -403,7 +466,7 @@ class WebDriver(Driver):
     @_confined
     def uncovered(self, node: Node) -> tuple[bool, list[tuple[str, str | None]]]:
         try:
-            got = self._hit(node.ref or "")
+            got = self._hit(node.ref or "", True)
         except Exception as e:  # noqa: BLE001 - detached between snapshot and test
             raise DriverError(f"cannot hit-test {node.label}: {str(e).splitlines()[0]}") from None
         return got["rendered"] and not got.get("behind"), [(f"{n} ({x}, {y})", who) for n, (x, y), who in got["points"]]
@@ -414,6 +477,8 @@ class WebDriver(Driver):
         try:
             if action.kind == "key":
                 self.page.keyboard.press(action.arg or "")
+            elif action.kind == "wait":
+                self.page.wait_for_timeout(int(action.arg or 0) + 50)
             else:
                 if action.kind == "form":
                     self._submit(action)

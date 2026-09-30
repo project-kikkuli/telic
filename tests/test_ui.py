@@ -184,13 +184,10 @@ def learn(app, lemmas, **kw):
     atoms = Atoms(s.lemmas)
     occl = {lem.name: Occlusion() for lem in s.lemmas if lem.prop.kind == "unobscured"}
 
-    def probe(state, snap, d):
+    def probe(state, snap, d, paths):
         for lem in s.lemmas:
             if lem.prop.kind == "unobscured" and lem.prop.cond.eval(snap, ex.model.home):
-                n, bad = hit_test(d, lem.prop.goal, snap)
-                occl[lem.name].rendered[state.id] = n
-                if bad:
-                    occl[lem.name].covered[state.id] = bad
+                occl[lem.name].record(state.id, *hit_test(d, lem.prop.goal, snap), paths)
 
     ex = Explorer([app], atoms.preds, Settings(keys=(), workers=1, **kw), "fake", probe)
     model = ex.learn()
@@ -201,7 +198,7 @@ def learn(app, lemmas, **kw):
 def test_every_overlay_can_be_left():
     model, got = learn(FakeApp(SCREENS), [("esc", "always reachable home from overlay"), ("about", 'reachable screen "/about"')])
     assert model.complete and len(model.states) == 4
-    assert got["esc"].status == "proved" and "routes replayed from 2/2" in got["esc"].detail
+    assert got["esc"].status == "proved" and "into 2/2 states" in got["esc"].detail
     assert got["about"].status == "proved" and got["about"].trace == ['click button "About"']
 
 
@@ -235,12 +232,56 @@ def test_invariants_and_occlusion():
     assert m.status == "refuted" and "covered in 1/4 states" in m.detail and m.trace == ['click button "About"']
 
 
+@pytest.mark.parametrize("walks", [0, 10])
+def test_a_dialog_that_traps_only_when_opened_one_way_is_not_proved(walks):
+    screens = {
+        "home": (None, {"Left": "home:info", "Right": "home:info:trap"}),
+        "home:info": ("Info", {"Close": "home"}),
+        "home:info:trap": ("Info", {"Close": "home:info:trap"}),
+    }
+    _, got = learn(FakeApp(screens), [("esc", "always reachable home from overlay")], walks=walks)
+    assert got["esc"].status == "open"
+
+
+@pytest.mark.parametrize("walks", [0, 10])
+def test_occlusion_is_tested_at_every_visit_not_once_per_state(walks):
+    screens = dict(SCREENS, home=(None, {"Settings": "home:settings", "About": "about", "Other": "about:2"}), **{"about:2": SCREENS["about"]})
+    _, got = learn(FakeApp(screens, menu_covered={"about:2"}), [("menu", 'unobscured button "Menu"')], walks=walks)
+    m = got["menu"]
+    assert m.status == "refuted" and m.replay["confirmed"] and m.trace == ['click button "Other"']
+
+
+class LateTip(FakeApp):
+    """Home offers "Tip" only once the app has been opened a few times."""
+
+    def observe(self):
+        snap = super().observe()
+        if self.at == "home" and self.resets > 3:
+            snap.root.children.append(Node("button", "Tip", ref="Tip"))
+        return snap
+
+    def do(self, a):
+        if a.sig == 'button "Tip"':
+            self.at = "home:tip"
+            return
+        super().do(a)
+
+
+def test_an_action_a_later_visit_offers_is_explored_too():
+    screens = dict(SCREENS, **{"home:tip": ("Tip", {"Close": "home"})})
+    model, got = learn(LateTip(screens), [("esc", "always reachable home from overlay"), ("tip", 'reachable overlay "Tip"')])
+    assert model.complete, model.stop
+    assert got["esc"].status == "proved" and got["tip"].status == "proved"
+
+
 def test_budgets_make_the_model_incomplete_and_verdicts_open():
     chain = {f"s{i}": (None, {"Next": f"s{i + 1}"}) for i in range(30)}
     chain["s30"] = ("Trap", {})
-    model, got = learn(FakeApp(chain, start="s0"), [("esc", "always reachable home from overlay"), ("n", "never overlay")], max_states=10)
+    lemmas = [("esc", "always reachable home from overlay"), ("n", "never overlay"), ("t", 'always not overlay while overlay "Trap"'), ("u", 'unobscured button "Menu" while overlay')]
+    model, got = learn(FakeApp(chain, start="s0"), lemmas, max_states=10)
     assert not model.complete and "state budget" in model.stop
-    assert got["esc"].status == "vacuous" and got["n"].status == "open"
+    # the trap is past the budget: nothing found is not nothing there
+    assert {k: o.status for k, o in got.items()} == {"esc": "open", "n": "open", "t": "open", "u": "open"}
 
 
 # ---------------------------------------------------------------------------
@@ -471,3 +512,88 @@ def test_nothing_telic_started_outlives_it(tmp_path, sig):
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# What the verdict cache is keyed by
+
+
+@pytest.mark.parametrize(
+    "path, counts",
+    [("src/App.tsx", True), ("src/build/Button.tsx", True), (".env", True), ("dist/app.js", False), ("node_modules/x/index.js", False)],
+)
+def test_the_cache_key_follows_what_the_app_is_built_from(tmp_path, path, counts):
+    from telic.ui.app import build_digest
+    from telic.ui.config import load
+
+    (tmp_path / "telic.toml").write_text('[ui]\ncommand = "npx vite --port {port}"\n')
+    f = tmp_path / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("one")
+    cfg = load(str(tmp_path / "telic.toml"), str(tmp_path))
+    before = build_digest(cfg)
+    f.write_text("two")
+    assert (build_digest(cfg) != before) == counts
+
+
+def test_an_app_telic_does_not_start_is_keyed_by_what_it_serves(tmp_path):
+    import functools
+    import http.server
+    import threading
+
+    from telic.ui.app import build_digest
+    from telic.ui.config import load
+
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_text('<script src="/app-1.js"></script>')
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(site)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        app = tmp_path / "app"
+        app.mkdir()
+        (app / "telic.toml").write_text(f'[ui]\nurl = "http://127.0.0.1:{server.server_address[1]}/"\n')
+        cfg = load(str(app / "telic.toml"), str(tmp_path))
+        before = build_digest(cfg)
+        assert build_digest(cfg) == before
+        (site / "index.html").write_text('<script src="/app-2.js"></script>')
+        assert build_digest(cfg) != before
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# What a person sees and can reach, in a real browser
+
+TINY = "<!doctype html><html lang=en><head><meta charset=utf-8><style>body{{margin:0}} {css}</style></head><body><main>{body}</main><script src=app.js></script></body></html>"
+
+
+def tiny_app(tmp_path, lemma, body, js="", css=""):
+    d = tmp_path / "tiny"
+    d.mkdir()
+    (d / "telic.toml").write_text('[ui]\nstatic = "."\nviewports = ["1280x800"]\nwalks = 2\n')
+    (d / "index.html").write_text(TINY.format(body=body, css=css))
+    (d / "app.js").write_text(f"//@ aim A: The app shall work.\n//@   by: x\n//@ [A] ui x: {lemma}\n{js}\n")
+    return d
+
+
+MENU = '<button id=menu onclick="">Menu</button>'
+
+
+@pytest.mark.parametrize(
+    "lemma, body, js, css, status, says",
+    [
+        ('unobscured button "Save"', '<div style="height:80px;overflow:hidden"><div style="height:600px"></div><button>Save</button></div>', "", "", "refuted", "covered by"),
+        ('unobscured button "Save"', '<div style="height:80px;overflow:auto"><div style="height:600px"></div><button>Save</button></div>', "", "", "proved", ""),
+        ('unobscured button "Menu"', MENU + "<div class=veil>Sale</div>", "", ".veil{position:fixed;top:0;left:0;width:300px;height:90px;background:#c00;pointer-events:none}", "refuted", "painted over it"),
+        ('unobscured button "Menu"', MENU + "<div class=veil></div>", "", ".veil{position:fixed;inset:0;pointer-events:none}", "proved", ""),
+        ('unobscured button "Menu"', MENU + '<div role=dialog aria-label="Cookies" class=ban>We use cookies</div>', "", ".ban{position:fixed;top:0;left:0;right:0;height:60px;background:#fd0}", "refuted", "Cookies"),
+        ('unobscured button "Menu" while not overlay', MENU + '<div class=bd><div role=dialog aria-modal=true aria-label="Hi">Hi</div></div>', "", ".bd{position:fixed;inset:0;background:#0006}", "vacuous", ""),
+        ('never overlay "Expired"', "<p>Hi</p>", "setTimeout(() => document.querySelector('main').insertAdjacentHTML('beforeend', '<div role=dialog aria-label=Expired>Expired</div>'), 1500);", "", "refuted", "Expired"),
+    ],
+)
+@needs_browser
+def test_what_a_person_sees_and_can_reach(tmp_path, lemma, body, js, css, status, says):
+    _, got = run_ui(tiny_app(tmp_path, lemma, body, js, css))
+    assert (got["x"].status, says in got["x"].detail) == (status, True), got["x"].detail

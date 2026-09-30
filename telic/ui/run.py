@@ -240,7 +240,7 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, si
             w, h = size  # type: ignore[misc]
             vp = f"{w}x{h}"
             for _ in range(browsers):
-                d = WebDriver(url, settle_ms=cfg.settle_ms)
+                d = WebDriver(url, settle_ms=cfg.settle_ms, wait_ms=int(cfg.wait * 1000))
                 drivers.append(d)
                 d.start()
                 d.viewport(w, h)
@@ -250,15 +250,11 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, si
             occl = {lem.name: Occlusion() for lem in occluding}
             holder: list[Explorer] = []
 
-            def probe(state, snap, driver):
+            def probe(state, snap, driver, paths):
                 for lem in occluding:
                     p = lem.prop
-                    if not p.cond.eval(snap, holder[0].model.home):
-                        continue
-                    n, bad = hit_test(driver, p.goal, snap)
-                    occl[lem.name].rendered[state.id] = n
-                    if n and bad:
-                        occl[lem.name].covered[state.id] = bad
+                    if p.cond.eval(snap, holder[0].model.home):
+                        occl[lem.name].record(state.id, *hit_test(driver, p.goal, snap), paths)
 
             ex = Explorer(drivers, atoms.preds, settings, vp, probe, lambda m: log(f"{vp}: {m}"))
             holder.append(ex)

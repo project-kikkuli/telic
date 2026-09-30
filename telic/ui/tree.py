@@ -81,6 +81,7 @@ class Node:
 class Snapshot:
     screen: str  # route or screen name
     root: Node
+    later: int | None = None  # ms until the app changes by itself (a timer it set), if it will
 
     def nodes(self):
         return self.root.walk()
@@ -91,7 +92,7 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class Action:
-    kind: str  # click | fill | key | select | press
+    kind: str  # click | fill | key | select | press | form | wait
     sig: str  # identity across states: 'button "Close"', 'key Escape', 'listitem › button 2'
     label: str  # what a person reads in a trace: 'click button "Close"'
     ref: str | None = None
@@ -108,7 +109,7 @@ def _data(name: str) -> str:
 
 
 def actions(
-    snap: Snapshot, *, text: str = "telic", fill: tuple[tuple[str, str], ...] = (), keys: tuple[str, ...] = (), ignore: tuple[str, ...] = (), leaves=None
+    snap: Snapshot, *, text: str = "telic", fill: tuple[tuple[str, str], ...] = (), keys: tuple[str, ...] = (), ignore: tuple[str, ...] = (), leaves=None, wait: bool = False
 ) -> tuple[list[Action], dict[str, int]]:
     """What a user can do in this state, and the repeated item groups seen
     (``list "Notes" › listitem`` -> how many). Only the first item of a group
@@ -200,6 +201,8 @@ def actions(
         out.append(Action("form", f"submit form {_q(submit or names[-1])}", f"fill in {', '.join(names)} and {how}", button.ref if button is not None else None, json.dumps(values)))
     for k in keys:
         out.append(Action("key", f"key {k}", f"press {k}", None, k))
+    if wait and snap.later is not None:
+        out.append(Action("wait", "wait", f"wait {snap.later / 1000:.1f}s", None, str(snap.later)))
     return out, groups
 
 

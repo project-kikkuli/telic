@@ -462,7 +462,7 @@ files work too), and it cites its aims with a tag:
 | `always reachable P [from Q]` | from every reachable state (where `Q` holds), some sequence of actions reaches `P` |
 | `reachable P` | some reachable state satisfies `P` |
 | `always P [while Q]` / `never P [while Q]` | every reachable state (where `Q` holds) satisfies `P` / not `P` |
-| `unobscured T [while Q]` | wherever `T` renders, its center and four corners hit `T` (or its label) at every viewport |
+| `unobscured T [while Q]` | wherever `T` renders, its center and four corners hit `T` (or its label) and nothing is painted over them, at every viewport |
 | `persists T` | changing control `T` and reopening the app (stored data kept) shows the new value |
 
 Any property can end with `via FUNC`: the function that handles the change.
@@ -477,12 +477,16 @@ expanded|collapsed|selected|pressed`, `ROLE "name" == "value"`, joined with
 
 **How it is checked.** telic starts the app, and learns its state graph from
 it: from a fresh start (new browser profile) it fires every action a user
-has (click, type, choose, `Escape`) in every state it finds, and abstracts
+has (click, type, choose, `Escape`, wait for a timer the app set) in every
+state it finds, and abstracts
 each screen to the route, the open overlays, the controls and their states,
 and the lemmas' predicates. Returning to a state replays its path from a
 fresh start. Then random walks through the model are replayed in the app;
 a step the model did not predict is added to it and learning resumes. The
-model is judged by the app, never the other way round.
+model is judged by the app, never the other way round, and it only knows
+what exploration saw: state the accessibility tree never shows (a counter
+behind a button that looks the same after every click) and keys not in
+`keys` are not explored.
 
 What counts as a different state is chosen so data does not make the model
 infinite: items of a list are acted on through the first item only and the
@@ -495,21 +499,25 @@ landmarks and the lemmas' predicates (`abstraction = "screens"`), and each
 route the model promises is replayed with re-planning from wherever the app
 actually is.
 
-An element behind a modal dialog it is not part of cannot be operated, so it
-is neither covered nor counted for `unobscured`; an action on a covered
-element is blocked, as it would be for a person.
+An element behind a modal dialog it is not part of (a `<dialog>` opened with
+`showModal`, `aria-modal="true"`, or a dialog whose backdrop spans the
+viewport) cannot be operated, so it is neither covered nor counted for
+`unobscured`; an action on a covered element is blocked, as it would be for
+a person. Hit-testing scrolls only what a person can scroll (not a container
+with `overflow: hidden`), and runs at every visit to a state, since one state
+of the model can be several in the app.
 
 **Statuses** say what they rest on:
 
 | status | means |
 |---|---|
-| proved on the learned model | holds in every state of a *complete* model (every action fired in every state); routes the model promises are replayed in the app |
+| proved on the learned model | holds in every state of a *complete* model (every action fired in every state); routes the model promises are replayed in the app from each observed way into a state, and a route through a step with more than one observed outcome leaves it open |
 | proved by a replayed witness | `reachable`: the path was replayed in the app |
-| unobscured wherever it renders | hit-tested in every state where it renders, at every viewport ("uncovered in 23/23 states") |
+| unobscured wherever it renders | hit-tested at every visit to every state where it renders, at every viewport ("uncovered in 23/23 states (140 hit-tests)") |
 | passed the test | `persists`: changed, reopened, still changed |
 | refuted | with the action trace, replayed in the app before it is reported |
 | open | exploration stopped at a budget, or a trace did not replay |
-| vacuous | no reachable state made it relevant: never counted as passed |
+| vacuous | no state of a complete model made it relevant (an incomplete one leaves it open): never counted as passed |
 
 Each model is shown with its size, whether exploration finished, how
 conformance testing went, and how many transitions were nondeterministic
@@ -534,12 +542,14 @@ keys = ["Escape"]                           # keys a user may press anywhere
 ignore = ['button "Sign out"']              # actions never fired (regexes)
 text = "telic"                              # what is typed into text fields
 fill = { "Coupon" = "SAVE10" }              # by field name (regex); emails, passwords, dates... are guessed
+wait = 5                                    # seconds: a timer the app sets for up to this long is waited for; 0: never
 seed = false                                # true: an oracle proposes paths from the source first
 ```
 
 Verdicts are cached in `.telic/ui.json` by the app's sources (every file
-under the `telic.toml`'s directory except dependencies and build output),
-the `[ui]` section, the lemma and telic's own UI code. `--no-ui` skips
+under the `telic.toml`'s directory except dependencies and the build output
+at its top level; for a `url` app, also the page it serves now), the `[ui]`
+section, the lemma and telic's own UI code. `--no-ui` skips
 running the app; cached verdicts still show. The web driver needs
 `pip install 'telic[ui]'` and `playwright install chromium`.
 

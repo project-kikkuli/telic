@@ -67,9 +67,11 @@ lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
 - **tasks-svelte** (Svelte 5, hash routing, a sidebar drawer, a task drawer,
   confirm dialogs, focus mode, a cookie banner): telling controls apart
   gives more than 100 states (filters, forms, the banner multiply), so the
-  model is over screens: about 25 and 15 states, complete. telic finds a
+  model is over screens: about 25 and 20 states, complete. telic finds a
   real defect: at 390x844 the cookie banner covers the sidebar's Settings
-  link, and the trace is one click (`Open sidebar`), replayed.
+  link, and the trace is one click (`Open sidebar`), replayed. Escape stays
+  open: a route out of two stacked dialogs, reached one of several ways, does
+  not replay.
 
 A first run takes a few minutes per app (one browser per viewport; `workers`
 adds more); later runs reuse the verdicts until a source file changes. Every

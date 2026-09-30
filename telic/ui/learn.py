@@ -147,6 +147,20 @@ class Model:
                     q.append(s)
         return out
 
+    def forcing(self, goals: set[int]) -> set[int]:
+        """States from which some sequence of actions reaches ``goals``
+        whichever of its observed outcomes each action has (hidden state
+        decides a nondeterministic one, not the user)."""
+        out = set(goals)
+        grew = True
+        while grew:
+            grew = False
+            for s, m in self.trans.items():
+                if s not in out and any(ts and ts <= out for ts in m.values()):
+                    out.add(s)
+                    grew = True
+        return out
+
     def closed_from(self, sid: int) -> bool:
         """Every state reachable from ``sid`` has had every action fired."""
         seen = {sid}
@@ -225,7 +239,7 @@ class Explorer:
         atoms: list[Pred],
         settings: Settings,
         viewport: str,
-        probe: Callable[[UiState, Snapshot, Driver], None] | None = None,
+        probe: Callable[[UiState, Snapshot, Driver, list[list[str]]], None] | None = None,
         log: Callable[[str], None] | None = None,
     ):
         self.workers = [Worker(d) for d in drivers]
@@ -275,7 +289,7 @@ class Explorer:
 
     def look(self, w: Worker) -> Snapshot:
         snap = w.d.observe()
-        acts, _ = actions(snap, text=self.s.text, fill=self.s.fill, keys=self.s.keys, ignore=self.s.ignore, leaves=w.d.leaves)
+        acts, _ = actions(snap, text=self.s.text, fill=self.s.fill, keys=self.s.keys, ignore=self.s.ignore, leaves=w.d.leaves, wait=True)
         w.snap = snap
         w.acts = {}
         for a in acts:
@@ -283,7 +297,6 @@ class Explorer:
         return snap
 
     def _intern(self, w: Worker, snap: Snapshot, parent: UiState | None, sig: str | None) -> UiState:
-        new = False
         with self.lock:
             key, atoms, body = self._abstract(snap, w.d)
             st = self.by_key.get(key)
@@ -298,14 +311,14 @@ class Explorer:
                 self.by_key[key] = st
                 if st.id == 0:
                     self.model.home = snap.screen
-                new = True
             else:
                 for sig2, a in w.acts.items():  # a coarse state offers what any visit to it offered
                     if sig2 not in st.labels:
                         st.actions.append(sig2)
                         st.labels[sig2] = a.label
-        if new and self.probe is not None:
-            self.probe(st, snap, w.d)
+        if self.probe is not None:  # every visit: one state of the model can be several in the app
+            ways = [parent.access + [sig]] if parent is not None and sig is not None else []
+            self.probe(st, snap, w.d, ways + [list(w.history)])
         return st
 
     # -- moving ----------------------------------------------------------------
@@ -555,12 +568,21 @@ class Explorer:
         self.reset(self.main)
         if seeds:
             self.seed(seeds)
+        def untried() -> list[UiState]:
+            return [s for s in self.model.states if s.id not in self.model.unreproducible and any(a not in s.fired for a in s.actions)]
+
         for r in range(rounds + 1):
             self.explore()
-            if self.model.stop or not self.s.walks or r == rounds or not self.conform():
+            if self.model.stop or not self.s.walks or r == rounds:
                 break
-        pending = sum(1 for s in self.model.states if s.id not in self.model.unreproducible for a in s.actions if a not in s.fired)
-        if not self.model.stop and pending:
+            # a walk can find actions no earlier visit offered: those are explored too
+            if not self.conform() and not untried():
+                break
+        left = untried()
+        if not self.model.stop and any(s.depth < self.s.max_depth for s in left):
+            n = sum(1 for s in left for a in s.actions if a not in s.fired)
+            self.model.stop = f"stopped after {rounds} rounds of testing the model with {n} action{'s' * (n != 1)} never fired"
+        elif not self.model.stop and left:
             self.model.stop = f"stopped at the depth bound ({self.s.max_depth})"
         if not self.model.stop and self.model.unreproducible:
             n = len(self.model.unreproducible)
