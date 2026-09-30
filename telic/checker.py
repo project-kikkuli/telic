@@ -112,6 +112,7 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
         from .frontend.swift import lower_swift_files
 
         swift_mods = lower_swift_files(swift_files, root)
+    rust_seen = {os.path.normpath(os.path.abspath(f)) for f in files if language_of(f) == "rust"}
     for f in files:
         lang = language_of(f)
         if lang == "swift":
@@ -122,8 +123,16 @@ def load_modules(paths: list[str], root: str | None = None) -> list[ir.Module]:
             mods.append(ts_mods[f])
         elif lang == "rust":
             from .frontend.rust import lower_rust
+            from .frontend.rust_crate import crate_for
 
-            mods.append(lower_rust(os.path.relpath(f, root), Path(f).read_text()))
+            mods.append(lower_rust(os.path.relpath(f, root), Path(f).read_text(), f, root))
+            # the other files of its crate come along as context: calls into them use their contracts
+            for g in sorted(crate_for(f).sources):
+                if g not in rust_seen:
+                    rust_seen.add(g)
+                    ctx = lower_rust(os.path.relpath(g, root), Path(g).read_text(), g, root)
+                    ctx.context = True
+                    mods.append(ctx)
     return mods + aims_modules(paths, aims_files, root)
 
 

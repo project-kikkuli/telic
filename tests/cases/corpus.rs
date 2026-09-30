@@ -284,53 +284,307 @@ pub fn unreachable_arm(x: u32) -> u32 {
     x
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Phase {
-    Open,
-    Won,
-    Lost,
+// -- enums with data, and match on them ------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shape {
+    Circle(u32),
+    Rect { w: u32, h: u32 },
+    Empty,
 }
 
-// A game, once won, stays won: whatever sequence of moves follows.
-//@ lifecycle phase: Phase::Open -> Phase::Won, Phase::Open -> Phase::Lost
-//@ lifecycle once self.phase == Phase::Won
-#[derive(Debug)]
-pub struct Game {
-    //@ lifecycle monotonic self.moves
-    pub phase: Phase,
-    pub moves: u32,
-    pub mines: u32,
+// expect: proved
+pub fn shape_area(s: Shape) -> u64 {
+    //@ ensures implies(matches!(s, Shape::Empty), result == 0)
+    match s {
+        Shape::Circle(r) => (r as u64) * (r as u64),
+        Shape::Rect { w, h } => (w as u64) * (h as u64),
+        Shape::Empty => 0,
+    }
 }
 
-impl Game {
-    // expect: proved
-    pub fn reveal(&mut self, mine: bool) {
-        if self.phase == Phase::Open && self.moves < 1000 {
-            self.moves += 1;
-            if mine {
-                self.phase = Phase::Lost;
-            }
-        }
+// expect: refuted
+pub fn perimeter(s: Shape) -> u32 {
+    match s {
+        Shape::Circle(r) => 6 * r,
+        Shape::Rect { w, h } => 2 * (w + h),
+        Shape::Empty => 0,
     }
+}
 
-    // expect: proved
-    pub fn check_win(&mut self) {
-        if self.phase == Phase::Open && self.moves >= self.mines {
-            self.phase = Phase::Won;
-        }
+// expect: proved
+pub fn square(side: u32) -> Shape {
+    //@ ensures result == Shape::Rect { w: side, h: side }
+    Shape::Rect { w: side, h: side }
+}
+
+// expect: proved
+pub fn is_round(s: Shape) -> bool {
+    //@ ensures result == matches!(s, Shape::Circle(_))
+    if let Shape::Circle(_) = s {
+        true
+    } else {
+        false
     }
+}
 
-    // expect: refuted
-    pub fn check_win_unguarded(&mut self) {
-        // stipulate's demo bug: marks a lost game won
-        if self.moves >= self.mines {
-            self.phase = Phase::Won;
+// expect: proved
+pub fn small_radius(s: Shape) -> u32 {
+    //@ ensures result <= 100
+    match s {
+        Shape::Circle(r) if r <= 100 => r,
+        _ => 0,
+    }
+}
+
+// expect: refuted
+pub fn grow(s: Shape) -> Shape {
+    match s {
+        Shape::Circle(r) => Shape::Circle(r + 1),
+        other => other,
+    }
+}
+
+impl Shape {
+    // expect: proved
+    pub fn is_empty(&self) -> bool {
+        //@ ensures result == (*self == Shape::Empty)
+        matches!(self, Shape::Empty)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cmd {
+    Move { dx: i8, dy: i8 },
+    Wait(u8),
+    Stop,
+}
+
+impl Cmd {
+    // expect: proved
+    pub fn cost(&self) -> u32 {
+        //@ ensures result <= 255
+        match *self {
+            Cmd::Move { dx, dy } => (dx.unsigned_abs() as u32).max(dy.unsigned_abs() as u32),
+            Cmd::Wait(n) => n as u32,
+            Self::Stop => 0,
         }
     }
 }
 
 // expect: refuted
-pub fn restart_game(g: &mut Game) {
-    // overwrites the caller's game, won or not
-    *g = Game { phase: Phase::Open, moves: 0, mines: g.mines };
+pub fn step(c: Cmd, x: i8) -> i8 {
+    match c {
+        Cmd::Move { dx, .. } => x + dx,
+        _ => x,
+    }
+}
+
+// -- tuple structs ---------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Meters(pub u32);
+
+// expect: proved
+pub fn add_meters(a: Meters, b: Meters) -> Meters {
+    //@ requires a.0 <= 1000 && b.0 <= 1000
+    //@ ensures result.0 == a.0 + b.0
+    Meters(a.0 + b.0)
+}
+
+// expect: refuted
+pub fn double_meters(a: Meters) -> Meters {
+    let Meters(x) = a;
+    Meters(x * 2)
+}
+
+// expect: proved
+pub fn meters_eq(a: Meters) -> bool {
+    //@ ensures result
+    a == Meters(a.0)
+}
+
+// -- Result and '?' ----------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+pub enum DigitError {
+    Empty,
+    TooBig(u32),
+}
+
+// expect: proved
+pub fn parse_digit(s: &str, v: u32) -> Result<u32, DigitError> {
+    //@ ensures implies(result.is_ok(), result.unwrap() < 10)
+    if s.is_empty() {
+        return Err(DigitError::Empty);
+    }
+    if v >= 10 {
+        return Err(DigitError::TooBig(v));
+    }
+    Ok(v)
+}
+
+// expect: proved
+pub fn sum_digits(a: &str, x: u32, b: &str, y: u32) -> Result<u32, DigitError> {
+    //@ ensures implies(result.is_ok(), result.unwrap() < 20)
+    let p = parse_digit(a, x)?;
+    let q = parse_digit(b, y)?;
+    Ok(p + q)
+}
+
+// expect: refuted
+pub fn must_parse(s: &str, v: u32) -> u32 {
+    parse_digit(s, v).unwrap()
+}
+
+// expect: proved
+pub fn digit_or_zero(s: &str, v: u32) -> u32 {
+    //@ ensures result < 10
+    match parse_digit(s, v) {
+        Ok(d) => d,
+        Err(DigitError::TooBig(_)) => 0,
+        Err(DigitError::Empty) => 0,
+    }
+}
+
+// expect: proved
+pub fn required(o: Option<u32>) -> Result<u32, u8> {
+    //@ ensures implies(o.is_none(), result.is_err())
+    let v = o.ok_or(7u8)?;
+    Ok(v)
+}
+
+// expect: refuted
+pub fn plus_one(r: Result<u8, String>) -> Result<u8, String> {
+    let v = r?;
+    Ok(v + 1)
+}
+
+#[derive(Debug)]
+pub enum AppError {
+    Code(u8),
+    Io,
+}
+
+impl From<u8> for AppError {
+    // expect: proved
+    fn from(e: u8) -> AppError {
+        AppError::Code(e)
+    }
+}
+
+pub type AppResult<T> = Result<T, AppError>;
+
+// expect: proved
+pub fn below_100(x: u32) -> Result<u32, u8> {
+    //@ ensures implies(result.is_ok(), result.unwrap() < 100)
+    if x < 100 {
+        Ok(x)
+    } else {
+        Err(1)
+    }
+}
+
+// expect: proved
+pub fn doubled_below_100(x: u32) -> AppResult<u32> {
+    //@ ensures implies(result.is_ok(), result.unwrap() < 200)
+    let a = below_100(x)?;
+    Ok(a * 2)
+}
+
+// -- traits and generics -----------------------------------------------------
+
+pub trait Scored {
+    //@ ensures result <= 10
+    fn score(&self) -> u32;
+
+    //@ ensures result >= 1
+    fn weight(&self) -> u32 {
+        1
+    }
+}
+
+pub struct Player {
+    pub points: u32,
+}
+
+impl Scored for Player {
+    // expect: proved
+    fn score(&self) -> u32 {
+        if self.points > 10 {
+            10
+        } else {
+            self.points
+        }
+    }
+}
+
+pub struct Cheater {
+    pub points: u32,
+}
+
+impl Scored for Cheater {
+    // expect: refuted
+    fn score(&self) -> u32 {
+        self.points
+    }
+
+    // expect: proved
+    fn weight(&self) -> u32 {
+        2
+    }
+}
+
+// expect: proved
+pub fn rank<T: Scored>(x: &T) -> u32 {
+    //@ ensures result >= 1 && result <= 20
+    x.score() + x.weight().min(10)
+}
+
+// expect: proved
+pub fn rank_dyn(x: &dyn Scored) -> u32 {
+    //@ ensures result <= 10
+    x.score()
+}
+
+// expect: proved
+pub fn player_weight(p: &Player) -> u32 {
+    //@ ensures result == 1
+    p.weight()
+}
+
+// expect: proved
+pub fn pick<T: Copy>(c: bool, a: T, b: T) -> T {
+    //@ ensures implies(c, result == a)
+    if c {
+        a
+    } else {
+        b
+    }
+}
+
+// expect: proved
+pub fn pick_first(x: u32) -> u32 {
+    //@ ensures result == x
+    pick(true, x, 7)
+}
+
+// -- modules -----------------------------------------------------------------
+
+pub mod units {
+    // expect: proved
+    pub fn clamp(x: u32, hi: u32) -> u32 {
+        //@ ensures result <= hi
+        if x > hi {
+            hi
+        } else {
+            x
+        }
+    }
+}
+
+// expect: proved
+pub fn clamped(x: u32) -> u32 {
+    //@ ensures result <= 10
+    units::clamp(x, 10)
 }

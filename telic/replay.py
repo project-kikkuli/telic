@@ -132,6 +132,10 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return format_value(Fraction(n, d), ir.REAL, lang)
+    if isinstance(ty, ir.TRecord) and isinstance(v, dict) and "__record__" not in v:
+        v = {"__record__": ty.name, "fields": v}
+    if isinstance(v, dict) and "__record__" in v and lang == "rust" and isinstance(ty, ir.TRecord):
+        return _rust_record(v["fields"], ty)
     if isinstance(v, dict) and "__record__" in v:
         inner = ", ".join(f"{k}={format_value(x, None, lang)}" if lang == "python" else f"{k}: {format_value(x, None, lang)}" for k, x in v["fields"].items())
         return f"{v['__record__']}({inner})" if lang == "python" else "{ " + inner + " }"
@@ -156,6 +160,25 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, str):
         return json.dumps(v) if lang != "python" else repr(v)
     return str(v)
+
+
+def _rust_record(fields: dict[str, Any], ty: ir.TRecord) -> str:
+    """A Rust struct, tuple struct or enum variant, as Rust writes it."""
+    base = ir.source_name(ty.name)
+    tag = ty.fields[0][1] if ty.fields[:1] and ty.fields[0][0] == "tag" else None
+    if isinstance(tag, ir.TEnum):
+        i = fields.get("tag")
+        vn = tag.members[i] if isinstance(i, int) and 0 <= i < len(tag.members) else tag.members[0]
+        head = vn if tag.name == "Result$tag" else f"{base}::{vn}"
+        slots = [(f[len(vn) + 1 :], ft, fields.get(f)) for f, ft in ty.fields[1:] if f.startswith(vn + "_")]
+    else:
+        head = base
+        slots = [(f, ft, fields.get(f)) for f, ft in ty.fields]
+    if not slots:
+        return head
+    if all(re.fullmatch(r"_?\d+", s) for s, _, _ in slots):
+        return f"{head}({', '.join(format_value(x, ft, 'rust') for _, ft, x in slots)})"
+    return f"{head} {{ " + ", ".join(f"{s}: {format_value(x, ft, 'rust')}" for s, ft, x in slots) + " }"
 
 
 def call_text(fn: ir.Function, model: dict[str, Any], lang: str, names: bool = True) -> str:

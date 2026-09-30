@@ -22,6 +22,8 @@ arithmetic is mathematical (no overflow), ``result`` is the return value,
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import re
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -37,8 +39,7 @@ from ..contracts import (
     parse_comment_lines,
     parse_aim_directive,
 )
-from ..lifecycle import LifecycleError
-from ..lifecycle import build as build_lifecycle
+from .rust_crate import ModPath, Res
 
 RUST_ASSUMPTIONS = [
     "f32/f64 are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
@@ -92,12 +93,48 @@ def _text(n: Any) -> str:
 
 @dataclass
 class StructInfo:
-    name: str
-    fields: list[tuple[str, str, Any]]  # (name, rust type text, type node)
+    name: str  # IR name: the Rust name, qualified when several modules define one
+    fields: list[tuple[str, str, Any]]  # (name, rust type text, type node); a tuple struct's are _0, _1, ...
     copy: bool
     node: Any
     record: bool = False  # a Copy struct of scalars: a value
     kinds: dict[str, str] = field(default_factory=dict)  # field -> integer kind
+    mod: ModPath = ()
+    tuple: bool = False
+    eq: str = ""  # what '==' runs: "derive", "impl" (its PartialEq::eq), "" (none known)
+    src: str = ""  # the Rust name
+    generics: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class EnumInfo:
+    """An enum whose variants carry data, modelled as a record of a tag and
+    every variant's fields (those of the other variants hold defaults)."""
+
+    name: str
+    src: str
+    mod: ModPath
+    node: Any
+    variants: list[tuple[str, str, list[tuple[str, str, Any]]]]  # (variant, unit|tuple|struct, [(field, rust type, node)])
+    copy: bool
+    eq: str = ""
+    record: ir.TRecord | None = None
+    why: str = ""  # why it is not modelled (record is None)
+    kinds: dict[str, str] = field(default_factory=dict)  # record slot -> integer kind
+    generics: dict[str, list[str]] = field(default_factory=dict)
+
+    def variant(self, name: str) -> tuple[str, str, list[tuple[str, str, Any]]] | None:
+        return next((v for v in self.variants if v[0] == name), None)
+
+
+@dataclass
+class TraitInfo:
+    name: str
+    src: str
+    mod: ModPath
+    node: Any
+    file: str
+    methods: dict[str, Any] = field(default_factory=dict)  # name -> signature or default-bodied fn
 
 
 @dataclass
@@ -112,71 +149,94 @@ class FnInfo:
     owner: str | None
     mut_params: set[str]
     elem_kinds: dict[str, str] = field(default_factory=dict)  # Vec/slice parameters -> element kind
+    mod: ModPath = ()
+    file: str = ""
+    generics: dict[str, list[str]] = field(default_factory=dict)  # type parameter -> trait bounds
+    trait_method: str | None = None  # key of the trait method this implements: its contract applies
+    decl: bool = False  # a trait's method declaration: callers through the trait use its contract
+    lens: dict[str, int] = field(default_factory=dict)  # [T; N] parameters -> N
+
+
+RESULT_TAG = ir.TEnum("Result$tag", ("Ok", "Err"))
+
+
+def _slot(variant: str, fname: str) -> str:
+    return f"{variant}_{fname}"
+
+
+def _tag_of(t: ir.Type) -> str:
+    return re.sub(r"\W", "_", str(t))
+
+
+def _derives(attrs: list[str], trait: str) -> bool:
+    return any(re.search(rf"\b{trait}\b", a) for a in attrs if "derive" in a)
 
 
 class RustFrontend:
-    def __init__(self, path: str, source: str):
+    def __init__(self, path: str, source: str, abs_path: str | None = None, root: str | None = None):
         self.path = path
         self.source = source
         self.lines = source.splitlines()
+        self.abs = os.path.normpath(os.path.abspath(abs_path or path))
+        self.root = os.path.normpath(os.path.abspath(root)) if root else os.getcwd()
         self.module = ir.Module(path=path, language="rust", source=source)
         self.module.assumptions = list(RUST_ASSUMPTIONS)
         self.structs: dict[str, StructInfo] = {}
-        self.enums: dict[str, ir.TEnum] = {}
-        self.consts: dict[str, tuple[Any, str | None]] = {}  # name -> (literal node, int kind)
-        self.fns: dict[str, FnInfo] = {}
+        self.enums: dict[str, ir.TEnum] = {}  # enums without data
+        self.data_enums: dict[str, EnumInfo] = {}
+        self.traits: dict[str, TraitInfo] = {}
+        self.classes: dict[str, ir.ClassDecl] = {}  # every class of the crate; module.classes holds this file's
+        self.records: dict[str, ir.TRecord] = {}
+        self.aliases: dict[tuple[ModPath, str], Any] = {}  # type aliases -> their item
+        self.consts: dict[tuple[ModPath, str], tuple[Any, str | None]] = {}  # -> (literal node, int kind)
+        self.const_types: dict[tuple[ModPath, str], Any] = {}  # other constants and statics -> their type
+        self.fns: dict[str, FnInfo] = {}  # by "file\0key": keys are unique per file only
+        self.file_keys: dict[str, set[str]] = {}
+        self.fn_keys: dict[int, str] = {}  # id(fn node) -> uid in fns
+        self.methods: dict[tuple[str, str], str] = {}  # (type or trait, method) -> uid; ("default:" + m) for a trait's default body
+        self.impls_of: dict[str, list[str]] = {}  # type -> traits it implements
+        self.ir_names: dict[int, str] = {}  # id(type item node) -> IR name
         self.contract_lines: list[ContractLine] = []
+        self.other_contracts: dict[str, tuple[list[str], list[ContractLine]]] = {}
+        self.cur_mod: ModPath = ()
+        self.cur_generics: dict[str, list[str]] = {}
+        self.cur_self: str | None = None
+        self.cur_subst: dict[str, ir.Type] = {}
+        self._alias_stack: list[int] = []
+        self._enum_stack: list[str] = []
+        self.call_names: dict[str, str] = {}
+        self.result_kinds: dict[str, dict[str, str]] = {}  # Result record -> slot -> integer kind
 
     # -- entry ----------------------------------------------------------
 
     def run(self) -> ir.Module:
-        tree = parser().parse(self.source.encode("utf8"))
+        from .rust_crate import crate_for
+
+        self.crate = crate_for(self.abs, self.source)
+        tree = self.crate.trees.get(self.abs) or parser().parse(self.source.encode("utf8"))
         root = tree.root_node
         if root.has_error:
             bad = _first_error(root)
             self.module.problems.append(("syntax error (or Rust syntax telic's parser does not know)", ir.Loc(bad.start_point[0] + 1 if bad else 1)))
-        comments = []
-        self._collect_comments(root, comments)
+        for f, msg, line in self.crate.problems:
+            if f == self.abs:
+                self.module.notes.append((msg, ir.Loc(line)))
+        comments: list = []
+        _collect_comments(root, comments)
         try:
             self.contract_lines = parse_comment_lines(comments, "//")
         except ContractSyntaxError as e:
             self.module.problems.append((str(e), ir.Loc(e.line, e.col)))
             return self.module
-        items = self._items(root)
-        # types first, then signatures, then bodies: calls may be forward
-        for it, attrs in items:
-            if it.type == "struct_item":
-                self._struct(it, attrs)
-            elif it.type == "enum_item":
-                self._enum(it)
-            elif it.type == "const_item":
-                self._const(it)
-        mutating_impls: set[str] = set()
-        for it, _ in items:
-            if it.type == "impl_item":
-                owner = self._impl_owner(it)
-                for f in self._impl_fns(it):
-                    sp = f.child_by_field_name("parameters")
-                    if sp is not None and any(c.type == "self_parameter" and "mut" in _text(c) and "&" in _text(c) for c in sp.children):
-                        mutating_impls.add(owner or "")
-        for s in self.structs.values():
-            scalar = all(self.rtype(tn, s.name)[0] in (ir.INT, ir.REAL, ir.BOOL, ir.STR) or isinstance(self.rtype(tn, s.name)[0], ir.TEnum) for _, _, tn in s.fields)
-            s.record = s.copy and scalar and s.name not in mutating_impls
-        for s in self.structs.values():
-            self._declare_struct(s)
-        for s in self.structs.values():
-            self._lifecycles(s)
-        for it, _ in items:
-            if it.type == "function_item":
-                self._signature(it, None)
-            elif it.type == "impl_item":
-                owner = self._impl_owner(it)
-                if owner is None:
-                    self.module.notes.append(("impl of a type telic does not model: its methods are unchecked", ir.Loc(it.start_point[0] + 1)))
-                    continue
-                for f in self._impl_fns(it):
-                    self._signature(f, owner)
-        for key, info in self.fns.items():
+        self.other_contracts[self.abs] = (self.lines, self.contract_lines)
+        self._declare()
+        self._signatures()
+        mine = set(self.crate.modules_in(self.abs))
+        for info in self.fns.values():
+            key = info.key
+            if info.file != self.abs or info.mod not in mine:
+                continue
+            self._enter(info)
             try:
                 fn = FunctionLowerer(self, info).lower()
             except LowerError as e:
@@ -199,7 +259,11 @@ class RustFrontend:
                     self.module.problems.append((f"'@aim {', '.join(ids)}' outside a function links nothing", ir.Loc(cl.line, cl.col)))
                 continue
             self.module.problems.append((f"'@{cl.keyword}' is not attached to anything telic checks", ir.Loc(cl.line, cl.col)))
+        self.module.records.update(self.records)
         return self.module
+
+    def _enter(self, info: FnInfo) -> None:
+        self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst = info.mod, info.generics, info.owner, {}
 
     def _stub(self, info: FnInfo, msg: str, line: int) -> ir.Function:
         n = info.node
@@ -207,64 +271,146 @@ class RustFrontend:
         fn.unsupported.append((msg, ir.Loc(line or n.start_point[0] + 1)))
         return fn
 
-    def _collect_comments(self, n: Any, out: list) -> None:
-        if n.type == "line_comment":
-            out.append((n.start_point[0] + 1, n.start_point[1], _text(n).rstrip("\n")))
-            return
-        for c in n.children:
-            self._collect_comments(c, out)
+    def rel(self, file: str) -> str:
+        return os.path.relpath(file, self.root)
 
-    def _items(self, root: Any) -> list[tuple[Any, list[str]]]:
-        """Top-level items (also inside inline 'mod m { ... }'), with their attributes."""
-        out: list[tuple[Any, list[str]]] = []
+    def call_name(self, info: FnInfo) -> str:
+        """How this module's IR names a call to ``info`` (imported when it
+        lives in another file)."""
+        if info.file == self.abs:
+            return info.key
+        name = self.call_names.get(info.key + "\0" + info.file)
+        if name is None:
+            name = info.key
+            local = self.file_keys.get(self.abs, set())
+            while name in local or name in self.module.imports and self.module.imports[name] != (self.rel(info.file), info.key):
+                name += "@" + (re.sub(r"\W", "_", "_".join(info.mod)) or "crate")
+            self.module.imports[name] = (self.rel(info.file), info.key)
+            self.call_names[info.key + "\0" + info.file] = name
+        return name
 
-        def walk(container: Any) -> None:
-            attrs: list[str] = []
-            for c in container.children:
-                if c.type == "attribute_item":
-                    attrs.append(_text(c))
-                    continue
-                if c.type == "mod_item":
-                    body = c.child_by_field_name("body")
-                    if body is not None:
-                        walk(body)
-                    attrs = []
-                    continue
-                if c.type in ("line_comment", "block_comment"):
-                    continue
-                if c.is_named:
-                    if not any("cfg(test)" in a for a in attrs):
-                        out.append((c, attrs))
-                    attrs = []
-
-        walk(root)
-        return out
-
-    def _impl_owner(self, it: Any) -> str | None:
-        t = it.child_by_field_name("type")
-        name = _text(t).split("<")[0].strip() if t is not None else ""
-        return name if name in self.structs else None
-
-    def _impl_fns(self, it: Any) -> list[Any]:
-        body = it.child_by_field_name("body")
-        return [c for c in body.children if c.type == "function_item"] if body is not None else []
+    def contracts_of(self, file: str) -> tuple[list[str], list[ContractLine]]:
+        """Source lines and contract lines of a file of the crate."""
+        if file not in self.other_contracts:
+            src = self.crate.sources.get(file, "")
+            comments: list = []
+            tree = self.crate.trees.get(file)
+            if tree is not None:
+                _collect_comments(tree.root_node, comments)
+            try:
+                cls = parse_comment_lines(comments, "//")
+            except ContractSyntaxError:
+                cls = []
+            self.other_contracts[file] = (src.splitlines(), cls)
+        return self.other_contracts[file]
 
     # -- declarations ---------------------------------------------------
 
-    def _struct(self, it: Any, attrs: list[str]) -> None:
-        name = _text(it.child_by_field_name("name"))
-        body = it.child_by_field_name("body")
-        copy = any(re.search(r"\bCopy\b", a) for a in attrs if "derive" in a)
+    def _declare(self) -> None:
+        items = self.crate.all_items()
+        counts: dict[str, int] = {}
+        for it in items:
+            if it.kind in ("struct", "enum", "trait", "union", "type"):
+                counts[it.name] = counts.get(it.name, 0) + 1
+        for it in items:
+            if it.kind in ("struct", "enum", "trait", "union", "type"):
+                self.ir_names[id(it.node)] = it.name if counts[it.name] <= 1 else f"{it.name}@{'_'.join(it.mod) or 'crate'}"
+        firsts = [its[0] for m in self.crate.mods.values() for its in m.items.values()]
+        for it in firsts:
+            self.cur_mod, self.cur_generics, self.cur_self = it.mod, {}, None
+            if it.kind == "struct":
+                self._struct(it)
+            elif it.kind == "enum":
+                self._enum(it)
+            elif it.kind == "trait":
+                self._trait(it)
+            elif it.kind == "const" or it.kind == "static":
+                self._const(it)
+            elif it.kind == "type":
+                self.aliases[(it.mod, it.name)] = it
+        mutated: set[str] = set()
+        for m in self.crate.mods.values():
+            for imp in m.impls:
+                self.cur_mod = imp.mod
+                owner = self._impl_owner(imp.node)
+                trait = imp.node.child_by_field_name("trait")
+                if owner is not None and trait is not None and _text(trait).split("<")[0].split("::")[-1] == "PartialEq":
+                    for info in (self.structs.get(owner), self.data_enums.get(owner)):
+                        if info is not None:
+                            info.eq = "impl"
+                for f in self._impl_fns(imp.node):
+                    sp = f.child_by_field_name("parameters")
+                    if sp is not None and any(c.type == "self_parameter" and "mut" in _text(c) and "&" in _text(c) for c in sp.children):
+                        mutated.add(owner or "")
+        for s in self.structs.values():
+            self._in(s.mod, s.generics)
+            types = [self.rtype(tn, s.name)[0] for _, _, tn in s.fields]
+            scalar = all(t in (ir.INT, ir.REAL, ir.BOOL, ir.STR) or isinstance(t, ir.TEnum) for t in types)
+            s.record = s.copy and scalar and s.name not in mutated
+        for s in self.structs.values():
+            self._in(s.mod, s.generics)
+            self._declare_struct(s)
+        for e in self.data_enums.values():
+            self._enum_record(e)
+
+    def _in(self, mod: ModPath, generics: dict[str, list[str]], owner: str | None = None) -> None:
+        self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst = mod, generics, owner, {}
+
+    def _generics(self, node: Any, outer: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+        """Type parameters and their trait bounds (inline and in where clauses)."""
+        out = {k: list(v) for k, v in (outer or {}).items()}
+        tps = node.child_by_field_name("type_parameters")
+        for p in tps.named_children if tps is not None else []:
+            if p.type in ("type_parameter", "constrained_type_parameter", "optional_type_parameter"):
+                nm = p.child_by_field_name("name") or p.child_by_field_name("left") or (p.named_children[0] if p.named_children else None)
+                if nm is None:
+                    continue
+                b = p.child_by_field_name("bounds")
+                out[_text(nm)] = out.get(_text(nm), []) + (self._bounds(b) if b is not None else [])
+            elif p.type == "type_identifier":
+                out.setdefault(_text(p), [])
+        for c in node.children:
+            if c.type == "where_clause":
+                for wp in c.named_children:
+                    if wp.type != "where_predicate":
+                        continue
+                    left, b = wp.child_by_field_name("left"), wp.child_by_field_name("bounds")
+                    if left is not None and _text(left) in out and b is not None:
+                        out[_text(left)] += self._bounds(b)
+        return out
+
+    def _bounds(self, b: Any) -> list[str]:
+        out = []
+        for t in b.named_children:
+            if t.type == "lifetime":
+                continue
+            txt = _text(t).split("<")[0].strip().lstrip("?")
+            full = " ".join(_text(t).split()).lstrip("?")
+            out.append(self._trait_named(txt) or full.split("<")[0].split("::")[-1] + full[len(full.split("<")[0]) :])
+        return out
+
+    def _trait_named(self, path: str) -> str | None:
+        r = self.crate.resolve(self.cur_mod, path.split("::"))
+        if r is not None and r.kind == "item" and r.item is not None and r.item.kind == "trait":
+            return self.ir_names.get(id(r.item.node))
+        return None
+
+    def _struct(self, it: Any) -> None:
+        name = self.ir_names[id(it.node)]
+        body = it.node.child_by_field_name("body")
+        copy = _derives(it.attrs, "Copy")
         fields: list[tuple[str, str, Any]] = []
-        if body is None or body.type != "field_declaration_list":
-            if body is not None:
-                self.module.notes.append((f"struct {name}: tuple structs are not modelled yet; its values are unchecked", ir.Loc(it.start_point[0] + 1)))
-                return
-        else:
+        tup = False
+        if body is not None and body.type == "ordered_field_declaration_list":
+            tup = True
+            for i, tn in enumerate(c for c in body.children if c.is_named and c.type not in ("visibility_modifier", "attribute_item", "line_comment", "block_comment")):
+                fields.append((f"_{i}", _text(tn), tn))
+        elif body is not None:
             for fd in body.children:
                 if fd.type == "field_declaration":
                     fields.append((_text(fd.child_by_field_name("name")), _text(fd.child_by_field_name("type")), fd.child_by_field_name("type")))
-        self.structs[name] = StructInfo(name, fields, copy, it)
+        eq = "derive" if _derives(it.attrs, "PartialEq") else ""
+        self.structs[name] = StructInfo(name, fields, copy, it.node, mod=it.mod, tuple=tup, eq=eq, src=it.name, generics=self._generics(it.node))
 
     def _declare_struct(self, s: StructInfo) -> None:
         typed = []
@@ -274,9 +420,15 @@ class RustFrontend:
                 s.kinds[fname] = kind
             typed.append((fname, t))
         if s.record:
-            self.module.records[s.name] = ir.TRecord(s.name, tuple(typed))
+            self.records[s.name] = ir.TRecord(s.name, tuple(typed))
         else:
-            self.module.classes[s.name] = ir.ClassDecl(s.name, [(f, t) for f, t in typed], [], ir.Loc(s.node.start_point[0] + 1, s.node.start_point[1]))
+            decl = ir.ClassDecl(s.name, [(f, t) for f, t in typed], [], ir.Loc(s.node.start_point[0] + 1, s.node.start_point[1]))
+            self.classes[s.name] = decl
+            it_file = next((i.file for i in self.crate.mods[s.mod].items.get(s.src, [])), "")
+            if it_file == self.abs:
+                self.module.classes[s.name] = decl
+            else:
+                self.module.class_origin[s.name] = self.rel(it_file)
 
     def _lifecycles(self, s: StructInfo) -> None:
         """Lifecycle lines inside a struct's braces or in the comments right above it."""
@@ -306,24 +458,130 @@ class RustFrontend:
                 self.module.problems.append((f"struct {s.name}: lifecycle: {e}", ir.Loc(cl.line, cl.col)))
 
     def _enum(self, it: Any) -> None:
-        name = _text(it.child_by_field_name("name"))
-        body = it.child_by_field_name("body")
-        members = []
+        name = self.ir_names[id(it.node)]
+        body = it.node.child_by_field_name("body")
+        variants: list[tuple[str, str, list[tuple[str, str, Any]]]] = []
         for v in body.children if body is not None else []:
-            if v.type == "enum_variant":
-                if v.child_by_field_name("body") is not None:
-                    self.module.notes.append((f"enum {name}: variants with data are not modelled yet; its values are unchecked", ir.Loc(it.start_point[0] + 1)))
-                    return
-                members.append(_text(v.child_by_field_name("name")))
-        self.enums[name] = ir.TEnum(name, tuple(members), tuple(members))
+            if v.type != "enum_variant":
+                continue
+            vn = _text(v.child_by_field_name("name"))
+            vb = v.child_by_field_name("body")
+            if vb is None:
+                variants.append((vn, "unit", []))
+            elif vb.type == "ordered_field_declaration_list":
+                tns = [c for c in vb.children if c.is_named and c.type not in ("visibility_modifier", "attribute_item", "line_comment", "block_comment")]
+                variants.append((vn, "tuple", [(str(i), _text(tn), tn) for i, tn in enumerate(tns)]))
+            else:
+                variants.append((vn, "struct", [(_text(fd.child_by_field_name("name")), _text(fd.child_by_field_name("type")), fd.child_by_field_name("type")) for fd in vb.children if fd.type == "field_declaration"]))
+        if all(k == "unit" for _, k, _ in variants):
+            members = tuple(v for v, _, _ in variants)
+            self.enums[name] = ir.TEnum(name, members, members)
+            return
+        eq = "derive" if _derives(it.attrs, "PartialEq") else ""
+        self.data_enums[name] = EnumInfo(name, it.name, it.mod, it.node, variants, _derives(it.attrs, "Copy"), eq, generics=self._generics(it.node))
+
+    def _enum_record(self, e: EnumInfo) -> ir.TRecord | None:
+        """The record modelling ``e``, or None (with ``e.why``) when a variant
+        holds what a record cannot: a list, a map, an object, or ``e`` itself."""
+        if e.record is not None or e.why:
+            return e.record
+        if e.name in self._enum_stack:
+            e.why = f"enum {e.src} is recursive"
+            return None
+        self._enum_stack.append(e.name)
+        saved = (self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst)
+        self._in(e.mod, e.generics, e.name)
+        try:
+            tag = ir.TEnum(f"{e.name}$tag", tuple(v for v, _, _ in e.variants), tuple(v for v, _, _ in e.variants))
+            fields: list[tuple[str, ir.Type]] = [("tag", tag)]
+            for vn, _, fs in e.variants:
+                for fname, rt, tn in fs:
+                    t, k = self.ty(tn, e.name)
+                    if e.name in self._enum_stack[:-1] or e.why:
+                        return None
+                    bad = self._record_field_problem(t)
+                    if bad:
+                        e.why = f"variant {vn} holds {rt} ({bad})"
+                        return None
+                    if t == ir.NONE:
+                        continue
+                    fields.append((_slot(vn, fname), t))
+                    if k:
+                        e.kinds[_slot(vn, fname)] = k
+            if len({f for f, _ in fields}) != len(fields):
+                e.why = "two variants' field names collide in telic's model"
+                return None
+            e.record = ir.TRecord(e.name, tuple(fields))
+            self.records[e.name] = e.record
+            return e.record
+        finally:
+            self._enum_stack.pop()
+            self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst = saved
+
+    def _record_field_problem(self, t: ir.Type) -> str:
+        if isinstance(t, (ir.TList, ir.TDict)):
+            return "a collection"
+        if isinstance(t, ir.TClass):
+            return "an object"
+        if isinstance(t, ir.TOption) and not (t.inner in (ir.INT, ir.REAL, ir.BOOL, ir.STR) or isinstance(t.inner, (ir.TEnum, ir.TOpaque))):
+            return "an Option of a compound value"
+        if isinstance(t, ir.TRecord) and not t.fields:
+            return "a type telic has not resolved"
+        return ""
+
+    def _trait(self, it: Any) -> None:
+        name = self.ir_names[id(it.node)]
+        info = TraitInfo(name, it.name, it.mod, it.node, it.file)
+        body = it.node.child_by_field_name("body")
+        for c in body.named_children if body is not None else []:
+            if c.type in ("function_signature_item", "function_item"):
+                info.methods[_text(c.child_by_field_name("name"))] = c
+        self.traits[name] = info
 
     def _const(self, it: Any) -> None:
-        name = _text(it.child_by_field_name("name"))
-        val = it.child_by_field_name("value")
-        t = it.child_by_field_name("type")
+        val = it.node.child_by_field_name("value")
+        t = it.node.child_by_field_name("type")
         kind = _text(t) if t is not None and _text(t) in INT_KINDS else None
-        if val is not None and val.type in ("integer_literal", "float_literal", "boolean_literal", "string_literal"):
-            self.consts[name] = (val, kind)
+        if val is not None and val.type in ("integer_literal", "float_literal", "boolean_literal", "string_literal") and it.kind == "const":
+            self.consts[(it.mod, it.name)] = (val, kind)
+        elif t is not None:
+            self.const_types[(it.mod, it.name)] = t
+        elif val is not None and val.type == "unary_expression" and _text(val).startswith("-") and val.named_children and val.named_children[0].type == "integer_literal" and it.kind == "const":
+            self.consts[(it.mod, it.name)] = (val, kind)
+
+    def _impl_owner(self, it: Any) -> str | None:
+        t = it.child_by_field_name("type")
+        if t is None:
+            return None
+        base = t.child_by_field_name("type") if t.type == "generic_type" else t
+        txt = _text(base)
+        if txt == "Self" and self.cur_self:
+            return self.cur_self
+        r = self.crate.resolve(self.cur_mod, txt.split("::"))
+        if r is None or r.kind != "item" or r.item is None or r.item.kind not in ("struct", "enum"):
+            return None
+        return self.ir_names.get(id(r.item.node))
+
+    def _impl_fns(self, it: Any) -> list[Any]:
+        body = it.child_by_field_name("body")
+        return [c for c in body.children if c.type == "function_item"] if body is not None else []
+
+    def owner_type(self, owner: str) -> ir.Type:
+        if owner in self.structs:
+            return self._resolve_record(ir.TRecord(owner, ()) if self.structs[owner].record else ir.TClass(owner))
+        if owner in self.enums:
+            return self.enums[owner]
+        if owner in self.data_enums:
+            r = self._enum_record(self.data_enums[owner])
+            return r if r is not None else ir.TOpaque(self.data_enums[owner].src)
+        if owner in self.traits:
+            return ir.TOpaque(f"generic:{owner}")
+        return ir.TOpaque(owner)
+
+    def class_decl(self, name: str) -> ir.ClassDecl:
+        return self.classes[name]
+
+    # -- types ------------------------------------------------------------
 
     def rtype(self, tn: Any, self_ty: str | None = None) -> tuple[ir.Type, str | None]:
         """IR type and integer kind of a Rust type node."""
@@ -345,21 +603,30 @@ class RustFrontend:
             return ir.NONE, None
         if k == "reference_type":
             return self.rtype(tn.child_by_field_name("type"), self_ty)
+        if k in ("dynamic_type", "abstract_type"):
+            tr = tn.child_by_field_name("trait")
+            names = [self._trait_named(_text(x).split("<")[0]) for x in ([tr] if tr is not None and tr.type != "trait_bounds" else (tr.named_children if tr is not None else []))]
+            return ir.TOpaque("generic:" + "|".join(n for n in names if n)), None
         if k in ("type_identifier", "scoped_type_identifier"):
+            if txt in self.cur_subst:
+                return self.cur_subst[txt], None
+            if txt in self.cur_generics:
+                return ir.TOpaque("generic:" + "|".join(self.cur_generics[txt])), None
             name = txt.split("::")[-1]
-            if name == "Self" and self_ty:
-                name = self_ty
-            if name == "String":
+            if name == "Self" and (self_ty or self.cur_self):
+                return self.owner_type(self_ty or self.cur_self), None  # type: ignore[arg-type]
+            if name == "String" and self._std(txt):
                 return ir.STR, None
-            if name in self.structs:
-                s = self.structs[name]
-                return (ir.TRecord(name, ()) if s.record else ir.TClass(name)), None  # records are completed by _resolve_record
-            if name in self.enums:
-                return self.enums[name], None
-            return ir.TOpaque(txt), None
+            if name == "Result" and self._std(txt):
+                return self.result_type(ir.NONE, ir.TOpaque("Error")), None
+            return self._named_type(txt, [])
         if k == "generic_type":
-            base = _text(tn.child_by_field_name("type")).split("::")[-1]
-            targs = [c for c in tn.child_by_field_name("type_arguments").children if c.is_named] if tn.child_by_field_name("type_arguments") is not None else []
+            base_n = tn.child_by_field_name("type")
+            base_txt = _text(base_n)
+            base = base_txt.split("::")[-1]
+            targs = [c for c in tn.child_by_field_name("type_arguments").children if c.is_named and c.type not in ("lifetime", "type_binding")] if tn.child_by_field_name("type_arguments") is not None else []
+            if not self._std(base_txt):
+                return self._named_type(base_txt, targs)
             if base in ("Vec", "VecDeque") and len(targs) == 1:
                 et, ek = self.rtype(targs[0], self_ty)
                 if isinstance(et, (ir.TList, ir.TDict, ir.TOption, ir.TNone)):
@@ -370,6 +637,10 @@ class RustFrontend:
                 if isinstance(it, (ir.TList, ir.TDict, ir.TOption, ir.TNone)):
                     return ir.TOpaque(txt), None
                 return ir.TOption(self._resolve_record(it)), ik
+            if base == "Result" and len(targs) in (1, 2):
+                t, tk = self.ty(targs[0], self_ty)
+                e, ek = self.ty(targs[1], self_ty) if len(targs) == 2 else (ir.TOpaque("Error"), None)
+                return self.result_type(t, e, tk, ek), tk
             if base in ("HashMap", "BTreeMap") and len(targs) == 2:
                 kt, _ = self.rtype(targs[0], self_ty)
                 vt, vk = self.rtype(targs[1], self_ty)
@@ -386,22 +657,122 @@ class RustFrontend:
             return ir.TList(self._resolve_record(et)), ek
         return ir.TOpaque(txt), None
 
+    def _std(self, path: str) -> bool:
+        """Does this type path name something outside the crate (std)?"""
+        return self.crate.resolve(self.cur_mod, path.split("::")) is None
+
+    def _named_type(self, path: str, targs: list[Any]) -> tuple[ir.Type, str | None]:
+        r = self.crate.resolve(self.cur_mod, path.split("::"))
+        if r is None or r.kind != "item" or r.item is None:
+            return ir.TOpaque(path), None
+        it = r.item
+        name = self.ir_names.get(id(it.node), it.name)
+        if it.kind == "struct" and name in self.structs:
+            s = self.structs[name]
+            return (ir.TRecord(name, ()) if s.record else ir.TClass(name)), None  # records are completed by _resolve_record
+        if it.kind == "enum":
+            if name in self.enums:
+                return self.enums[name], None
+            e = self.data_enums.get(name)
+            rec = self._enum_record(e) if e is not None else None
+            return (rec if rec is not None else ir.TOpaque(path)), None
+        if it.kind == "type":
+            if id(it.node) in self._alias_stack:
+                return ir.TOpaque(path), None
+            params = self._generics(it.node)
+            args = [self.ty(a)[0] for a in targs]
+            saved = (self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst)
+            self._alias_stack.append(id(it.node))
+            try:
+                self.cur_mod, self.cur_generics = it.mod, {}
+                self.cur_subst = dict(zip(params, args))
+                return self.ty(it.node.child_by_field_name("type"))
+            finally:
+                self._alias_stack.pop()
+                self.cur_mod, self.cur_generics, self.cur_self, self.cur_subst = saved
+        return ir.TOpaque(path), None
+
+    def type_of_text(self, text: str) -> tuple[ir.Type, str | None]:
+        """The type a piece of Rust type syntax names, here."""
+        tree = parser().parse(f"type __T = {text};".encode("utf8"))
+        item = tree.root_node.named_children[0] if tree.root_node.named_children else None
+        tn = item.child_by_field_name("type") if item is not None and not tree.root_node.has_error else None
+        if tn is None:
+            return ir.TOpaque(text), None
+        return self.ty(tn)
+
+    def result_type(self, t: ir.Type, e: ir.Type, tk: str | None = None, ek: str | None = None) -> ir.Type:
+        """``Result<T, E>``: a record of a tag and both payloads (named by
+        their types and integer kinds, so one name means one model)."""
+        fields: list[tuple[str, ir.Type]] = [("tag", RESULT_TAG)]
+        for slot, x in (("Ok_0", t), ("Err_0", e)):
+            if self._record_field_problem(x):
+                return ir.TOpaque(f"Result<{t}, {e}>")
+            if x != ir.NONE:
+                fields.append((slot, x))
+        rec = ir.TRecord(f"Result_{tk or _tag_of(t)}_{ek or _tag_of(e)}", tuple(fields))
+        self.records[rec.name] = rec
+        self.result_kinds[rec.name] = {s: k for s, k in (("Ok_0", tk), ("Err_0", ek)) if k}
+        return rec
+
     def _resolve_record(self, t: ir.Type) -> ir.Type:
-        if isinstance(t, ir.TRecord) and not t.fields and t.name in self.module.records:
-            return self.module.records[t.name]
+        if isinstance(t, ir.TRecord) and not t.fields and t.name in self.records:
+            return self.records[t.name]
         return t
 
     def ty(self, tn: Any, self_ty: str | None = None) -> tuple[ir.Type, str | None]:
         t, k = self.rtype(tn, self_ty)
         return self._resolve_record(t), k
 
-    def _signature(self, f: Any, owner: str | None) -> None:
+    # -- signatures ---------------------------------------------------------
+
+    def _signatures(self) -> None:
+        for m in self.crate.mods.values():
+            for its in m.items.values():
+                it = its[0]
+                if it.kind == "fn" and it.node.type == "function_item":
+                    self._in(it.mod, self._generics(it.node))
+                    self._signature(it.node, None, it.mod, it.file)
+        for tr in self.traits.values():
+            for mname, node in tr.methods.items():
+                self._in(tr.mod, self._generics(node, self._generics(tr.node)), tr.name)
+                self._signature(node, tr.name, tr.mod, tr.file, key=f"{tr.name}.{mname}", decl=True)
+                if node.type == "function_item":
+                    self._signature(node, tr.name, tr.mod, tr.file, key=f"{tr.name}.{mname}@default", trait_method=f"{tr.name}.{mname}")
+        for m in self.crate.mods.values():
+            for imp in m.impls:
+                self._in(imp.mod, self._generics(imp.node))
+                owner = self._impl_owner(imp.node)
+                tn = imp.node.child_by_field_name("trait")
+                trait = self._trait_named(_text(tn).split("<")[0]) if tn is not None else None
+                if owner is None:
+                    if imp.file == self.abs:
+                        self.module.notes.append(("impl of a type telic does not model: its methods are unchecked", ir.Loc(imp.node.start_point[0] + 1)))
+                        if trait is not None:
+                            self.module.assumptions.append(f"impl {_text(tn)} for {_text(imp.node.child_by_field_name('type'))} meets the trait's contracts (telic does not check it)")
+                    continue
+                if trait is not None:
+                    self.impls_of.setdefault(owner, []).append(trait)
+                for f in self._impl_fns(imp.node):
+                    mname = _text(f.child_by_field_name("name"))
+                    self._in(imp.mod, self._generics(f, self._generics(imp.node)), owner)
+                    tm = f"{trait}.{mname}" if trait is not None and mname in self.traits[trait].methods else None
+                    key = f"{owner}.{mname}"
+                    if (owner, mname) in self.methods:
+                        key += "@" + (re.sub(r"\W", "_", _text(tn)) if tn is not None else "impl")
+                    self._signature(f, owner, imp.mod, imp.file, key=key, trait_method=tm)
+
+    def _signature(self, f: Any, owner: str | None, mod: ModPath, file: str, key: str | None = None, decl: bool = False, trait_method: str | None = None) -> None:
         name = _text(f.child_by_field_name("name"))
-        key = f"{owner}.{name}" if owner else name
+        if key is None:
+            key = name
+            if key in self.file_keys.get(file, set()):
+                key = f"{name}@{'_'.join(mod) or 'crate'}"
         params: list[ir.Param] = []
         kinds: dict[str, str] = {}
         ekinds: dict[str, str] = {}
         mut_params: set[str] = set()
+        lens: dict[str, int] = {}
         self_mode = None
         ps = f.child_by_field_name("parameters")
         for p in ps.children if ps is not None else []:
@@ -409,7 +780,7 @@ class RustFrontend:
                 t = _text(p)
                 self_mode = "mut" if "&" in t and "mut" in t else "ref" if "&" in t else "value"
                 assert owner is not None
-                params.append(ir.Param("self", self._resolve_record(ir.TRecord(owner, ()) if self.structs[owner].record else ir.TClass(owner))))
+                params.append(ir.Param("self", self.owner_type(owner)))
                 if self_mode == "mut":
                     mut_params.add("self")
             elif p.type == "parameter":
@@ -422,15 +793,173 @@ class RustFrontend:
                 if tn is not None and tn.type == "reference_type" and "mut" in _text(tn).split(">")[0]:
                     mut_params.add(pname)
                     if not isinstance(t, (ir.TList, ir.TDict, ir.TClass, ir.TOpaque)):
-                        t, k = ir.TOpaque(f"&mut {_text(tn.child_by_field_name('type'))}"), None  # a mutable reference to a scalar: not modelled
-                if k and t == ir.INT:
+                        t, k = ir.TOpaque(f"&mut {_text(tn.child_by_field_name('type'))}"), None  # a mutable reference to a value: not modelled
+                if k and (t == ir.INT or isinstance(t, ir.TOption)):
                     kinds[pname] = k
                 elif k and isinstance(t, (ir.TList, ir.TDict)):
                     ekinds[pname] = k
+                size = _array_len(tn)
+                if size is not None and isinstance(t, ir.TList):
+                    lens[pname] = size
                 params.append(ir.Param(pname, t))
         rt = f.child_by_field_name("return_type")
         ret, rk = self.ty(rt, owner) if rt is not None else (ir.NONE, None)
-        self.fns[key] = FnInfo(key, f, params, ret, rk if ret == ir.INT or isinstance(ret, ir.TOption) else None, kinds, self_mode, owner, mut_params, ekinds)
+        info = FnInfo(key, f, params, ret, rk if ret == ir.INT or isinstance(ret, ir.TOption) or _is_result(ret) else None, kinds, self_mode, owner, mut_params, ekinds, mod, file, dict(self.cur_generics), trait_method, decl, lens)
+        uid = f"{file}\0{key}"
+        self.fns[uid] = info
+        self.file_keys.setdefault(file, set()).add(key)
+        if owner is None:
+            self.fn_keys[id(f)] = uid
+        elif decl:
+            self.methods[(owner, name)] = uid
+        elif key.endswith("@default"):
+            self.methods[(owner, "default:" + name)] = uid
+        else:
+            self.methods.setdefault((owner, name), uid)
+
+    def lookup(self, path: str) -> tuple | None:
+        """What a path in an expression names, from the current module:
+        ("fn", uid), ("type", name), ("variant", type, variant),
+        ("assoc", type or trait, member), ("const", key), ("generic", T, member)
+        or ("mod", path); None when it is outside the crate."""
+        segs = [s.strip() for s in re.sub(r"<[^<>]*(?:<[^<>]*>[^<>]*)*>", "", path).split("::") if s.strip()]
+        if not segs:
+            return None
+        if segs[0] == "Self" and self.cur_self:
+            owner = self.cur_self
+            if len(segs) == 1:
+                return ("type", owner)
+            if self._has_variant(owner, segs[1]):
+                return ("variant", owner, segs[1])
+            return ("assoc", owner, segs[1])
+        if segs[0] in self.cur_generics and len(segs) == 2:
+            return ("generic", segs[0], segs[1])
+        r: Res | None = self.crate.resolve(self.cur_mod, segs)
+        if r is None:
+            return None
+        if r.kind == "mod":
+            return ("mod", r.mod)
+        it = r.item
+        assert it is not None
+        if r.kind == "item":
+            if it.kind == "fn":
+                uid = self.fn_keys.get(id(it.node))
+                return ("fn", uid) if uid is not None else None
+            if it.kind in ("const", "static"):
+                return ("const", (it.mod, it.name))
+            return ("type", self.ir_names.get(id(it.node), it.name))
+        owner = self.ir_names.get(id(it.node), it.name)
+        return (r.kind, owner, r.member)
+
+    def _has_variant(self, owner: str, name: str) -> bool:
+        if owner in self.enums:
+            return name in self.enums[owner].members
+        return owner in self.data_enums and self.data_enums[owner].variant(name) is not None
+
+    def method_of(self, owner: str, m: str) -> FnInfo | None:
+        """``owner.m``: its own, or a default of a trait it implements (or,
+        for a trait, its declaration or a supertrait's)."""
+        uid = self.methods.get((owner, m))
+        if uid is not None:
+            return self.fns[uid]
+        for tr in self.impls_of.get(owner, []):
+            uid = self.methods.get((tr, "default:" + m))
+            if uid is not None:
+                return self.fns[uid]
+        if owner in self.traits:
+            for sup in self.supertraits(owner):
+                uid = self.methods.get((sup, m))
+                if uid is not None:
+                    return self.fns[uid]
+        return None
+
+    def supertraits(self, trait: str) -> list[str]:
+        out, todo = [], [trait]
+        while todo:
+            t = todo.pop()
+            if t in out or t not in self.traits:
+                continue
+            out.append(t)
+            tr = self.traits[t]
+            b = tr.node.child_by_field_name("bounds")
+            if b is not None:
+                saved = self.cur_mod
+                self.cur_mod = tr.mod
+                todo += [x for x in self._bounds(b) if x in self.traits]
+                self.cur_mod = saved
+        return out
+
+    def slot_kind(self, rec: str, slot: str) -> str | None:
+        """The integer kind of a record field."""
+        if rec in self.structs:
+            return self.structs[rec].kinds.get(slot)
+        if rec in self.data_enums:
+            return self.data_enums[rec].kinds.get(slot)
+        return self.result_kinds.get(rec, {}).get(slot)
+
+    def default_value(self, t: ir.Type, loc: ir.Loc) -> ir.Expr:
+        """The value an inactive variant's field holds in the model."""
+        d = _default(t, loc)
+        if d is not None:
+            return d
+        if isinstance(t, ir.TEnum):
+            return ir.Lit(t, loc, 0)
+        if isinstance(t, ir.TOption):
+            return ir.Lit(t, loc, None)
+        if isinstance(t, ir.TRecord):
+            return ir.RecordLit(t, loc, tuple((f, self.default_value(ft, loc)) for f, ft in t.fields))
+        return ir.Builtin(t, loc, "opaque_op", (ir.Lit(ir.STR, loc, "default"),))
+
+
+def _array_len(tn: Any) -> int | None:
+    """N in [T; N] (behind references)."""
+    while tn is not None and tn.type == "reference_type":
+        tn = tn.child_by_field_name("type")
+    if tn is None or tn.type != "array_type":
+        return None
+    n = tn.child_by_field_name("length")
+    if n is None or n.type != "integer_literal":
+        return None
+    try:
+        return int(re.sub(r"[_a-z]+\d*$", "", _text(n).replace("_", "")), 0)
+    except ValueError:
+        return None
+
+
+def _is_result(t: ir.Type) -> bool:
+    return isinstance(t, ir.TRecord) and t.fields[:1] == (("tag", RESULT_TAG),)
+
+
+def _collect_comments(n: Any, out: list) -> None:
+    if n.type == "line_comment":
+        out.append((n.start_point[0] + 1, n.start_point[1], _text(n).rstrip("\n")))
+        return
+    for c in n.children:
+        _collect_comments(c, out)
+
+
+def _header_contracts(node: Any, lines: list[str], contract_lines: list[ContractLine], consumed_ok: bool = False) -> list[ContractLine]:
+    """Function contract lines above a function (among its attributes and
+    comments) and at the top of its body."""
+    body = node.child_by_field_name("body")
+    start = node.start_point[0] + 1
+    by_line = {l: cl for cl in contract_lines for l in cl.raw_lines}
+    above: list[ContractLine] = []
+    ln = start - 1
+    while ln >= 1:
+        t = lines[ln - 1].strip()
+        if not (t.startswith("//") or t.startswith("#[")):
+            break
+        cl = by_line.get(ln)
+        if cl is not None and cl.keyword in FUNCTION_KEYWORDS and (consumed_ok or not cl.consumed) and cl not in above:
+            above.append(cl)
+        ln -= 1
+    above.reverse()
+    if body is not None:
+        first = next((c for c in body.children if c.is_named and c.type not in ("line_comment", "block_comment")), None)
+        limit = first.start_point[0] + 1 if first is not None else body.end_point[0] + 1
+        above += [cl for cl in contract_lines if body.start_point[0] + 1 <= cl.line < limit and cl.keyword in FUNCTION_KEYWORDS and (consumed_ok or not cl.consumed) and cl not in above]
+    return above
 
 
 def _first_error(n: Any) -> Any:
@@ -466,6 +995,7 @@ class FunctionLowerer:
         self.loop_value: list[str | None] = []  # target of 'break value' per enclosing loop
         self.range_after: list[ir.Stmt] = []
         self.escaped: set[str] = set()
+        self.refmut: set[str] = set()  # names bound into a value matched through &mut
 
     # -- entry ----------------------------------------------------------
 
@@ -482,20 +1012,32 @@ class FunctionLowerer:
             source=_text(n),
             exported=_text(n).lstrip().startswith("pub"),
         )
-        for cl in self._header_contracts(body):
+        for cl in _header_contracts(self.node, self.fe.lines, self.fe.contract_lines):
             cl.consumed = True
             try:
                 self._function_contract(cl)
             except (LowerError, ContractSyntaxError) as e:
                 self.fn.unsupported.append((f"contract: {e}", ir.Loc(getattr(e, "line", cl.line) or cl.line)))
-        if body is None:
-            self.fn.trusted = True  # a declaration without a body (trait/extern): its contract is what callers use
+        if info.trait_method is not None:
+            self._inherit(info.trait_method)
+        if body is None or info.decl:
+            self.fn.trusted = True  # a declaration (trait/extern): its contract is what callers use
             return self.fn
+        if info.self_mode == "mut" and isinstance(info.params[0].ty, (ir.TRecord, ir.TEnum)) and self.fn.ensures:
+            self.fn.unsupported.append(("'@ensures' of a method that changes a value in place (&mut self on an enum or Copy value) is not modelled", self.fn.loc))
         stmts: list[ir.Stmt] = []
         for p in info.params:
             k = self.kinds.get(p.name)
-            if k:
+            if k and p.ty == ir.INT:
                 stmts.append(ir.ExprStmt(self.fn.loc, self.in_range(ir.Var(ir.INT, self.fn.loc, p.name), k)))
+            elif k and isinstance(p.ty, ir.TOption) and p.ty.inner == ir.INT:
+                pv = ir.Var(p.ty, self.fn.loc, p.name)
+                present = ir.Unary(ir.BOOL, self.fn.loc, "not", ir.Builtin(ir.BOOL, self.fn.loc, "is_none", (pv,)))
+                stmts.append(ir.If(self.fn.loc, present, (ir.ExprStmt(self.fn.loc, self.in_range(ir.Builtin(ir.INT, self.fn.loc, "unwrap", (pv,)), k)),), ()))
+            stmts += _tag_ranges(ir.Var(p.ty, self.fn.loc, p.name), self.fn.loc)
+            if p.name in info.lens:
+                size = ir.Lit(ir.INT, self.fn.loc, info.lens[p.name])
+                stmts.append(ir.ExprStmt(self.fn.loc, ir.Builtin(ir.INT, self.fn.loc, "in_range", (ir.Builtin(ir.INT, self.fn.loc, "len", (ir.Var(p.ty, self.fn.loc, p.name),)), size, size))))
         out = self.block_value(body, stmts, info.ret, info.ret_kind)
         if out is not None and info.ret != ir.NONE:
             stmts.append(ir.Return(out.loc, self.coerce(out, info.ret)))
@@ -522,25 +1064,32 @@ class FunctionLowerer:
 
     # -- contracts ------------------------------------------------------
 
-    def _header_contracts(self, body: Any) -> list[ContractLine]:
-        start = self.node.start_point[0] + 1
-        by_line = {l: cl for cl in self.fe.contract_lines for l in cl.raw_lines}
-        above: list[ContractLine] = []
-        ln = start - 1
-        while ln >= 1:
-            t = self.fe.lines[ln - 1].strip()
-            if not (t.startswith("//") or t.startswith("#[")):
-                break
-            cl = by_line.get(ln)
-            if cl is not None and cl.keyword in FUNCTION_KEYWORDS and not cl.consumed and cl not in above:
-                above.append(cl)
-            ln -= 1
-        above.reverse()
-        if body is not None:
-            first = next((c for c in body.children if c.is_named and c.type not in ("line_comment", "block_comment")), None)
-            limit = first.start_point[0] + 1 if first is not None else body.end_point[0] + 1
-            above += [cl for cl in self.local_contracts if body.start_point[0] + 1 <= cl.line < limit and cl.keyword in FUNCTION_KEYWORDS and not cl.consumed and cl not in above]
-        return above
+    def _inherit(self, key: str) -> None:
+        """A trait method's contract binds every implementation: callers
+        through the trait rely on it, so each impl is checked against it."""
+        uid = next((u for u, i in self.fe.fns.items() if i.key == key and i.decl), None)
+        if uid is None:
+            return
+        decl = self.fe.fns[uid]
+        if self.fn.requires and not self.info.decl and self.info.trait_method:
+            self.fn.unsupported.append((f"an implementation of {ir.source_name(key)} cannot add '@requires' (callers through the trait do not know it); state it on the trait", self.fn.loc))
+        lines, cls = self.fe.contracts_of(decl.file)
+        own = [p.name for p in self.info.params]
+        theirs = [p.name for p in decl.params]
+        self.scopes.append({t: self.resolve(o) for t, o in zip(theirs, own)})
+        try:
+            for cl in _header_contracts(decl.node, lines, cls, consumed_ok=True):
+                if cl.keyword not in ("requires", "ensures", "raises"):
+                    continue
+                try:
+                    c = self.clause(cl, cl.keyword, tuple(cl.tags))
+                except (LowerError, ContractSyntaxError) as e:
+                    self.fn.unsupported.append((f"contract of {ir.source_name(key)}: {e}", self.fn.loc))
+                    continue
+                c = ir.Clause(c.kind, c.expr, self.fn.loc, c.text, c.aims)
+                {"requires": self.fn.requires, "ensures": self.fn.ensures, "raises": self.fn.raises}[cl.keyword].append(c)
+        finally:
+            self.scopes.pop()
 
     def _function_contract(self, cl: ContractLine) -> None:
         kw = cl.keyword
@@ -731,6 +1280,19 @@ class FunctionLowerer:
                         self.kinds[irn] = k2
                 out.append(ir.Assign(loc, irn, v))
                 return
+            if pat.type in ("tuple_struct_pattern", "struct_pattern") and val is not None:
+                el = ExprLowerer(self)
+                v = el.expr(val, ann, akind)
+                v = el.hoist(v) if not isinstance(v, ir.Var) else v
+                out.extend(el.pre)
+                pl = ExprLowerer(self)
+                _, binds = pl._pattern(pat, pl.kinded(v, el.kind_of(v)))  # irrefutable: rustc checks it
+                if pl.pre:
+                    raise self.err(f"unsupported pattern in let: {_text(pat)}", s)
+                by_ref = self.mut_ref(val)
+                for b, e in binds:
+                    self.bind(b, e, pl, s, out, loc, by_ref)
+                return
             if pat.type == "tuple_pattern" and val is not None:
                 el = ExprLowerer(self)
                 v = el.expr(val)
@@ -894,31 +1456,25 @@ class FunctionLowerer:
         el = ExprLowerer(self)
         v = el.expr(val)
         out.extend(el.pre)
-        binds = self._option_pattern(pat)
-        if binds is None or not isinstance(v.ty, ir.TOption):
-            raise self.err("only 'while let Some(x) = ...' is supported", cond)
-        t = self.fresh("opt", v.ty)
+        t = self.fresh("scrut", v.ty)
         out.append(ir.Assign(loc, t, v))
         tv = ir.Var(v.ty, loc, t)
-        out.append(ir.If(loc, ir.Builtin(ir.BOOL, loc, "is_none", (tv,)), (ir.Break(loc),), ()))
+        k = el.kind_of(v)
+        if k:
+            self.kinds[t] = k
+        pl = ExprLowerer(self)
+        c, binds = pl._pattern(pat, pl.kinded(tv, k))
+        if pl.pre:
+            raise self.err("this 'while let' pattern is not supported", cond)
+        out.append(ir.If(loc, ir.Unary(ir.BOOL, loc, "not", c), (ir.Break(loc),), ()))
+        by_ref = self.mut_ref(val)
         self.push_scope()
         try:
-            if binds:
-                irn = self.declare(binds, v.ty.inner, pat)
-                out.append(ir.Assign(loc, irn, ir.Builtin(v.ty.inner, loc, "unwrap", (tv,))))
+            for b, e in binds:
+                self.bind(b, e, pl, pat, out, loc, by_ref)
             self._loop_body(body, out)
         finally:
             self.pop_scope()
-
-    def _option_pattern(self, pat: Any) -> str | None:
-        """'Some(x)' -> 'x', 'Some(_)' -> ''; anything else None."""
-        if pat.type == "tuple_struct_pattern" and _text(pat.child_by_field_name("type")) == "Some":
-            args = pat.named_children[1:]
-            if len(args) == 1 and args[0].type == "identifier":
-                return _text(args[0])
-            if len(args) == 1 and _text(args[0]) == "_":
-                return ""
-        return None
 
     def _for_clauses(self, cls: list[ContractLine], node: Any) -> tuple[ir.Clause, ...]:
         invs, dec = self._loop_clauses(cls)
@@ -1031,10 +1587,50 @@ class FunctionLowerer:
         self._loop_body(body, b)
         out.append(ir.ForEach(loc, ename, idx, seq, invs, tuple(b), idx_visible=visible))
 
+    def bind(self, name: str, e: ir.Expr, el: "ExprLowerer", node: Any, out: list[ir.Stmt], loc: ir.Loc, by_ref: bool = False) -> str:
+        """Bind a pattern's name to ``e`` (its integer kind follows it). A
+        binding into a ``&mut`` scrutinee is a reference telic does not
+        track, so writing through it is rejected."""
+        irn = self.declare(name, e.ty, node)
+        if isinstance(e.ty, (ir.TList, ir.TDict)):
+            k = el.kind_of_elems(e)
+            if k:
+                self.elem_kinds[irn] = k
+        else:
+            k = el.kind_of(e)
+            if k:
+                self.kinds[irn] = k
+        if by_ref and not isinstance(e.ty, ir.TClass):
+            self.refmut.add(irn)
+        out.append(ir.Assign(loc, irn, e))
+        return irn
+
+    def writable(self, name: str, node: Any) -> None:
+        if name in self.refmut:
+            raise self.err(f"'{name.split('$')[0]}' refers into a value matched through &mut; writing through it is not modelled", node)
+
+    def mut_ref(self, n: Any) -> bool:
+        """Is this scrutinee a ``&mut`` reference (so bindings borrow into it)?"""
+        while n.type == "parenthesized_expression":
+            n = n.named_children[0]
+        if n.type == "reference_expression":
+            return _is_mut_ref(n)
+        if n.type == "self":
+            return self.info.self_mode == "mut"
+        if n.type == "identifier":
+            r = self.resolve(_text(n))
+            return r in self.info.mut_params or r in self.refmut
+        if n.type == "call_expression":
+            f = n.child_by_field_name("function")
+            return f.type == "field_expression" and _text(f.child_by_field_name("field")) in ("as_mut", "get_mut", "iter_mut", "as_deref_mut", "last_mut", "first_mut")
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Expressions
 
+
+VEC_MUTATORS = {"push", "pop", "clear", "truncate", "extend", "extend_from_slice", "append", "sort", "sort_unstable", "reverse", "dedup", "retain", "insert", "remove", "swap_remove", "sort_by", "sort_by_key", "sort_unstable_by", "sort_unstable_by_key", "drain", "iter_mut", "resize", "swap", "fill", "rotate_left", "rotate_right", "split_off", "as_mut_slice", "last_mut", "first_mut", "get_mut", "push_back", "push_front", "pop_back", "pop_front"}
 
 BINOPS = {"+": "add", "-": "sub", "*": "mul", "<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "ne"}
 
@@ -1116,9 +1712,25 @@ class ExprLowerer:
         st = self.fe.structs.get(e.ty.name)
         if st is None or not st.copy:
             return e
+        return self._copy_obj(e, e.loc, 0)
+
+    def _copy_obj(self, e: ir.Expr, loc: ir.Loc, depth: int) -> ir.Expr:
+        """A fresh object with ``e``'s fields, objects in them copied too
+        (a derived Clone, or a Copy)."""
+        assert isinstance(e.ty, ir.TClass)
+        if depth > 3:
+            raise LowerError("copying objects nested this deep is not modelled", loc.line)
         src = self.hoist(e) if not isinstance(e, ir.Var) else e
-        decl = self.fe.module.classes[e.ty.name]
-        return self.hoist(ir.New(e.ty, e.loc, e.ty.name, tuple(ir.Field(t, e.loc, src, f) for f, t in decl.fields)))
+        decl = self.fe.classes[e.ty.name]
+        fields = []
+        for f, t in decl.fields:
+            v: ir.Expr = ir.Field(t, loc, src, f)
+            if isinstance(t, ir.TClass):
+                v = self._copy_obj(v, loc, depth + 1)
+            elif isinstance(t, ir.TList) and isinstance(t.elem, ir.TClass) or isinstance(t, ir.TDict) and isinstance(t.val, ir.TClass) or isinstance(t, ir.TOption) and isinstance(t.inner, ir.TClass):
+                v = self.hoist(ir.Extern(t, loc, "clone of a collection of objects", ()))
+            fields.append(v)
+        return self.hoist(ir.New(e.ty, loc, e.ty.name, tuple(fields)))
 
     def hoist(self, e: ir.Expr) -> ir.Expr:
         """Evaluate an effectful expression now, into a temporary."""
@@ -1127,6 +1739,8 @@ class ExprLowerer:
         t = self.fl.fresh("t", e.ty)
         self.pre.append(ir.Assign(e.loc, t, e))
         v = ir.Var(e.ty, e.loc, t)
+        if isinstance(e.ty, ir.TRecord) and not isinstance(e, ir.RecordLit):
+            self.pre += _tag_ranges(v, e.loc)
         k = self.kind_of(e)
         if k:
             self.fl.kinds[t] = k
@@ -1165,6 +1779,13 @@ class ExprLowerer:
 
     def x_string_literal(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         raw = _text(n)
+        if raw.startswith('b"'):
+            try:
+                data = bytes(raw[2:-1], "utf8").decode("unicode_escape").encode("latin-1")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                return self.opaque_str(n)
+            loc = self.loc(n)
+            return self.elems_kinded(ir.ListLit(ir.TList(ir.INT), loc, tuple(ir.Lit(ir.INT, loc, x) for x in data)), "u8")
         if raw.startswith("r") or raw.startswith("b"):
             return self.opaque_str(n)
         body = raw[1:-1]
@@ -1196,9 +1817,11 @@ class ExprLowerer:
         r = self.fl.resolve(name)
         if r in self.fl.env:
             return self.kinded(ir.Var(self.fl.env[r], loc, r), self.fl.kinds.get(r))
-        if name in self.fe.consts:
-            lit, k = self.fe.consts[name]
-            return self.expr(lit, expect, k)
+        hit = self.fe.lookup(name)
+        if hit is not None:
+            v = self._path_value(hit, name, n, expect, loc)
+            if v is not None:
+                return v
         raise self.err(f"unknown name '{name}'", n)
 
     def x_self(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
@@ -1210,15 +1833,16 @@ class ExprLowerer:
         txt = _text(n)
         parts = txt.split("::")
         loc = self.loc(n)
-        if len(parts) == 2 and parts[0] in self.fe.enums:
-            et = self.fe.enums[parts[0]]
-            if parts[1] in et.members:
-                return self._enum_lit(et, parts[1], loc)
         if len(parts) == 2 and parts[0] in INT_KINDS and parts[1] in ("MAX", "MIN"):
             lo, hi = int_range(parts[0])
             return self.kinded(ir.Lit(ir.INT, loc, hi if parts[1] == "MAX" else lo), parts[0])
         if len(parts) >= 2 and parts[-2] in ("f32", "f64") and parts[-1] in ("EPSILON",):
             return ir.Lit(ir.REAL, loc, Fraction(2) ** -52 if parts[-2] == "f64" else Fraction(2) ** -23)
+        hit = self.fe.lookup(txt)
+        if hit is not None:
+            v = self._path_value(hit, txt, n, expect, loc)
+            if v is not None:
+                return v
         if self.spec:
             raise self.err(f"'{txt}' is not supported in specifications", n)
         return ir.Extern(ir.TOpaque(txt), loc, txt, ())
@@ -1284,6 +1908,8 @@ class ExprLowerer:
                 return ir.Builtin(ir.REAL, loc, "to_real", (v,))
             if v.ty == ir.REAL:
                 return v
+        if tt == "char" and v.ty == ir.INT:
+            return self.opaque("as_char", [v], ir.STR, loc)
         raise self.err(f"unsupported cast from {v.ty} to {tt}", n)
 
     def x_binary_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
@@ -1307,6 +1933,12 @@ class ExprLowerer:
             return tv
         a = self.expr(ln, None, kind)
         b = self.expr(rn, a.ty if a.ty in (ir.INT, ir.REAL) else None, self.kind_of(a) or kind)
+        if op not in ("==", "!=") and not self.spec:
+            # a value from unchecked code in arithmetic has the other operand's type
+            if isinstance(a.ty, ir.TOpaque) and (b.ty == ir.REAL or b.ty == ir.INT and self.kind_of(b)):
+                a = self._opaque_as(a, b.ty, self.kind_of(b))
+            elif isinstance(b.ty, ir.TOpaque) and (a.ty == ir.REAL or a.ty == ir.INT and self.kind_of(a)):
+                b = self._opaque_as(b, a.ty, self.kind_of(a))
         if a.ty == ir.INT and b.ty == ir.INT and not self.kind_of(a) and self.kind_of(b):
             self.kinded(a, self.kind_of(b))
         k = self.kind_of(a) or self.kind_of(b)
@@ -1315,8 +1947,7 @@ class ExprLowerer:
         if b.ty == ir.REAL and a.ty == ir.INT and isinstance(a, ir.Lit):
             a = ir.Lit(ir.REAL, a.loc, Fraction(a.value))  # type: ignore[arg-type]
         if op in ("==", "!="):
-            a, b = self._same(a, b, n)
-            return ir.Binary(ir.BOOL, loc, BINOPS[op], a, b)
+            return self._eq(a, b, n, BINOPS[op])
         if op in ("<", "<=", ">", ">="):
             if not (a.ty == b.ty and a.ty in (ir.INT, ir.REAL, ir.STR)):
                 raise self.err(f"cannot compare {a.ty} and {b.ty}", n)
@@ -1342,8 +1973,48 @@ class ExprLowerer:
             if a.ty == ir.BOOL and b.ty == ir.BOOL and op in ("&", "|", "^"):
                 return ir.Binary(ir.BOOL, loc, {"&": "and", "|": "or", "^": "ne"}[op], a, b)  # non-short-circuit on bools
             if a.ty == ir.INT and b.ty == ir.INT:
-                return self.ranged(self.opaque(f"bit{op}", [a, b], ir.INT, loc), self.kind_of(a))
+                return self._bitop(op, a, b, loc)
         raise self.err(f"unsupported operator {op} on {a.ty}", n)
+
+    def _bitop(self, op: str, a: ir.Expr, b: ir.Expr, loc: ir.Loc) -> ir.Expr:
+        """Shifts by a constant and masks of contiguous bits are arithmetic;
+        other bit operations give some value of the type. A shift by the
+        type's width or more panics."""
+        if op == "&" and isinstance(a, ir.Lit) and not isinstance(b, ir.Lit):
+            a, b = b, a
+        k = self.kind_of(a) or (self.kind_of(b) if op in ("&", "|", "^") else None)
+        lit = b.value if isinstance(b, ir.Lit) and isinstance(b.value, int) and not isinstance(b.value, bool) else None
+        if not k:
+            return self.ranged(self.opaque(f"bit{op}", [a, b], ir.INT, loc), k)
+        signed, bits = INT_KINDS[k]
+        if op in ("<<", ">>"):
+            if not (lit is not None and 0 <= lit < bits):
+                if not self.spec:
+                    fits = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), b), ir.Binary(ir.BOOL, loc, "lt", b, ir.Lit(ir.INT, loc, bits)))
+                    self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", fits, loc, f"the shift amount is below {bits}"), native=True))
+                return self.ranged(self.opaque(f"bit{op}", [a, b], ir.INT, loc), k)
+            p = ir.Lit(ir.INT, loc, 1 << lit)
+            if op == ">>":
+                return self.kinded(ir.Binary(ir.INT, loc, "floordiv", a, p), k)  # an arithmetic shift rounds down
+            raw = ir.Binary(ir.INT, loc, "mul", a, p)
+            mod = ir.Lit(ir.INT, loc, 1 << bits)
+            if not signed:
+                return self.kinded(ir.Binary(ir.INT, loc, "fmod", raw, mod), k)
+            h = ir.Lit(ir.INT, loc, 1 << (bits - 1))
+            return self.kinded(ir.Binary(ir.INT, loc, "sub", ir.Binary(ir.INT, loc, "fmod", ir.Binary(ir.INT, loc, "add", raw, h), mod), h), k)
+        if op == "&" and not signed and lit is not None and 0 <= lit < (1 << bits):
+            if lit & (lit + 1) == 0:
+                return self.kinded(ir.Binary(ir.INT, loc, "fmod", a, ir.Lit(ir.INT, loc, lit + 1)), k)
+            low = lit & -lit
+            high = lit + low
+            if high & (high - 1) == 0:  # one run of bits: a mod 2^hi - a mod 2^lo
+                return self.kinded(ir.Binary(ir.INT, loc, "sub", ir.Binary(ir.INT, loc, "fmod", a, ir.Lit(ir.INT, loc, high)), ir.Binary(ir.INT, loc, "fmod", a, ir.Lit(ir.INT, loc, low))), k)
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (self.opaque("bit&", [a, b], ir.INT, loc), ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, lit))), k)
+        return self.ranged(self.opaque(f"bit{op}", [a, b], ir.INT, loc), k)
+
+    def _opaque_as(self, e: ir.Expr, t: ir.Type, k: str | None) -> ir.Expr:
+        v = self.hoist(ir.Builtin(t, e.loc, "from_opaque", (e,)))
+        return self.ranged(v, k) if t == ir.INT else v
 
     def _same(self, a: ir.Expr, b: ir.Expr, n: Any) -> tuple[ir.Expr, ir.Expr]:
         if a.ty == b.ty:
@@ -1412,6 +2083,7 @@ class ExprLowerer:
             name = self.fl.resolve(_text(left))
             if name not in self.fl.env:
                 raise self.err(f"unknown variable '{name}'", left)
+            self.fl.writable(name, left)
             ty = self.fl.env[name]
             value = self.fl.coerce(value, ty)
             if isinstance(ty, ir.TList) and ty.elem == ir.NONE and isinstance(value.ty, ir.TList):
@@ -1424,13 +2096,14 @@ class ExprLowerer:
             obj = self.expr(left.child_by_field_name("value"))
             fname = _text(left.child_by_field_name("field"))
             if isinstance(obj.ty, ir.TClass):
-                decl = self.fe.module.classes[obj.ty.name]
+                decl = self.fe.classes[obj.ty.name]
                 ft = decl.field_type(fname)
                 if ft is None:
                     raise self.err(f"{obj.ty.name} has no field '{fname}'", left)
                 self.pre.append(ir.FieldAssign(loc, obj, obj.ty.name, fname, self.fl.coerce(value, ft)))
                 return
             if isinstance(obj.ty, ir.TRecord) and isinstance(obj, ir.Var):
+                self.fl.writable(obj.name, left)
                 # a Copy struct is a value: rebuild it with the field replaced
                 fields = tuple((f, self.fl.coerce(value, t) if f == fname else ir.Field(t, loc, obj, f)) for f, t in obj.ty.fields)
                 if fname not in dict(obj.ty.fields):
@@ -1443,6 +2116,7 @@ class ExprLowerer:
             seq = self.expr(seq_n)
             idx = self.expr(idx_n, ir.INT)
             if isinstance(seq.ty, ir.TList) and isinstance(seq, ir.Var):
+                self.fl.writable(seq.name, left)
                 self.pre.append(ir.IndexAssign(loc, seq.name, idx, self.fl.coerce(value, seq.ty.elem), wrap=False))
                 return
             if isinstance(seq.ty, ir.TDict) and isinstance(seq, ir.Var):
@@ -1453,35 +2127,31 @@ class ExprLowerer:
                 return
             raise self.err("assignment through an index needs a Vec variable or field", left)
         if left.type == "unary_expression" and _text(left.children[0]) == "*":
-            target = left.named_children[0]
-            obj = self.expr(target) if target.type == "identifier" else None
-            if obj is not None and isinstance(obj.ty, ir.TClass):
-                # the struct behind the reference is overwritten in place, field by field
-                tmp = self.fl.fresh("whole", obj.ty)
-                self.pre.append(ir.Assign(loc, tmp, self.fl.coerce(value, obj.ty)))
-                src = ir.Var(obj.ty, loc, tmp)
-                for f, t in self.fe.module.classes[obj.ty.name].fields:
-                    self.pre.append(ir.FieldAssign(loc, obj, obj.ty.name, f, ir.Field(t, loc, src, f)))
+            inner = left.named_children[0]
+            if inner.type == "self":
+                if "self" not in self.fl.env or isinstance(self.fl.env["self"], ir.TClass):
+                    raise self.err("assigning a whole object through *self is not modelled", left)
+                self.pre.append(ir.Assign(loc, "self", self.fl.coerce(value, self.fl.env["self"])))
                 return
-            return self._store(target, value, n)
+            return self._store(inner, value, n)
         raise self.err(f"unsupported assignment target: {_text(left)}", left)
 
     def x_field_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         obj = self.expr(n.child_by_field_name("value"))
         f = _text(n.child_by_field_name("field"))
+        f = f"_{f}" if f.isdigit() else f
         loc = self.loc(n)
         if isinstance(obj.ty, ir.TOption) and not self.spec:
             raise self.err("field of an Option: unwrap it first", n)
-        if isinstance(obj.ty, (ir.TClass, ir.TRecord)):
-            s = self.fe.structs[obj.ty.name]
-            ft = dict(obj.ty.fields).get(f) if isinstance(obj.ty, ir.TRecord) else self.fe.module.classes[obj.ty.name].field_type(f)
+        if isinstance(obj.ty, (ir.TClass, ir.TRecord)) and obj.ty.name in self.fe.structs:
+            ft = dict(obj.ty.fields).get(f) if isinstance(obj.ty, ir.TRecord) else self.fe.classes[obj.ty.name].field_type(f)
             if ft is None:
                 raise self.err(f"{obj.ty.name} has no field '{f}'", n)
             v = ir.Field(ft, loc, obj, f)
-            k = s.kinds.get(f)
+            k = self.fe.slot_kind(obj.ty.name, f)
             if isinstance(ft, ir.TList):
                 return self.elems_kinded(v, k)
-            return self.ranged(v, k) if ft == ir.INT else v
+            return self.ranged(v, k) if ft == ir.INT else self.kinded(v, k)
         if isinstance(obj.ty, ir.TOpaque):
             if self.spec:
                 raise self.err(f"field '{f}' of an unchecked value in a specification", n)
@@ -1563,41 +2233,45 @@ class ExprLowerer:
         return ir.Var(ir.TList(v.ty), loc, t)
 
     def x_struct_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
-        name = _text(n.child_by_field_name("name")).split("::")[-1]
-        if name == "Self" and self.fl.info.owner:
-            name = self.fl.info.owner
+        path = _text(n.child_by_field_name("name"))
         loc = self.loc(n)
-        if name not in self.fe.structs:
-            if self.spec:
-                raise self.err(f"struct {name} is not modelled", n)
-            return ir.Extern(ir.TOpaque(name), loc, name, tuple(self.hoist(self.expr(c)) for c in n.child_by_field_name("body").named_children if c.type != "base_field_initializer"))
-        s = self.fe.structs[name]
         body = n.child_by_field_name("body")
-        vals: dict[str, ir.Expr] = {}
+        hit = self.fe.lookup(path)
+        if hit is not None and hit[0] == "variant" and hit[1] in self.fe.data_enums:
+            e = self.fe.data_enums[hit[1]]
+            rec = self.fe._enum_record(e)
+            if rec is not None:
+                vals: dict[str, ir.Expr] = {}
+                types = dict(rec.fields)
+                for c in body.named_children:
+                    if c.type == "shorthand_field_initializer":
+                        slot = _slot(hit[2], _text(c))
+                        vals[slot] = self.x_identifier(c.named_children[0] if c.named_children else c, types.get(slot), self.fe.slot_kind(rec.name, slot))
+                    elif c.type == "field_initializer":
+                        slot = _slot(hit[2], _text(c.child_by_field_name("field")))
+                        vals[slot] = self.expr(c.child_by_field_name("value"), types.get(slot), self.fe.slot_kind(rec.name, slot))
+                    elif c.type == "base_field_initializer":
+                        raise self.err("'..base' in an enum variant", c)
+                return self._variant(rec, hit[2], vals, loc)
+        s = self.fe.structs.get(hit[1]) if hit is not None and hit[0] == "type" else None
+        if s is None:
+            if self.spec:
+                raise self.err(f"struct {path} is not modelled", n)
+            return ir.Extern(ir.TOpaque(path), loc, path, tuple(self.hoist(self.expr(c)) for c in body.named_children if c.type != "base_field_initializer"))
+        vals = {}
         base = None
-        types = dict((f, t) for f, t in (self.fe.module.records[name].fields if s.record else self.fe.module.classes[name].fields))
+        types = self._struct_fields(s)
         for c in body.named_children:
             if c.type == "shorthand_field_initializer":
                 f = _text(c)
                 vals[f] = self.x_identifier(c.named_children[0] if c.named_children else c, types.get(f), s.kinds.get(f))
             elif c.type == "field_initializer":
                 f = _text(c.child_by_field_name("field"))
+                f = f"_{f}" if f.isdigit() else f
                 vals[f] = self.copy_value(self.expr(c.child_by_field_name("value"), types.get(f), s.kinds.get(f)))
             elif c.type == "base_field_initializer":
                 base = self.hoist(self.expr(c.named_children[0]))
-        args = []
-        for f, t in types.items():
-            if f in vals:
-                args.append(self.fl.coerce(vals[f], t))
-            elif base is not None:
-                args.append(ir.Field(t, loc, base, f))
-            else:
-                raise self.err(f"{name} literal is missing field '{f}'", n)
-        if s.record:
-            return ir.RecordLit(self.fe.module.records[name], loc, tuple(zip(types, args)))
-        if self.spec:
-            raise self.err("specifications cannot create objects", n)
-        return self.hoist(ir.New(ir.TClass(name), loc, name, tuple(args)))
+        return self._build_struct(s, vals, base, loc, n)
 
     def x_if_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         loc = self.loc(n)
@@ -1649,19 +2323,18 @@ class ExprLowerer:
 
     def _if_let(self, cond: Any, cons: Any, alt: Any, expect: Any, kind: Any, loc: ir.Loc) -> ir.Expr:
         pat = cond.child_by_field_name("pattern")
-        v = self.expr(cond.child_by_field_name("value"))
-        binds = self.fl._option_pattern(pat)
-        if binds is None or not isinstance(v.ty, ir.TOption):
-            raise self.err("only 'if let Some(x) = ...' is supported", cond)
+        value_n = cond.child_by_field_name("value")
         if self.spec:
             raise self.err("if let in a specification", cond)
+        v = self.expr(value_n)
         t = self.hoist(v) if not isinstance(v, ir.Var) else v
+        c, binds = self._pattern(pat, t)
+        by_ref = self.fl.mut_ref(value_n)
         then_pre: list[ir.Stmt] = []
         self.fl.push_scope()
         try:
-            if binds:
-                irn = self.fl.declare(binds, v.ty.inner, pat)
-                then_pre.append(ir.Assign(loc, irn, ir.Builtin(v.ty.inner, loc, "unwrap", (t,))))
+            for b, e in binds:
+                self.fl.bind(b, e, self, pat, then_pre, loc, by_ref)
             tv = self.fl.block_value(cons, then_pre, expect, kind)
         finally:
             self.fl.pop_scope()
@@ -1674,17 +2347,16 @@ class ExprLowerer:
                 s = self.sub()
                 ev = s.expr(alt, expect, kind)
                 else_pre = s.pre
-        c = ir.Unary(ir.BOOL, loc, "not", ir.Builtin(ir.BOOL, loc, "is_none", (t,)))
         return self._join(c, then_pre, tv, else_pre, ev, expect, loc)
 
     def x_match_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         loc = self.loc(n)
         if self.spec:
             raise self.err("match in a specification", n)
-        scrut = self.hoist(self.expr(n.child_by_field_name("value")))
+        value_n = n.child_by_field_name("value")
+        scrut = self.hoist(self.expr(value_n))
+        by_ref = self.fl.mut_ref(value_n)
         arms = [c for c in n.child_by_field_name("body").named_children if c.type == "match_arm"]
-        # build an if-chain from the last arm up
-        result: tuple[list[ir.Stmt], ir.Expr | None] | None = None
         conds = []
         for arm in arms:
             pat = arm.child_by_field_name("pattern")
@@ -1692,22 +2364,15 @@ class ExprLowerer:
             cond, binds = self._pattern(pat, scrut)
             guard = pat.child_by_field_name("condition") if pat.type == "match_pattern" else None
             conds.append((cond, binds, guard, val))
-        out_var = None
-        chain: list[ir.Stmt] = []
         results = []
         for cond, binds, guard, val in conds:
             self.fl.push_scope()
             pre: list[ir.Stmt] = []
             for b, e in binds:
-                pre.append(ir.Assign(loc, self.fl.declare(b, e.ty, val), e))
+                self.fl.bind(b, e, self, val, pre, loc, by_ref)
             if guard is not None:
-                g = self.sub()
-                gc = g.expr(guard, ir.BOOL)
-                if g.pre:
-                    raise self.err("match guards with side effects are not supported", guard)
+                gc = self._guard(guard, binds)
                 cond = ir.Binary(ir.BOOL, loc, "and", cond, gc) if not (isinstance(cond, ir.Lit) and cond.value is True) else gc
-                if binds:
-                    raise self.err("match guards on patterns that bind names are not supported", guard)
             if val.type == "block":
                 v = self.fl.block_value(val, pre, expect, kind)
             else:
@@ -1718,6 +2383,7 @@ class ExprLowerer:
             results.append((cond, pre, v))
         valued = all(v is not None and v.ty != ir.NONE for _, _, v in results) and not (expect == ir.NONE)
         ty = None
+        out_var = None
         if valued:
             ty = expect if expect is not None else next((v.ty for _, _, v in results if not (isinstance(v, ir.Lit) and v.value is None and v.ty == ir.NONE)), results[0][2].ty)  # type: ignore[union-attr]
             out_var = self.fl.fresh("match", ty)
@@ -1745,33 +2411,82 @@ class ExprLowerer:
         return ir.Var(ty, loc, out_var)  # type: ignore[arg-type]
 
     def _pattern(self, pat: Any, scrut: ir.Expr) -> tuple[ir.Expr, list[tuple[str, ir.Expr]]]:
-        """(condition, bindings) for a match arm pattern."""
+        """(condition, bindings) for a pattern matched against ``scrut``."""
         loc = self.loc(pat)
-        if pat.type == "match_pattern":
-            inner = pat.named_children[0]
-            return self._pattern(inner, scrut)
+        t = pat.type
+        if t == "match_pattern":
+            return self._pattern(pat.children[0], scrut)
         txt = _text(pat)
         true = ir.Lit(ir.BOOL, loc, True)
-        if txt == "_":
+        if txt == "_" or t == "remaining_field_pattern":
             return true, []
-        if pat.type == "identifier" and txt not in ("None",):
-            if isinstance(scrut.ty, ir.TEnum) and txt in scrut.ty.members:
-                return ir.Binary(ir.BOOL, loc, "eq", scrut, self._enum_lit(scrut.ty, txt, loc)), []
+        if t in ("reference_pattern", "ref_pattern"):
+            if txt.startswith("ref "):
+                raise self.err("'ref' bindings are not supported", pat)
+            return self._pattern(pat.named_children[0], scrut)
+        if t == "mut_pattern":
+            return self._pattern(pat.named_children[0], scrut)
+        if t == "captured_pattern":
+            name = _text(pat.named_children[0])
+            c, b = self._pattern(pat.named_children[-1], scrut)
+            return c, [(name, scrut)] + b
+        if t == "identifier":
+            if txt == "None" and isinstance(scrut.ty, ir.TOption):
+                return ir.Builtin(ir.BOOL, loc, "is_none", (scrut,)), []
+            hit = self.fe.lookup(txt)
+            if hit is not None and hit[0] in ("variant", "const"):
+                return self._path_pattern(hit, pat, scrut, loc)
             return true, [(txt, scrut)]
-        if txt == "None" and isinstance(scrut.ty, ir.TOption):
-            return ir.Builtin(ir.BOOL, loc, "is_none", (scrut,)), []
-        if pat.type == "tuple_struct_pattern" and isinstance(scrut.ty, ir.TOption):
-            b = self.fl._option_pattern(pat)
-            if b is None:
+        if t == "scoped_identifier":
+            hit = self.fe.lookup(txt)
+            if hit is None:
+                if txt.split("::")[-1] == "None" and isinstance(scrut.ty, ir.TOption):
+                    return ir.Builtin(ir.BOOL, loc, "is_none", (scrut,)), []
                 raise self.err(f"unsupported pattern {txt}", pat)
-            present = ir.Unary(ir.BOOL, loc, "not", ir.Builtin(ir.BOOL, loc, "is_none", (scrut,)))
-            return present, ([(b, ir.Builtin(scrut.ty.inner, loc, "unwrap", (scrut,)))] if b else [])
-        if pat.type == "scoped_identifier" and isinstance(scrut.ty, ir.TEnum):
-            member = txt.split("::")[-1]
-            if member not in scrut.ty.members:
-                raise self.err(f"{scrut.ty.name} has no variant {member}", pat)
-            return ir.Binary(ir.BOOL, loc, "eq", scrut, self._enum_lit(scrut.ty, member, loc)), []
-        if pat.type == "or_pattern":
+            return self._path_pattern(hit, pat, scrut, loc)
+        if t in ("tuple_struct_pattern", "struct_pattern"):
+            tname = _text(pat.child_by_field_name("type"))
+            subs = self._subpatterns(pat)
+            hit = self.fe.lookup(tname)
+            short = tname.split("::")[-1]
+            if hit is None and short == "Some" and isinstance(scrut.ty, ir.TOption):
+                if len(subs) != 1:
+                    raise self.err(f"unsupported pattern {txt}", pat)
+                present = ir.Unary(ir.BOOL, loc, "not", ir.Builtin(ir.BOOL, loc, "is_none", (scrut,)))
+                inner = ir.Builtin(scrut.ty.inner, loc, "unwrap", (scrut,))
+                inner = self.ranged(inner, self.kind_of(scrut)) if scrut.ty.inner == ir.INT else self.kinded(inner, self.kind_of(scrut))
+                return self._and_sub(present, subs[0][1], inner, loc)
+            if hit is None and short in ("Ok", "Err") and _is_result(scrut.ty):
+                return self._variant_pattern(scrut, short, subs, pat, loc)
+            if hit is not None and hit[0] == "variant":
+                if hit[1] in self.fe.enums:
+                    return self._path_pattern(hit, pat, scrut, loc)
+                if not (isinstance(scrut.ty, ir.TRecord) and scrut.ty.name == hit[1]):
+                    raise self.err(f"pattern {tname} on {scrut.ty}", pat)
+                return self._variant_pattern(scrut, hit[2], subs, pat, loc)
+            if hit is not None and hit[0] == "type" and hit[1] in self.fe.structs:
+                s = self.fe.structs[hit[1]]
+                if not (isinstance(scrut.ty, (ir.TRecord, ir.TClass)) and scrut.ty.name == s.name):
+                    raise self.err(f"pattern {tname} on {scrut.ty}", pat)
+                types = self._struct_fields(s)
+                cond: ir.Expr = true
+                binds: list[tuple[str, ir.Expr]] = []
+                for fname, sp in subs:
+                    f = f"_{fname}" if fname.isdigit() else fname
+                    if f not in types:
+                        raise self.err(f"{s.src} has no field '{fname}'", pat)
+                    k = s.kinds.get(f)
+                    fv = ir.Field(types[f], loc, scrut, f)
+                    fv = self.ranged(fv, k) if types[f] == ir.INT else self.kinded(fv, k)
+                    if sp is None:
+                        binds.append((fname, fv))
+                        continue
+                    c, b = self._pattern(sp, fv)
+                    cond = c if isinstance(cond, ir.Lit) else (cond if isinstance(c, ir.Lit) and c.value is True else ir.Binary(ir.BOOL, loc, "and", cond, c))
+                    binds += b
+                return cond, binds
+            raise self.err(f"unsupported pattern {txt}", pat)
+        if t == "or_pattern":
             parts = [self._pattern(c, scrut) for c in pat.named_children]
             if any(b for _, b in parts):
                 raise self.err("or-patterns that bind names are not supported", pat)
@@ -1779,7 +2494,7 @@ class ExprLowerer:
             for c, _ in parts[1:]:
                 out = ir.Binary(ir.BOOL, loc, "or", out, c)
             return out, []
-        if pat.type == "range_pattern" and scrut.ty == ir.INT:
+        if t == "range_pattern" and scrut.ty == ir.INT:
             kids = pat.named_children
             lo = self.expr(kids[0], ir.INT) if kids else None
             hi = self.expr(kids[-1], ir.INT) if len(kids) > 1 else None
@@ -1792,8 +2507,8 @@ class ExprLowerer:
             for c in conds[1:]:
                 out = ir.Binary(ir.BOOL, loc, "and", out, c)
             return out, []
-        if pat.type in ("integer_literal", "string_literal", "boolean_literal", "char_literal", "negative_literal"):
-            lit = self.expr(pat if pat.type != "negative_literal" else pat, scrut.ty) if pat.type != "negative_literal" else ir.Lit(ir.INT, loc, int(txt.replace("_", "")))
+        if t in ("integer_literal", "string_literal", "boolean_literal", "char_literal", "negative_literal"):
+            lit = self.expr(pat, scrut.ty) if t != "negative_literal" else ir.Lit(ir.INT, loc, int(txt.replace("_", "")))
             a, b = self._same(scrut, lit, pat)
             return ir.Binary(ir.BOOL, loc, "eq", a, b), []
         raise self.err(f"unsupported pattern {txt}", pat)
@@ -1870,7 +2585,21 @@ class ExprLowerer:
         ret = self.fl.info.ret
         if isinstance(v.ty, ir.TOption):
             self.pre.append(ir.If(loc, ir.Builtin(ir.BOOL, loc, "is_none", (v,)), (ir.Return(loc, self.fl.coerce(ir.Lit(ir.NONE, loc, None), ret) if ret != ir.NONE else None),), ()))
-            return ir.Builtin(v.ty.inner, loc, "unwrap", (v,))
+            u = ir.Builtin(v.ty.inner, loc, "unwrap", (v,))
+            return self.ranged(u, self.kind_of(v)) if v.ty.inner == ir.INT else self.kinded(u, self.kind_of(v))
+        if _is_result(v.ty):
+            err = self._slot(v, "Err_0", loc)
+            if _is_result(ret):
+                ret_err = dict(ret.fields).get("Err_0")
+                vals = {}
+                if ret_err is not None:
+                    vals["Err_0"] = self._convert_err(err, ret_err, loc) if err is not None else self.fe.default_value(ret_err, loc)
+                early: ir.Expr | None = self._variant(ret, "Err", vals, loc)
+            else:
+                early = self.fl.coerce(self.opaque("err", [self.fl.coerce(err, ir.TOpaque("")) if err is not None else ir.Lit(ir.INT, loc, 0)], ir.TOpaque(""), loc), ret) if ret != ir.NONE else None
+            self.pre.append(ir.If(loc, self._tag_is(v, "Err", loc), (ir.Return(loc, early),), ()))
+            ok = self._slot(v, "Ok_0", loc)
+            return ok if ok is not None else ir.Lit(ir.NONE, loc, None)
         # Result (unchecked): Err returns early, Ok gives some value
         is_err = self.opaque("is_err", [v], ir.BOOL, loc)
         early = self.opaque("err", [v], ir.TOpaque(""), loc)
@@ -1920,16 +2649,15 @@ class ExprLowerer:
             if f.type == "field_expression":
                 return self.method(f.child_by_field_name("value"), _text(f.child_by_field_name("field")), argn, n, expect, kind)
         name = _text(f)
-        if name == "Some":
+        hit = self.fe.lookup(name) if f.type in ("identifier", "scoped_identifier") else None
+        short = name.split("::")[-1]
+        if hit is None and short == "Some" and len(argn) == 1:
             v = self.expr(argn[0], expect.inner if isinstance(expect, ir.TOption) else None, kind)
             if isinstance(v.ty, (ir.TList, ir.TDict, ir.TOption, ir.TOpaque)):
                 raise self.err(f"Option<{v.ty}> is not modelled", n)
             return self.kinded(ir.Builtin(ir.TOption(v.ty), loc, "some", (v,)), self.kind_of(v))
-        if name in ("Ok", "Err"):
-            if self.spec:
-                raise self.err("Result in a specification", n)
-            v = self.expr(argn[0]) if argn else ir.Lit(ir.NONE, loc, None)
-            return self.opaque(name.lower(), [self.fl.coerce(v, ir.TOpaque("")) if not isinstance(v.ty, ir.TOpaque) else v], ir.TOpaque("Result"), loc)
+        if hit is None and short in ("Ok", "Err") and len(argn) <= 1:
+            return self._result_ctor(short, argn, n, expect, loc)
         if self.spec and name == "old":
             if not self.allow_old:
                 raise self.err("old(...) is only meaningful in '@ensures' and invariants", n)
@@ -1938,31 +2666,93 @@ class ExprLowerer:
         if self.spec and name == "implies":
             a, b = self.expr(argn[0], ir.BOOL), self.expr(argn[1], ir.BOOL)
             return ir.Binary(ir.BOOL, loc, "implies", a, b)
-        key = name.replace("::", ".") if "::" in name else name
-        if key.startswith("Self.") and self.fl.info.owner:
-            key = self.fl.info.owner + key[4:]
-        info = self.fe.fns.get(key)
-        if info is None:
-            if key.endswith(".new") or key.endswith(".from") or key.endswith(".default"):
-                owner = key.rsplit(".", 1)[0]
-                if owner == "String":
-                    return self.expr(argn[0], ir.STR) if argn else ir.Lit(ir.STR, loc, "")
-                if owner in ("Vec", "HashMap", "BTreeMap", "VecDeque") and not argn:
-                    if owner in ("HashMap", "BTreeMap"):
-                        return ir.Builtin(expect if isinstance(expect, ir.TDict) else ir.TDict(ir.NONE, ir.NONE), loc, "dict_lit", ())
-                    return ir.ListLit(expect if isinstance(expect, ir.TList) else ir.TList(ir.NONE), loc, ())
+        if hit is not None and hit[0] == "fn":
+            return self.call(self.fe.fns[hit[1]], None, argn, n, expect)
+        if hit is not None and hit[0] == "type" and hit[1] in self.fe.structs and self.fe.structs[hit[1]].tuple:
+            s = self.fe.structs[hit[1]]
+            types = self._struct_fields(s)
+            if len(argn) != len(types):
+                raise self.err(f"{s.src} has {len(types)} fields", n)
+            vals = {f: self.copy_value(self.expr(a, t, s.kinds.get(f))) for (f, t), a in zip(types.items(), argn)}
+            return self._build_struct(s, vals, None, loc, n)
+        if hit is not None and hit[0] == "variant" and hit[1] in self.fe.data_enums:
+            e = self.fe.data_enums[hit[1]]
+            rec = self.fe._enum_record(e)
+            variant = e.variant(hit[2])
+            if rec is not None and variant is not None:
+                fields = variant[2]
+                if len(argn) != len(fields):
+                    raise self.err(f"{e.src}::{hit[2]} has {len(fields)} fields", n)
+                types = dict(rec.fields)
+                vals = {}
+                for (fname, _, _), a in zip(fields, argn):
+                    slot = _slot(hit[2], fname)
+                    v = self.expr(a, types.get(slot), self.fe.slot_kind(rec.name, slot))
+                    if slot in types:
+                        vals[slot] = v
+                    elif not self.spec and not isinstance(v, (ir.Lit, ir.Var)):
+                        self.pre.append(ir.ExprStmt(loc, v))
+                return self._variant(rec, hit[2], vals, loc)
             if self.spec:
-                raise self.err(f"'{name}' is not a checked function", n)
-            args = [self.hoist(self.expr(a)) for a in argn]
-            return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of {name}"), loc, name, tuple(args)))
-        return self.call(info, None, argn, n, expect)
+                raise self.err(f"enum {e.src} is not modelled ({e.why})", n)
+        if hit is not None and hit[0] == "assoc":
+            info = self.fe.method_of(hit[1], hit[2])
+            if info is not None:
+                if info.self_mode is not None:  # Type::method(x, ...)
+                    if not argn:
+                        raise self.err(f"'{info.key}' needs a receiver", n)
+                    recv = self.expr(argn[0], info.params[0].ty)
+                    return self.call(info, recv, argn[1:], n, expect)
+                return self.call(info, None, argn, n, expect)
+        if hit is None and short in ("new", "from", "default") and "::" in name:
+            owner = name.rsplit("::", 1)[0].split("::")[-1].split("<")[0]
+            if owner == "String":
+                return self.expr(argn[0], ir.STR) if argn else ir.Lit(ir.STR, loc, "")
+            if owner in ("Vec", "HashMap", "BTreeMap", "VecDeque") and not argn:
+                if owner in ("HashMap", "BTreeMap"):
+                    return ir.Builtin(expect if isinstance(expect, ir.TDict) else ir.TDict(ir.NONE, ir.NONE), loc, "dict_lit", ())
+                return ir.ListLit(expect if isinstance(expect, ir.TList) else ir.TList(ir.NONE), loc, ())
+        if self.spec:
+            raise self.err(f"'{name}' is not a checked function", n)
+        args, writes = self.extern_args(argn)
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of {name}"), loc, name, tuple(args)))
+        self.after_extern(writes)
+        return out
+
+    def extern_args(self, argn: list[Any]) -> tuple[list[ir.Expr], list[tuple[ir.Expr, Any]]]:
+        """Arguments of a call into unchecked code, and the places it may
+        write through ``&mut``."""
+        args: list[ir.Expr] = []
+        writes: list[tuple[ir.Expr, Any]] = []
+        for a in argn:
+            if a.type == "reference_expression" and _is_mut_ref(a):
+                place = self.expr(_deref_target(a.named_children[-1]))
+                writes.append((place, a))
+                args.append(place if isinstance(place, ir.Var) and isinstance(place.ty, (ir.TList, ir.TDict)) else self.hoist(place))
+            else:
+                args.append(self.hoist(self.expr(a)))
+        return args, writes
+
+    def after_extern(self, writes: list[tuple[ir.Expr, Any]]) -> None:
+        for place, node in writes:
+            if isinstance(place.ty, ir.TClass) or isinstance(place, ir.Var) and isinstance(place.ty, (ir.TList, ir.TDict)):
+                if isinstance(place, ir.Var):
+                    self.fl.writable(place.name, node)
+                continue  # (unchecked code passed a list variable or an object may change it: the VC generator havocs those)
+            self.havoc_place(place, node)
 
     def call(self, info: FnInfo, recv: ir.Expr | None, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
         loc = self.loc(n)
         params = info.params
         args: list[ir.Expr] = []
+        changed = None
         if recv is not None:
-            args.append(recv)
+            if info.self_mode == "mut" and not isinstance(recv.ty, (ir.TClass, ir.TList, ir.TDict, ir.TOpaque)) and not self.spec:
+                changed = recv  # a value behind &mut self: whatever the method leaves in it
+            r = self.fl.coerce(self.copy_value(recv) if info.self_mode == "value" else recv, params[0].ty)
+            if r.ty != params[0].ty:
+                raise self.err(f"'{info.key}' called on {recv.ty}", n)
+            args.append(r)
             params = params[1:]
         if len(argn) != len(params):
             raise self.err(f"'{info.key}' takes {len(params)} arguments", n)
@@ -1970,8 +2760,10 @@ class ExprLowerer:
         for p, a in zip(params, argn):
             if a.type == "reference_expression" and _is_mut_ref(a) and _deref_target(a.named_children[-1]).type == "identifier":
                 v = self.expr(_deref_target(a.named_children[-1]))  # &mut v: the callee may change v
-                if isinstance(v, ir.Var) and not isinstance(v.ty, (ir.TList, ir.TDict, ir.TClass)):
-                    written.append(v)  # a scalar behind &mut: whatever the callee stored
+                if isinstance(v, ir.Var):
+                    self.fl.writable(v.name, a)
+                    if not isinstance(v.ty, (ir.TList, ir.TDict, ir.TClass)):
+                        written.append(v)  # a value behind &mut: whatever the callee stored
             else:
                 v = self.expr(a, p.ty, info.param_kinds.get(p.name))
                 if a.type != "reference_expression":
@@ -1980,16 +2772,18 @@ class ExprLowerer:
             if v.ty != p.ty and not (isinstance(p.ty, ir.TList) and isinstance(v.ty, ir.TList) and v.ty.elem == ir.NONE):
                 raise self.err(f"argument '{p.name}' of '{info.key}' expects {p.ty}, got {v.ty}", a)
             args.append(v)
-        e = ir.Call(info.ret, loc, info.key, tuple(args))
+        e = ir.Call(info.ret, loc, self.fe.call_name(info), tuple(args))
         if self.spec:
             return self.kinded(e, info.ret_kind)
         if info.ret == ir.NONE:
             self.pre.append(ir.ExprStmt(loc, e))
             out: ir.Expr = ir.Lit(ir.NONE, loc, None)
         else:
-            out = self.hoist(self.ranged(e, info.ret_kind) if info.ret_kind else e)
+            out = self.hoist(self.ranged(e, info.ret_kind) if info.ret_kind and info.ret == ir.INT else self.kinded(e, info.ret_kind))
         for w in written:
             self.havoc_scalar(w, loc)
+        if changed is not None:
+            self.havoc_place(changed, n)
         return out
 
     def havoc_scalar(self, v: ir.Var, loc: ir.Loc) -> None:
@@ -1997,6 +2791,7 @@ class ExprLowerer:
         val = ir.Extern(v.ty, loc, "write through &mut", ())
         k = self.fl.kinds.get(v.name)
         self.pre.append(ir.Assign(loc, v.name, self.fl.in_range(val, k) if k and v.ty == ir.INT else val))
+        self.pre += _tag_ranges(ir.Var(v.ty, loc, v.name), loc)
 
     def x_macro_invocation(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         name = _text(n.child_by_field_name("macro")).rstrip("!")
@@ -2019,6 +2814,17 @@ class ExprLowerer:
             if any(e.ty != elems[0].ty for e in elems):
                 raise self.err("vec! elements must have one type", n)
             return self.elems_kinded(ir.ListLit(ir.TList(elems[0].ty), loc, tuple(elems)), ek)
+        if name == "matches":
+            parts = _top_level_split(body, ",")
+            if len(parts) != 2:
+                raise self.err("matches!(e, pattern)", n)
+            (en,) = self._parse_exprs(parts[0], n)
+            scrut = self.hoist(self.expr(en))
+            pat = self._parse_pattern(parts[1], n)
+            cond, binds = self._pattern(pat, scrut)
+            if binds:
+                raise self.err("matches! with bindings is not supported", n)
+            return cond
         if self.spec:
             raise self.err(f"{name}! in a specification", n)
         if name in ("panic", "unreachable", "todo", "unimplemented"):
@@ -2035,26 +2841,14 @@ class ExprLowerer:
             args = self._parse_exprs(body, n)
             a = self.expr(args[0])
             b = self.expr(args[1], a.ty)
-            a, b = self._same(a, b, n)
             op = "eq" if name.endswith("eq") else "ne"
             text = f"{' '.join(_text(args[0]).split())} {'==' if op == 'eq' else '!='} {' '.join(_text(args[1]).split())}"
-            self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Binary(ir.BOOL, loc, op, a, b), loc, text), native=True))
+            self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", self._eq(a, b, n, op), loc, text), native=True))
             return ir.Lit(ir.NONE, loc, None)
         if name in ("println", "print", "eprintln", "eprint", "dbg", "trace", "debug", "info", "warn", "error", "log"):
             return ir.Lit(ir.NONE, loc, None)
         if name == "format":
             return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "format"), ir.Lit(ir.STR, loc, body)))
-        if name == "matches":
-            parts = _top_level_split(body, ",")
-            if len(parts) != 2:
-                raise self.err("matches!(e, pattern)", n)
-            (en,) = self._parse_exprs(parts[0], n)
-            scrut = self.hoist(self.expr(en))
-            pat = self._parse_pattern(parts[1], n)
-            cond, binds = self._pattern(pat, scrut)
-            if binds:
-                raise self.err("matches! with bindings is not supported", n)
-            return cond
         return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"{name}!"), loc, f"{name}!", ()))
 
     def _parse_exprs(self, text: str, n: Any) -> list[Any]:
@@ -2083,18 +2877,29 @@ class ExprLowerer:
             return chain
         recv = self.expr(recv_n)
         t = recv.ty
-        # checked methods of a struct
-        if isinstance(t, (ir.TClass, ir.TRecord)):
-            info = self.fe.fns.get(f"{t.name}.{m}")
+        owner = t.name if isinstance(t, (ir.TClass, ir.TRecord, ir.TEnum)) else None
+        if owner is not None and (owner in self.fe.structs or owner in self.fe.enums or owner in self.fe.data_enums):
+            info = self.fe.method_of(owner, m)
             if info is not None:
                 return self.call(info, recv, argn, n, expect)
-            if m == "clone":
-                if isinstance(t, ir.TRecord):
+            if m == "clone" and not argn:
+                if not isinstance(t, ir.TClass):
                     return recv
                 if self.spec:
                     raise self.err("clone() in a specification", n)
-                decl = self.fe.module.classes[t.name]
-                return self.hoist(ir.New(t, loc, t.name, tuple(ir.Field(ft, loc, recv, f) for f, ft in decl.fields)))
+                return self._copy_obj(recv, loc, 0)
+        if _is_result(t):
+            return self.result_method(recv, m, argn, n, expect)
+        if isinstance(t, ir.TOpaque) and t.why.startswith("generic:"):
+            bounds = [x for x in t.why[len("generic:") :].split("|") if x]
+            for tr in bounds:
+                for sup in self.fe.supertraits(tr):
+                    uid = self.fe.methods.get((sup, m))
+                    if uid is not None:
+                        return self.call(self.fe.fns[uid], recv, argn, n, expect)
+            conv = self._conversion(recv, m, argn, bounds, loc)
+            if conv is not None:
+                return conv
         k = self.kind_of(recv)
         if t == ir.INT:
             return self.int_method(recv, m, argn, n, k)
@@ -2116,10 +2921,34 @@ class ExprLowerer:
             return self.str_method(recv, m, argn, n, expect)
         if self.spec:
             raise self.err(f".{m}() is not supported in specifications here", n)
+        if isinstance(t, ir.TOpaque) and m in ("len", "count", "capacity") and not argn:
+            v = self._opaque_as(self.hoist(ir.Extern(ir.TOpaque(""), loc, f"{t}.{m}", (recv,))), ir.INT, None)
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (v, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, (1 << 63) - 1))), "usize")  # (no collection holds more than isize::MAX)
         if isinstance(t, ir.TOpaque) and m in ("unwrap", "expect"):
-            return self.opaque(f"unwrap", [recv], ir.TOpaque(""), loc)  # a Result from unchecked code
-        args = [self.hoist(self.expr(a)) for a in argn]
-        return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of .{m}()"), loc, f"{t}.{m}", (recv, *args)))
+            return self.opaque("unwrap", [recv], ir.TOpaque(""), loc)  # a Result from unchecked code
+        args, writes = self.extern_args(argn)
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of .{m}()"), loc, f"{t}.{m}", (recv, *args)))
+        self.after_extern(writes)
+        return out
+
+    def _conversion(self, recv: ir.Expr, m: str, argn: list[Any], bounds: list[str], loc: ir.Loc) -> ir.Expr | None:
+        """x.as_ref() / x.into() / x.borrow() on a generic bounded by
+        AsRef<U> / Into<U> / Borrow<U>: some value of type U."""
+        want = {"as_ref": "AsRef", "into": "Into", "borrow": "Borrow", "as_mut": "AsMut"}.get(m)
+        if want is None or argn or self.spec:
+            return None
+        for b in bounds:
+            base, _, arg = b.partition("<")
+            if base.strip() != want or not arg.endswith(">"):
+                continue
+            t, k = self.fe.type_of_text(arg[:-1])
+            if isinstance(t, (ir.TOpaque, ir.TNone)):
+                return None
+            v = self.hoist(ir.Builtin(t, loc, "from_opaque", (self.opaque(m, [recv], ir.TOpaque(""), loc),)))
+            if isinstance(t, (ir.TList, ir.TDict)):
+                return self.elems_kinded(v, k)
+            return self.ranged(v, k) if t == ir.INT else v
+        return None
 
     def int_method(self, recv: ir.Expr, m: str, argn: list[Any], n: Any, k: str | None) -> ir.Expr:
         loc = self.loc(n)
@@ -2128,8 +2957,8 @@ class ExprLowerer:
             return self.checked(ir.Builtin(ir.INT, loc, "abs", (recv,)), k)
         if m in ("min", "max"):
             return self.kinded(ir.Builtin(ir.INT, loc, m, (recv, args[0])), k)
-        if m == "pow" and argn and argn[0].type == "integer_literal":
-            p = int(_text(argn[0]).rstrip("u32").replace("_", ""))
+        if m == "pow" and argn and argn[0].type == "integer_literal" and int(re.match(r"\d+", _text(argn[0]).replace("_", "")).group(0)) <= 128:  # type: ignore[union-attr]
+            p = int(re.match(r"\d+", _text(argn[0]).replace("_", "")).group(0))  # type: ignore[union-attr]
             out: ir.Expr = ir.Lit(ir.INT, loc, 1)
             for _ in range(p):
                 out = ir.Binary(ir.INT, loc, "mul", out, recv)
@@ -2167,9 +2996,50 @@ class ExprLowerer:
             return ir.Binary(ir.BOOL, loc, "gt" if m == "is_positive" else "lt", recv, ir.Lit(ir.INT, loc, 0))
         if m == "signum":
             return self.kinded(ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "gt", recv, ir.Lit(ir.INT, loc, 0)), ir.Lit(ir.INT, loc, 1), ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "lt", recv, ir.Lit(ir.INT, loc, 0)), ir.Lit(ir.INT, loc, -1), ir.Lit(ir.INT, loc, 0))), k)
+        unsigned = ("u" + k[1:]) if k and k.startswith("i") else k
+        zero = ir.Lit(ir.INT, loc, 0)
+        if m == "unsigned_abs" and not argn:
+            return self.kinded(ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "lt", recv, zero), ir.Unary(ir.INT, loc, "neg", recv), recv), unsigned)
+        if m == "abs_diff" and len(args) == 1:
+            return self.kinded(ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "gt", recv, args[0]), ir.Binary(ir.INT, loc, "sub", recv, args[0]), ir.Binary(ir.INT, loc, "sub", args[0], recv)), unsigned)
+        if m == "clamp" and len(args) == 2:
+            if not self.spec:
+                ok = ir.Binary(ir.BOOL, loc, "le", args[0], args[1])
+                self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, "clamp's min <= max"), native=True))
+            return self.kinded(ir.Builtin(ir.INT, loc, "min", (ir.Builtin(ir.INT, loc, "max", (recv, args[0])), args[1])), k)
         if self.spec:
             raise self.err(f"integer method .{m}() in a specification", n)
-        return self.ranged(self.opaque(f"int.{m}", [recv, *args], ir.INT, loc), k)
+        if m in ("count_ones", "count_zeros", "leading_zeros", "trailing_zeros", "leading_ones", "trailing_ones") and k:
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (self.opaque(f"int.{m}", [recv], ir.INT, loc), zero, ir.Lit(ir.INT, loc, INT_KINDS[k][1]))), "u32")
+        if m == "is_power_of_two":
+            return self.opaque("int.is_power_of_two", [recv], ir.BOOL, loc)
+        if m in ("rem_euclid", "div_euclid", "wrapping_div", "wrapping_rem") and len(args) == 1 and k:
+            y = self.hoist(args[0])
+            r = ir.Binary(ir.INT, loc, "tmod", recv, y)  # (dividing by zero panics)
+            if m == "wrapping_rem":
+                return self.kinded(ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "eq", y, ir.Lit(ir.INT, loc, -1)), zero, r), k)
+            if m == "wrapping_div":
+                q = ir.Binary(ir.INT, loc, "tdiv", recv, y)
+                lo = ir.Lit(ir.INT, loc, int_range(k)[0])
+                return self.kinded(ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "gt", q, ir.Lit(ir.INT, loc, int_range(k)[1])), lo, q), k)
+            r = self.hoist(r)
+            rem = ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "lt", r, zero), ir.Binary(ir.INT, loc, "add", r, ir.Builtin(ir.INT, loc, "abs", (y,))), r)
+            if INT_KINDS[k][0]:  # MIN % -1 overflows
+                lo = ir.Lit(ir.INT, loc, int_range(k)[0])
+                ok = ir.Unary(ir.BOOL, loc, "not", ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "eq", recv, lo), ir.Binary(ir.BOOL, loc, "eq", y, ir.Lit(ir.INT, loc, -1))))
+                self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, f"{k}::{m} does not overflow"), native=True))
+            if m == "rem_euclid":
+                return self.kinded(rem, k)
+            return self.kinded(ir.Binary(ir.INT, loc, "tdiv", ir.Binary(ir.INT, loc, "sub", recv, rem), y), k)
+        if m in ("pow", "next_power_of_two") and k:
+            return self.checked(self.opaque(f"int.{m}", [recv, *args], ir.INT, loc), k)  # (it panics when the result does not fit)
+        if m in ("isqrt", "ilog2", "ilog10", "ilog") and k:
+            ok = ir.Binary(ir.BOOL, loc, "ge" if m == "isqrt" else "gt", recv, zero)
+            self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, f"{m} of a {'negative' if m == 'isqrt' else 'non-positive'} number panics"), native=True))
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (self.opaque(f"int.{m}", [recv, *args], ir.INT, loc), zero, ir.Lit(ir.INT, loc, int_range(k)[1]))), k if m == "isqrt" else "u32")
+        if m in ("wrapping_neg", "rotate_left", "rotate_right", "swap_bytes", "reverse_bits", "saturating_pow", "wrapping_pow", "to_be", "to_le", "from_be", "from_le"):
+            return self.ranged(self.opaque(f"int.{m}", [recv, *args], ir.INT, loc), k)  # same type as the receiver
+        return self.hoist(ir.Extern(ir.TOpaque(f"result of .{m}()"), loc, f"int.{m}", (self.fl.coerce(recv, ir.TOpaque("")), *[self.fl.coerce(a, ir.TOpaque("")) for a in args])))
 
     def option_method(self, recv: ir.Expr, m: str, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
         loc = self.loc(n)
@@ -2191,9 +3061,33 @@ class ExprLowerer:
             return self.ranged(v, k) if t.inner == ir.INT else self.kinded(v, k)
         if m in ("clone", "copied", "cloned", "as_ref"):
             return recv
+        if m in ("take", "replace") and not self.spec and len(argn) == (1 if m == "replace" else 0):
+            old = self.hoist(recv)
+            new = self.fl.coerce(self.expr(argn[0], t.inner, k), t) if m == "replace" else ir.Lit(t, loc, None)
+            if isinstance(recv, ir.Var):
+                self.fl.writable(recv.name, n)
+                self.pre.append(ir.Assign(loc, recv.name, new))
+            elif isinstance(recv, ir.Field) and isinstance(recv.obj.ty, ir.TClass):
+                self.pre.append(ir.FieldAssign(loc, recv.obj, recv.obj.ty.name, recv.name, new))
+            else:
+                raise self.err(f".{m}() on an Option that is not a variable or field", n)
+            return self.kinded(old, k)
+        if m == "ok_or" and len(argn) == 1:
+            e = self.expr(argn[0])
+            rt = expect if _is_result(expect) else self.fe.result_type(t.inner, e.ty, k, self.kind_of(e))
+            if _is_result(rt):
+                assert isinstance(rt, ir.TRecord)
+                some = self._variant(rt, "Ok", {"Ok_0": ir.Builtin(t.inner, loc, "unwrap", (recv,))} if "Ok_0" in dict(rt.fields) else {}, loc)
+                none = self._variant(rt, "Err", {"Err_0": e} if "Err_0" in dict(rt.fields) else {}, loc)
+                return ir.Ite(rt, loc, ir.Builtin(ir.BOOL, loc, "is_none", (recv,)), none, some)
         if self.spec:
             raise self.err(f"Option method .{m}() in a specification", n)
-        return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"Option.{m}", (recv,)))
+        args, writes = self.extern_args(argn)
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"Option.{m}", (recv, *args)))
+        if m in ("insert", "get_or_insert", "get_or_insert_with", "as_mut", "iter_mut", "as_deref_mut", "take_if"):
+            self.havoc_place(recv, n)
+        self.after_extern(writes)
+        return out
 
     def vec_method(self, recv: ir.Expr, recv_n: Any, m: str, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
         loc = self.loc(n)
@@ -2222,6 +3116,8 @@ class ExprLowerer:
             return recv
         if self.spec:
             raise self.err(f"Vec method .{m}() in a specification", n)
+        if isinstance(recv, ir.Var) and m not in ("len", "iter", "get", "first", "last", "contains", "is_empty", "to_vec", "clone"):
+            self.fl.writable(recv.name, n)
         if m == "push":
             v = self.fl.coerce(self.expr(argn[0], t.elem if t.elem != ir.NONE else None, ek), t.elem) if t.elem != ir.NONE else self.expr(argn[0])
             if isinstance(recv, ir.Var):
@@ -2264,6 +3160,16 @@ class ExprLowerer:
             self.pre.append(ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice", (recv, ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "min", (k, length))))))
             return ir.Lit(ir.NONE, loc, None)
         mutating = m in ("sort", "sort_unstable", "reverse", "dedup", "retain", "insert", "remove", "sort_by", "sort_by_key", "drain", "iter_mut", "resize")
+        if m in ("remove", "swap_remove", "insert") and len(argn) == (2 if m == "insert" else 1):
+            i = self.hoist(self.expr(argn[0], ir.INT, "usize"))
+            bound = ir.Binary(ir.BOOL, loc, "le" if m == "insert" else "lt", i, length)
+            self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), i), bound), loc, f"the {m} index is within bounds"), native=True))
+        if not isinstance(recv, ir.Var) and m in VEC_MUTATORS:
+            args, writes = self.extern_args(argn)
+            out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"Vec.{m}", (self.fl.coerce(recv, ir.TOpaque("")), *args)))
+            self.havoc_place(recv, n)  # a list in a field, changed in a way telic does not track
+            self.after_extern(writes)
+            return out
         args = [self.hoist(self.expr(a)) for a in argn]
         if mutating and isinstance(recv, ir.Var):
             # the list changes in a way telic does not track: an unchecked call that may change it
@@ -2292,6 +3198,8 @@ class ExprLowerer:
             return recv
         if self.spec:
             raise self.err(f"map method .{m}() in a specification", n)
+        if isinstance(recv, ir.Var) and m in ("insert", "remove", "clear", "retain", "entry", "get_mut", "extend", "drain"):
+            self.fl.writable(recv.name, n)
         if m == "insert" and isinstance(recv, ir.Var):
             k = self.hoist(self.expr(argn[0], t.key))
             v = self.fl.coerce(self.expr(argn[1], t.val, self.kind_of_elems(recv)), t.val)
@@ -2305,8 +3213,12 @@ class ExprLowerer:
             return old if old is not None else ir.Lit(ir.NONE, loc, None)
         if m == "len":
             return self.hoist(ir.Extern(ir.INT, loc, "HashMap.len", (self.fl.coerce(recv, ir.TOpaque("")),)))
-        args = [self.hoist(self.expr(a)) for a in argn]
-        return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"HashMap.{m}", (recv, *args)))
+        args, writes = self.extern_args(argn)
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"HashMap.{m}", (recv, *args)))
+        if not isinstance(recv, ir.Var) and m not in ("get", "contains_key", "is_empty", "keys", "values", "iter", "clone", "get_key_value"):
+            self.havoc_place(recv, n)
+        self.after_extern(writes)
+        return out
 
     def str_method(self, recv: ir.Expr, m: str, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
         loc = self.loc(n)
@@ -2326,7 +3238,10 @@ class ExprLowerer:
         args = [self.expr(a) for a in argn]
         if m in ("trim", "to_lowercase", "to_uppercase", "replace", "trim_start", "trim_end", "repeat"):
             return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, m), recv, *[a if not isinstance(a.ty, (ir.TList, ir.TDict)) else self.fl.coerce(a, ir.TOpaque("")) for a in args]))
-        return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"str.{m}", (recv, *[self.hoist(a) for a in args])))
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"str.{m}", (recv, *[self.hoist(a) for a in args])))
+        if m in ("push", "push_str", "pop", "clear", "insert", "insert_str", "remove", "retain", "truncate", "drain", "extend", "make_ascii_lowercase", "make_ascii_uppercase", "replace_range", "split_off", "as_mut_str", "reserve", "shrink_to_fit"):
+            self.havoc_place(recv, n)  # a String changed in a way telic does not track
+        return out
 
     # -- iterator chains ---------------------------------------------------
 
@@ -2438,11 +3353,403 @@ class ExprLowerer:
             raise self.err("closures here take one simple parameter", c)
         return names[0].split(":")[0].strip(), c.child_by_field_name("body")
 
+    def _path_value(self, hit: tuple, txt: str, n: Any, expect: Any, loc: ir.Loc) -> ir.Expr | None:
+        """The value a path names: a constant, a unit variant, a unit struct."""
+        if hit[0] == "const":
+            c = self.fe.consts.get(hit[1])
+            if c is not None:
+                lit, k = c
+                if lit.type == "unary_expression":
+                    v = self.expr(lit.named_children[0], expect, k)
+                    return self.kinded(ir.Lit(v.ty, loc, -v.value), k)  # type: ignore[operator]
+                v = self.expr(lit, expect, k)
+                return self.kinded(dataclasses.replace(v, loc=loc), self.kind_of(v))
+            if self.spec:
+                raise self.err(f"the value of '{txt}' is not known to telic", n)
+            tn = self.fe.const_types.get(hit[1])
+            if tn is not None:
+                saved = self.fe.cur_mod, self.fe.cur_generics, self.fe.cur_self, self.fe.cur_subst
+                self.fe._in(hit[1][0], {})
+                try:
+                    t, k = self.fe.ty(tn)
+                finally:
+                    self.fe.cur_mod, self.fe.cur_generics, self.fe.cur_self, self.fe.cur_subst = saved
+                if not isinstance(t, (ir.TOpaque, ir.TNone)):
+                    v = self.hoist(ir.Extern(t, loc, txt, ()))
+                    size = _array_len(tn)
+                    if size is not None:
+                        self.pre.append(ir.ExprStmt(loc, ir.Builtin(ir.INT, loc, "in_range", (ir.Builtin(ir.INT, loc, "len", (v,)), ir.Lit(ir.INT, loc, size), ir.Lit(ir.INT, loc, size)))))
+                    if isinstance(t, (ir.TList, ir.TDict)):
+                        return self.elems_kinded(v, k)
+                    return self.ranged(v, k) if t == ir.INT else v
+            return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(txt), loc, txt, ()))
+        if hit[0] == "variant":
+            owner, v = hit[1], hit[2]
+            if owner in self.fe.enums:
+                return self._enum_lit(self.fe.enums[owner], v, loc)
+            e = self.fe.data_enums.get(owner)
+            if e is None:
+                return None
+            rec = self.fe._enum_record(e)
+            variant = e.variant(v)
+            if rec is None or variant is None or variant[1] != "unit":
+                if self.spec:
+                    raise self.err(f"enum {e.src} is not modelled ({e.why or 'a variant used as a function'})", n)
+                return self.hoist(ir.Extern(ir.TOpaque(txt), loc, txt, ()))
+            return self._variant(rec, v, {}, loc)
+        if hit[0] == "type":
+            s = self.fe.structs.get(hit[1])
+            if s is not None and not s.fields:
+                return self._build_struct(s, {}, None, loc, n)
+        if hit[0] == "fn":
+            if self.spec:
+                raise self.err(f"function '{txt}' used as a value in a specification", n)
+            return self.opaque("fn", [ir.Lit(ir.STR, loc, txt)], ir.TOpaque("fn"), loc)
+        return None
+
+    def _variant(self, rec: ir.TRecord, variant: str, vals: dict[str, ir.Expr], loc: ir.Loc) -> ir.Expr:
+        """A value of a data-carrying enum (or Result): the tag, this
+        variant's fields, and defaults in every other variant's."""
+        tag = dict(rec.fields)["tag"]
+        assert isinstance(tag, ir.TEnum)
+        out = []
+        for f, t in rec.fields:
+            if f == "tag":
+                out.append((f, ir.Lit(tag, loc, tag.members.index(variant))))
+            elif f in vals:
+                v = self.fl.coerce(vals[f], t)
+                if v.ty != t:
+                    raise LowerError(f"{variant} holds {t}, not {v.ty}", loc.line)
+                out.append((f, v))
+            else:
+                out.append((f, self.fe.default_value(t, loc)))
+        return ir.RecordLit(rec, loc, tuple(out))
+
+    def _tag_is(self, scrut: ir.Expr, variant: str, loc: ir.Loc) -> ir.Expr:
+        assert isinstance(scrut.ty, ir.TRecord)
+        tag = dict(scrut.ty.fields)["tag"]
+        assert isinstance(tag, ir.TEnum)
+        return ir.Binary(ir.BOOL, loc, "eq", ir.Field(tag, loc, scrut, "tag"), ir.Lit(tag, loc, tag.members.index(variant)))
+
+    def _slot(self, scrut: ir.Expr, slot: str, loc: ir.Loc) -> ir.Expr | None:
+        assert isinstance(scrut.ty, ir.TRecord)
+        ft = dict(scrut.ty.fields).get(slot)
+        if ft is None:
+            return None
+        v = ir.Field(ft, loc, scrut, slot)
+        k = self.fe.slot_kind(scrut.ty.name, slot)
+        return self.ranged(v, k) if ft == ir.INT else self.kinded(v, k)
+
+    def _struct_fields(self, s: StructInfo) -> dict[str, ir.Type]:
+        return dict(self.fe.records[s.name].fields if s.record else self.fe.classes[s.name].fields)
+
+    def _build_struct(self, s: StructInfo, vals: dict[str, ir.Expr], base: ir.Expr | None, loc: ir.Loc, n: Any) -> ir.Expr:
+        types = self._struct_fields(s)
+        args = []
+        for f, t in types.items():
+            if f in vals:
+                args.append(self.fl.coerce(vals[f], t))
+            elif base is not None:
+                args.append(ir.Field(t, loc, base, f))
+            else:
+                raise self.err(f"{s.src} literal is missing field '{f}'", n)
+        if s.record:
+            return ir.RecordLit(self.fe.records[s.name], loc, tuple(zip(types, args)))
+        if self.spec:
+            raise self.err("specifications cannot create objects", n)
+        return self.hoist(ir.New(ir.TClass(s.name), loc, s.name, tuple(args)))
+
+    def _guard(self, guard: Any, binds: list[tuple[str, ir.Expr]]) -> ir.Expr:
+        """A match guard, over the arm's bindings (substituted: they are
+        bound only once the arm is taken)."""
+        g = self.sub()
+        saved = {}
+        for b, e in binds:
+            g.bound[b] = e.ty
+            saved[b] = self.fl.kinds.get(b)
+            k = self.kind_of(e)
+            if k:
+                self.fl.kinds[b] = k
+        try:
+            gc = g.expr(guard, ir.BOOL)
+        finally:
+            for b, k0 in saved.items():
+                if k0 is None:
+                    self.fl.kinds.pop(b, None)
+                else:
+                    self.fl.kinds[b] = k0
+        if g.pre:
+            raise self.err("match guards with side effects are not supported", guard)
+        for b, e in binds:
+            gc = _subst(gc, b, e)
+        return gc
+
+    def _subpatterns(self, pat: Any) -> list[tuple[str, Any]]:
+        """(field, sub-pattern) of 'P(a, _)' (fields 0, 1, ...) or 'S { a, b: p, .. }'
+        (a sub-pattern of None binds the field's own name)."""
+        out: list[tuple[str, Any]] = []
+        if pat.type == "tuple_struct_pattern":
+            i = 0
+            kids = [c for j, c in enumerate(pat.children) if pat.field_name_for_child(j) != "type" and c.type not in ("(", ")", ",", "line_comment", "block_comment")]
+            for j, c in enumerate(kids):
+                if c.type == "remaining_field_pattern":
+                    if j != len(kids) - 1:
+                        raise self.err("'..' before the last field of a pattern is not supported", pat)
+                    break
+                out.append((str(i), c))
+                i += 1
+            return out
+        for c in pat.named_children:
+            if c.type == "field_pattern":
+                nm = c.child_by_field_name("name")
+                sp = c.child_by_field_name("pattern")
+                if _text(c).startswith("ref "):
+                    raise self.err("'ref' bindings are not supported", c)
+                out.append((_text(nm), sp))
+            elif c.type == "shorthand_field_identifier":
+                out.append((_text(c), None))
+        return out
+
+    def _and_sub(self, cond: ir.Expr, sp: Any, v: ir.Expr, loc: ir.Loc) -> tuple[ir.Expr, list[tuple[str, ir.Expr]]]:
+        if sp is None:
+            return cond, []
+        c, b = self._pattern(sp, v)
+        if isinstance(c, ir.Lit) and c.value is True:
+            return cond, b
+        return ir.Binary(ir.BOOL, loc, "and", cond, c), b
+
+    def _variant_pattern(self, scrut: ir.Expr, variant: str, subs: list[tuple[str, Any]], pat: Any, loc: ir.Loc) -> tuple[ir.Expr, list[tuple[str, ir.Expr]]]:
+        cond = self._tag_is(scrut, variant, loc)
+        binds: list[tuple[str, ir.Expr]] = []
+        for fname, sp in subs:
+            fv = self._slot(scrut, _slot(variant, fname), loc)
+            if fv is None:  # a () payload
+                if sp is not None and _text(sp) not in ("_", "()"):
+                    raise self.err(f"unsupported pattern {_text(sp)}", sp)
+                continue
+            if sp is None:
+                binds.append((fname, fv))
+                continue
+            c, b = self._pattern(sp, fv)
+            if not (isinstance(c, ir.Lit) and c.value is True):
+                cond = ir.Binary(ir.BOOL, loc, "and", cond, c)
+            binds += b
+        return cond, binds
+
+    def _path_pattern(self, hit: tuple, pat: Any, scrut: ir.Expr, loc: ir.Loc) -> tuple[ir.Expr, list[tuple[str, ir.Expr]]]:
+        if hit[0] == "variant":
+            if hit[1] in self.fe.enums:
+                if not (isinstance(scrut.ty, ir.TEnum) and scrut.ty.name == hit[1]):
+                    raise self.err(f"pattern {_text(pat)} on {scrut.ty}", pat)
+                return ir.Binary(ir.BOOL, loc, "eq", scrut, self._enum_lit(scrut.ty, hit[2], loc)), []
+            if isinstance(scrut.ty, ir.TRecord) and scrut.ty.name == hit[1]:
+                return self._tag_is(scrut, hit[2], loc), []
+        if hit[0] == "const":
+            v = self._path_value(hit, _text(pat), pat, scrut.ty, loc)
+            if v is not None and not isinstance(v, ir.Var):
+                a, b = self._same(scrut, v, pat)
+                return ir.Binary(ir.BOOL, loc, "eq", a, b), []
+        raise self.err(f"unsupported pattern {_text(pat)}", pat)
+
+    def _result_ctor(self, name: str, argn: list[Any], n: Any, expect: Any, loc: ir.Loc) -> ir.Expr:
+        """Ok(v) / Err(e): a Result record when the context fixes its type."""
+        if _is_result(expect):
+            slot = f"{name}_0"
+            ft = dict(expect.fields).get(slot)
+            vals = {}
+            if argn:
+                v = self.expr(argn[0], ft, self.fe.slot_kind(expect.name, slot))
+                if ft is not None:
+                    vals[slot] = v
+                elif not self.spec and not isinstance(v, (ir.Lit, ir.Var)):
+                    self.pre.append(ir.ExprStmt(loc, v))
+            return self._variant(expect, name, vals, loc)
+        if self.spec:
+            raise self.err("a Result whose type telic does not know, in a specification", n)
+        v = self.expr(argn[0]) if argn else ir.Lit(ir.NONE, loc, None)
+        return self.opaque(name.lower(), [self.fl.coerce(v, ir.TOpaque("")) if not isinstance(v.ty, ir.TOpaque) else v], ir.TOpaque("Result"), loc)
+
+    def havoc_place(self, v: ir.Expr, n: Any) -> None:
+        """A value a ``&mut self`` method changed: telic does not model what
+        it leaves there."""
+        loc = self.loc(n)
+        if isinstance(v, ir.Var):
+            self.fl.writable(v.name, n)
+            self.havoc_scalar(v, loc)
+            return
+        if isinstance(v, ir.Field) and isinstance(v.obj.ty, ir.TClass):
+            self.pre.append(ir.FieldAssign(loc, v.obj, v.obj.ty.name, v.name, ir.Extern(v.ty, loc, "write through &mut", ())))
+            return
+        if isinstance(v, ir.Field) and isinstance(v.obj.ty, ir.TRecord) and isinstance(v.obj, (ir.Var, ir.Field)):
+            rec = v.obj.ty
+            self.havoc_place_with(v.obj, ir.RecordLit(rec, loc, tuple((f, ir.Extern(ft, loc, "write through &mut", ()) if f == v.name else ir.Field(ft, loc, v.obj, f)) for f, ft in rec.fields)), n)
+            return
+        raise self.err("a value changed through &mut that is not a variable or field is not modelled", n)
+
+    def havoc_place_with(self, place: ir.Expr, value: ir.Expr, n: Any) -> None:
+        """Store ``value`` into a variable, or a field of one (records are values: rebuilt)."""
+        loc = self.loc(n)
+        if isinstance(place, ir.Var):
+            self.fl.writable(place.name, n)
+            self.pre.append(ir.Assign(loc, place.name, value))
+            self.pre += _tag_ranges(ir.Var(place.ty, loc, place.name), loc)
+            return
+        if isinstance(place, ir.Field) and isinstance(place.obj.ty, ir.TClass):
+            self.pre.append(ir.FieldAssign(loc, place.obj, place.obj.ty.name, place.name, value))
+            return
+        if isinstance(place, ir.Field) and isinstance(place.obj.ty, ir.TRecord):
+            rec = place.obj.ty
+            self.havoc_place_with(place.obj, ir.RecordLit(rec, loc, tuple((f, value if f == place.name else ir.Field(ft, loc, place.obj, f)) for f, ft in rec.fields)), n)
+            return
+        raise self.err("a value changed through &mut that is not a variable or field is not modelled", n)
+
+    def _convert_err(self, err: ir.Expr, to: ir.Type, loc: ir.Loc) -> ir.Expr:
+        """'?' converts the error with From::from: the identity, a checked
+        'impl From<E> for F', or an unchecked conversion."""
+        if err.ty == to:
+            return err
+        name = getattr(to, "name", None)
+        if name is not None:
+            for info in self.fe.fns.values():
+                if info.owner == name and info.key.split("@")[0] == f"{name}.from" and len(info.params) == 1 and info.params[0].ty == err.ty:
+                    e = ir.Call(info.ret, loc, self.fe.call_name(info), (err,))
+                    return self.hoist(e) if info.ret == to else self.fl.coerce(self.fl.coerce(self.hoist(e), ir.TOpaque("")), to)
+        return self.hoist(ir.Extern(to, loc, "From::from", (self.fl.coerce(err, ir.TOpaque("")) if not isinstance(err.ty, ir.TOpaque) else err,)))
+
+    def result_method(self, recv: ir.Expr, m: str, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
+        loc = self.loc(n)
+        t = recv.ty
+        assert isinstance(t, ir.TRecord)
+        ok = self._slot(recv, "Ok_0", loc)
+        err = self._slot(recv, "Err_0", loc)
+        is_ok = self._tag_is(recv, "Ok", loc)
+        if m == "is_ok":
+            return is_ok
+        if m == "is_err":
+            return ir.Unary(ir.BOOL, loc, "not", is_ok)
+        if m in ("clone", "copied", "cloned", "as_ref", "as_deref"):
+            return recv
+        if m in ("unwrap", "expect", "unwrap_err", "expect_err"):
+            want_ok = m in ("unwrap", "expect")
+            cond = is_ok if want_ok else ir.Unary(ir.BOOL, loc, "not", is_ok)
+            val = ok if want_ok else err
+            if self.spec:
+                if val is None:
+                    return ir.Lit(ir.NONE, loc, None)
+                return ir.Ite(val.ty, loc, cond, val, ir.Builtin(val.ty, loc, "from_opaque", (ir.Builtin(ir.TOpaque(""), loc, "opaque_op", (ir.Lit(ir.STR, loc, f"{m} of the other variant"), self.fl.coerce(recv, ir.TOpaque(""))),),)))
+            text = f"called `Result::{m}()` on an `{'Err' if want_ok else 'Ok'}` value"
+            self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", cond, loc, text), native=True))
+            return val if val is not None else ir.Lit(ir.NONE, loc, None)
+        if m in ("unwrap_or", "unwrap_or_default") and ok is not None:
+            d = self.expr(argn[0], ok.ty, self.kind_of(ok)) if argn else _default(ok.ty, loc)
+            if d is None:
+                raise self.err(f"no default for {ok.ty}", n)
+            return self.kinded(ir.Ite(ok.ty, loc, is_ok, ok, self.fl.coerce(d, ok.ty)), self.kind_of(ok))
+        if m in ("ok", "err"):
+            val = ok if m == "ok" else err
+            cond = is_ok if m == "ok" else ir.Unary(ir.BOOL, loc, "not", is_ok)
+            if val is not None and not isinstance(val.ty, (ir.TOption, ir.TList, ir.TDict, ir.TOpaque)):
+                ot = ir.TOption(val.ty)
+                return self.kinded(ir.Ite(ot, loc, cond, ir.Builtin(ot, loc, "some", (val,)), ir.Lit(ot, loc, None)), self.kind_of(val))
+        if self.spec:
+            raise self.err(f"Result method .{m}() in a specification", n)
+        args, writes = self.extern_args(argn)
+        out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"Result.{m}", (self.fl.coerce(recv, ir.TOpaque("")), *args)))
+        if m in ("as_mut", "iter_mut", "insert", "get_or_insert_with"):
+            self.havoc_place(recv, n)
+        self.after_extern(writes)
+        return out
+
+    def _eq(self, a: ir.Expr, b: ir.Expr, n: Any, op: str) -> ir.Expr:
+        """``a == b`` as Rust runs it: PartialEq::eq, derived (structural) or
+        a checked impl; unknown for types telic does not model."""
+        loc = self.loc(n)
+        a, b = self._same(a, b, n)
+        t = a.ty
+        name = getattr(t, "name", None)
+        custom = None
+        if name in self.fe.structs:
+            custom = self.fe.structs[name].eq
+        elif name in self.fe.data_enums:
+            custom = self.fe.data_enums[name].eq
+        if custom == "impl" and not self.spec:
+            info = self.fe.method_of(name, "eq")  # type: ignore[arg-type]
+            if info is not None and len(info.params) == 2:
+                r = self.hoist(ir.Call(ir.BOOL, loc, self.fe.call_name(info), (a, self.fl.coerce(b, info.params[1].ty))))
+            else:
+                r = self.hoist(ir.Extern(ir.BOOL, loc, "PartialEq::eq", (self.fl.coerce(a, ir.TOpaque("")), self.fl.coerce(b, ir.TOpaque("")))))
+        elif isinstance(t, ir.TOpaque) and not self.spec:
+            r = self.hoist(ir.Extern(ir.BOOL, loc, "PartialEq::eq", (a, b)))
+        else:
+            r = self._structural_eq(a, b, loc, 0) or (None if self.spec else self.hoist(ir.Extern(ir.BOOL, loc, "PartialEq::eq", (self.fl.coerce(a, ir.TOpaque("")), self.fl.coerce(b, ir.TOpaque(""))))))
+            if r is None:
+                r = ir.Binary(ir.BOOL, loc, "eq", a, b)
+        return r if op == "eq" else ir.Unary(ir.BOOL, loc, "not", r)
+
+    def _structural_eq(self, a: ir.Expr, b: ir.Expr, loc: ir.Loc, depth: int) -> ir.Expr | None:
+        """Field-by-field equality (derived PartialEq); None when telic cannot
+        compare these values that way."""
+        t = a.ty
+        if isinstance(t, ir.TRecord) and t.fields[:1] and t.fields[0][0] == "tag":
+            if t.name in self.fe.data_enums and self.fe.data_enums[t.name].eq != "derive" and not self.spec:
+                return None
+            tag = t.fields[0][1]
+            assert isinstance(tag, ir.TEnum)
+            out: ir.Expr = ir.Binary(ir.BOOL, loc, "eq", ir.Field(tag, loc, a, "tag"), ir.Field(tag, loc, b, "tag"))
+            for i, v in enumerate(tag.members):
+                parts = []
+                for f, ft in t.fields[1:]:
+                    if f.startswith(v + "_"):
+                        e = self._structural_eq(ir.Field(ft, loc, a, f), ir.Field(ft, loc, b, f), loc, depth + 1)
+                        if e is None:
+                            return None
+                        parts.append(e)
+                if parts:
+                    body = parts[0]
+                    for p in parts[1:]:
+                        body = ir.Binary(ir.BOOL, loc, "and", body, p)
+                    out = ir.Binary(ir.BOOL, loc, "and", out, ir.Binary(ir.BOOL, loc, "implies", ir.Binary(ir.BOOL, loc, "eq", ir.Field(tag, loc, a, "tag"), ir.Lit(tag, loc, i)), body))
+            return out
+        if isinstance(t, ir.TRecord):
+            s = self.fe.structs.get(t.name)
+            if s is not None and s.eq != "derive" and not self.spec:
+                return None
+            out = ir.Lit(ir.BOOL, loc, True)
+            for f, ft in t.fields:
+                e = self._structural_eq(ir.Field(ft, loc, a, f), ir.Field(ft, loc, b, f), loc, depth + 1)
+                if e is None:
+                    return None
+                out = e if isinstance(out, ir.Lit) else ir.Binary(ir.BOOL, loc, "and", out, e)
+            return out
+        if isinstance(t, ir.TClass):
+            if self.spec:
+                return ir.Binary(ir.BOOL, loc, "eq", a, b)
+            s = self.fe.structs.get(t.name)
+            if s is None or s.eq != "derive" or depth > 2:
+                return None
+            decl = self.fe.classes[t.name]
+            out = ir.Lit(ir.BOOL, loc, True)
+            for f, ft in decl.fields:
+                fa, fb = self.hoist(ir.Field(ft, loc, a, f)), self.hoist(ir.Field(ft, loc, b, f))
+                e = self._structural_eq(fa, fb, loc, depth + 1)
+                if e is None:
+                    return None
+                out = e if isinstance(out, ir.Lit) else ir.Binary(ir.BOOL, loc, "and", out, e)
+            return out
+        if isinstance(t, ir.TList) and isinstance(t.elem, ir.TRecord) and not self.spec:
+            s = self.fe.structs.get(t.elem.name)
+            return ir.Binary(ir.BOOL, loc, "eq", a, b) if s is not None and s.eq == "derive" else None  # (a tagged record's unused fields may differ)
+        if isinstance(t, ir.TList) and isinstance(t.elem, (ir.TClass, ir.TOpaque)):
+            return None if not self.spec else ir.Binary(ir.BOOL, loc, "eq", a, b)
+        if isinstance(t, ir.TDict) and isinstance(t.val, (ir.TClass, ir.TOpaque, ir.TRecord)):
+            return None if not self.spec else ir.Binary(ir.BOOL, loc, "eq", a, b)
+        if isinstance(t, ir.TOpaque):
+            return None if not self.spec else ir.Binary(ir.BOOL, loc, "eq", a, b)
+        return ir.Binary(ir.BOOL, loc, "eq", a, b)
+
 
 def _rename(e: ir.Expr, old: str, new: str) -> ir.Expr:
     """Rename a bound variable (the quantified index) throughout an expression."""
-    import dataclasses
-
     if isinstance(e, ir.Var) and e.name == old:
         return ir.Var(e.ty, e.loc, new)
     changes = {}
@@ -2452,6 +3759,41 @@ def _rename(e: ir.Expr, old: str, new: str) -> ir.Expr:
             changes[f.name] = _rename(v, old, new)
         elif isinstance(v, tuple) and v and all(isinstance(x, ir.Expr) for x in v):
             changes[f.name] = tuple(_rename(x, old, new) for x in v)
+    return dataclasses.replace(e, **changes) if changes else e
+
+
+def _tag_ranges(v: ir.Expr, loc: ir.Loc, depth: int = 0) -> list[ir.Stmt]:
+    """A value of a data-carrying enum is one of its variants (and so are
+    such values held in its fields)."""
+    t = v.ty
+    if not isinstance(t, ir.TRecord) or depth > 3:
+        return []
+    out: list[ir.Stmt] = []
+    for f, ft in t.fields:
+        if f == "tag" and isinstance(ft, ir.TEnum):
+            tag = ir.Field(ft, loc, v, "tag")
+            out.append(ir.ExprStmt(loc, ir.Builtin(ir.INT, loc, "in_range", (tag, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, len(ft.members) - 1)))))
+        elif isinstance(ft, ir.TRecord):
+            out += _tag_ranges(ir.Field(ft, loc, v, f), loc, depth + 1)
+    return out
+
+
+def _subst(e: ir.Expr, name: str, by: ir.Expr) -> ir.Expr:
+    """Replace the variable ``name`` by the expression ``by`` (not where a
+    quantifier or comprehension binds its own ``name``)."""
+    if isinstance(e, ir.Var) and e.name == name:
+        return by
+    if isinstance(e, ir.Quant) and name in (e.elem, e.idx):
+        return dataclasses.replace(e, lo=_subst(e.lo, name, by), hi=_subst(e.hi, name, by), seq=_subst(e.seq, name, by) if e.seq is not None else None)
+    if isinstance(e, ir.Builtin) and e.name == "comp" and len(e.args) > 1 and isinstance(e.args[1], ir.Lit) and e.args[1].value == name:
+        return dataclasses.replace(e, args=(_subst(e.args[0], name, by), *e.args[1:]))
+    changes = {}
+    for f in dataclasses.fields(e):
+        v = getattr(e, f.name)
+        if isinstance(v, ir.Expr):
+            changes[f.name] = _subst(v, name, by)
+        elif isinstance(v, tuple) and v and all(isinstance(x, ir.Expr) for x in v):
+            changes[f.name] = tuple(_subst(x, name, by) for x in v)
     return dataclasses.replace(e, **changes) if changes else e
 
 
@@ -2542,5 +3884,7 @@ class _Text:
         self.text = s.encode()
 
 
-def lower_rust(path: str, source: str) -> ir.Module:
-    return RustFrontend(path, source).run()
+def lower_rust(path: str, source: str, abs_path: str | None = None, root: str | None = None) -> ir.Module:
+    """Lower one file. Its crate (found from ``abs_path``) gives the types,
+    traits and functions other files declare; calls into them are imports."""
+    return RustFrontend(path, source, abs_path, root).run()

@@ -759,7 +759,14 @@ and builtin g ctx (e : Ir.expr) name args =
        | None -> ());
       note_assumed g loc "values from unchecked code have the types they are used at";
       v
-    | "to_opaque", [ x ] -> T (fn ("box." ^ ty_str (List.hd args).ty) (Array.of_list (flatten x)) Opaque)
+    | "to_opaque", [ x ] ->
+      let aty = (List.hd args).ty in
+      let tag = ty_str aty in
+      let comps = flatten x in
+      let b = fn ("box." ^ tag) (Array.of_list comps) Opaque in
+      (* unboxed at the type it was boxed at, a value is itself (a generic function's T) *)
+      if aty <> TNone then List.iter2 (fun (suffix, srt) c -> assume_ (eq (fn (Printf.sprintf "unbox.%s.%s" tag suffix) [| b |] srt) c)) (components aty) comps;
+      T b
     | "opaque_op", _ ->
       let op = lit_str (List.hd args) in
       let srt = sort_of e.ty in

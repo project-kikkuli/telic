@@ -1712,6 +1712,10 @@ class VCGen:
                 return flat[0].args[0]  # type: ignore[attr-defined]
             b = L.Fn(f"box.{tag}", flat, L.OPAQUE)
             self.box_facts(b, x, ty, ctx, known=True)
+            if ty != ir.NONE:
+                # unboxed at the type it was boxed at, a value is itself (a generic function's T)
+                for (suffix, srt), c in zip(components(ty), flat):
+                    ctx.assume(L.eq(L.Fn(f"unbox.{tag}.{suffix}", (b,), srt), c))
             return b
         if name == "opaque_op":
             # An operation involving an opaque value: some deterministic,
