@@ -54,6 +54,12 @@ class Driver:
         operable, so nothing can cover it."""
         raise NotImplementedError
 
+    read: frozenset[str] | set[str] = frozenset()  # keys ('path:name') of watched variables read so far
+
+    def watch(self, hidden: list) -> None:
+        """Read these variables (``source.Hidden``) into every snapshot's
+        ``hidden``, where the platform lets it. This one cannot."""
+
     def leaves(self, node: Node) -> bool:
         """Would activating this element leave the app (an external link)?"""
         return False

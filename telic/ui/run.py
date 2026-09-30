@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from . import slots
+from . import slots, source
 from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
@@ -89,7 +89,7 @@ def tool_digest() -> str:
     global _TOOL
     if _TOOL is None:
         h = hashlib.sha256(str(VERSION).encode())
-        for f in sorted(Path(__file__).parent.glob("*.py")):
+        for f in [*sorted(Path(__file__).parent.glob("*.py")), Path(__file__).parent.parent / "frontend" / "ts" / "uiscan.mjs"]:
             h.update(f.name.encode() + f.read_bytes())
         _TOOL = h.hexdigest()[:16]
     return _TOOL
@@ -194,11 +194,14 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
         with torn_down_on_signals(), App(cfg, log) as url:
             app.url = url
             atoms = Atoms(lems)
+            facts = source.scan(cfg.dir, cfg.platform)
+            if facts.keys:
+                cfg = replace(cfg, settings=replace(cfg.settings, keys=tuple(dict.fromkeys([*cfg.settings.keys, *(k.key for k in facts.keys)]))))
             seeds = propose(cfg, lems) if cfg.seed else None
             # one simulator at a time: each device is learned after the last
             jobs = list(enumerate(cfg.viewports if cfg.platform == "web" else cfg.devices or [""]))
             with ThreadPoolExecutor(max_workers=len(jobs) if cfg.platform == "web" else 1) as pool:
-                done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, seeds, job[0], job[1], log), jobs))
+                done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, seeds, facts, job[0], job[1], log), jobs))
     except (AppError, DriverError) as e:
         app.error = str(e)
         return {lem.name: UiResult(lem, cfg.path, "open", "", f"the app did not run: {e}") for lem in lems}
@@ -214,14 +217,14 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     return out
 
 
-def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, facts, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     # one browser (or simulator) slot each, machine-wide: runs in other processes queue for them
     vp = f"{size[0]}x{size[1]}" if isinstance(size, tuple) else size or "iOS"
     with slots.hold(max(1, cfg.settings.workers) if cfg.platform == "web" else 1, log=lambda m: log(f"{vp}: {m}")) as n:
-        return _learn(cfg, url, lems, atoms, seeds, size, n, log)
+        return _learn(cfg, url, lems, atoms, seeds, facts, size, n, log)
 
 
-def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, facts, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     from .learn import Explorer
 
     drivers: list = []
@@ -244,6 +247,10 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, si
                 drivers.append(d)
                 d.start()
                 d.viewport(w, h)
+        # a variable a timer also changes is not waited for (like a timer longer than [ui] wait)
+        watched = [h for h in facts.hidden if not h.clock]
+        for d in drivers:
+            d.watch(watched)
         occluding = [lem for lem in lems if lem.prop and lem.prop.kind == "unobscured"]
 
         def learn(settings):
@@ -269,9 +276,10 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, si
                 model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
         else:
             ex, model, occl = learn(s)
-        dialogs = sum(d.dialogs for d in drivers)
+        dialogs = sum(getattr(d, "dialogs", 0) for d in drivers)
         if dialogs:
             model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
+        _source_notes(model, facts, watched, set().union(*(d.read for d in drivers)))
         _dump(cfg, model)
         mc = ModelCheck(ex, atoms, occl, cfg.witnesses)
         got: dict[str, Outcome] = {}
@@ -281,6 +289,24 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, si
     finally:
         for d in drivers:
             d.stop()
+
+
+def _source_notes(model, facts, watched, read: set[str]) -> None:
+    """What the source added to the model, and what it says the model cannot see."""
+    if facts.keys:
+        model.keys = [f"{k.key} ({k.at()})" for k in facts.keys]
+        model.notes.insert(0, "keys found in the source: " + ", ".join(model.keys))
+    model.hidden = [h.describe() for h in watched if f"{h.path}:{h.name}" in read]
+    model.unread = [h.describe() for h in watched if f"{h.path}:{h.name}" not in read]
+    if model.hidden:
+        model.notes.append(f"state the tree does not show, read from the app: {', '.join(h.name for h in watched if f'{h.path}:{h.name}' in read)}")
+    if model.unread:
+        model.notes.insert(0, f"cannot read {', '.join(model.unread)} from the app: handlers change it and it decides what renders")
+    clocked = [h for h in facts.hidden if h.clock]
+    if clocked:
+        model.notes.append("changed by timers, not waited for: " + ", ".join(f"{h.describe()}, timer at line {', '.join(map(str, h.clock))}" for h in clocked))
+    for e in facts.errors[:3]:
+        model.notes.append(e)
 
 
 def _dump(cfg: UiConfig, model) -> None:

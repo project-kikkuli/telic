@@ -16,13 +16,14 @@ vacuous, never passed.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from .driver import DriverError
 from .learn import Explorer, Model, UiState, Worker
 from .spec import TRUE, Pred, Prop, Target, UiLemma
-from .tree import Node, Snapshot, value_of
+from .tree import Node, Snapshot, controls, value_of
 
 
 @dataclass
@@ -140,22 +141,25 @@ class ModelCheck:
         snap, _, why = self.replay(path, w)
         if snap is None:
             return False, why
-        avoid: set[tuple[int, str]] = set()
+        # One state of the model can be several in the app (two dialogs that
+        # look alike): each step is taken once from each screen as the app
+        # shows it, so a route that leads back round is not taken again.
+        used: dict[str, set[str]] = {}
         for _ in range(budget or 3 * (len(self.m.states) + 2)):
             if goal.eval(w.snap, self.m.home):
                 return True, ""
             at = w.cur
             if at is None:
                 return False, "the app left the model"
+            here = used.setdefault(_concrete(w), set())
+            avoid = {(at.id, sig) for sig in here | (set(at.actions) - set(w.acts))}
             route = self.m.path(at.id, goals, avoid=avoid)
             if not route:
                 return False, f"no route left from {at.describe()}"
             sig = route[0]
-            # a step that fails, or leaves the app where it was, is not tried there again
-            if sig not in w.acts or self.ex.fire(w, at, sig) is None or w.cur is at:
-                avoid.add((at.id, sig))
-                if w.cur is None:
-                    return False, f"{at.labels.get(sig, sig)} failed in {at.describe()}"
+            here.add(sig)
+            if self.ex.fire(w, at, sig) is None and w.cur is None:
+                return False, f"{at.labels.get(sig, sig)} failed in {at.describe()}"
         return False, "gave up after too many steps"
 
     def trace_of(self, s: UiState) -> list[str]:
@@ -191,6 +195,15 @@ class ModelCheck:
             "unobscured": self.unobscured,
         }[p.kind](p, lem)
         out.viewport = self.m.viewport
+        return self._blind(out) if p.kind != "reachable" else out
+
+    def _blind(self, out: Outcome) -> Outcome:
+        """A proof over every state rests on the model seeing what decides
+        what renders: when the source names state it could not read, the
+        model may have merged states the app keeps apart."""
+        if self.m.unread and out.status in ("proved", "vacuous"):
+            what = "proved" if out.status == "proved" else "vacuous"
+            return Outcome("open", out.method, f"{what} on the model, but it cannot see {', '.join(self.m.unread[:3])}: handlers change it and it decides what renders ({out.detail})", out.viewport, out.trace, out.replay, out.relevant)
         return out
 
     def _states(self, p: Pred) -> list[UiState]:
@@ -342,7 +355,7 @@ class ModelCheck:
         if not cands:
             out = self._nothing("tested", f"{t} is never shown enabled")
             out.viewport = self.m.viewport
-            return out
+            return self._blind(out)
         s = cands[0]
         snap, done, why = self.replay(s.access)
         if snap is None:
@@ -399,6 +412,14 @@ class ModelCheck:
             viewport=self.m.viewport,
             relevant=1,
         )
+
+
+def _concrete(w: Worker) -> str:
+    """The screen as the app shows it now, finer than any abstraction: what can be done and every control's state."""
+    snap = w.snap
+    if snap is None:
+        return ""
+    return json.dumps([snap.screen, snap.overlays(), sorted(w.acts), controls(snap), snap.hidden], sort_keys=True, default=str)
 
 
 def _enabled(t: Target, snap: Snapshot) -> Node | None:

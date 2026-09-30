@@ -82,6 +82,7 @@ class Snapshot:
     screen: str  # route or screen name
     root: Node
     later: int | None = None  # ms until the app changes by itself (a timer it set), if it will
+    hidden: dict[str, list] | None = None  # state the tree does not show, read from the app: 'path:name' -> its values
 
     def nodes(self):
         return self.root.walk()

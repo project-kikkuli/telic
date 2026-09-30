@@ -54,6 +54,15 @@ The learned model is in `.telic/ui-model-<viewport>.json` next to the app:
 every state (route, overlays, controls), how to reach it, what was blocked
 and why, and every transition.
 
+The tree is not all there is. telic also reads the app's source for the keys
+its handlers listen for (pressed like any action: `keys found in the source`
+under the model) and for variables a handler changes that decide what renders
+(a step counter, an open flag). Those are read from the page into every state
+(`state the tree does not show`). One it cannot read, say in a minified
+build, is named, and no model-wide verdict is `proved` while it is unseen:
+serve a development build, or keep that state in the tree (an
+`aria-expanded`, a visible step number).
+
 ## Examples
 
 `examples/ui/` holds two apps written without telic in mind, with their
@@ -109,6 +118,9 @@ and taps where a finger would).
 
 3. **Write lemmas** in any Swift file, in the same comment syntax:
    `//@ [ESCAPE] ui escape: always reachable home from overlay`.
+
+Keys come from the Swift source too (`.keyboardShortcut`, `.onKeyPress`,
+`UIKeyCommand`); state the tree does not show is not read on iOS.
 
 A fresh start reinstalls the app (no stored data); reopening terminates and
 relaunches it. A screen is named by its navigation title. Each device gets

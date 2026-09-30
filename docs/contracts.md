@@ -549,7 +549,7 @@ max_depth = 30
 max_seconds = 600
 workers = 1                                 # browsers per viewport (each takes one of TELIC_UI_SLOTS, default 2, machine-wide)
 abstraction = "auto"                        # "controls", "screens", or auto: controls unless that exceeds 100 states
-keys = ["Escape"]                           # keys a user may press anywhere
+keys = ["Escape"]                           # keys a user may press anywhere (plus those found in the source)
 ignore = ['button "Sign out"']              # actions never fired (regexes)
 text = "telic"                              # what is typed into text fields
 fill = { "Coupon" = "SAVE10" }              # by field name (regex); emails, passwords, dates... are guessed
@@ -557,6 +557,20 @@ wait = 5                                    # seconds: a timer the app sets for 
 seed = false                                # true: an oracle proposes paths from the source first
 walk_seed = 0                               # of the random walks that test the model; the same seed, the same model
 ```
+
+**What the source adds.** The app's source (TypeScript, JavaScript,
+Svelte, Vue; Swift for keys) is read for two things the accessibility tree
+does not show. Keys its handlers compare against (`e.key === "k"`,
+`switch (e.key)`, `onKeyDown`, `on:keydown`, `@keydown.esc`,
+`useHotkeys("mod+s")`, `.keyboardShortcut("n")`) are pressed in every state
+like any action; each model lists them with where they were found. Variables
+a handler changes that decide what renders (a flag, a step counter, an
+`{#if}` or `&&` condition, a `useState`) are read from the running page
+along with every snapshot (through the handlers' closures and React's
+fibers) and are part of the state: scalars exactly, lists as 0, 1 or 2+
+items. A variable the model could not read (a minified build, an unmounted
+component) leaves every model-wide verdict open, naming it. A variable a
+timer also changes is not waited for, and the model says so.
 
 Verdicts are cached in `.telic/ui.json` by the app's sources (every file
 under the `telic.toml`'s directory except dependencies and the build output

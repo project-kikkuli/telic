@@ -65,6 +65,19 @@ KEYS = {
 }
 
 
+MODIFIERS = {"Control": 224, "Shift": 225, "Alt": 226, "Meta": 227, "ControlOrMeta": 227}
+_CHARS = {**{chr(97 + i): 4 + i for i in range(26)}, **{str(i): 29 + i for i in range(1, 10)}, "0": 39, "-": 45, "=": 46, "[": 47, "]": 48, "\\": 49, ";": 51, "'": 52, "`": 53, ",": 54, ".": 55, "/": 56}
+
+
+def hid(key: str) -> tuple[list[int], int] | None:
+    """'Meta+Shift+n' -> ([227, 225], 17): modifiers and key as HID usage codes."""
+    *mods, name = key.split("+") if key != "+" else ["+"]
+    code = KEYS.get(name) or _CHARS.get(name.lower() if len(name) == 1 else name)
+    if code is None or any(m not in MODIFIERS for m in mods):
+        return None
+    return [MODIFIERS[m] for m in mods], code
+
+
 def _kind(d: dict[str, Any]) -> str:
     t = d.get("type") or ""
     if t:
@@ -310,10 +323,14 @@ class IosDriver(Driver):
     def do(self, action: Action) -> None:
         shown = self.text
         if action.kind == "key":
-            code = KEYS.get(action.arg or "")
-            if code is None:
-                raise DriverError(f"no key {action.arg!r} on iOS (known: {', '.join(KEYS)})")
-            sim.axe("key", str(code), udid=self.udid)
+            got = hid(action.arg or "")
+            if got is None:
+                raise DriverError(f"no key {action.arg!r} on iOS (known: letters, digits, {', '.join(KEYS)}, with {', '.join(MODIFIERS)})")
+            mods, code = got
+            if mods:
+                sim.axe("key-combo", "--modifiers", ",".join(map(str, mods)), "--key", str(code), udid=self.udid)
+            else:
+                sim.axe("key", str(code), udid=self.udid)
         elif action.kind == "click":
             self._tap(action.ref)
         elif action.kind == "fill":

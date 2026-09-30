@@ -174,6 +174,106 @@ _FORM_JS = """
 """
 
 
+# Every function the page runs on an event (listeners, Svelte's delegated
+# handlers, React's props) whose source names a watched variable. Evaluated
+# with the DevTools command line API (getEventListeners).
+_HANDLERS_JS = """
+((names) => {
+  const re = new RegExp('(^|[^\\w$])(' + names.join('|') + ')($|[^\\w$])');
+  const fns = new Set();
+  const add = (f) => {
+    if (typeof f !== 'function' || fns.has(f)) return;
+    let s;
+    try { s = Function.prototype.toString.call(f); } catch (e) { return; }
+    if (!s.includes('[native code]') && re.test(s)) fns.add(f);
+  };
+  for (const t of [window, document, ...document.querySelectorAll('*')]) {
+    try { const ls = getEventListeners(t); for (const k in ls) for (const l of ls[k]) add(l.listener); } catch (e) {}
+    if (t === window) continue;
+    for (const k of Object.keys(t)) {
+      let v;
+      try { v = t[k]; } catch (e) { continue; }
+      if (typeof v === 'function') add(v);
+      else if (Array.isArray(v)) v.forEach(add);
+      else if (v && typeof v === 'object' && k.startsWith('__reactProps$')) Object.values(v).forEach(add);
+    }
+  }
+  return [...fns];
+})
+"""
+
+# A value as the model keeps it: scalars exactly, collections by size (0, 1,
+# 2+: which items are data, as in the tree), records by their fields.
+_ABSTRACT_JS = """
+function () {
+  'use strict';
+  const abs = (v, depth) => {
+    if (v === null || v === undefined) return String(v);
+    const t = typeof v;
+    if (t === 'boolean' || t === 'number') return v;
+    if (t === 'string') return v.length <= 40 ? v : 'text';
+    if (t !== 'object') return t;
+    try {
+      if ('v' in v && typeof v.f === 'number' && ('reactions' in v || 'wv' in v)) return abs(v.v, depth);  // a Svelte signal
+      if (v instanceof Node || v === window) return 'element';
+      const n = Array.isArray(v) ? v.length : v instanceof Map || v instanceof Set ? v.size : -1;
+      if (n >= 0) return n === 0 ? '[0]' : n === 1 ? '[1]' : '[2+]';
+      if (depth >= 2) return 'object';
+      const out = {};
+      for (const k of Object.keys(v).sort().slice(0, 24)) {
+        let x;
+        try { x = v[k]; } catch (e) { continue; }
+        if (typeof x !== 'function') out[k] = abs(x, depth + 1);
+      }
+      return out;
+    } catch (e) {
+      return 'object';
+    }
+  };
+  return abs(this, 0);
+}
+"""
+
+# React keeps state in fibers, not closures: every stateful hook
+# (useState, useReducer) of the function components named.
+_FIBERS_JS = """
+(names) => {
+  const want = new Set(names), out = {}, seen = new Set();
+  const abs = (%s);
+  for (const el of document.querySelectorAll('*')) {
+    const k = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+    for (let f = k && el[k]; f; f = f.return) {
+      if (seen.has(f) || (f.alternate && seen.has(f.alternate))) continue;
+      seen.add(f);
+      const name = f.type && (f.type.displayName || f.type.name);
+      if (typeof f.type !== 'function' || !want.has(name)) continue;
+      const vals = [];
+      for (let h = f.memoizedState; h; h = h.next) if (h.queue && h.queue.lastRenderedReducer) vals.push(abs.call(h.memoizedState));
+      (out[name] = out[name] || []).push(JSON.stringify(vals));
+    }
+  }
+  return out;
+}
+""" % _ABSTRACT_JS.strip()
+
+
+def _scalar(o: dict):
+    """A primitive remote object's value as ``_ABSTRACT_JS`` keeps it, or None if it is an object."""
+    t = o.get("type")
+    if t == "undefined":
+        return "undefined"
+    if t == "object" and o.get("subtype") == "null":
+        return "null"
+    if t in ("boolean", "number"):
+        return o.get("value", o.get("unserializableValue"))
+    if t == "string":
+        v = o.get("value", "")
+        return v if len(v) <= 40 else "text"
+    if t in ("function", "symbol", "bigint"):
+        return t
+    return None
+
+
 def parse_aria(text: str) -> Node:
     """Playwright's aria snapshot (YAML-like, with refs) -> a Node tree."""
     root = Node("root")
@@ -317,6 +417,10 @@ class WebDriver(Driver):
         self.text = ""
         self.dialogs = 0
         self._home = _Home()
+        self._watch: list = []
+        self._cdp = None
+        self._scripts: dict[str, str] = {}  # scriptId -> URL path
+        self.read: set[str] = set()
 
     @_confined
     def start(self) -> None:
@@ -345,6 +449,96 @@ class WebDriver(Driver):
                 pass
         self._pw = self._browser = self._ctx = self.page = None
 
+    def watch(self, hidden: list) -> None:
+        self._watch = list(hidden)
+
+    def _debugger(self) -> None:
+        """A DevTools session on the page, knowing which file each script is."""
+        self._scripts = {}
+        self._cdp = self._ctx.new_cdp_session(self.page)
+        self._cdp.on("Debugger.scriptParsed", lambda e: self._scripts.__setitem__(e["scriptId"], urlsplit(e.get("url") or "").path))
+        self._cdp.send("Debugger.enable")
+        self._cdp.send("Debugger.setSkipAllPauses", {"skip": True})
+        self._cdp.send("Runtime.enable")
+
+    def _hidden(self) -> dict[str, list] | None:
+        """The watched variables' values now: from the scopes of the page's
+        handlers (and of the getters of objects they hold), matched by name
+        and by the file the function is in, and from React's fibers."""
+        if not self._watch or self._cdp is None:
+            return None
+        cdp = self._cdp
+        want: dict[str, list] = {}
+        for h in self._watch:
+            if not h.react:
+                want.setdefault(h.name, []).append(h)
+        got: dict[str, set[str]] = {}
+
+        def owner(fn_id: str) -> tuple[str, str | None]:
+            props = cdp.send("Runtime.getProperties", {"objectId": fn_id, "ownProperties": True})
+            where, scopes = "", None
+            for p in props.get("internalProperties", []):
+                if p["name"] == "[[FunctionLocation]]":
+                    where = self._scripts.get(p["value"]["value"]["scriptId"], "")
+                elif p["name"] == "[[Scopes]]":
+                    scopes = p["value"].get("objectId")
+            return where, scopes
+
+        def value(o: dict) -> str:
+            v = _scalar(o)
+            if v is None and o.get("objectId"):
+                v = cdp.send("Runtime.callFunctionOn", {"objectId": o["objectId"], "functionDeclaration": _ABSTRACT_JS, "returnByValue": True, "objectGroup": "telic"})["result"].get("value")
+            return json.dumps(v, sort_keys=True)
+
+        try:
+            if want:
+                arr = cdp.send(
+                    "Runtime.evaluate", {"expression": f"({_HANDLERS_JS})({json.dumps(sorted(want))})", "includeCommandLineAPI": True, "objectGroup": "telic"}
+                )["result"].get("objectId")
+                fns = [p["value"]["objectId"] for p in cdp.send("Runtime.getProperties", {"objectId": arr, "ownProperties": True})["result"] if p["name"].isdigit()] if arr else []
+                holders: list[str] = []  # objects in scope: their getters may hold state too
+                for depth in range(2):
+                    for fn in fns:
+                        where, scopes = owner(fn)
+                        if scopes is None:
+                            continue
+                        for sc in cdp.send("Runtime.getProperties", {"objectId": scopes, "ownProperties": True})["result"]:
+                            obj = sc["value"]
+                            if obj.get("description") == "Global" or not obj.get("objectId"):
+                                continue
+                            for var in cdp.send("Runtime.getProperties", {"objectId": obj["objectId"], "ownProperties": True})["result"]:
+                                v = var.get("value") or {}
+                                for h in want.get(var["name"], []):
+                                    if where.endswith("/" + h.path):
+                                        got.setdefault(f"{h.path}:{h.name}", set()).add(value(v))
+                                if depth == 0 and v.get("type") == "object" and v.get("subtype") is None and v.get("objectId") and len(holders) < 64:
+                                    holders.append(v["objectId"])
+                    fns = []
+                    for o in holders:
+                        for p in cdp.send("Runtime.getProperties", {"objectId": o, "ownProperties": True, "accessorPropertiesOnly": True})["result"]:
+                            g = (p.get("get") or {}).get("objectId")
+                            if g:
+                                fns.append(g)
+                    holders = []
+                    if not fns or all(f"{h.path}:{h.name}" in got for hs in want.values() for h in hs):
+                        break
+            comps = sorted({h.component for h in self._watch if h.react and h.component})
+            if comps:
+                fib = self.page.evaluate(_FIBERS_JS, comps)
+                for h in self._watch:
+                    if h.react and h.component in fib:
+                        got.setdefault(f"{h.path}:{h.component}", set()).update(fib[h.component])
+                        self.read.add(f"{h.path}:{h.name}")
+        except Exception:  # noqa: BLE001 - navigating: read at the next snapshot
+            return None
+        finally:
+            try:
+                cdp.send("Runtime.releaseObjectGroup", {"objectGroup": "telic"})
+            except Exception:  # noqa: BLE001 - the page went away
+                pass
+        self.read.update(f"{h.path}:{h.name}" for h in self._watch if not h.react and f"{h.path}:{h.name}" in got)
+        return {k: sorted(v) for k, v in sorted(got.items())}
+
     @_confined
     def viewport(self, width: int, height: int) -> None:
         self.size = (width, height)
@@ -361,6 +555,8 @@ class WebDriver(Driver):
         self.page = self._ctx.new_page()
         self._ctx.on("page", lambda p: p.close())  # popups and new tabs leave the app
         self.page.on("dialog", self._on_dialog)
+        if self._watch:
+            self._debugger()
         self._goto()
 
     @_confined
@@ -424,7 +620,7 @@ class WebDriver(Driver):
             later = self.page.evaluate(_LATER_JS) if self.wait_ms else None
         except Exception:  # noqa: BLE001 - navigating: nothing pending in the new document yet
             later = None
-        return Snapshot(self.screen(), root, int(later) + 1 if later is not None and later <= self.wait_ms else None)
+        return Snapshot(self.screen(), root, int(later) + 1 if later is not None and later <= self.wait_ms else None, self._hidden())
 
     @_confined
     def leaves(self, node: Node) -> bool:

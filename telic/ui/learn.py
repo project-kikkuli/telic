@@ -1,9 +1,10 @@
 """Learning the app's state graph from the running app.
 
-Nothing is read from source. From a fresh start, every action a user has
-(clicking, typing, choosing, pressing a key) is fired in every state found,
-each observation is abstracted to what the lemmas can tell apart (screen,
-open overlays, controls and their states, the predicates the lemmas use),
+From a fresh start, every action a user has (clicking, typing, choosing,
+pressing a key) is fired in every state found, each observation is
+abstracted to what the lemmas can tell apart (screen, open overlays,
+controls and their states, the predicates the lemmas use, and the variables
+the source says handlers change to decide what renders, read from the app),
 and the transitions form the model. Getting back to a state replays its
 access sequence from a fresh start, as in active automata learning.
 
@@ -92,6 +93,9 @@ class Model:
     seeded: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     unreproducible: set[int] = field(default_factory=set)  # seen once, never reached again by any known path
+    keys: list[str] = field(default_factory=list)  # found in the source, pressed like any action ('Escape (app.js:3)')
+    hidden: list[str] = field(default_factory=list)  # read from the app into every state
+    unread: list[str] = field(default_factory=list)  # decides what renders, but the model cannot see it
 
     @property
     def transitions(self) -> int:
@@ -214,6 +218,9 @@ class Model:
             "nondeterministic": self.nondeterministic,
             "seeded": self.seeded,
             "unreproducible": len(self.unreproducible),
+            "keys": self.keys,
+            "hidden": self.hidden,
+            "unread": self.unread,
             "notes": self.notes,
         }
 
@@ -281,6 +288,7 @@ class Explorer:
                 "open": [c for c in controls(snap) if "[expanded]" in c or "[pressed]" in c],
                 "landmarks": sorted({n.label for n in snap.nodes() if n.role in LANDMARKS and n.name}),
                 "atoms": list(atoms),
+                **({"hidden": snap.hidden} if snap.hidden else {}),
             }
         else:
             body = {
@@ -290,6 +298,7 @@ class Explorer:
                 "controls": controls(snap),
                 "groups": {g: bucket(n) for g, n in sorted(groups.items())},
                 "atoms": list(atoms),
+                **({"hidden": snap.hidden} if snap.hidden else {}),
             }
         return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20], atoms, body
 
