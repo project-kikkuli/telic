@@ -136,6 +136,41 @@ behind the class work found four holes, now closed, each with an exploit in
   assumed as if it had finished (Python too, `async1.py`);
 - `void f()`, which dropped the call.
 
+## Swift
+
+The Swift frontend was run on [mxcl/Version](https://github.com/mxcl/Version)
+`Sources/` at `3043fcd` (5 files, 376 lines, 13 functions), unmodified and
+with no contracts added, `--no-lean --no-cache`:
+
+| | refuted | proved | nothing to check | unsupported |
+|---|---|---|---|---|
+| first run | 1 | 1 | 3 | 8 |
+| after the fixes below | 1 | 2 | 5 | 5 |
+
+**A real crash.** `Version(Int.min, 0, 0)` traps: the initializer takes
+`abs` of each component, and `abs(Int.min)` overflows. telic reports it for
+each of the three components and replays each one: `swiftc` compiles the
+package's own `Version.swift` with a generated harness and the call traps.
+
+The run found these gaps, now fixed:
+
+- `self.init(...)` delegating to another initializer, and `self = v` in a
+  struct initializer;
+- `"-" + ids.joined(separator: ".")`, which tree-sitter-swift parses as a
+  call of `"-" + ids.joined`;
+- `String` methods whose result type telic does not know (`firstIndex(of:)`),
+  which were typed as `String`.
+
+Still unsupported: `#if` inside a function body, a local function,
+`1...3 ~= n`, `for (a, b) in zip(...)`, and `Version.init(tolerant:)` used
+as a function value.
+
+The Swift corpus, compared engine against Python core, also found a bug in
+the native engine: its JSON reader turned integers too wide for an OCaml
+`int` into floats, so `Int.max` became 2^63 and it proved that
+`-Int.min` and `Int.min / -1` do not overflow. Both engines now read those
+integers exactly.
+
 ## What it means
 
 Most functions in glue code have **nothing to check**. They have no contract
