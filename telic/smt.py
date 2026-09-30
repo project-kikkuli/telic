@@ -66,6 +66,7 @@ class Z3Encoder:
         self.key_candidates: dict[str, list[Any]] = {}
         # keys an unchecked value rebuilt as JSON may have: those the obligation names
         self.json_keys: list[str] | None = None
+        self.regexes: dict[str, z3.ReRef] = {}
         self.json_attrs: set[L.Term] = set()  # t.k reads the obligation makes
         self.json_ops: set[str] = set()
         self.json_kinds: set[str] = set()
@@ -114,6 +115,13 @@ class Z3Encoder:
         return self.datatypes[s.rec]
 
     # -- functions --------------------------------------------------------
+
+    def regex(self, text: str) -> z3.ReRef:
+        """A regular language written in SMT-LIB, in this context."""
+        if text not in self.regexes:
+            (f,) = z3.parse_smt2_string(f"(declare-const s String)(assert (str.in_re s {text}))", ctx=self.ctx)
+            self.regexes[text] = f.arg(1)
+        return self.regexes[text]
 
     def declare(self, d: L.FunDef) -> None:
         doms = [self.sort(p.sort) for p in d.params]
@@ -207,6 +215,10 @@ class Z3Encoder:
             return z3.Store(a[0], a[1], a[2])
         if op == "str.++":
             return z3.Concat(*a)
+        if op == "str.to_int":
+            return z3.StrToInt(a[0])
+        if op == "str.in_re":
+            return z3.InRe(a[0], self.regex(t.args[1].value))  # type: ignore[attr-defined]
         if op == "str.len":
             return z3.Length(a[0])
         if op == "str.contains":

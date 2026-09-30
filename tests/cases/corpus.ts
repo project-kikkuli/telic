@@ -509,3 +509,24 @@ export function mapStatementsUnguarded(xs: number[]): number {
   });
   return 0;
 }
+
+// expect: proved
+export function parseDigits(s: string): number {
+  //@ requires s === "42"
+  //@ ensures result === 42
+  return Number.parseInt(s, 10)
+}
+
+// expect: proved
+export function parseLeadingDigit(s: string): number {
+  //@ requires s.startsWith("7")
+  //@ ensures result >= 0
+  return parseInt(s)
+}
+
+// expect: refuted
+export function parseFloatWrong(s: string): number {
+  //@ requires s === "5"
+  //@ ensures result === 6
+  return parseFloat(s)
+}

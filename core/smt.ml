@@ -133,6 +133,7 @@ and pr_node p t =
   | App ("K", [| v |]) -> Buffer.add_string b (Printf.sprintf "((as const %s) " (sort_smt t.sort)); pr p v; Buffer.add_char b ')'
   | App ("str.from_int", [| a |]) ->
     Buffer.add_string b "(ite (>= "; pr p a; Buffer.add_string b " 0) (str.from_int "; pr p a; Buffer.add_string b ") (str.++ \"-\" (str.from_int (- "; pr p a; Buffer.add_string b "))))"
+  | App ("str.in_re", [| s; { node = StrV re; _ } |]) -> Buffer.add_string b "(str.in_re "; pr p s; Buffer.add_char b ' '; Buffer.add_string b re; Buffer.add_char b ')'
   | App ("str.at", [| s; i |]) -> Buffer.add_string b "(str.substr "; pr p s; Buffer.add_char b ' '; pr p i; Buffer.add_string b " 1)"
   | App (op, xs) when String.length op > 6 && String.sub op 0 6 = "field:" -> (
     match xs.(0).sort with

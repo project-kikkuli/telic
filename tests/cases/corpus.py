@@ -857,3 +857,33 @@ def cleared(rest: list[int], i: int) -> bool:
     #@ requires all(rest[k] >= 0 for k in range(i))
     #@ ensures all(rest[m] == 0 for m in range(len(rest)))
     return True
+
+
+# expect: proved
+def parse_digits(s: str) -> int:
+    #@ requires s == "-42"
+    #@ ensures result == -42
+    return int(s)
+
+
+# expect: refuted
+def parse_unchecked(s: str) -> int:
+    # int() raises ValueError on text it cannot parse
+    #@ ensures result >= 0 or result < 0
+    return int(s)
+
+
+# expect: proved
+def parse_or_zero(s: str) -> int:
+    #@ ensures True
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
+
+# expect: proved
+def parse_float_digits(s: str) -> float:
+    #@ requires s == "3"
+    #@ ensures result == 3.0
+    return float(s)

@@ -378,6 +378,9 @@ let () =
   let req = Json.parse input in
   phase "parse";
   let terms = read_terms (Json.member "theory" req) in
+  (match Json.member "regexes" (Json.member "theory" req) with
+   | Json.Assoc kvs -> List.iter (fun (k, v) -> Hashtbl.replace Term.regexes k (Json.to_str v)) kvs
+   | _ -> ());
   let th =
     let fundefs = Hashtbl.create 16 in
     List.iter

@@ -655,6 +655,42 @@ def seqcount_def(elem: Sort) -> FunDef:
 
 
 # ---------------------------------------------------------------------------
+# Regular languages of text the parsing builtins accept (SMT-LIB syntax)
+
+_D = "(re.range \"0\" \"9\")"
+_WS = "(re.union (str.to_re \" \") (re.range \"\\u{9}\" \"\\u{d}\"))"
+_SIGN = "(re.opt (re.union (str.to_re \"+\") (str.to_re \"-\")))"
+_PART = f"(re.++ {_D} (re.* (re.++ (re.opt (str.to_re \"_\")) {_D})))"  # 1_000
+_EXP = f"(re.++ (re.union (str.to_re \"e\") (str.to_re \"E\")) {_SIGN} {_PART})"
+_WORDS = "(re.union " + " ".join(f"(str.to_re \"{w}\")" for w in ("inf", "infinity", "nan", "Inf", "Infinity", "NaN", "INF", "INFINITY", "NAN")) + ")"
+REGEXES = {
+    "digits": f"(re.+ {_D})",
+    "neg_digits": f"(re.++ (str.to_re \"-\") (re.+ {_D}))",
+    "pos_digits": f"(re.++ (str.to_re \"+\") (re.+ {_D}))",
+    # Python's int(): spaces, a sign, digits with single underscores (ASCII only: a
+    # string outside may still parse, with Unicode digits)
+    "py_int": f"(re.++ (re.* {_WS}) {_SIGN} {_PART} (re.* {_WS}))",
+    # Python's float() (the words in a few spellings; outside may still parse)
+    "py_float": f"(re.++ (re.* {_WS}) {_SIGN} (re.union (re.++ (re.union (re.++ {_PART} (re.opt (re.++ (str.to_re \".\") (re.opt {_PART})))) (re.++ (str.to_re \".\") {_PART})) (re.opt {_EXP})) {_WORDS}) (re.* {_WS}))",
+    # float() text that is not a finite number
+    "py_float_word": f"(re.++ (re.* {_WS}) {_SIGN} {_WORDS} (re.* {_WS}))",
+    # JavaScript's parseInt/parseFloat read a leading number: after spaces and a sign, a digit
+    "js_num_prefix": f"(re.++ (re.* {_WS}) {_SIGN} {_D} re.all)",
+    "js_nonneg_prefix": f"(re.++ (re.* {_WS}) (re.opt (str.to_re \"+\")) {_D} re.all)",
+}
+
+
+def in_re(s: Term, name: str) -> Term:
+    """``s`` is in the regular language ``REGEXES[name]``."""
+    return App("str.in_re", (s, StrV(REGEXES[name])), BOOL)
+
+
+def str_to_int(s: Term) -> Term:
+    """The number a string of decimal digits spells (-1 for any other string)."""
+    return App("str.to_int", (s,), INT)
+
+
+# ---------------------------------------------------------------------------
 # Pretty printing (for humans; also the canonical text used for hashing)
 
 _INFIX = {

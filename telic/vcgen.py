@@ -1689,6 +1689,8 @@ class VCGen:
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
             return DictVal(vals, has, e.ty)
         args = [self.ev(a, ctx) for a in e.args]
+        if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
+            return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
             assert isinstance(e.ty, ir.TOption)
             return coerce(args[0], e.ty)
@@ -2006,6 +2008,43 @@ class VCGen:
                 flat.extend(flatten(a))
             return L.Fn(f"str.{op.value}", tuple(flat), sort_of(e.ty))
         raise VCError(f"unknown string operation {name}", e.loc)
+
+    def parse_number(self, name: str, s: L.Term, e: ir.Builtin, ctx: Ctx) -> L.Term:
+        """``int(s)``/``float(s)`` (Python), ``parseInt(s)``/``parseFloat(s)``
+        (JavaScript) on a string: exact on plain decimal digits; otherwise a
+        number telic does not compute. Python raises ValueError on text
+        outside its grammar (checked like a raise statement); JavaScript
+        gives NaN, which telic's numbers do not include (a listed assumption)."""
+        py = name.startswith("py_")
+        real = name != "py_int_parse"
+        tail = L.App("str.substr", (s, L.ONE, L.sub(L.App("str.len", (s,), L.INT), L.ONE)), L.STR)
+        other = L.Fn(name, (s,), L.REAL if real else L.INT)
+        exact = L.ite(L.in_re(s, "digits"), L.str_to_int(s), L.ite(L.in_re(s, "neg_digits"), L.neg(L.str_to_int(tail)), L.str_to_int(tail)))
+        known = L.or_(L.in_re(s, "digits"), L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits"))
+        # (Z3 does not find these itself: digits spell a number >= 0)
+        ctx.assume(L.implies(L.in_re(s, "digits"), L.le(L.ZERO, L.str_to_int(s))))
+        ctx.assume(L.implies(L.or_(L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits")), L.le(L.ZERO, L.str_to_int(tail))))
+        v = L.ite(known, L.to_real(exact) if real else exact, other)
+        what = {"py_int_parse": "int()", "py_float_parse": "float()", "js_parse_int": "parseInt", "js_parse_float": "parseFloat"}[name]
+        if py:
+            ok = L.in_re(s, "py_int" if name == "py_int_parse" else "py_float")
+            caught = isinstance(e.args[-1], ir.Lit) and e.args[-1].value is True
+            if not caught and not ctx.spec and ctx.state is not None:
+                if self.fn.raises:
+                    ectx = Ctx(base=ctx.base, env=self.entry, module=self.module, spec=True, quiet=True)
+                    cond = L.or_(*[self.ev(r.expr, ectx) for r in self.fn.raises])
+                    self.oblige("raise", ctx, L.or_(ok, cond), e.loc, f"{what} of text it cannot parse raises ValueError outside '@raises {self.fn.raises[0].text}'")
+                elif self.fn.requires or self.fn.ensures:
+                    self.oblige("raise", ctx, ok, e.loc, f"{what} can parse '{_expr_name(e.args[0])}' (else it raises ValueError)")
+            if name == "py_float_parse":
+                self.note(e.loc, "float() of 'nan', 'inf' or an overflowing exponent is not a number telic models")
+        else:
+            prefix = L.in_re(s, "js_num_prefix")
+            ctx.assume(L.implies(L.in_re(s, "js_nonneg_prefix"), L.le(L.RealV(Fraction(0)), other)))
+            if name == "js_parse_int":
+                ctx.assume(L.implies(prefix, L.is_int(other)))
+            self.note(e.loc, f"{what} of text without a leading number is NaN, which telic models as an unknown number")
+        return v
 
     def comprehension(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> Val:
         assert isinstance(seq, ListVal) and isinstance(e.ty, ir.TList)

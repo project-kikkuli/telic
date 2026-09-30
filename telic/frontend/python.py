@@ -2488,6 +2488,8 @@ class ExprLowerer:
             return ir.sum_of(x, loc)
         if name == "float":
             (x,) = self._args(n, 1)
+            if x.ty == ir.STR:
+                return ir.Builtin(ir.REAL, loc, "py_float_parse", (x, ir.Lit(ir.BOOL, loc, self.fl.try_depth > 0)))
             if not ir.is_numeric(x.ty):
                 return self.extern("float", [x], None, loc, ir.REAL)
             return self.fl.coerce(x, ir.REAL)
@@ -2497,7 +2499,9 @@ class ExprLowerer:
                 return x
             if isinstance(x.ty, ir.TReal):
                 return ir.Builtin(ir.INT, loc, "trunc", (x,))
-            return self.extern("int", [x], None, loc, ir.INT)  # int(s): parsing, may raise
+            if x.ty == ir.STR and not n.keywords:
+                return ir.Builtin(ir.INT, loc, "py_int_parse", (x, ir.Lit(ir.BOOL, loc, self.fl.try_depth > 0)))
+            return self.extern("int", [x], None, loc, ir.INT)  # int(x, base), int(obj): may raise
         if name == "round":
             if len(n.args) != 1:
                 return self.extern("round", [], n, loc, ir.REAL)

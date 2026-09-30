@@ -167,7 +167,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
         "heap_writes": {k: {cf: sorted(ts) for cf, ts in w.items()} for k, w in program.heap_writes.items()},
         "allocates": sorted(program.allocates),
         "def_heap": {k: program.def_heap_keys(k) for k in program.definitional},
-        "theory": {**tw.dump(), "fundefs": fundefs, "axioms": axioms},
+        "theory": {**tw.dump(), "fundefs": fundefs, "axioms": axioms, "regexes": L.REGEXES},
         "timeout_ms": timeout_ms,
         "rlimit": rlimit,
         "jobs": jobs or 0,

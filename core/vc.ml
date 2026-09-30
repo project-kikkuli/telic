@@ -784,6 +784,7 @@ and builtin g ctx (e : Ir.expr) name args =
   let lit_str (a : Ir.expr) = match a.e with Lit (LStr s) -> s | Lit (LInt s) -> s | _ -> raise (Vc_error ("expected a literal", loc)) in
   let assume_ t = assume ctx t in
   match name with
+  | "py_int_parse" | "py_float_parse" | "js_parse_int" | "js_parse_float" -> parse_number g ctx e name (tm (ev g ctx (List.hd args)))
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
   | "each" ->
     let seq = match ev g ctx (List.hd args) with L l -> l | _ -> raise (Vc_error ("comprehension over a non-list", loc)) in
@@ -1252,6 +1253,45 @@ and comprehension g ctx (e : Ir.expr) seq =
             [ [| select arr k |] ]));
     L { arr = !comp_arr; off = zero; len = ln; lty = e.ty }
   end
+
+(* int(s)/float(s) (Python), parseInt(s)/parseFloat(s) (JavaScript) on a
+   string: exact on plain decimal digits, otherwise a number telic does not
+   compute. Python raises ValueError on text outside its grammar (checked like
+   a raise statement); JavaScript gives NaN, which telic's numbers do not
+   include (a listed assumption). *)
+and parse_number g ctx (e : Ir.expr) name s =
+  let loc = e.loc in
+  let py = String.sub name 0 3 = "py_" in
+  let real = name <> "py_int_parse" in
+  let tail = app "str.substr" [| s; one; Term.sub (app "str.len" [| s |] Int) one |] Str in
+  let other = fn name [| s |] (if real then Real else Int) in
+  let exact = ite (in_re s "digits") (str_to_int s) (ite (in_re s "neg_digits") (neg (str_to_int tail)) (str_to_int tail)) in
+  let known = or_ [ in_re s "digits"; in_re s "neg_digits"; in_re s "pos_digits" ] in
+  (* (z3 does not find these itself: digits spell a number >= 0) *)
+  assume ctx (implies (in_re s "digits") (le zero (str_to_int s)));
+  assume ctx (implies (or_ [ in_re s "neg_digits"; in_re s "pos_digits" ]) (le zero (str_to_int tail)));
+  let v = ite known (if real then to_real exact else exact) other in
+  let what = match name with "py_int_parse" -> "int()" | "py_float_parse" -> "float()" | "js_parse_int" -> "parseInt" | _ -> "parseFloat" in
+  if py then begin
+    let ok = in_re s (if name = "py_int_parse" then "py_int" else "py_float") in
+    let caught = match List.rev (match e.e with Builtin (_, a) -> a | _ -> []) with { e = Lit (LBool true); _ } :: _ -> true | _ -> false in
+    (if (not caught) && (not ctx.spec) && ctx.state <> None then
+       let arg = expr_name (match e.e with Builtin (_, a :: _) -> a | _ -> e) in
+       if g.info.fn.raises <> [] then begin
+         let ectx = { ctx with env = g.entry; live = None; spec = true; quiet = true } in
+         let cond = or_ (List.map (fun (r : Ir.clause) -> term_of loc (ev g ectx r.cexpr)) g.info.fn.raises) in
+         oblige g "raise" ctx (or_ [ ok; cond ]) loc (Printf.sprintf "%s of text it cannot parse raises ValueError outside '@raises %s'" what (List.hd g.info.fn.raises).text)
+       end
+       else if g.info.fn.requires <> [] || g.info.fn.ensures <> [] then
+         oblige g "raise" ctx ok loc (Printf.sprintf "%s can parse '%s' (else it raises ValueError)" what arg));
+    if name = "py_float_parse" then note_assumed g loc "float() of 'nan', 'inf' or an overflowing exponent is not a number telic models"
+  end
+  else begin
+    assume ctx (implies (in_re s "js_nonneg_prefix") (le (Term.real (Q.of_int 0)) other));
+    if name = "js_parse_int" then assume ctx (implies (in_re s "js_num_prefix") (is_int other));
+    note_assumed g loc (Printf.sprintf "%s of text without a leading number is NaN, which telic models as an unknown number" what)
+  end;
+  T v
 
 (* relate a sum over a comprehension to the earlier sums over ones with the
    same body: equal on their common prefix wherever the elements are

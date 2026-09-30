@@ -2177,6 +2177,16 @@ class FunctionLowerer {
     return { e: "Builtin", ty, loc, name: "opaque_op", args: [{ e: "Lit", ty: STR, loc, value: op }, ...parts] };
   }
 
+  // parseInt(s) / parseInt(s, 10) / parseFloat(s) on a string: the number it reads
+  parseNumber(which, args, loc) {
+    if (this.spec || args.length < 1) return null;
+    const radix = which === "parseInt" && args.length === 2 && ts.isNumericLiteral(args[1]) && args[1].text === "10";
+    if (args.length > (radix ? 2 : 1)) return null;
+    const s = this.unwrap(this.expr(args[0]));
+    if (s.ty.k !== "str") return null;
+    return { e: "Builtin", ty: REAL, loc, name: which === "parseInt" ? "js_parse_int" : "js_parse_float", args: [s] };
+  }
+
   extern(name, args, ty, loc) {
     if (this.spec) throw this.err(`specifications cannot call unchecked code ('${name}')`, loc[0]);
     return { e: "Extern", ty: ty && ty.k !== "opaque" ? ty : opaque(`result of ${name}`), loc, name, args };
@@ -2723,6 +2733,10 @@ class FunctionLowerer {
           const d = this.unwrap(this.expr(args[0]));
           if (d.ty.k === "dict") return { e: "Builtin", ty: listOf(m === "keys" ? d.ty.key : d.ty.val), loc, name: m === "keys" ? "dict_keys" : "dict_values", args: [d] };
         }
+        if (base === "Number" && (m === "parseInt" || m === "parseFloat")) {
+          const p = this.parseNumber(m, args, loc);
+          if (p) return p;
+        }
         if (base === "Number" || base === "parseInt" || base === "parseFloat") return this.extern(key, args.map((a) => this.expr(a)), REAL, loc);
         if (this.ml.globalsBound.has(base) || GLOBALS.has(base) || this.ml.imported[base] || this.ml.namespaces[base] || this.ml.enums[base] || this.ml.classes[base]) {
           if (this.spec) throw this.err(`specifications cannot call unchecked code ('${key}')`, this.nline(n));
@@ -2814,6 +2828,10 @@ class FunctionLowerer {
     }
     const isLocal = this.resolve(name) !== null || (this.bound && name in this.bound);
     if (!isLocal && name === "String" && args.length === 1) return this.toStr(this.expr(args[0]), loc);
+    if (!isLocal && !this.spec && (name === "parseInt" || name === "parseFloat")) {
+      const p = this.parseNumber(name, args, loc);
+      if (p) return p;
+    }
     if (!isLocal && name === "Boolean" && args.length === 1) return this.cond(args[0]);
     const sig = !isLocal ? this.ml.sigs[name] : null;
     if (sig && !sig.cls) return this.callSig(name, [], args, n, loc);

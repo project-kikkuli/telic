@@ -416,3 +416,14 @@ let subst (m : (term * term) list) (t : term) : term =
         r)
   in
   go m t
+
+(* regular languages of text the parsing builtins accept, by name (SMT-LIB
+   syntax; the request carries them from telic/logic.py) *)
+let regexes : (string, string) Hashtbl.t = Hashtbl.create 8
+
+let in_re s name =
+  match Hashtbl.find_opt regexes name with
+  | Some text -> app "str.in_re" [| s; str text |] Bool
+  | None -> failwith ("no regular language " ^ name)
+
+let str_to_int s = app "str.to_int" [| s |] Int
