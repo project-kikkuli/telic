@@ -246,3 +246,75 @@ interface Holder {
 export function labelLength({ label }: Holder): number {
   return label.length;
 }
+
+type Payment = { method: "card"; last4: string; amount: number } | { method: "cash"; amount: number } | { method: "credit"; amount: number; expires?: number };
+
+// expect: proved
+export function fee(p: Payment): number {
+  //@ requires p.amount >= 0
+  //@ ensures result >= 0
+  switch (p.method) {
+    case "card":
+      return p.amount / 50 + p.last4.length * 0;
+    case "cash":
+      return 0;
+    default:
+      return (p.expires ?? 1) > 0 ? p.amount : 0;
+  }
+}
+
+// expect: refuted
+export function feeBad(p: Payment): number {
+  //@ ensures result >= 0
+  if (p.method !== "card") return 0;
+  return p.amount / 50;
+}
+
+// expect: proved
+export function isCard(p: Payment): boolean {
+  //@ ensures result === (p.method === "card")
+  return p.method === "card" && p.last4.length >= 0;
+}
+
+// expect: proved
+export function cash(amount: number): Payment {
+  //@ ensures result.method === "cash" && result.amount === amount
+  return { method: "cash", amount };
+}
+
+interface Profile {
+  nick?: string;
+  age?: number;
+}
+
+// expect: proved
+export function greeting(p: Profile | undefined): string {
+  //@ ensures result.length >= 2
+  return "hi" + (p?.nick ?? "");
+}
+
+// expect: refuted
+export function ageNext(p: Profile | undefined): number {
+  //@ ensures result > 0
+  return (p?.age ?? 0) + 1;
+}
+
+// expect: proved
+export function firstOf(xs: readonly number[]): number {
+  //@ requires xs.length > 0
+  //@ ensures result === xs[0]
+  return xs[0];
+}
+
+// expect: proved
+export function lookup(m: ReadonlyMap<string, number>, k: string): number {
+  //@ ensures implies(!m.has(k), result === -1)
+  return m.get(k) ?? -1;
+}
+
+// expect: proved
+export async function doubledLater(x: number): Promise<number> {
+  //@ ensures result === 2 * x
+  await Promise.resolve();
+  return 2 * x;
+}

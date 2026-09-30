@@ -135,6 +135,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "recursive": key in program.recursive,
             "termination": program.needs_termination(key),
             "resolve": resolve,
+            "untrusted": sorted([c, i] for c, i in program.untrusted.get(key, ())),
         }
     req = {
         "modules": [irjson.module(m) for m in program.modules],

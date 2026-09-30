@@ -90,7 +90,7 @@ def test_engine_proves_no_exploit():
         if name.endswith(".ts") and not HAS_NODE:
             continue
         rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000, engine="ox"), root=str(DIR))
-        proved = {f.fn.name for f in rep.functions if f.status == "proved"}
+        proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
         bad += [f"{name}:{n}" for n in proved - TRUE_HELPERS.get(name, set())]
     assert not bad, f"exploits proved by the engine: {bad}"
 

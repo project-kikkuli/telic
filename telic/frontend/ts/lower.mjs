@@ -131,6 +131,7 @@ const JS_ASSUMPTIONS = [
   "integer-valued numbers stay within the safe range ±2^53",
   "distinct array arguments do not alias each other",
   "console.* calls have no effect on program state",
+  "objects of interface and object-literal types are not changed by other code while checked code reads them",
 ];
 
 class ModuleLowerer {
@@ -149,6 +150,8 @@ class ModuleLowerer {
     this.imported = {}; // local -> {mod, name}
     this.importDecls = [];
     this.constants = {}; // module-level `const X = <literal>`
+    this.memberLists = {}; // interface / object type alias -> its members
+    this.unions = new Map(); // union type node -> its record type (null: not a discriminated union)
     this.globalsBound = new Set(); // module-level names that are not modelled
   }
 
@@ -205,18 +208,20 @@ class ModuleLowerer {
     }
     for (const st of this.sf.statements) {
       if (ts.isClassDeclaration(st) && st.name) {
+        const name = st.name.text;
         const ext = st.heritageClauses && st.heritageClauses.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
+        const c = { name, node: st, fields: [], props: new Set(), setters: new Set(), statics: new Set(), abstracts: new Set(), home: this, abstract: hasModifier(st, ts.SyntaxKind.AbstractKeyword) };
         if (ext) {
-          this.globalsBound.add(st.name.text);
-          const base = ext.types[0] ? ext.types[0].expression.getText(this.sf) : "?";
-          // an Error subclass is only ever thrown; other subclasses are library-like values
-          if (!/(Error|Exception)$/.test(base)) {
-            this.module.notes.push([`class ${st.name.text}: subclass of ${base}; inheritance is not modelled for TypeScript yet, so its instances are treated as library values`, this.line(st)]);
-            this.module.opaque_subclasses.push([st.name.text, base, this.line(st)]);
+          const te = ext.types[0];
+          c.baseText = te ? te.expression.getText(this.sf) : "?";
+          // an Error subclass is only ever thrown
+          if (/(Error|Exception)$/.test(c.baseText)) {
+            this.globalsBound.add(name);
+            continue;
           }
-          continue;
+          c.baseName = te && ts.isIdentifier(te.expression) ? te.expression.text : null;
         }
-        this.classes[st.name.text] = { node: st, fields: [], props: new Set(), setters: new Set(), statics: new Set(), home: this };
+        this.classes[name] = c;
       }
     }
     for (const st of this.sf.statements) {
@@ -235,6 +240,7 @@ class ModuleLowerer {
       } catch (e) {
         if (!(e instanceof LowerError)) throw e;
         this.module.problems.push([`class ${name}: ${e.message}`, e.line || this.line(c.node)]);
+        c.dropped = true;
         delete this.classes[name];
       }
     }
@@ -256,7 +262,10 @@ class ModuleLowerer {
       for (const m of c.node.members) {
         const isStatic = !!(m.modifiers && m.modifiers.some((x) => x.kind === ts.SyntaxKind.StaticKeyword));
         if (ts.isConstructorDeclaration(m) && m.body) ctor = m;
-        else if (ts.isMethodDeclaration(m) && m.body && ts.isIdentifier(m.name) && !m.asteriskToken) {
+        else if (ts.isMethodDeclaration(m) && !m.body && ts.isIdentifier(m.name) && hasModifier(m, ts.SyntaxKind.AbstractKeyword)) {
+          c.abstracts.add(m.name.text);
+          fns.push({ name: `${cname}.${m.name.text}`, node: m, cls: cname, abstract: true, exported: true });
+        } else if (ts.isMethodDeclaration(m) && m.body && ts.isIdentifier(m.name) && !m.asteriskToken) {
           if (isStatic) c.statics.add(`${cname}.${m.name.text}`);
           fns.push({ name: `${cname}.${m.name.text}`, node: m, cls: cname, isStatic, exported: true });
         } else if (ts.isGetAccessorDeclaration(m) && m.body && ts.isIdentifier(m.name)) {
@@ -267,6 +276,7 @@ class ModuleLowerer {
           fns.push({ name: `${cname}.${m.name.text}.setter`, node: m, cls: cname, exported: true });
         }
       }
+      c.ctorNode = ctor;
       fns.push({ name: `${cname}.__init__`, node: ctor, cls: cname, ctor: true, classNode: c.node, exported: true });
     }
     for (const f of fns) {
@@ -280,11 +290,24 @@ class ModuleLowerer {
     this.inferIntegrality(fns.filter((f) => !f.ctor));
     yield "signatures";
     for (const [cname, c] of Object.entries(this.classes)) {
+      const gone = this.chain(cname).find((a) => a.dropped);
+      if (!gone) continue;
+      if (c.home === this) this.module.problems.push([`class ${cname}: its base ${gone.name} is not checked (see the problem reported for it)`, this.line(c.node)]);
+      c.dropped = true;
+      delete this.classes[cname];
+    }
+    for (const [cname, c] of Object.entries(this.classes)) {
       if (c.home !== this) continue;
-      this.module.classes[cname] = { fields: c.fields, invariants: this.classInvariants(cname, c), loc: this.loc(c.node) };
+      const { fields, owner } = this.flatFields(cname);
+      const decl = { fields, owner, bases: c.base ? [c.base.name] : [], invariants: this.classInvariants(cname, c), loc: this.loc(c.node) };
+      if (!c.abstract) {
+        const missing = this.chain(cname).flatMap((a) => [...a.abstracts]).filter((m) => !this.chain(cname).some((a) => a.home.sigs[`${a.name}.${m}`] && !a.abstracts.has(m)));
+        if (missing.length) this.module.problems.push([`class ${cname}: does not implement abstract method '${missing[0]}'`, this.line(c.node)]);
+      }
+      this.module.classes[cname] = decl;
     }
     for (const f of fns) {
-      if (!this.sigs[f.name]) continue;
+      if (!this.sigs[f.name] || (f.cls && !this.classes[f.cls])) continue;
       const fl = new FunctionLowerer(this, f);
       this.module.functions.push(fl.lower());
     }
@@ -323,6 +346,46 @@ class ModuleLowerer {
     }
   }
 
+  // The class and its checked ancestors, nearest first.
+  chain(cname) {
+    const out = [];
+    for (let c = this.classes[cname]; c && !out.includes(c); c = c.base) out.push(c);
+    return out;
+  }
+
+  // Fields of a class, inherited ones first; `owner` names the class that introduced each.
+  flatFields(cname) {
+    const fields = [], owner = {};
+    for (const c of this.chain(cname).reverse()) {
+      for (const [n, t] of c.fields) {
+        if (n in owner) continue;
+        fields.push([n, t]);
+        owner[n] = c.name;
+      }
+    }
+    return { fields, owner };
+  }
+
+  fieldOf(cname, name) {
+    const f = this.flatFields(cname).fields.find((x) => x[0] === name);
+    return f ? f[1] : null;
+  }
+
+  // The key of `cname.m`, its own or inherited: a method, getter ("props"), setter or static.
+  memberKey(cname, m, kind = "method") {
+    for (const c of this.chain(cname)) {
+      const key = `${c.name}.${m}`;
+      const sig = c.home.sigs[kind === "setters" ? `${key}.setter` : key];
+      const hit = kind === "props" ? c.props.has(key) : kind === "setters" ? c.setters.has(key) : !!sig && !c.props.has(key);
+      if (hit) {
+        if (sig) this.sigs[kind === "setters" ? `${key}.setter` : key] = sig;
+        return key;
+      }
+      if (c.fields.some((x) => x[0] === m)) return null;
+    }
+    return null;
+  }
+
   enumDecl(st) {
     const members = [], values = [];
     let next = 0;
@@ -343,6 +406,7 @@ class ModuleLowerer {
 
   classFields(cname, c) {
     const known = new Set();
+    c.declared = new Set(); // property declarations that define the field at run time
     const add = (n, t) => {
       if (known.has(n)) return;
       known.add(n);
@@ -361,6 +425,7 @@ class ModuleLowerer {
         let t = m.type ? this.typeOf(m.type) : litType(m.initializer) || opaque(`field ${m.name.text}`);
         if (m.questionToken) t = optionOf(t);
         add(m.name.text, t);
+        if (!hasModifier(m, ts.SyntaxKind.DeclareKeyword) && !hasModifier(m, ts.SyntaxKind.AbstractKeyword)) c.declared.add(m.name.text);
       }
       if (ts.isConstructorDeclaration(m)) {
         for (const p of m.parameters) {
@@ -416,6 +481,7 @@ class ModuleLowerer {
   }
 
   record(name, members, node) {
+    this.memberLists[name] = members;
     const fields = [];
     for (const m of members) {
       if (!ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return;
@@ -479,6 +545,10 @@ class ModuleLowerer {
       if (this.module.records[n]) return this.module.records[n];
       if (this.classes[n]) return classOf(n);
       if (this.enums[n]) return this.enums[n];
+      if (this.aliases[n] && ts.isUnionTypeNode(this.aliases[n])) {
+        const u = this.unionRecord(this.aliases[n], n, depth);
+        if (u) return u;
+      }
       if (this.aliases[n]) return this.typeOf(this.aliases[n], intHint, depth + 1);
       return opaque(n); // a library type: unchecked
     }
@@ -491,6 +561,8 @@ class ModuleLowerer {
     if (ts.isParenthesizedTypeNode(tn)) return this.typeOf(tn.type, intHint, depth + 1);
     if (ts.isUnionTypeNode(tn)) {
       if (tn.types.every((t) => ts.isLiteralTypeNode(t) && ts.isStringLiteral(t.literal))) return STR;
+      const u = this.unionRecord(tn, null, depth);
+      if (u) return u;
       const parts = tn.types.map((t) => this.typeOf(t, intHint, depth + 1));
       const rest = parts.filter((t) => t.k !== "none");
       const uniq = rest.filter((t, i) => rest.findIndex((u) => tyEq(u, t)) === i);
@@ -504,6 +576,60 @@ class ModuleLowerer {
     if (ts.isLiteralTypeNode(tn) && ts.isStringLiteral(tn.literal)) return STR;
     if (ts.isLiteralTypeNode(tn) && ts.isNumericLiteral(tn.literal)) return REAL;
     return opaque(tn.getText(this.sf));
+  }
+
+  // A discriminated union of object types ({ kind: "a", ... } | { kind: "b", ... }):
+  // a record whose tag is an enum of the literals and whose other fields are
+  // those of every variant; a field another variant lacks is read only where
+  // the code has checked the tag. Undefined/null members make it optional.
+  unionRecord(tn, name, depth = 0) {
+    const K = ts.SyntaxKind;
+    if (this.unions.has(tn)) return this.unions.get(tn);
+    this.unions.set(tn, null);
+    const variants = [];
+    let optional = false;
+    for (const t of tn.types) {
+      if (t.kind === K.UndefinedKeyword || t.kind === K.NullKeyword || (ts.isLiteralTypeNode(t) && t.literal.kind === K.NullKeyword)) {
+        optional = true;
+        continue;
+      }
+      let ms = null;
+      if (ts.isTypeLiteralNode(t)) ms = t.members;
+      else if (ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && !t.typeArguments) ms = this.memberLists[t.typeName.text] || (this.aliases[t.typeName.text] && ts.isTypeLiteralNode(this.aliases[t.typeName.text]) ? this.aliases[t.typeName.text].members : null);
+      if (!ms || !ms.every((m) => ts.isPropertySignature(m) && m.type && ts.isIdentifier(m.name))) return null;
+      variants.push(ms);
+    }
+    if (variants.length < 2) return null;
+    const lits = (ms) => Object.fromEntries(ms.filter((m) => !m.questionToken && ts.isLiteralTypeNode(m.type) && ts.isStringLiteral(m.type.literal)).map((m) => [m.name.text, m.type.literal.text]));
+    const tag = Object.keys(lits(variants[0])).find((k) => variants.every((v) => k in lits(v)) && new Set(variants.map((v) => lits(v)[k])).size === variants.length);
+    if (!tag) return null;
+    const values = variants.map((v) => lits(v)[tag]);
+    const rname = name || `Union_${tag}_${values.join("_")}`.replace(/\W/g, "_");
+    const fields = [[tag, { k: "enum", name: `${rname}.${tag}`, members: values.slice(), values: values.slice() }]];
+    const has = {};
+    for (let i = 0; i < variants.length; i++) {
+      has[values[i]] = [tag];
+      for (const m of variants[i]) {
+        const f = m.name.text;
+        if (f === tag) continue;
+        let t;
+        try {
+          t = this.typeOf(m.type, false, depth + 1);
+        } catch {
+          return null;
+        }
+        if (m.questionToken) t = optionOf(t);
+        if (["list", "dict", "opaque", "class"].includes(t.k) || (t.k === "option" && t.inner.k !== "enum" && !["int", "real", "str", "bool"].includes(t.inner.k))) return null;
+        const prev = fields.find((x) => x[0] === f);
+        if (prev && !tyEq(prev[1], t)) return null;
+        if (!prev) fields.push([f, t]);
+        has[values[i]].push(f);
+      }
+    }
+    const rec = { k: "record", name: rname, fields, tag, variants: has };
+    this.module.records[rname] = rec;
+    this.unions.set(tn, optional ? optionOf(rec) : rec);
+    return this.unions.get(tn);
   }
 
   functionContracts(f) {
@@ -640,6 +766,15 @@ class FunctionLowerer {
     this.closures = new Map(); // local function name -> captured source names
     this.escaped = new Set();
     this.tryDepth = 0;
+    this.narrow = new Map(); // IR variable of a union type -> the tags it may have here
+    this.reassigned = new Set(); // source names assigned after their declaration
+    const assigns = (n) => {
+      const K = ts.SyntaxKind;
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind >= K.FirstAssignment && n.operatorToken.kind <= K.LastAssignment && ts.isIdentifier(n.left)) this.reassigned.add(n.left.text);
+      if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) && ts.isIdentifier(n.operand) && (n.operator === K.PlusPlusToken || n.operator === K.MinusMinusToken)) this.reassigned.add(n.operand.text);
+      ts.forEachChild(n, assigns);
+    };
+    if (f.node && f.node.body) assigns(f.node.body);
     const collect = (n) => {
       if (ts.isIdentifier(n)) this.srcNames.add(n.text);
       ts.forEachChild(n, collect);
@@ -759,6 +894,7 @@ class FunctionLowerer {
       unsupported: this.unsupported,
       trusted: false,
       exported: this.f.exported,
+      is_async: !!(node && node.modifiers && node.modifiers.some((x) => x.kind === ts.SyntaxKind.AsyncKeyword)),
       source: anchor.getText(ml.sf),
       locals: {},
       escaped: [],
@@ -772,6 +908,12 @@ class FunctionLowerer {
         if (!(e instanceof LowerError)) throw e;
         this.unsupported.push([`contract: ${e.message}`, e.line || cl.line]);
       }
+    }
+    if (this.f.abstract) {
+      // never runs itself: every override is checked against this contract
+      fn.trusted = true;
+      fn.abstract = true;
+      return fn;
     }
     if (this.f.ctor) {
       fn.body = this.constructorBody();
@@ -812,13 +954,20 @@ class FunctionLowerer {
   }
 
   // A class's constructor: parameter properties, then field initializers,
-  // then the constructor body (JavaScript's order).
+  // then the constructor body (JavaScript's order). In a subclass they run
+  // when `super(...)` returns; without a constructor it passes its
+  // arguments to the base's.
   constructorBody() {
     const ml = this.ml, cls = this.f.cls, node = this.node;
     const c = ml.classes[cls];
     const out = [];
     const self = { e: "Var", ty: classOf(cls), loc: ml.loc(c.node), name: "self" };
-    const fieldTy = (n) => (c.fields.find((x) => x[0] === n) || [null, null])[1];
+    const fieldTy = (n) => ml.fieldOf(cls, n);
+    for (const f of c.declared) {
+      const init = c.node.members.some((m) => ts.isPropertyDeclaration(m) && ts.isIdentifier(m.name) && m.name.text === f && m.initializer);
+      const from = ml.chain(cls).slice(1).find((a) => a.fields.some((x) => x[0] === f));
+      if (from && !init) this.unsupported.push([`'${f}' redeclares a field of ${from.name} without an initializer: JavaScript resets it to undefined after ${from.name}'s constructor ran (use 'declare ${f}: ...' to only narrow its type)`, ml.line(c.node)]);
+    }
     if (node) {
       for (const p of node.parameters) {
         const isProp = p.modifiers && p.modifiers.some((x) => [ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.PrivateKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.ReadonlyKeyword].includes(x.kind));
@@ -843,11 +992,42 @@ class FunctionLowerer {
         }
       }
     }
-    if (node && node.body) {
-      this.scanClosures(node);
-      out.push(...this.block(node.body.statements, node.body));
+    if (!c.base) {
+      if (node && node.body) {
+        this.scanClosures(node);
+        out.push(...this.block(node.body.statements, node.body));
+      }
+      return out;
     }
-    return out;
+    if (!node) {
+      const args = this.sig.params.slice(1).map((p) => ({ e: "Var", ty: p.ty, loc: ml.loc(c.node), name: p.name }));
+      return [{ s: "ExprStmt", loc: ml.loc(c.node), expr: this.baseInit(args, ml.loc(c.node)) }, ...out];
+    }
+    this.scanClosures(node);
+    this.afterSuper = out;
+    const body = this.block(node.body.statements, node.body);
+    if (this.afterSuper) throw this.err("a subclass constructor must call super(...)", node);
+    return body;
+  }
+
+  // `super(args)`: the base constructor, run on this object.
+  baseInit(args, loc) {
+    const base = this.ml.classes[this.f.cls].base;
+    const key = `${base.name}.__init__`;
+    if (base.home.sigs[key]) this.ml.sigs[key] = base.home.sigs[key];
+    return { e: "Call", ty: NONE, loc, func: key, args: [{ e: "Var", ty: classOf(this.f.cls), loc, name: "self" }, ...args] };
+  }
+
+  superCall(e, node) {
+    if (!this.afterSuper || !this.f.ctor || node.parent !== this.node.body) throw this.err("super(...) must be a statement of the constructor itself, run once", node);
+    const base = this.ml.classes[this.f.cls].base;
+    const key = `${base.name}.__init__`;
+    const sig = base.home.sigs[key];
+    if (!sig) throw this.err(`${base.name}'s constructor is not checked`, node);
+    const args = this.bindArgs(key, sig, sig.params.slice(1), e.arguments, e);
+    const rest = this.afterSuper;
+    this.afterSuper = null;
+    return [{ s: "ExprStmt", loc: this.ml.loc(node), expr: this.baseInit(args, this.ml.loc(node)) }, ...rest];
   }
 
   // Closures capture enclosing variables by reference, and JavaScript lets
@@ -972,6 +1152,68 @@ class FunctionLowerer {
 
   // -- statements --------------------------------------------------------
 
+  // -- union tags ---------------------------------------------------------
+  // What a condition says about the tag of a union-typed variable, when it
+  // holds (pos) and when it fails (neg): lists of [IR variable, tags].
+
+  tagOf(x) {
+    while (ts.isParenthesizedExpression(x)) x = x.expression;
+    if (!ts.isPropertyAccessExpression(x) || !ts.isIdentifier(x.expression) || this.reassigned.has(x.expression.text)) return null;
+    if (this.bound && x.expression.text in this.bound) return null;
+    const v = this.resolve(x.expression.text);
+    const t = v !== null ? this.env[v] : null;
+    return t && t.k === "record" && t.variants && t.tag === x.name.text ? [v, t] : null;
+  }
+
+  tagFacts(n) {
+    const K = ts.SyntaxKind;
+    while (ts.isParenthesizedExpression(n)) n = n.expression;
+    const meet = (a, b) => {
+      const m = new Map(a.map(([v, t]) => [v, t]));
+      for (const [v, t] of b) m.set(v, m.has(v) ? new Set([...m.get(v)].filter((x) => t.has(x))) : t);
+      return [...m];
+    };
+    const join = (a, b) => a.filter(([v]) => b.some(([w]) => w === v)).map(([v, t]) => [v, new Set([...t, ...b.find(([w]) => w === v)[1]])]);
+    if (ts.isPrefixUnaryExpression(n) && n.operator === K.ExclamationToken) {
+      const r = this.tagFacts(n.operand);
+      return { pos: r.neg, neg: r.pos };
+    }
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "implies" && this.spec && n.arguments.length === 2) {
+      const a = this.tagFacts(n.arguments[0]);
+      return { pos: [], neg: a.pos };
+    }
+    if (ts.isBinaryExpression(n)) {
+      const k = n.operatorToken.kind;
+      if (k === K.AmpersandAmpersandToken || k === K.BarBarToken) {
+        const a = this.tagFacts(n.left), b = this.tagFacts(n.right);
+        return k === K.AmpersandAmpersandToken ? { pos: meet(a.pos, b.pos), neg: join(a.neg, b.neg) } : { pos: join(a.pos, b.pos), neg: meet(a.neg, b.neg) };
+      }
+      if ([K.EqualsEqualsEqualsToken, K.EqualsEqualsToken, K.ExclamationEqualsEqualsToken, K.ExclamationEqualsToken].includes(k)) {
+        let tg = this.tagOf(n.left), lit = n.right;
+        if (!tg) [tg, lit] = [this.tagOf(n.right), n.left];
+        if (tg && (ts.isStringLiteral(lit) || ts.isNoSubstitutionTemplateLiteral(lit))) {
+          const [v, t] = tg;
+          const yes = [v, new Set(Object.keys(t.variants).filter((x) => x === lit.text))];
+          const no = [v, new Set(Object.keys(t.variants).filter((x) => x !== lit.text))];
+          const eq = k === K.EqualsEqualsEqualsToken || k === K.EqualsEqualsToken;
+          return eq ? { pos: [yes], neg: [no] } : { pos: [no], neg: [yes] };
+        }
+      }
+    }
+    return { pos: [], neg: [] };
+  }
+
+  withTags(facts, f) {
+    const saved = this.narrow;
+    this.narrow = new Map(saved);
+    for (const [v, t] of facts) this.narrow.set(v, this.narrow.has(v) ? new Set([...this.narrow.get(v)].filter((x) => t.has(x))) : t);
+    try {
+      return f();
+    } finally {
+      this.narrow = saved;
+    }
+  }
+
   blockContracts(block, stmts) {
     // assert/assume comments inside this block, not inside a child statement
     const open = block.getStart(this.ml.sf), close = block.getEnd();
@@ -987,12 +1229,23 @@ class FunctionLowerer {
   block(stmts, block) {
     const out = [];
     const pending = block ? this.blockContracts(block, stmts) : [];
-    for (const s of stmts) {
-      const start = s.getStart(this.ml.sf);
-      for (const cl of pending.filter((c) => !c.consumed && c.pos < start)) out.push(...this.stmtContract(cl));
-      out.push(...this.stmt(s));
+    const saved = this.narrow;
+    const exits = (x) => ts.isReturnStatement(x) || ts.isThrowStatement(x) || (ts.isBlock(x) && x.statements.length > 0 && exits(x.statements[x.statements.length - 1]));
+    try {
+      for (const s of stmts) {
+        const start = s.getStart(this.ml.sf);
+        for (const cl of pending.filter((c) => !c.consumed && c.pos < start)) out.push(...this.stmtContract(cl));
+        out.push(...this.stmt(s));
+        // if (x.kind !== "a") return;  -- what follows knows x.kind === "a"
+        if (ts.isIfStatement(s) && !s.elseStatement && exits(s.thenStatement) && !this.callbackDepth) {
+          const facts = this.tagFacts(s.expression).neg;
+          if (facts.length) this.narrow = this.withTags(facts, () => this.narrow);
+        }
+      }
+      for (const cl of pending.filter((c) => !c.consumed)) out.push(...this.stmtContract(cl));
+    } finally {
+      this.narrow = saved;
     }
-    for (const cl of pending.filter((c) => !c.consumed)) out.push(...this.stmtContract(cl));
     return out;
   }
 
@@ -1076,6 +1329,8 @@ class FunctionLowerer {
 
   coerce(e, ty) {
     if (!ty || tyEq(e.ty, ty)) return e;
+    if (ty.k === "enum" && e.ty.k === "str" && e.e === "Lit" && ty.values.includes(e.value)) return { e: "Lit", ty, loc: e.loc, value: ty.values.indexOf(e.value) };
+    if (ty.k === "option" && ty.inner.k === "enum" && e.ty.k === "str" && e.e === "Lit" && ty.inner.values.includes(e.value)) return this.coerce(this.coerce(e, ty.inner), ty);
     if (ty.k !== "opaque" && e.ty.k !== "opaque" && e.ty.k !== "none" && (hasOpaque(e.ty) || hasOpaque(ty)) && !(ty.k === "option" && tyEq(ty.inner, e.ty))) return { e: "Builtin", ty, loc: e.loc, name: "from_opaque", args: [e] };
     if (e.ty.k === "opaque" && ty.k !== "none") {
       if (e.e === "Extern") return { ...e, ty };
@@ -1238,6 +1493,7 @@ class FunctionLowerer {
       const cur = { e: "Var", ty: t, loc, name };
       return [{ s: "Assign", loc, name, value: { e: "Binary", ty: t, loc, op: e.operator === K.PlusPlusToken ? "add" : "sub", left: cur, right: one } }];
     }
+    if (ts.isCallExpression(e) && e.expression.kind === K.SuperKeyword) return this.superCall(e, node);
     if (ts.isCallExpression(e)) {
       const c = e.expression;
       if (ts.isPropertyAccessExpression(c) && ts.isIdentifier(c.expression) && c.expression.text === "console" && this.resolve("console") === null) return this.logEffects(e.arguments, loc);
@@ -1303,7 +1559,8 @@ class FunctionLowerer {
       const target = this.expr(e.expression.expression);
       if (target.ty.k === "dict") return this.mapWrite(target, "delete", [e.expression.argumentExpression], node);
     }
-    if (ts.isIdentifier(e) || ts.isStringLiteral(e) || e.kind === K.VoidExpression) return [];
+    if (ts.isVoidExpression(e)) return this.exprStatement(e.expression, node);
+    if (ts.isIdentifier(e) || ts.isStringLiteral(e) || ts.isNumericLiteral(e)) return [];
     throw this.err(`unsupported expression statement '${e.getText(this.ml.sf).slice(0, 40)}'`, node);
   }
 
@@ -1316,15 +1573,15 @@ class FunctionLowerer {
     if (obj.ty.k === "dict" && obj.ty.js === "object") return this.mapWrite(obj, "set", [null, valueNode], node, { e: "Lit", ty: STR, loc, value: name }, op);
     if (obj.ty.k !== "class") throw this.err(`cannot assign '.${name}' on ${tyStr(obj.ty)}`, node);
     const cls = obj.ty.name;
-    const c = this.ml.classes[cls];
-    const key = `${cls}.${name}`;
-    if (c.setters.has(key)) {
-      const sig = this.ml.sigs[`${key}.setter`];
+    const skey = this.ml.memberKey(cls, name, "setters");
+    if (skey) {
+      const sig = this.ml.sigs[`${skey}.setter`];
       const pt = sig && sig.params[1] ? sig.params[1].ty : opaque("");
-      return [{ s: "ExprStmt", loc, expr: { e: "Call", ty: NONE, loc, func: `${key}.setter`, args: [obj, this.coerce(this.expr(valueNode, pt), pt)] } }];
+      return [{ s: "ExprStmt", loc, expr: { e: "Call", ty: NONE, loc, func: `${skey}.setter`, args: [obj, this.coerce(this.expr(valueNode, pt), pt)] } }];
     }
-    if (c.props.has(key)) return [{ s: "Raise", loc, what: `TypeError: '${name}' of ${cls} has a getter and no setter`, caught: this.tryDepth > 0 }];
-    const f = c.fields.find((x) => x[0] === name);
+    if (this.ml.memberKey(cls, name, "props")) return [{ s: "Raise", loc, what: `TypeError: '${name}' of ${cls} has a getter and no setter`, caught: this.tryDepth > 0 }];
+    const ft = this.ml.fieldOf(cls, name);
+    const f = ft ? [name, ft] : null;
     if (!f) throw this.err(`${cls} has no field '${name}' (declare it in the class)`, node);
     let v = this.expr(valueNode, f[1]);
     if (op) v = this.arith(op, { e: "Field", ty: f[1], loc, obj, name }, v, node);
@@ -1525,8 +1782,9 @@ class FunctionLowerer {
     if (ts.isExpressionStatement(s)) return this.exprStatement(s.expression, s);
     if (ts.isIfStatement(s)) {
       const c = this.cond(s.expression);
-      const then = this.inner(s.thenStatement);
-      const orelse = s.elseStatement ? this.inner(s.elseStatement) : [];
+      const facts = this.tagFacts(s.expression);
+      const then = this.withTags(facts.pos, () => this.inner(s.thenStatement));
+      const orelse = s.elseStatement ? this.withTags(facts.neg, () => this.inner(s.elseStatement)) : [];
       return [{ s: "If", loc, cond: c, then, orelse }];
     }
     if (ts.isWhileStatement(s)) {
@@ -1595,8 +1853,16 @@ class FunctionLowerer {
         return b;
       };
       if (stripped.some(breaksOut)) throw this.err("break inside a nested block of a switch case is not supported", g[0]);
-      const lowered = this.scoped(() => stripped.flatMap((x) => this.stmt(x)));
       const isDefault = g.some((c) => ts.isDefaultClause(c));
+      const tg = this.tagOf(s.expression);
+      let facts = [];
+      if (tg) {
+        const named = (cs) => cs.filter((c) => !ts.isDefaultClause(c) && (ts.isStringLiteral(c.expression) || ts.isNoSubstitutionTemplateLiteral(c.expression))).map((c) => c.expression.text);
+        const all = Object.keys(tg[1].variants);
+        const here = isDefault ? all.filter((v) => !named(clauses).includes(v) || named(g).includes(v)) : all.filter((v) => named(g).includes(v));
+        facts = [[tg[0], new Set(here)]];
+      }
+      const lowered = this.withTags(facts, () => this.scoped(() => stripped.flatMap((x) => this.stmt(x))));
       if (isDefault) {
         chain = lowered;
         continue;
@@ -1750,7 +2016,9 @@ class FunctionLowerer {
     const K = ts.SyntaxKind;
     if (ts.isParenthesizedExpression(n)) return this.cond(n.expression);
     if (ts.isBinaryExpression(n) && (n.operatorToken.kind === K.AmpersandAmpersandToken || n.operatorToken.kind === K.BarBarToken)) {
-      return { e: "Binary", ty: BOOL, loc: this.nloc(n), op: n.operatorToken.kind === K.AmpersandAmpersandToken ? "and" : "or", left: this.cond(n.left), right: this.cond(n.right) };
+      const and = n.operatorToken.kind === K.AmpersandAmpersandToken;
+      const facts = this.tagFacts(n.left);
+      return { e: "Binary", ty: BOOL, loc: this.nloc(n), op: and ? "and" : "or", left: this.cond(n.left), right: this.withTags(and ? facts.pos : facts.neg, () => this.cond(n.right)) };
     }
     return this.truthy(this.expr(n), n);
   }
@@ -1893,7 +2161,10 @@ class FunctionLowerer {
       throw this.err(`'as ${tyStr(t)}' on a ${tyStr(x.ty)} hides a type change telic would have to trust`, this.nline(n));
     }
     if (ts.isTypeOfExpression(n)) return this.opaqueOp("typeof", [this.expr(n.expression)], STR, loc);
-    if (ts.isVoidExpression(n)) return { e: "Lit", ty: NONE, loc, value: null };
+    if (ts.isVoidExpression(n)) {
+      if (!(ts.isIdentifier(n.expression) || ts.isLiteralExpression(n.expression))) throw this.err("'void' discards a value its operand computes; write the operand as its own statement", this.nline(n));
+      return { e: "Lit", ty: NONE, loc, value: null };
+    }
     if (ts.isArrowFunction(n) || ts.isFunctionExpression(n)) {
       if (this.spec) throw this.err("functions are not values in specifications", this.nline(n));
       return this.opaqueOp("closure", [], opaque("closure"), loc);
@@ -1914,7 +2185,8 @@ class FunctionLowerer {
     if (ts.isBinaryExpression(n)) return this.binary(n, loc);
     if (ts.isConditionalExpression(n)) {
       const c = this.cond(n.condition);
-      let a = this.expr(n.whenTrue, expect), b = this.expr(n.whenFalse, expect);
+      const facts = this.tagFacts(n.condition);
+      let a = this.withTags(facts.pos, () => this.expr(n.whenTrue, expect)), b = this.withTags(facts.neg, () => this.expr(n.whenFalse, expect));
       if (!tyEq(a.ty, b.ty)) {
         const j = this.join(a.ty, b.ty);
         if (j) [a, b] = [this.coerce(a, j), this.coerce(b, j)];
@@ -1941,6 +2213,12 @@ class FunctionLowerer {
         }
         const ns = this.ml.namespaces[base];
         if (ns && ns.constants[name]) return this.expr(ns.constants[name], expect);
+      }
+      if (n.expression.kind === K.SuperKeyword) {
+        const base = this.f.cls && this.ml.classes[this.f.cls] && this.ml.classes[this.f.cls].base;
+        const key = base && this.ml.memberKey(base.name, name, "props");
+        if (!key) throw this.err(`super.${name} needs a checked base getter`, this.nline(n));
+        return this.callSig(key, [{ e: "Var", ty: this.selfTy(), loc, name: "self" }], [], n, loc);
       }
       const obj = this.expr(n.expression);
       if (n.questionDotToken && obj.ty.k === "option") return this.optionalChain(obj, (x) => this.propertyOf(x, name, n, loc), loc);
@@ -1980,6 +2258,7 @@ class FunctionLowerer {
       if (elems.some((e) => !tyEq(e.ty, t))) throw this.err("array elements must all have one type", this.nline(n));
       return { e: "ListLit", ty: listOf(t), loc, elems };
     }
+    if (ts.isObjectLiteralExpression(n) && expect && expect.k === "option" && expect.inner.k === "record") return this.coerce(this.expr(n, expect.inner), expect);
     if (ts.isObjectLiteralExpression(n) && expect && expect.k === "dict") {
       const args = [];
       for (const p of n.properties) {
@@ -2019,6 +2298,17 @@ class FunctionLowerer {
           vals[p.name.text] = this.coerce({ e: "Var", ty: this.lookup(p.name.text, p), loc, name: this.irName(p.name.text) }, ft[1]);
         } else throw this.err("unsupported object literal member", this.nline(p));
       }
+      let own = expect.fields.map((f) => f[0]);
+      if (expect.variants) {
+        // one variant of a union: its tag says which; the others' fields are never read
+        const tag = vals[expect.tag];
+        const v = tag && tag.e === "Lit" && tag.ty.k === "enum" ? tag.ty.values[tag.value] : null;
+        if (v === null) throw this.err(`a ${expect.name} literal needs a literal '${expect.tag}'`, this.nline(n));
+        own = expect.variants[v];
+        const extra = Object.keys(vals).find((f) => !own.includes(f));
+        if (extra) throw this.err(`'${extra}' is not a field of ${expect.name} when ${expect.tag} is "${v}"`, this.nline(n));
+        for (const f of expect.fields) if (!own.includes(f[0])) vals[f[0]] = zeroOf(f[1], loc);
+      }
       for (const f of expect.fields) if (!(f[0] in vals) && f[1].k === "option") vals[f[0]] = { e: "Lit", ty: f[1], loc, value: null };  // optional fields left out are undefined
       const missing = expect.fields.filter((f) => !(f[0] in vals)).map((f) => f[0]);
       if (missing.length) throw this.err(`${expect.name} literal is missing ${missing.join(", ")}`, this.nline(n));
@@ -2052,15 +2342,19 @@ class FunctionLowerer {
     if (t.k === "record") {
       const f = t.fields.find((x) => x[0] === name);
       if (!f) throw this.err(`${t.name} has no field '${name}'`, this.nline(n));
+      if (t.variants) {
+        const may = obj.e === "Var" && this.narrow.has(obj.name) ? [...this.narrow.get(obj.name)] : Object.keys(t.variants);
+        const lacking = may.filter((v) => !t.variants[v].includes(name));
+        if (lacking.length) throw this.err(`'.${name}' is undefined when .${t.tag} is "${lacking[0]}"; check .${t.tag} first (with if, switch or ?:)`, this.nline(n));
+      }
       return { e: "Field", ty: f[1], loc, obj, name };
     }
     if (t.k === "class") {
-      const c = this.ml.classes[t.name];
-      const key = `${t.name}.${name}`;
-      if (c && c.props.has(key)) return this.callSig(key, [obj], [], n, loc);
-      const f = c && c.fields.find((x) => x[0] === name);
-      if (!f) throw this.err(`${t.name} has no field '${name}'`, this.nline(n));
-      return { e: "Field", ty: f[1], loc, obj, name };
+      const key = this.ml.memberKey(t.name, name, "props");
+      if (key) return this.callSig(key, [obj], [], n, loc);
+      const ft = this.ml.fieldOf(t.name, name);
+      if (!ft) throw this.err(`${t.name} has no field '${name}'`, this.nline(n));
+      return { e: "Field", ty: ft, loc, obj, name };
     }
     if (t.k === "opaque") return this.opaqueOp(`attr.${name}`, [obj], opaque(""), loc);
     if (t.k === "dict" && t.js === "object") return this.elementOfDict(obj, { e: "Lit", ty: STR, loc, value: name }, loc);
@@ -2129,7 +2423,8 @@ class FunctionLowerer {
     }
     if (k === K.AmpersandAmpersandToken || k === K.BarBarToken) {
       // As a value, `a || b` is one of its operands, not a boolean.
-      const a = this.expr(n.left), b = this.expr(n.right);
+      const facts = this.tagFacts(n.left);
+      const a = this.expr(n.left), b = this.withTags(k === K.AmpersandAmpersandToken ? facts.pos : facts.neg, () => this.expr(n.right));
       if (a.ty.k === "bool" && b.ty.k === "bool") return { e: "Binary", ty: BOOL, loc, op: k === K.AmpersandAmpersandToken ? "and" : "or", left: a, right: b };
       if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(k === K.BarBarToken ? "||" : "&&", [a, b], opaque(""), loc);
       if (k === K.BarBarToken) {
@@ -2159,6 +2454,12 @@ class FunctionLowerer {
         return cmp[k] === "eq" ? c : { e: "Unary", ty: BOOL, loc, op: "not", arg: c };
       }
       if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(`cmp.${cmp[k]}`, [a, b], BOOL, loc);
+      if (eqop && (a.ty.k === "enum" || b.ty.k === "enum") && (a.e === "Lit" && a.ty.k === "str" || b.e === "Lit" && b.ty.k === "str")) {
+        // tag === "circle": a string enum compared with one of its values (or with a string it never equals)
+        const [en, lit] = a.ty.k === "enum" ? [a, b] : [b, a];
+        if (!en.ty.values.includes(lit.value)) return { e: "Lit", ty: BOOL, loc, value: cmp[k] === "ne" };
+        return { e: "Binary", ty: BOOL, loc, op: cmp[k], left: en, right: this.coerce(lit, en.ty) };
+      }
       if (eqop && (a.ty.k === "option" || b.ty.k === "option")) {
         const j = this.join(a.ty, b.ty) || (isNum(a.ty.inner || a.ty) && isNum(b.ty.inner || b.ty) ? optionOf(REAL) : null);
         if (!j) throw this.err(`comparing ${tyStr(a.ty)} with ${tyStr(b.ty)}`, this.nline(n));
@@ -2268,7 +2569,8 @@ class FunctionLowerer {
       if (ts.isIdentifier(c.expression) && this.resolve(c.expression.text) === null && !(this.bound && c.expression.text in this.bound)) {
         const base = c.expression.text;
         const key = `${base}.${m}`;
-        if (this.ml.classes[base] && this.ml.sigs[key] && this.ml.sigs[key].isStatic) return this.callSig(key, [], args, n, loc);
+        const skey = this.ml.classes[base] && this.ml.memberKey(base, m);
+        if (skey && this.ml.sigs[skey].isStatic) return this.callSig(skey, [], args, n, loc);
         const ns = this.ml.namespaces[base];
         if (ns && ns.sigs[m] && !m.includes(".")) {
           if (!this.ml.sigs[key]) {
@@ -2286,6 +2588,13 @@ class FunctionLowerer {
           if (this.spec) throw this.err(`specifications cannot call unchecked code ('${key}')`, this.nline(n));
           return this.extern(key, args.map((a) => this.argValue(a)), expect, loc);
         }
+      }
+      if (c.expression.kind === ts.SyntaxKind.SuperKeyword) {
+        // super.m(...): the base's method, whatever this object's class overrides
+        const base = this.f.cls && !this.sig.isStatic && this.ml.classes[this.f.cls] && this.ml.classes[this.f.cls].base;
+        const key = base && this.ml.memberKey(base.name, m);
+        if (!key || this.ml.sigs[key].isStatic) throw this.err(`super.${m}() needs a checked base method`, this.nline(n));
+        return this.callSig(key, [{ e: "Var", ty: this.selfTy(), loc, name: "self" }], args, n, loc);
       }
       // range(lo, hi).every(i => ...)   (spec helper)
       if ((m === "every" || m === "some") && ts.isCallExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "range") {
@@ -2350,7 +2659,7 @@ class FunctionLowerer {
       return { e: "Old", ty: x.ty, loc, expr: x };
     }
     if (this.spec && name === "implies") {
-      const a = this.cond(args[0]), b = this.cond(args[1]);
+      const a = this.cond(args[0]), b = this.withTags(this.tagFacts(args[0]).pos, () => this.cond(args[1]));
       return { e: "Binary", ty: BOOL, loc, op: "implies", left: a, right: b };
     }
     if (this.spec && name === "sum") {
@@ -2425,8 +2734,8 @@ class FunctionLowerer {
     const args = n.arguments;
     const t = obj.ty;
     if (t.k === "class") {
-      const key = `${t.name}.${m}`;
-      const sig = this.ml.sigs[key];
+      const key = this.ml.memberKey(t.name, m);
+      const sig = key && this.ml.sigs[key];
       if (!sig || sig.isStatic) throw this.err(`${t.name} has no checked method '${m}'`, this.nline(n));
       return this.callSig(key, [obj], args, n, loc);
     }
@@ -2508,6 +2817,72 @@ class FunctionLowerer {
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+// A value of type t, for a field a union variant does not have (never read).
+function zeroOf(t, loc) {
+  if (t.k === "option" || t.k === "none") return { e: "Lit", ty: t, loc, value: null };
+  if (t.k === "record") return { e: "RecordLit", ty: t, loc, fields: t.fields.map(([f, ft]) => [f, zeroOf(ft, loc)]) };
+  return { e: "Lit", ty: t, loc, value: { int: 0, real: 0, str: "", bool: false, enum: 0 }[t.k] ?? 0 };
+}
+
+function hasModifier(node, kind) {
+  return !!(node.modifiers && node.modifiers.some((x) => x.kind === kind));
+}
+
+// Once every module knows the classes it defines and imports: a subclass of
+// a checked class is checked; one of anything else (a library class) is a
+// library-like value, and so is a subclass of one.
+function resolveBases(mls) {
+  const pending = [];
+  for (const ml of mls) for (const c of Object.values(ml.classes)) if (c.home === ml && c.baseText !== undefined) pending.push([ml, c]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [ml, c] of pending) {
+      if (c.base || c.dropped) continue;
+      const b = c.baseName ? ml.classes[c.baseName] : null;
+      if (b && !b.dropped && (b.baseText === undefined || b.base)) {
+        c.base = b;
+        changed = true;
+      } else if (!b || b.dropped) {
+        c.dropped = true;
+        changed = true;
+        ml.module.notes.push([`class ${c.name}: subclass of ${c.baseText}, which telic does not check: its instances are treated as library values`, ml.line(c.node)]);
+        ml.module.opaque_subclasses.push([c.name, c.baseText, ml.line(c.node)]);
+      }
+    }
+  }
+  for (const [ml, c] of pending) if (!c.base) c.dropped = true;
+  for (const ml of mls) {
+    for (const [k, c] of Object.entries(ml.classes)) {
+      if (!c.dropped) continue;
+      delete ml.classes[k];
+      ml.globalsBound.add(k);
+      delete ml.module.class_origin[k];
+    }
+  }
+}
+
+// A subclass without a constructor takes its base's parameters and passes
+// them on; it keeps the base constructor's contract (and is checked against it).
+function inheritConstructors(mls) {
+  const todo = [];
+  for (const ml of mls) for (const c of Object.values(ml.classes)) if (c.home === ml && c.base && !c.ctorNode) todo.push([ml, c]);
+  const done = new Set();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [ml, c] of todo) {
+      if (done.has(c) || (c.base.base && !c.base.ctorNode && !done.has(c.base))) continue;
+      const sig = ml.sigs[`${c.name}.__init__`];
+      const bsig = c.base.home.sigs[`${c.base.name}.__init__`];
+      done.add(c);
+      changed = true;
+      if (!sig || !bsig) continue;
+      Object.assign(sig, { params: [sig.params[0], ...bsig.params.slice(1)], defaults: bsig.defaults, rest: bsig.rest, contracts: bsig.contracts, intsFromContract: bsig.intsFromContract, destructs: [], inheritedFrom: c.base.name });
+    }
+  }
+}
 
 function safeType(ml, tn) {
   try {
@@ -2707,7 +3082,9 @@ function main() {
   };
   advance("names");
   link(mls, byFile, "names");
+  resolveBases(mls);
   advance("signatures");
+  inheritConstructors(mls);
   link(mls, byFile, "signatures");
   advance("done");
   const out = [];

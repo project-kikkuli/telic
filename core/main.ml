@@ -403,6 +403,7 @@ let () =
               recursive = Json.to_bool (Json.member "recursive" pj);
               termination = (match Json.member "termination" pj with Json.Bool b -> b | _ -> true);
               resolve = (match Json.member "resolve" pj with Json.Assoc kvs -> List.map (fun (k, v) -> (k, Json.to_str v)) kvs | _ -> []);
+              untrusted = List.map (fun x -> match Json.to_list x with [ c; i ] -> (Json.to_str c, Json.to_int i) | _ -> raise (Json.Error "expected [class, index]")) (Json.to_list (Json.member "untrusted" pj));
             })
         m.functions)
     modules;

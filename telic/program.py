@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from . import ir
 
@@ -43,6 +44,9 @@ class Program:
     ambiguous: dict[str, dict[str, str]] = field(default_factory=dict)
     # method key -> keys of every override (a call through the base may run any of them)
     dispatch: dict[str, set[str]] = field(default_factory=dict)
+    # override key -> (class, index) of invariants of its own class that a call
+    # through a base does not establish, so its entry may not assume them
+    untrusted: dict[str, set[tuple[str, int]]] = field(default_factory=dict)
 
     @classmethod
     def build(cls, modules: list[ir.Module]) -> "Program":
@@ -53,6 +57,7 @@ class Program:
             for f in m.functions.values():
                 ref = FuncRef(m, f)
                 p.funcs[ref.key] = ref
+        p._unawaited()
         for m in modules:
             for cname, decl in m.classes.items():
                 p.classes[cname] = decl
@@ -60,6 +65,7 @@ class Program:
         p._overrides()
         p._call_graph()
         p._opaque_subclasses()
+        p._escaping_constructors()
         p._sccs()
         p._mutation()
         p._heap()
@@ -109,6 +115,9 @@ class Program:
                 meth = fn.name[len(cname) + 1 :]
                 if meth in ("__init__", "__post_init__"):
                     continue
+                roots = [a for a in ancestors if f"{self.class_module[a].path}::{a}.{meth}" in self.funcs]
+                if roots:
+                    self._untrusted(f"{m.path}::{fn.name}", cname, roots)
                 for a in ancestors:
                     base = self.funcs.get(f"{self.class_module[a].path}::{a}.{meth}")
                     if base is None:
@@ -133,6 +142,55 @@ class Program:
                 if more:
                     subs |= more
                     changed = True
+
+    def _unawaited(self) -> None:
+        """A call to an async function that is not awaited returns before
+        the callee finishes (Python runs none of it yet, JavaScript runs it
+        up to its first await): the caller gets neither its effects nor its
+        postcondition, so the call is unchecked code that may touch its
+        arguments."""
+        for ref in self.funcs.values():
+
+            def swap(e: ir.Expr, parent: ir.Expr | None) -> ir.Expr | None:
+                if not isinstance(e, ir.Call) or (isinstance(parent, ir.Builtin) and parent.name == "await"):
+                    return None
+                tgt = self.resolve(ref.module, e.func)
+                if tgt is None or not tgt.fn.is_async:
+                    return None
+                return ir.Extern(e.ty, e.loc, f"{ir.source_name(e.func)} (not awaited)", e.args)
+
+            ref.fn.body = _rewrite_stmts(ref.fn.body, swap)
+
+    def _untrusted(self, key: str, cname: str, roots: list[str]) -> None:
+        """A call typed as a base ``r`` establishes ``r``'s invariants only,
+        and code typed ``r`` may have changed any field ``r`` has without
+        checking a subclass's invariant over it: the override may assume a
+        subclass invariant only if it reads no such field."""
+        out: set[tuple[str, int]] = set()
+        decl = self.classes[cname]
+        for c in self.mro(cname):
+            for i, inv in enumerate(self.classes[c].invariants):
+                read = {x.name for x in ir.walk_expr(inv.expr) if isinstance(x, ir.Field) and isinstance(x.obj, ir.Var) and x.obj.name == "self"}
+                for r in roots:
+                    seen = set(self.mro(r))
+                    if c not in seen and any(decl.field_owner(f) in seen for f in read):
+                        out.add((c, i))
+        if out:
+            self.untrusted[key] = out
+
+    def _escaping_constructors(self) -> None:
+        """A constructor that hands ``self`` to other code before a subclass
+        has initialised its own fields lets that code run an override on a
+        half-built object: its fields unset, its invariants not established."""
+        for cname in self.classes:
+            subs = [c for c in self.classes if c != cname and cname in self.mro(c)]
+            ref = self.funcs.get(f"{self.class_module[cname].path}::{cname}.__init__")
+            if not subs or ref is None:
+                continue
+            for x in _escapes_of_self(ref.fn.body):
+                what = f"'{ir.source_name(x.func)}'" if isinstance(x, (ir.Call, ir.Extern)) else "other code"
+                ref.fn.unsupported.append((f"the constructor hands 'self' to {what} before {ir.source_name(subs[0])}, a subclass, has set its own fields; an override could run on a half-built object", x.loc))
+                break
 
     def _opaque_subclasses(self) -> None:
         """A checked class with a subclass the frontend does not model: a call
@@ -612,3 +670,73 @@ def _rename(m: ir.Module, view: dict[str, str]) -> None:
         classes[name(cname)] = decl
     m.classes = classes
     m.class_origin = {name(c): p for c, p in m.class_origin.items()}
+
+
+def _escapes_of_self(body: list[ir.Stmt]) -> list[ir.Expr]:
+    """Expressions that hand ``self`` on (anything but reading or writing
+    one of its fields, or running a base constructor on it)."""
+    out: list[ir.Expr] = []
+
+    def visit(e: ir.Expr, parent: ir.Expr | None) -> None:
+        if isinstance(e, ir.Var) and e.name == "self":
+            if isinstance(parent, ir.Field) or (isinstance(parent, ir.Call) and parent.func.endswith(".__init__") and parent.args[:1] == (e,)):
+                return
+            out.append(parent or e)
+            return
+        for sub in ir.walk_expr(e):
+            if sub is not e and _child(e, sub):
+                visit(sub, e)
+
+    for s in ir.walk_stmts(body):
+        for e in ir.stmt_exprs(s):
+            if isinstance(s, ir.FieldAssign) and e is s.obj and isinstance(e, ir.Var):
+                continue
+            visit(e, None)
+    return out
+
+
+def _child(e: ir.Expr, sub: ir.Expr) -> bool:
+    """Is ``sub`` an immediate sub-expression of ``e``?"""
+    for f in dataclasses.fields(e):
+        v = getattr(e, f.name)
+        if v is sub or (isinstance(v, tuple) and any(x is sub or (isinstance(x, tuple) and sub in x) for x in v)):
+            return True
+    return False
+
+
+def _rewrite_expr(e: Any, f, parent: ir.Expr | None = None) -> Any:
+    """``e`` with every sub-expression ``x`` for which ``f(x, parent)``
+    returns a replacement replaced (children first)."""
+    if isinstance(e, tuple):
+        return tuple(_rewrite_expr(x, f, parent) for x in e)
+    if not isinstance(e, ir.Expr):
+        return e
+    changes = {}
+    for fl in dataclasses.fields(e):
+        v = getattr(e, fl.name)
+        if isinstance(v, (ir.Expr, tuple)):
+            nv = _rewrite_expr(v, f, e)
+            if nv is not v:
+                changes[fl.name] = nv
+    out = dataclasses.replace(e, **changes) if changes else e
+    return f(out, parent) or out
+
+
+def _rewrite_stmts(stmts: list[ir.Stmt], f) -> list[ir.Stmt]:
+    out = []
+    for s in stmts:
+        changes = {}
+        for fl in dataclasses.fields(s):
+            v = getattr(s, fl.name)
+            if isinstance(v, ir.Expr):
+                nv = _rewrite_expr(v, f)
+            elif isinstance(v, list) and all(isinstance(x, ir.Stmt) for x in v):
+                nv = _rewrite_stmts(v, f)
+            elif isinstance(v, tuple) and v and all(isinstance(x, list) for x in v):
+                nv = tuple(_rewrite_stmts(x, f) for x in v)
+            else:
+                continue
+            if nv != v:
+                changes[fl.name] = nv
+        out.append(dataclasses.replace(s, **changes) if changes else s)
+    return out

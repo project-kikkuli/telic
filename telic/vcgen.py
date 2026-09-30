@@ -450,14 +450,14 @@ class VCGen:
     def heap_env(self, env: dict[str, Val]) -> dict[str, Val]:
         return {k: v for k, v in env.items() if k.startswith("@")}
 
-    def class_invariants(self, cls: str, ref: L.Term, env: dict[str, Val], ctx_base: list[L.Term]) -> list[tuple[ir.Clause, L.Term]]:
+    def class_invariants(self, cls: str, ref: L.Term, env: dict[str, Val], ctx_base: list[L.Term], skip: set[tuple[str, int]] = set()) -> list[tuple[ir.Clause, L.Term]]:  # noqa: B006
         e = dict(self.heap_env(env))
         e["self"] = ref
         out = []
         for c in self.program.mro(cls):  # a subclass keeps its bases' invariants
             decl = self.program.classes[c]
             ctx = Ctx(base=ctx_base, env=e, module=self.program.class_module[c], spec=True, quiet=True)
-            out += [(inv, self.ev(inv.expr, ctx)) for inv in decl.invariants]
+            out += [(inv, self.ev(inv.expr, ctx)) for i, inv in enumerate(decl.invariants) if (c, i) not in skip]
         return out
 
     # -- obligations ------------------------------------------------------
@@ -542,7 +542,8 @@ class VCGen:
         n0 = len(st.facts)
         for p in fn.params:
             if isinstance(p.ty, ir.TClass) and not (self.is_init and p.name == "self"):
-                for _, t in self.class_invariants(p.ty.name, env[p.name], env, st.facts):  # type: ignore[arg-type]
+                skip = self.program.untrusted.get(self.ref.key, set()) if p.name == "self" else set()
+                for _, t in self.class_invariants(p.ty.name, env[p.name], env, st.facts, skip):  # type: ignore[arg-type]
                     st.facts.append(t)
         self.invariant_facts = list(st.facts) if len(st.facts) > n0 else []
         ctx = self.ctx(st, spec=True)
@@ -591,6 +592,9 @@ class VCGen:
         """Objects handed to a function already exist."""
         if isinstance(ty, ir.TEnum) and isinstance(v, L.Term):
             return [L.le(L.ZERO, v), L.lt(v, L.IntV(len(ty.members)))]
+        if isinstance(ty, ir.TRecord) and isinstance(v, L.Term):
+            # an enum field of a record (a union's tag) is one of its members
+            return [f for n, t in ty.fields if isinstance(t, (ir.TEnum, ir.TRecord)) for f in self.alloc_facts(L.field(v, n), t, env)]
         if isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TEnum) and isinstance(v, OptVal):
             return [L.implies(v.some, L.and_(L.le(L.ZERO, v.val), L.lt(v.val, L.IntV(len(ty.inner.members)))))]
         alloc = env["@alloc"]
@@ -1731,7 +1735,9 @@ class VCGen:
         if callee is None:
             raise VCError(f"unknown function '{e.func}'", e.loc)
         args = [coerce(self.ev(a, ctx), p.ty) for a, p in zip(e.args, callee.fn.params)]
-        return self.call(callee, args, list(e.args), ctx, e.loc)
+        # a base constructor run on the object this constructor is building
+        base_init = self.is_init and callee.fn.name.endswith(".__init__") and bool(e.args) and isinstance(e.args[0], ir.Var) and e.args[0].name == "self"
+        return self.call(callee, args, list(e.args), ctx, e.loc, new_self=base_init)
 
     def ev_New(self, e: ir.New, ctx: Ctx) -> Val:
         if ctx.spec:

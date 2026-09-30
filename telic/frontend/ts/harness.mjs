@@ -197,6 +197,24 @@ function wrap(name, fn, c) {
   };
 }
 
+// A constructor's contract: @requires on its arguments before it runs,
+// @ensures of the object it built.
+function wrapClass(name, C, c) {
+  if (!c || (!c.requires.length && !c.ensures.length) || typeof C !== "function") return C;
+  const params = c.params.slice(1);
+  const reqs = c.requires.map((t) => [t, compileSpec(params, t)]);
+  const ens = c.ensures.map((t) => [t, compileSpec(params, extractOld(t)[0])]);
+  const H = Object.values(helpers);
+  return new Proxy(C, {
+    construct(target, args, newTarget) {
+      for (const [t, f] of reqs) if (!f.call(undefined, ...args, undefined, [], ...H)) throw new Violation("requires", t, name);
+      const o = Reflect.construct(target, args, newTarget === C ? target : newTarget);
+      for (const [t, f] of ens) if (!f.call(o, ...args, undefined, [], ...H)) throw new Violation("ensures", t, name, `built ${show(o)}`);
+      return o;
+    },
+  });
+}
+
 function structuredCloneSafe(v) {
   if (Array.isArray(v)) return v.map(structuredCloneSafe);
   if (v && typeof v === "object") return { ...v };
@@ -245,11 +263,13 @@ function load(path, contracts) {
   }
   let suffix = "\n;";
   for (const n of decls) if (contracts[n]) suffix += `${n} = (globalThis as any).__telic_wrap(${JSON.stringify(n)}, ${n});\n`;
+  for (const n of classes) if (contracts[`${n}.__init__`]) suffix += `${n} = (globalThis as any).__telic_wrap_class(${JSON.stringify(`${n}.__init__`)}, ${n});\n`;
   suffix += `(globalThis as any).__telic_fns = { ${decls.concat(consts, classes).join(", ")} };\n`;
   const js = ts.transpileModule(src + suffix, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const sandbox = { console: { log() {}, error() {}, warn() {}, info() {}, debug() {} }, structuredClone, Map, Set, Date, JSON, Math, Promise, Error, TypeError, RangeError, Number, String, Object, Array, Symbol, parseInt, parseFloat, isNaN, isFinite, setTimeout, clearTimeout };
   sandbox.globalThis = sandbox;
   sandbox.__telic_wrap = (n, f) => wrap(n, f, contracts[n]);
+  sandbox.__telic_wrap_class = (n, C) => wrapClass(n, C, contracts[n]);
   vm.createContext(sandbox);
   const cache = new Map();
   const mod = { exports: {} };

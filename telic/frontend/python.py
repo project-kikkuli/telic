@@ -739,6 +739,7 @@ class FunctionLowerer:
             ret=ret,
             source=seg,
             exported=not node.name.startswith("_") or node.name == "__init__",
+            is_async=isinstance(node, ast.AsyncFunctionDef),
         )
         for p in params:
             self.env[p.name] = p.ty

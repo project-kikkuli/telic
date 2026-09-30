@@ -7,6 +7,8 @@ import pytest
 from telic.checker import CheckOptions, check
 from telic.replay import call_text
 
+from conftest import needs_node
+
 CASES = Path(__file__).parent / "cases" / "objects"
 
 
@@ -81,6 +83,19 @@ def test_inheritance():
     # a call through the base depends on every override, and one is broken
     tb = got["through_base"]
     assert any("Leaky.withdraw" in d for d in tb.open_deps), tb.open_deps
+
+
+@needs_node
+def test_inheritance_ts():
+    got = run("inherit.ts")
+    for name in ("Account.deposit", "Account.withdraw", "Savings.__init__", "Savings.addInterest", "Capped.__init__", "Capped.withdraw", "Logged.deposit", "savingsDeposit", "openCapped", "Square.area", "Shape.twice"):
+        assert got[name].status == "proved", (name, got[name].status, got[name].problems, [(v.ob.id, v.status) for v in got[name].verdicts])
+    for name in ("Leaky.withdraw", "Hole.area", "badSavings"):
+        assert refuted_confirmed(got[name]), (name, got[name].status)
+    assert got["Shape.area"].status == "trusted"  # abstract: its overrides are checked against it
+    # a call through the base depends on every override, and one is broken
+    assert any("Leaky.withdraw" in d for d in got["throughBase"].open_deps), got["throughBase"].open_deps
+    assert any("Hole.area" in d for d in got["totalArea"].open_deps)
 
 
 def test_same_class_name_in_two_files_is_checked_against_its_own(tmp_path):

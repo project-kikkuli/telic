@@ -67,7 +67,14 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(ty, ir.TList):
         return [encode_value(x, ty.elem) for x in (v or [])]
     if isinstance(ty, ir.TRecord):
-        return {"__record__": ty.name, "fields": {n: encode_value((v or {}).get(n), t) for n, t in ty.fields}}
+        fields = {n: encode_value((v or {}).get(n), t) for n, t in ty.fields}
+        tag = fields.get(ty.tag)
+        if ty.variants and isinstance(tag, dict) and "member" in tag:
+            keep = dict(ty.variants).get(tag["member"], ())
+            fields = {n: x for n, x in fields.items() if n in keep}
+        return {"__record__": ty.name, "fields": fields}
+    if isinstance(ty, ir.TEnum) and isinstance(v, int) and not isinstance(v, bool):
+        return {"__enum__": ty.name, "member": ty.members[v] if 0 <= v < len(ty.members) else ty.members[0]}
     if isinstance(ty, ir.TReal):
         if isinstance(v, Fraction):
             return {"__real__": [v.numerator, v.denominator]}
@@ -98,6 +105,8 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         inner = " ".join(f"{k}={format_value(x, None, lang, names)}" for k, x in v["fields"].items())
         return f"<{tag} {inner}>" if inner else f"<{tag}>"
     if isinstance(v, dict) and "__enum__" in v:
+        if "." in v["__enum__"]:  # a union's tag: its string value
+            return json.dumps(v["member"])
         return f"{v['__enum__']}.{v['member']}"
     if isinstance(v, dict) and "__opaque__" in v:
         return "…"
@@ -296,7 +305,8 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
     if k == "raises":
         return "returned_repr" in out
     if k == "return":
-        return bool(out.get("returned_is_none")) and "returned_repr" in out
+        fell = out.get("violation") == "ensures" and lang == "typescript" and str(out.get("detail", "")) == "returned undefined"
+        return (bool(out.get("returned_is_none")) and "returned_repr" in out) or fell
     return False
 
 

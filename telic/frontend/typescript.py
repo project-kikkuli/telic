@@ -60,7 +60,7 @@ def _type(t: dict[str, Any]) -> ir.Type:
     if k == "list":
         return ir.TList(_type(t["elem"]))
     if k == "record":
-        return ir.TRecord(t["name"], tuple((n, _type(ft)) for n, ft in t["fields"]))
+        return ir.TRecord(t["name"], tuple((n, _type(ft)) for n, ft in t["fields"]), t.get("tag", ""), tuple((k, tuple(v)) for k, v in (t.get("variants") or {}).items()))
     if k == "option":
         return ir.TOption(_type(t["inner"]))
     if k == "dict":
@@ -206,6 +206,7 @@ def _function(d: dict[str, Any]) -> ir.Function:
         unsupported=[(m, ir.Loc(int(line))) for m, line in d.get("unsupported") or []],
         trusted=bool(d.get("trusted")),
         exported=bool(d.get("exported", True)),
+        is_async=bool(d.get("is_async")),
         source=d.get("source", ""),
         locals={n: _type(t) for n, t in (d.get("locals") or {}).items()},
         escaped=set(d.get("escaped") or []),
@@ -219,7 +220,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
         fn = _function(f)
         m.functions[fn.name] = fn
     for cname, c in (d.get("classes") or {}).items():
-        m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")))  # type: ignore[misc]
+        m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")), bases=list(c.get("bases") or []), owner=dict(c.get("owner") or {}))  # type: ignore[misc]
     m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.class_origin = dict(d.get("class_origin") or {})
     m.opaque_subclasses = [(s, b, ir.Loc(int(line))) for s, b, line in d.get("opaque_subclasses", [])]

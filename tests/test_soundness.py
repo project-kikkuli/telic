@@ -3,7 +3,9 @@
 Every function in tests/cases/soundness/ that is not listed below carries a
 contract that is false for the real program (see the README there); telic
 must refute it, report it open, or reject the construct. Helpers whose
-contracts are true are allowed to prove.
+contracts are true are allowed to prove. A proof that rests on a contract
+telic could not prove (a callee, or an override a call may dispatch to) is
+not a proof: it names the unproved contract.
 """
 
 from pathlib import Path
@@ -44,8 +46,16 @@ TRUE_HELPERS = {
     "t25.ts": {"fine"},
     "t26.rs": {"fine"},
     "t27.py": {"Box.__init__", "Box.get"},
-    "t30.ts": {"Shape.area", "Shape.__init__"},
+    "t30.ts": {"Shape.area", "Shape.__init__", "Square.__init__"},
     "t31.py": {"claim", "claim2"},  # proved only assuming the recursion, which stays open
+    "inh1.py": {"Base.__init__", "Base.setx", "Base.helper", "Sub.__init__"},
+    "inh2.py": {"Base.size", "Sub.size"},
+    "async1.py": {"Counter.__init__", "bump"},
+    "async1.ts": {"Counter.__init__", "bump", "set"},
+    "inh1.ts": {"Base.__init__", "Base.setx", "Base.helper"},
+    "inh2.ts": {"Base.size", "Sub.size"},
+    "inh3.ts": {"A.__init__"},
+    "inh4.ts": {"A.__init__", "A.m", "A.viaSuper", "B.__init__", "B.m"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))
@@ -61,7 +71,7 @@ def test_no_exploit_is_proved(name):
     if name.endswith(".rs"):
         pytest.importorskip("tree_sitter_rust")
     rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
-    proved = {f.fn.name for f in rep.functions if f.status == "proved"}
+    proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
     unexpected = proved - TRUE_HELPERS.get(name, set())
     assert not unexpected, f"{name}: exploits proved: {sorted(unexpected)}"
 

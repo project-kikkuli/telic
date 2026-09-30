@@ -66,6 +66,9 @@ class TList:
 class TRecord:
     name: str
     fields: tuple[tuple[str, "Type"], ...]
+    # a discriminated union: the tag field, and each tag value's fields (replay drops the rest)
+    tag: str = field(default="", compare=False)
+    variants: tuple[tuple[str, tuple[str, ...]], ...] = field(default=(), compare=False)
 
     def field_type(self, name: str) -> "Type | None":
         for fname, ftype in self.fields:
@@ -510,6 +513,7 @@ class Function:
     unsupported: list[tuple[str, Loc]] = field(default_factory=list)
     trusted: bool = False  # "@trusted": contract assumed, body not verified
     exported: bool = True
+    is_async: bool = False  # a call it does not await runs (some of) it later
     source: str = ""  # exact source text of the function
     locals: dict[str, "Type"] = field(default_factory=dict)  # every variable's type
     # locals captured by closures that escape: any unchecked call may change them

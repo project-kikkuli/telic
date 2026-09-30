@@ -166,6 +166,7 @@ type finfo = {
   recursive : bool;
   termination : bool;  (** does its recursion group need a termination proof *)
   resolve : (string * string) list;  (** call name -> function key *)
+  untrusted : (string * int) list;  (** (class, index) of invariants a call through a base does not establish on self *)
 }
 
 type classinfo = {
@@ -415,9 +416,11 @@ let spec_ctx g ?(modpath = g.info.modpath) ?old_env ?result ?(quiet = true) ?(gu
 let alloc_of env = match SM.find_opt "@alloc" env with Some (T a) -> a | _ -> raise (Vc_error ("no allocation map", Ir.noloc))
 
 (* objects handed to a function already exist; enum values are in range *)
-let alloc_facts g v (ty : Ir.ty) env =
+let rec alloc_facts g v (ty : Ir.ty) env =
   match (ty, v) with
   | TEnum (_, ms, _), T t -> [ le zero t; lt t (int_ (List.length ms)) ]
+  (* an enum field of a record (a union's tag) is one of its members *)
+  | TRecord (_, fs), T t -> List.concat_map (fun (n, (ft : Ir.ty)) -> match ft with TEnum _ | TRecord _ -> alloc_facts g (T (field t n)) ft env | _ -> []) fs
   | TOption (TEnum (_, ms, _)), O o -> [ implies o.some (and_ [ le zero o.v; lt o.v (int_ (List.length ms)) ]) ]
   | TClass _, T t ->
     let self_ = match SM.find_opt "self" g.entry with Some (T s) -> s == t | _ -> false in
@@ -562,7 +565,10 @@ let rec ev g ctx (e : Ir.expr) : value =
   | Call (f, args) ->
     let callee = match resolve g ctx.modpath f with Some c -> c | None -> raise (Vc_error (Printf.sprintf "unknown function '%s'" f, loc)) in
     let vals = List.map (fun (a, (_, pty)) -> coerce (ev g ctx a) (Some pty)) (zip args callee.fn.params) in
-    call g callee vals (List.map Option.some args) ctx loc
+    (* a base constructor run on the object this constructor is building *)
+    let ends s suffix = String.length s >= String.length suffix && String.sub s (String.length s - String.length suffix) (String.length suffix) = suffix in
+    let new_self = is_init g && ends callee.fn.name ".__init__" && (match args with { e = Var "self"; _ } :: _ -> true | _ -> false) in
+    call g ~new_self callee vals (List.map Option.some args) ctx loc
   | New (cls, args) -> new_object g ctx loc cls args
   | Extern (name, args) -> extern g ctx e name args
 
@@ -580,14 +586,14 @@ and equal g a b =
   | NoneV, NoneV -> tt
   | _ -> raise (Vc_error ("comparing values of different shapes", Ir.noloc))
 
-and class_invariants g cls r env base =
+and class_invariants ?(skip = []) g cls r env base =
   let e = SM.add "self" (T r) (heap_env env) in
   List.concat_map
     (fun cn ->
       match class_of g cn with
       | Some c when c.cinvs <> [] ->
         let ctx = spec_ctx g ~modpath:c.cmod ~base ~env:e () in
-        List.map (fun (inv : Ir.clause) -> (inv, term_of inv.cloc (ev g ctx inv.cexpr))) c.cinvs
+        List.concat (List.mapi (fun i (inv : Ir.clause) -> if List.mem (cn, i) skip then [] else [ (inv, term_of inv.cloc (ev g ctx inv.cexpr)) ]) c.cinvs)
       | _ -> [])
     (mro g cls)
 
@@ -1637,7 +1643,9 @@ let run g =
   List.iter
     (fun (p, (ty : Ir.ty)) ->
       match (ty, SM.find_opt p st.env) with
-      | TClass c, Some (T r) when not (is_init g && p = "self") -> List.iter (fun (_, t) -> Dynarray.add_last st.facts t) (class_invariants g c r st.env st.facts)
+      | TClass c, Some (T r) when not (is_init g && p = "self") ->
+        let skip = if p = "self" then g.info.untrusted else [] in
+        List.iter (fun (_, t) -> Dynarray.add_last st.facts t) (class_invariants ~skip g c r st.env st.facts)
       | _ -> ())
     fn.params;
   let ctx = state_ctx g ~spec:true st in
