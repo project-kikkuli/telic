@@ -219,3 +219,17 @@ pub fn twice<T: AsRef<[u8]>>(x: &T) -> bool {
     //@ ensures result
     x.as_ref().len() == x.as_ref().len()
 }
+
+pub fn rem_min(x: i32, y: i32) -> i32 {
+    //@ requires y != 0
+    x % y
+}
+
+pub fn rem_min_i8(x: i8) -> i8 {
+    x % -1
+}
+
+pub fn div_min_i64(x: i64, y: i64) -> i64 {
+    //@ requires y != 0
+    x / y
+}

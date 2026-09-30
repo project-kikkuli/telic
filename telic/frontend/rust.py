@@ -1973,7 +1973,12 @@ class ExprLowerer:
                 return ir.Binary(ir.REAL, loc, BINOPS[op], a, b)
             name = {"+": "add", "-": "sub", "*": "mul", "/": "tdiv", "%": "tmod"}[op]
             # an integer whose type nothing fixes is an i32 in Rust
-            return self.checked(ir.Binary(ir.INT, loc, name, a, b), k or kind or "i32")
+            kk = k or kind or "i32"
+            if op == "%" and INT_KINDS[kk][0] and not self.spec:
+                # MIN % -1 overflows (the quotient does not fit) and panics
+                a, b = self.hoist(a), self.hoist(b)
+                self.pre.append(ir.ExprStmt(loc, self.checked(ir.Binary(ir.INT, loc, "tdiv", a, b), kk)))
+            return self.checked(ir.Binary(ir.INT, loc, name, a, b), kk)
         if op in ("&", "|", "^", "<<", ">>"):
             if a.ty == ir.BOOL and b.ty == ir.BOOL and op in ("&", "|", "^"):
                 return ir.Binary(ir.BOOL, loc, {"&": "and", "|": "or", "^": "ne"}[op], a, b)  # non-short-circuit on bools
@@ -3031,9 +3036,7 @@ class ExprLowerer:
             r = self.hoist(r)
             rem = ir.Ite(ir.INT, loc, ir.Binary(ir.BOOL, loc, "lt", r, zero), ir.Binary(ir.INT, loc, "add", r, ir.Builtin(ir.INT, loc, "abs", (y,))), r)
             if INT_KINDS[k][0]:  # MIN % -1 overflows
-                lo = ir.Lit(ir.INT, loc, int_range(k)[0])
-                ok = ir.Unary(ir.BOOL, loc, "not", ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "eq", recv, lo), ir.Binary(ir.BOOL, loc, "eq", y, ir.Lit(ir.INT, loc, -1))))
-                self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, f"{k}::{m} does not overflow"), native=True))
+                self.pre.append(ir.ExprStmt(loc, self.checked(ir.Binary(ir.INT, loc, "tdiv", recv, y), k)))
             if m == "rem_euclid":
                 return self.kinded(rem, k)
             return self.kinded(ir.Binary(ir.INT, loc, "tdiv", ir.Binary(ir.INT, loc, "sub", recv, rem), y), k)
