@@ -71,5 +71,7 @@ lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
   real defect: at 390x844 the cookie banner covers the sidebar's Settings
   link, and the trace is one click (`Open sidebar`), replayed.
 
-A first run takes a few minutes per app (both viewports side by side, three
-browsers each); later runs reuse the verdicts until a source file changes.
+A first run takes a few minutes per app (one browser per viewport; `workers`
+adds more); later runs reuse the verdicts until a source file changes. Every
+browser takes one of `TELIC_UI_SLOTS` (default 2) slots shared by all telic
+runs on the machine, so concurrent runs queue instead of stacking browsers.

@@ -14,7 +14,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .app import App, AppError, build_digest
+from . import slots
+from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
 from .driver import DriverError
@@ -190,7 +191,7 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     from concurrent.futures import ThreadPoolExecutor
 
     try:
-        with App(cfg, log) as url:
+        with torn_down_on_signals(), App(cfg, log) as url:
             app.url = url
             atoms = Atoms(lems)
             seeds = propose(cfg, lems) if cfg.seed else None
@@ -213,6 +214,12 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
 
 
 def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, i: int, size: tuple[int, int], log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+    # one browser slot each, machine-wide: runs in other processes queue for them
+    with slots.hold(max(1, cfg.settings.workers), log=lambda m: log(f"{size[0]}x{size[1]}: {m}")) as n:
+        return _learn(cfg, url, lems, atoms, seeds, size, n, log)
+
+
+def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, size: tuple[int, int], browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     from .learn import Explorer
     from .web import WebDriver
 
@@ -220,7 +227,7 @@ def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds,
     vp = f"{w}x{h}"
     drivers = []
     try:
-        for _ in range(max(1, cfg.settings.workers)):
+        for _ in range(browsers):
             d = WebDriver(url, settle_ms=cfg.settle_ms)
             drivers.append(d)
             d.start()

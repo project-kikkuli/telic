@@ -39,7 +39,7 @@ class Settings:
     max_seconds: float = 600.0
     walks: int = 10
     walk_length: int = 0  # 0: two more than the deepest state
-    workers: int = 3  # browsers per viewport
+    workers: int = 1  # browsers per viewport: more only when asked for
     text: str = "telic"
     fill: tuple[tuple[str, str], ...] = ()  # (name regex, value) tried before the built-in guesses
     # "controls": a state is the screen, overlays, controls and lists; "screens": only

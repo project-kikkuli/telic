@@ -14,7 +14,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from .config import UiConfig
 from .spec import SKIP_DIRS
@@ -22,6 +24,33 @@ from .spec import SKIP_DIRS
 
 class AppError(Exception):
     pass
+
+
+_LIVE: set[App] = set()  # apps whose server is up, for a signal to take down
+
+
+@contextmanager
+def torn_down_on_signals() -> Iterator[None]:
+    """On SIGTERM or SIGINT, stop every dev server this process started, then
+    die of the signal as before. Browsers go with the process (their driver
+    exits when its pipe to this process closes); servers run in their own
+    session, so they would not."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(sig, _frame) -> None:
+        for app in list(_LIVE):
+            app.kill()
+        signal.signal(sig, signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
+
+    old = {s: signal.signal(s, handler) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
 
 
 def free_port() -> int:
@@ -116,6 +145,7 @@ class App:
             self.log(f"starting: {cmd}")
             env = dict(os.environ, PORT=str(port), BROWSER="none")
             self.proc = subprocess.Popen(cmd, shell=True, cwd=cfg.dir, env=env, stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True)
+            _LIVE.add(self)
             deadline = time.monotonic() + cfg.ready_timeout
             while time.monotonic() < deadline:
                 if answers(url):
@@ -135,7 +165,9 @@ class App:
         errors = [x for x in lines if "error" in x.lower()]
         return (errors[0] if errors else " | ".join(lines[-3:]))[:300] or "no output"
 
-    def __exit__(self, *exc) -> None:
+    def kill(self) -> None:
+        """Stop the dev server and everything it started."""
+        _LIVE.discard(self)
         if self.proc is not None and self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
@@ -145,6 +177,9 @@ class App:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
+
+    def __exit__(self, *exc) -> None:
+        self.kill()
         if self.server is not None:
             self.server.shutdown()
             self.server.server_close()

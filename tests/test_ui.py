@@ -353,3 +353,113 @@ def test_screens_abstraction_keeps_only_what_the_lemmas_see():
     coarse, got = learn(FakeApp(screens, start="home:A"), [("r", "reachable home")], abstraction="screens")
     assert len(fine.states) == 10 and len(coarse.states) == 1 and coarse.complete
     assert got["r"].status == "proved"
+
+
+# ---------------------------------------------------------------------------
+# Sharing the machine: a browser budget across processes, and no orphans
+
+HOLDER = "import sys, time; from telic.ui import slots\nwith slots.hold(1):\n    print('held', flush=True)\n    time.sleep(60)\n"
+
+
+@pytest.mark.parametrize("ends", ["exits", "is killed"])
+def test_a_browser_slot_is_released_however_its_holder_ends(tmp_path, monkeypatch, ends):
+    import signal
+    import subprocess
+    import sys
+
+    from telic.ui import slots
+
+    monkeypatch.setenv("TELIC_UI_SLOTS", "1")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    holder = subprocess.Popen([sys.executable, "-c", HOLDER], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(slots.SlotTimeout):
+            with slots.hold(1, timeout=0.5):
+                pass
+        holder.send_signal(signal.SIGTERM if ends == "exits" else signal.SIGKILL)
+        holder.wait(timeout=10)
+        with slots.hold(1, timeout=5) as n:
+            assert n == 1
+    finally:
+        holder.kill()
+
+
+@pytest.mark.parametrize("budget", [1, 2])
+@needs_browser
+def test_concurrent_browsers_never_exceed_the_machine_budget(tmp_path, monkeypatch, budget):
+    import threading
+
+    from telic.ui.web import WebDriver
+
+    monkeypatch.setenv("TELIC_UI_SLOTS", str(budget))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    live, peak, lock = [0], [0], threading.Lock()
+    start, stop = WebDriver.start, WebDriver.stop
+
+    def counted_start(self):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        start(self)
+
+    def counted_stop(self):
+        stop(self)
+        with lock:
+            live[0] -= 1
+
+    monkeypatch.setattr(WebDriver, "start", counted_start)
+    monkeypatch.setattr(WebDriver, "stop", counted_stop)
+    d = fixture_app(tmp_path, viewports=("390x844", "1280x800", "1024x768"))
+    _, got = run_ui(d)
+    assert got["escape"].status == "proved"
+    assert peak[0] == budget and live[0] == 0
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
+@needs_browser
+def test_a_signal_takes_down_the_dev_server_and_browsers(tmp_path, sig):
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    d = fixture_app(tmp_path)
+    toml = (d / "telic.toml").read_text().replace('static = "."', f'command = "{sys.executable} -m http.server {{port}} --bind 127.0.0.1"')
+    (d / "telic.toml").write_text(toml + "max_seconds = 300\n")
+    proc = subprocess.Popen([sys.executable, "-m", "telic.cli", "check", str(d), "--no-cache"], cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def tree() -> set[int]:
+        rows = [ln.split() for ln in subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout.splitlines()]
+        kids: dict[int, list[int]] = {}
+        for r in rows:
+            kids.setdefault(int(r[1]), []).append(int(r[0]))
+        out, todo = set(), [proc.pid]
+        while todo:
+            p = todo.pop()
+            out.add(p)
+            todo += kids.get(p, [])
+        return out - {proc.pid}
+
+    def commands(pids: set[int]) -> list[str]:
+        got = subprocess.run(["ps", "-o", "command=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout if pids else ""
+        return got.splitlines()
+
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            running = tree()
+            names = " ".join(commands(running))
+            if "http.server" in names and "headless" in names:
+                break
+            time.sleep(0.3)
+        else:
+            pytest.fail("the app and a browser never started")
+        proc.send_signal(getattr(signal, sig))
+        proc.wait(timeout=30)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and commands(running):
+            time.sleep(0.3)
+        assert commands(running) == []
+    finally:
+        proc.kill()
