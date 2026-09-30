@@ -1,0 +1,14 @@
+# Router renames /settings to /preferences; Sidebar link still points at #/settings (not found)
+diff --git a/src/lib/router.svelte.ts b/src/lib/router.svelte.ts
+index 8c4774a..366ea98 100644
+--- a/src/lib/router.svelte.ts
++++ b/src/lib/router.svelte.ts
+@@ -3,7 +3,7 @@ type Route = { name: 'project'; projectId: string } | { name: 'all' } | { name:
+ function parse(hash: string): Route {
+   const path = hash.replace(/^#/, '') || '/'
+   if (path === '/' || path === '/all') return { name: 'all' }
+-  if (path === '/settings') return { name: 'settings' }
++  if (path === '/preferences') return { name: 'settings' }
+   const m = path.match(/^\/projects\/([^/]+)$/)
+   if (m) return { name: 'project', projectId: decodeURIComponent(m[1]) }
+   return { name: 'notfound' }

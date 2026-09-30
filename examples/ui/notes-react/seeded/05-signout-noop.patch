@@ -1,0 +1,14 @@
+# Sign-out confirm handler drops the signOut() call; user lands on /login which bounces back, still signed in
+diff --git a/src/pages/AccountPage.tsx b/src/pages/AccountPage.tsx
+index 22f6499..8f07e35 100644
+--- a/src/pages/AccountPage.tsx
++++ b/src/pages/AccountPage.tsx
+@@ -15,7 +15,7 @@ export default function AccountPage() {
+   const [confirming, setConfirming] = useState(false)
+ 
+   const handleSignOut = () => {
+-    signOut()
++    setConfirming(false)
+     toast('Signed out')
+     navigate('/login')
+   }

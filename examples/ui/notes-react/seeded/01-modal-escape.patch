@@ -1,0 +1,14 @@
+# Modal Escape handler checks legacy key name 'Esc', so Escape no longer closes any modal
+diff --git a/src/components/Modal.tsx b/src/components/Modal.tsx
+index 1a7b53b..ea25c36 100644
+--- a/src/components/Modal.tsx
++++ b/src/components/Modal.tsx
+@@ -14,7 +14,7 @@ export function Modal({ title, onClose, children, footer }: ModalProps) {
+     const previouslyFocused = document.activeElement as HTMLElement | null
+     dialogRef.current?.querySelector<HTMLElement>('button, input, [tabindex]')?.focus()
+     const onKey = (e: KeyboardEvent) => {
+-      if (e.key === 'Escape') onClose()
++      if (e.key === 'Esc') onClose()
+     }
+     window.addEventListener('keydown', onKey)
+     return () => {

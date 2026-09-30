@@ -1,0 +1,16 @@
+# Focus mode relies on browser fullscreen Esc; Exit button and Escape handler removed
+diff --git a/src/lib/components/FocusMode.svelte b/src/lib/components/FocusMode.svelte
+index d7e3fd4..7011978 100644
+--- a/src/lib/components/FocusMode.svelte
++++ b/src/lib/components/FocusMode.svelte
+@@ -61,10 +61,8 @@
+   }
+ </script>
+ 
+-<svelte:window onkeydown={(e) => e.key === 'Escape' && onexit()} />
+ 
+ <div class="focus" bind:this={root} role="dialog" aria-modal="true" aria-label="Focus mode">
+-  <button class="exit btn" onclick={onexit}>Exit focus</button>
+   {#if current}
+     <p class="meta">
+       {#if project}<span class="dot" style="background: {project.color}"></span>{project.name} ·{/if}

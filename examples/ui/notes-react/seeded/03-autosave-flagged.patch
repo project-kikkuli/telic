@@ -1,0 +1,21 @@
+# Autosave toggle moved behind VITE_EDITOR_SETTINGS flag; unreachable by default, so autosave can't be turned off
+diff --git a/src/pages/SettingsPage.tsx b/src/pages/SettingsPage.tsx
+index c3caa6a..755610e 100644
+--- a/src/pages/SettingsPage.tsx
++++ b/src/pages/SettingsPage.tsx
+@@ -45,6 +45,7 @@ export default function SettingsPage() {
+         </label>
+       </section>
+ 
++      {import.meta.env.VITE_EDITOR_SETTINGS === 'true' && (
+       <section className="card">
+         <h2>Editor</h2>
+         <label className="toggle">
+@@ -59,6 +60,7 @@ export default function SettingsPage() {
+           <span>Autosave notes while typing</span>
+         </label>
+       </section>
++      )}
+ 
+       <section className="card">
+         <h2>Profile</h2>

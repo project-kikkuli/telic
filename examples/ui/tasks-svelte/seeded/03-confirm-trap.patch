@@ -1,0 +1,14 @@
+# 'Keep editing' in the discard dialog re-opens the same dialog; only way out is Discard
+diff --git a/src/lib/components/TaskDrawer.svelte b/src/lib/components/TaskDrawer.svelte
+index f23f12f..7fbfbec 100644
+--- a/src/lib/components/TaskDrawer.svelte
++++ b/src/lib/components/TaskDrawer.svelte
+@@ -104,7 +104,7 @@
+     confirmLabel="Discard"
+     cancelLabel="Keep editing"
+     danger
+-    oncancel={() => (confirm = null)}
++    oncancel={() => (confirm = 'discard')}
+     onconfirm={() => {
+       confirm = null
+       onclose()

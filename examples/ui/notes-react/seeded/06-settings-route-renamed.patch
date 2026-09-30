@@ -1,0 +1,14 @@
+# Route /settings renamed to /preferences; NavBar link and mod+, still point at /settings (404)
+diff --git a/src/App.tsx b/src/App.tsx
+index 1e8d350..76e42ca 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -66,7 +66,7 @@ export default function App() {
+             }
+           />
+           <Route
+-            path="/settings"
++            path="/preferences"
+             element={
+               <RequireAuth>
+                 <SettingsPage />

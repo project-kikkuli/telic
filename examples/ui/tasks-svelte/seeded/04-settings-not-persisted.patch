@@ -1,0 +1,22 @@
+# Settings store switched from persisted() to plain $state; preferences reset on reload
+diff --git a/src/lib/store.svelte.ts b/src/lib/store.svelte.ts
+index aaa8304..c7c7b2a 100644
+--- a/src/lib/store.svelte.ts
++++ b/src/lib/store.svelte.ts
+@@ -31,7 +31,15 @@ const defaultSettings: Settings = {
+ 
+ export const projects = persisted<Project[]>('tasks.projects', seedProjects)
+ export const tasks = persisted<Task[]>('tasks.items', seedTasks)
+-export const settings = persisted<Settings>('tasks.settings', defaultSettings)
++let settingsState = $state<Settings>({ ...defaultSettings })
++export const settings = {
++  get value() {
++    return settingsState
++  },
++  set value(v: Settings) {
++    settingsState = v
++  },
++}
+ export const consent = persisted<'accepted' | 'rejected' | null>('tasks.consent', null)
+ 
+ export function addProject(name: string) {

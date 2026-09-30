@@ -1,0 +1,25 @@
+# Drawer hides its close button on mobile and drops the redundant Cancel button
+diff --git a/src/lib/components/TaskDrawer.svelte b/src/lib/components/TaskDrawer.svelte
+index f23f12f..154b0f2 100644
+--- a/src/lib/components/TaskDrawer.svelte
++++ b/src/lib/components/TaskDrawer.svelte
+@@ -91,7 +91,6 @@
+       <button type="button" class="btn btn-danger" onclick={() => (confirm = 'delete')}>Delete</button>
+       <span class="spacer"></span>
+       {#if dirty}<span class="unsaved">Unsaved changes</span>{/if}
+-      <button type="button" class="btn" onclick={requestClose}>Cancel</button>
+       <button type="submit" class="btn btn-primary" disabled={!dirty}>Save</button>
+     </footer>
+   </form>
+@@ -191,6 +190,11 @@
+   .spacer {
+     flex: 1;
+   }
++  @media (max-width: 768px) {
++    header .icon-btn {
++      display: none;
++    }
++  }
+   .unsaved {
+     font-size: 0.8rem;
+     color: var(--warning);

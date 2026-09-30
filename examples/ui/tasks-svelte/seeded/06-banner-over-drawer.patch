@@ -1,0 +1,14 @@
+# Cookie banner z-index raised to 100 so it's 'always visible'; covers the drawer's Save button and focus controls
+diff --git a/src/lib/components/CookieBanner.svelte b/src/lib/components/CookieBanner.svelte
+index 37ce3b7..0b784cf 100644
+--- a/src/lib/components/CookieBanner.svelte
++++ b/src/lib/components/CookieBanner.svelte
+@@ -44,7 +44,7 @@
+     display: flex;
+     gap: 1rem;
+     align-items: center;
+-    z-index: 35;
++    z-index: 100;
+   }
+   .text {
+     flex: 1;

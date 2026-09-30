@@ -1,0 +1,25 @@
+# New fixed announcement banner at the top overlays the navbar and hamburger
+diff --git a/src/App.tsx b/src/App.tsx
+index 1e8d350..ad3370c 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -45,6 +45,7 @@ export default function App() {
+ 
+   return (
+     <div className="app">
++      <div className="announce">New: markdown support is here!</div>
+       {!onLogin && user && <NavBar onShowShortcuts={() => setShowShortcuts(true)} />}
+       <main className="content">
+         <Routes>
+diff --git a/src/index.css b/src/index.css
+index b1ed408..78f8dd5 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -38,6 +38,7 @@ body {
+ 
+ a { color: var(--primary); }
+ 
++.announce { position: fixed; top: 0; left: 0; right: 0; z-index: 40; padding: 1rem; background: var(--primary); color: var(--primary-text); text-align: center; }
+ .app { display: flex; flex-direction: column; min-height: 100%; }
+ .content { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+ 

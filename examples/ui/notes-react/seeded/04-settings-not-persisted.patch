@@ -1,0 +1,21 @@
+# Settings moved from localStorage to in-memory state; theme/font/name reset on reload
+diff --git a/src/context/SettingsContext.tsx b/src/context/SettingsContext.tsx
+index 539c5f7..a828529 100644
+--- a/src/context/SettingsContext.tsx
++++ b/src/context/SettingsContext.tsx
+@@ -1,5 +1,4 @@
+-import { createContext, useContext, useEffect, type ReactNode } from 'react'
+-import { useLocalStorage } from '../hooks/useLocalStorage'
++import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+ import { useMediaQuery } from '../hooks/useMediaQuery'
+ import type { Settings } from '../types'
+ 
+@@ -20,7 +19,7 @@ interface SettingsContextValue {
+ const SettingsContext = createContext<SettingsContextValue | null>(null)
+ 
+ export function SettingsProvider({ children }: { children: ReactNode }) {
+-  const [settings, setSettings] = useLocalStorage<Settings>('notes.settings', defaults)
++  const [settings, setSettings] = useState<Settings>(defaults)
+   const prefersDark = useMediaQuery('(prefers-color-scheme: dark)')
+   const resolvedTheme = settings.theme === 'system' ? (prefersDark ? 'dark' : 'light') : settings.theme
+ 
