@@ -45,13 +45,23 @@ def _encode_any(v: Any) -> Any:
     return v
 
 
+# opaque types that admit every value: a stand-in passed for one is a real input
+ANYTHING = {"unknown", "any", "object", "unannotated", "Any", "typing.Any", "*args", "**kwargs"}
+
+
+def _anything(ty: ir.Type) -> bool:
+    return isinstance(ty, ir.TOpaque) and ty.why in ANYTHING
+
+
 def encode_value(v: Any, ty: ir.Type) -> Any:
-    if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
+    if isinstance(v, dict) and "__opaque__" in v:
+        return {"__opaque__": True, "any": _anything(ty)}
+    if isinstance(v, dict) and "__enum__" in v:
         return v
     if isinstance(v, dict) and "__record__" in v and isinstance(ty, ir.TRecord):
         return encode_value(v["fields"], ty)
     if isinstance(ty, ir.TOpaque):
-        return {"__opaque__": True}
+        return {"__opaque__": True, "any": _anything(ty)}
     if isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum)):
         return [_encode_any(x) for x in (v or [])]
     if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TRecord):
@@ -171,7 +181,7 @@ def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth
     if isinstance(ty, ir.TEnum):
         return {"k": "enum", "name": ty.name, "members": list(ty.members)}
     if isinstance(ty, ir.TOpaque):
-        return {"k": "opaque"}
+        return {"k": "opaque", "any": _anything(ty)}
     if isinstance(ty, ir.TClass):
         decl = (classes or {}).get(ty.name)
         fields = [[f, type_desc(t, classes, depth + 1)] for f, t in decl.fields] if decl is not None and depth < 3 else None
@@ -345,6 +355,8 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
     if out.get("violation") == "requires" and out.get("func") == ir.source_name(fn.name) and ob.kind != "call":
         return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
     summary = describe(out, runtime)
+    if out.get("stand_in"):
+        return False, f"{summary}, but only by reading a stand-in for a value telic does not model, so the run shows nothing", None
     if matches(ob, out, fn, lang):
         what = out.get("violation") or out.get("crash") or ob.kind
         return True, summary, str(what)
@@ -418,7 +430,10 @@ def replay_verdicts(program: Program, rep) -> None:
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
     if pending and lang != "rust":
         out = fuzz(full, fn, lang, module=rep.ref.module)
-        if out.get("found"):
+        if out.get("found") and out.get("stand_in"):
+            for v in pending:
+                v.replay.fuzz_summary = "random inputs failed only by reading stand-ins for values telic does not model"  # type: ignore[attr-defined]
+        elif out.get("found"):
             what = out.get("violation") or out.get("crash")
             text = out.get("text", out.get("msg", ""))
             call = f"{fn.name}({out['args_repr']})"

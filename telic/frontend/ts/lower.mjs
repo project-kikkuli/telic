@@ -482,20 +482,26 @@ class ModuleLowerer {
 
   record(name, members, node) {
     this.memberLists[name] = members;
+    const fields = this.recordFields(members);
+    if (fields) this.module.records[name] = { k: "record", name, fields };
+  }
+
+  // The fields of an object type, or null if one is not a plain value.
+  recordFields(members, depth = 0) {
     const fields = [];
     for (const m of members) {
-      if (!m || !ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return;
+      if (!m || !ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return null;
       let t;
       try {
-        t = this.typeOf(m.type);
+        t = this.typeOf(m.type, false, depth + 1);
       } catch {
-        return;
+        return null;
       }
       if (m.questionToken) t = optionOf(t);
-      if (t.k === "list" || t.k === "dict" || t.k === "opaque" || t.k === "class") return;
+      if (t.k === "list" || t.k === "dict" || t.k === "opaque" || t.k === "class") return null;
       fields.push([m.name.text, t]);
     }
-    this.module.records[name] = { k: "record", name, fields };
+    return fields;
   }
 
   typeOf(tn, intHint = false, depth = 0) {
@@ -556,6 +562,12 @@ class ModuleLowerer {
       const sig = tn.members[0];
       const k = this.typeOf(sig.parameters[0].type, false, depth + 1), v = this.typeOf(sig.type, false, depth + 1);
       if (["int", "real", "str"].includes(k.k) && !["list", "dict", "option"].includes(v.k)) return { k: "dict", key: k, val: v, js: "object" };
+      return opaque(tn.getText(this.sf));
+    }
+    if (ts.isTypeLiteralNode(tn)) {
+      // an inline object type: a record named by its shape
+      const fields = this.recordFields(tn.members, depth);
+      if (fields && fields.length) return { k: "record", name: `{ ${fields.map(([n, t]) => `${n}: ${tyStr(t)}`).join("; ")} }`, fields };
       return opaque(tn.getText(this.sf));
     }
     if (ts.isParenthesizedTypeNode(tn)) return this.typeOf(tn.type, intHint, depth + 1);

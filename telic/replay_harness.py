@@ -35,7 +35,9 @@ def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
     if isinstance(v, dict) and "__enum__" in v:
         return getattr(getattr(module, v["__enum__"]), v["member"])
     if isinstance(v, dict) and "__opaque__" in v:
-        return _Stub()
+        s = _Stub()
+        object.__setattr__(s, "_anything", bool(v.get("any")))
+        return s
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return float(Fraction(n, d))
@@ -98,6 +100,12 @@ REJECTED: dict = {}
 def _outcome(fn: Any, args: list, module: Any, ContractViolation: Any, fname: str) -> dict | None:
     """None if the call passes, REJECTED if its own precondition rejects the
     input, otherwise a description of the failure."""
+    STAND_IN.clear()
+    out = _run(fn, args, module, ContractViolation, fname)
+    return {**out, "stand_in": True} if out and out is not REJECTED and STAND_IN else out
+
+
+def _run(fn: Any, args: list, module: Any, ContractViolation: Any, fname: str) -> dict | None:
     import copy
 
     try:
@@ -181,10 +189,16 @@ def fuzz(fn: Any, types: list, n: int, module: Any, ContractViolation: Any, fnam
 
 
 STUBBED: list[str] = []
+# set once a run looks inside a stub: it computed with made-up values
+STAND_IN: list[bool] = []
 
 
 class _Stub:
-    """Stands in for anything from a module that is not installed."""
+    """Stands in for anything from a module that is not installed, or for an
+    input telic does not model; ``_anything`` if that input's type admits
+    every value (then the stub is a real input, not a made-up one)."""
+
+    _anything = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         for k, v in kwargs.items():
@@ -194,12 +208,19 @@ class _Stub:
         pass
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return _Stub()
+        return self._derived()
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
             raise AttributeError(name)
-        return _Stub()
+        return self._derived()
+
+    def _derived(self) -> "_Stub":
+        if not self._anything:
+            STAND_IN.append(True)
+        s = _Stub()
+        object.__setattr__(s, "_anything", self._anything)
+        return s
 
 
 class _StubFinder:
@@ -261,19 +282,23 @@ def main() -> None:
     if "fuzz" in req:
         print(json.dumps(fuzz(fn, req["types"], req["fuzz"], mod, ContractViolation, req["func"])))
         return
+    def emit(d: dict) -> None:
+        print(json.dumps({**d, "stand_in": True} if STAND_IN else d))
+
+    STAND_IN.clear()
     try:
         r = settle(fn(*args))
-        print(json.dumps({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED}))
+        emit({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED})
     except ContractViolation as e:
-        print(json.dumps({"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}))
+        emit({"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail})
     except RecursionError:
-        print(json.dumps({"crash": "RecursionError", "msg": "maximum recursion depth exceeded"}))
+        emit({"crash": "RecursionError", "msg": "maximum recursion depth exceeded"})
     except Exception as e:
         line = None
         for fr in traceback.extract_tb(e.__traceback__):
             if fr.filename == path:
                 line = fr.lineno
-        print(json.dumps({"crash": type(e).__name__, "msg": str(e), "line": line}))
+        emit({"crash": type(e).__name__, "msg": str(e), "line": line})
 
 
 if __name__ == "__main__":

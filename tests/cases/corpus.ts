@@ -375,3 +375,17 @@ export function newWallets(ws: Wallet[], out: Wallet[]): void {
     out.push(w);
   }
 }
+
+export type Nested = { n: number; inner: { m: number; tag?: string } };
+
+// expect: proved
+export function nestedField(r: Nested): number {
+  //@ ensures result === r.n + r.inner.m
+  return r.n + r.inner.m;
+}
+
+// expect: refuted
+export function nestedWrong(r: Nested): number {
+  //@ ensures result === r.inner.m
+  return r.n;
+}

@@ -35,21 +35,29 @@ function guard(arr) {
 }
 
 // A stand-in for anything telic knows nothing about (opaque values, modules
-// that are not installed): every property and call yields another stub.
-function stub(name = "stub") {
+// that are not installed): every property and call yields another stub. A
+// run that looks inside one computed with made-up values, so it is recorded,
+// unless it stands for an input of a type every value has (unknown, any).
+let STAND_IN = null;
+
+function stub(name = "stub", anything = false) {
   const f = function () {};
+  const used = () => anything || (STAND_IN ??= name);
   return new Proxy(f, {
     get(t, p) {
-      if (p === Symbol.toPrimitive) return () => NaN;
       if (p === "then") return undefined;
+      used();
+      if (p === Symbol.toPrimitive) return () => NaN;
       if (p === "toString") return () => `<${name}>`;
-      return stub(`${name}.${String(p)}`);
+      return stub(`${name}.${String(p)}`, anything);
     },
     apply() {
-      return stub(`${name}()`);
+      used();
+      return stub(`${name}()`, anything);
     },
     construct() {
-      return stub(`new ${name}`);
+      used();
+      return stub(`new ${name}`, anything);
     },
   });
 }
@@ -64,7 +72,7 @@ function decode(v, ty = null, memo = new Map()) {
   if (Array.isArray(v)) return guard(v.map((x) => decode(x, ty && ty.k === "list" ? ty.elem : null, memo)));
   if (typeof v !== "object") return v;
   if ("__real__" in v) return v.__real__[0] / v.__real__[1];
-  if ("__opaque__" in v) return stub("opaque");
+  if ("__opaque__" in v) return stub("opaque", !!v.any);
   if ("__enum__" in v) {
     const E = SCOPE[v.__enum__];
     return E ? E[v.member] : v.member;
@@ -312,6 +320,12 @@ function resolveFn(fns, name) {
 }
 
 async function outcome(fn, args) {
+  STAND_IN = null;
+  const o = await run(fn, args);
+  return STAND_IN ? { ...o, stand_in: STAND_IN } : o;
+}
+
+async function run(fn, args) {
   try {
     let r = fn(...args);
     if (r && typeof r.then === "function") r = await r;
@@ -384,7 +398,7 @@ function gen(ty, r) {
       return o;
     }
     case "opaque":
-      return stub("opaque");
+      return stub("opaque", !!ty.any);
   }
   return null;
 }
