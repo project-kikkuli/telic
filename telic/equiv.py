@@ -15,6 +15,7 @@ Code with loops is compared by differential testing and labelled as such.
 
 from __future__ import annotations
 
+import itertools
 import os
 import random
 from dataclasses import dataclass, field
@@ -94,11 +95,13 @@ def _has_loops(fn: ir.Function) -> bool:
     return any(isinstance(s, (ir.While, ir.ForRange, ir.ForEach)) for s in ir.walk_stmts(fn.body))
 
 
-def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple[L.Term, list[L.Term], L.Term]:
-    """The function's result as one term over ``inputs`` (loop-free only),
-    its preconditions over the same inputs, and the condition under which it
-    raises instead of returning."""
+def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val], side: str = "a") -> tuple[L.Term, list[L.Term], L.Term]:
+    """The function's result as a symbol over ``inputs`` (loop-free only),
+    the facts that define it and its preconditions, and the condition under
+    which it raises instead of returning. Symbols the two sides create are
+    kept apart by ``side``; only the inputs and the heap are shared."""
     g = VCGen(program, ref, inputs=inputs)
+    g.counter = itertools.count(1 if side == "a" else 1_000_000)
     g.definitional_mode = True
     env = dict(inputs)
     g.heap_init(env)  # both sides start from the same heap; a call havocs it
@@ -110,13 +113,17 @@ def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple
     exits = [ex for ex in g.exits if ex.value is not None]
     if not exits:
         raise Incomparable(f"'{ref.fn.name}' returns no value")
-    body = exits[-1].value
-    for ex in reversed(exits[:-1]):
-        body = L.ite(L.and_(*ex.facts), ex.value, body)  # type: ignore[arg-type]
-    if isinstance(body, ListVal):
+    if any(isinstance(ex.value, ListVal) for ex in exits):
         raise Incomparable("comparing list results symbolically is not supported yet")
+    if not all(isinstance(ex.value, L.Term) for ex in exits):
+        raise Incomparable(f"'{ref.fn.name}' returns a value telic cannot compare symbolically")
+    r = L.Const(f"mirror.{side}.result", exits[0].value.sort)  # type: ignore[union-attr]
+    # The run follows exactly one path, and every fact on it holds there
+    # (including the definitions of symbols it made).
+    paths = [L.and_(*ex.facts) for ex in exits]
     raises = L.or_(*[L.and_(*facts) for facts in g.raise_paths])
-    return body, reqs, raises
+    defs = [L.or_(*paths, raises)] + [L.implies(p, L.eq(r, ex.value)) for p, ex in zip(paths, exits)]  # type: ignore[arg-type]
+    return r, list(rctx.base) + reqs + defs, raises
 
 
 def _coerce_pair(ra: L.Term, rb: L.Term) -> tuple[L.Term, L.Term]:
@@ -286,8 +293,8 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
     rep.explanation = explain_difference(a.fn, b.fn, notes)
     if not _has_loops(a.fn) and not _has_loops(b.fn) and not a.fn.unsupported and not b.fn.unsupported:
         try:
-            ra, reqa, xa = result_term(program, a, ina)
-            rb, reqb, xb = result_term(program, b, inb)
+            ra, reqa, xa = result_term(program, a, ina, "a")
+            rb, reqb, xb = result_term(program, b, inb, "b")
             ra, rb = _coerce_pair(ra, rb)
             hyps = reqa + reqb
             for _, v in shown:

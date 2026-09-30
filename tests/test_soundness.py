@@ -118,6 +118,13 @@ def test_no_exploit_is_proved(name):
     assert not lifecycles, f"{name}: false lifecycles proved: {sorted(lifecycles)}"
 
 
+def test_mirror_sides_keep_their_own_symbols():
+    rep = check([str(DIR / "mircomp")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mircomp"))
+    got = {m.b.fn.name: m for m in rep.mirrors}
+    assert set(got) == {"g", "h"}
+    assert all(m.status == "refuted" and m.witness["replay"]["confirmed"] for m in got.values())
+
+
 @needs_node
 def test_mirror_compares_exceptions():
     rep = check([str(DIR / "mir" / "g.ts")], CheckOptions(cache_path=None, lean=False), root=str(DIR))
