@@ -321,7 +321,31 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def run_rust_samples(path: str, targets: list[tuple[ir.Function, list[dict[str, Any]]]]) -> dict[str, list[dict[str, Any]]] | None:
+def run_rust_batch(path: str, fn: ir.Function, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Run the function on each model in one program: per model, what
+    ``run_rust`` reports (without checking postconditions), or ``rejected``
+    when the model breaks a @requires or cannot be written as Rust."""
+    if shutil.which("rustc") is None:
+        return [{"harness_error": "rustc is not installed"}] * len(models)
+    t = _Target(path, fn)
+    if t.info is None:
+        return [{"harness_error": "function not found"}] * len(models)
+    if any(r is None or "old(" in r for r in (_rust_implies(c.text) for c in fn.requires)):
+        return [{"harness_error": "a @requires is not Rust the harness can evaluate"}] * len(models)
+    usable = [i for i, m in enumerate(models) if t.invocation(m) is not None]
+    got = run_rust_samples(path, [(fn, [models[i] for i in usable])], checks=False) if usable else {}
+    if got is None:
+        return [{"harness_error": "rustc could not build the batch"}] * len(models)
+    rows = got.get(fn.name)
+    if usable and rows is None:
+        return [{"harness_error": "rustc could not build the batch"}] * len(models)
+    out: list[dict[str, Any]] = [{"rejected": True}] * len(models)
+    for i, row in zip(usable, rows or []):
+        out[i] = {"rejected": True} if row.get("skipped") else row
+    return out
+
+
+def run_rust_samples(path: str, targets: list[tuple[ir.Function, list[dict[str, Any]]]], checks: bool = True) -> dict[str, list[dict[str, Any]]] | None:
     """Run functions of one file on several models each, in one build: per
     model, the panic or broken postcondition, or {"skipped": True} when the
     inputs do not meet the preconditions (checked where their text is Rust).
@@ -339,9 +363,10 @@ def run_rust_samples(path: str, targets: list[tuple[ir.Function, list[dict[str, 
         if any(x is None for x in invs):
             continue
         variants = []
-        for checks, show in ((" ".join(t.checks()), True), (" ".join(t.checks()), False), ("", True), ("", False)):
+        post = " ".join(t.checks()) if checks else ""
+        for checks_, show in ((post, True), (post, False), ("", True), ("", False)):
             value = 'format!("{:?}", __v)' if show else "String::new()"
-            variants.append(" ".join(f'println!("TELIC_SAMPLE {fn.name} {i}"); let __r = std::panic::catch_unwind(move || {{ {setup} {guard} let __v = {call}; {checks} {value} }}); if let Ok(s) = __r {{ println!("TELIC_RETURNED {{}}", s); }}' for i, (setup, call) in enumerate(invs)))  # type: ignore[misc]
+            variants.append(" ".join(f'println!("TELIC_SAMPLE {fn.name} {i}"); let __r = std::panic::catch_unwind(move || {{ {setup} {guard} let __v = {call}; {checks_} {value} }}); if let Ok(s) = __r {{ println!("TELIC_RETURNED {{}}", s); }}' for i, (setup, call) in enumerate(invs)))  # type: ignore[misc]
         runs.append((t, variants))
     if not runs:
         return {}
