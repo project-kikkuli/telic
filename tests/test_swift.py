@@ -261,3 +261,42 @@ def test_swift_aims_and_citations(tmp_path):
     rep = run_check(tmp_path, {"shop.swift": shop}, lean=False, replay=False)
     (aim,) = rep.aims
     assert aim.id == "REFUND-CAP" and aim.status == "backed"
+
+
+UNMODELLED = """actor Clock {
+    var ticks = 0
+}
+
+struct Stamp {
+    var clock: Clock
+    var n: Int
+
+    func next() -> Int {
+        //@ ensures result > n
+        return n
+    }
+}
+
+func tick(_ c: Clock, _ x: Int) -> Int {
+    //@ ensures result == 1
+    return x
+}
+"""
+
+
+@needs_swiftc
+@pytest.mark.parametrize("fn", ["tick", "Stamp.next"])
+def test_replay_makes_up_no_value_for_an_unmodelled_type(tmp_path, fn):
+    """A counterexample over a value telic does not model (here an actor) is
+    not run on a stand-in, so it confirms nothing."""
+    rep = run_check(tmp_path, {"u.swift": UNMODELLED}, lean=False)
+    (f,) = [f for f in rep.functions if f.fn.name == fn]
+    assert not any(v.replay is not None and v.replay.confirmed for v in f.verdicts)
+
+
+@needs_swiftc
+def test_an_unconstrained_type_parameter_is_replayed_on_any_value(report):
+    """The function cannot look inside a T, so any value is a real input."""
+    _, got = report
+    (v,) = [v for v in got["secondOf"].verdicts if v.status == "refuted"]
+    assert v.replay.confirmed

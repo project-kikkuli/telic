@@ -125,7 +125,9 @@ class Harness:
             name = _base_name(text(tn))
             args = _generic_args(tn)
             if name in self.free_generics():
-                return "int", "Int"  # an unconstrained type parameter: any type will do
+                # an unconstrained type parameter: the function cannot look
+                # inside its values, so any value of any type is a real input
+                return "param", None
             if name in INT_KINDS:
                 return "int", name
             if name in REAL_TYPES:
@@ -180,7 +182,7 @@ class Harness:
         self.decoders[key] = name
         cat, d = self._tinfo(tn)
         T = self.ty_text(tn)
-        if cat == "int":
+        if cat in ("int", "param"):
             body = "telicInt(j)"
         elif cat == "real":
             body = "telicDouble(j)" if d == "Double" else f"{d}(telicDouble(j))"
@@ -479,6 +481,11 @@ def wire(v: Any, tn: Any, h: Harness, seen: set) -> str:
     """The solver's value (as replay.encode_value normalizes it) in the
     harness's input format."""
     cat, d = h._tinfo(tn)
+    if cat == "param":
+        return "i0"
+    if isinstance(v, dict) and "__opaque__" in v:
+        # a value telic does not model: no stand-in is made up for it
+        raise NotReplayable("a value telic does not model")
     if cat == "int":
         if isinstance(v, bool) or not isinstance(v, (int, Fraction)):
             v = 0
