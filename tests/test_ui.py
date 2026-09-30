@@ -501,7 +501,8 @@ def test_nothing_telic_started_outlives_it(tmp_path, sig):
     running: set[int] = set()
     toml = (d / "telic.toml").read_text().replace('static = "."', f'command = "{sys.executable} -m http.server {{port}} --bind 127.0.0.1"')
     (d / "telic.toml").write_text(toml + "max_seconds = 300\n")
-    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    # its own browser budget: another telic run on the machine may hold the shared slots
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]), TELIC_SLOTS_DIR=str(tmp_path / "slots"))
     proc = subprocess.Popen([sys.executable, "-m", "telic.cli", "check", str(d), "--no-cache"], cwd=d, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def tree() -> set[int]:
