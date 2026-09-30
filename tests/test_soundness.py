@@ -128,6 +128,14 @@ def test_mirror_sides_keep_their_own_symbols():
 
 
 @needs_node
+def test_strings_are_not_compared_symbolically_across_languages():
+    rep = check([str(DIR / "mirstr")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mirstr"))
+    got = {m.b.fn.name: m for m in rep.mirrors}
+    assert set(got) == {"size", "before"}
+    assert all(m.status == "refuted" and m.witness["replay"]["confirmed"] for m in got.values())
+
+
+@needs_node
 def test_mirror_compares_exceptions():
     rep = check([str(DIR / "mir" / "g.ts")], CheckOptions(cache_path=None, lean=False), root=str(DIR))
     assert rep.mirrors and all(m.status != "proved" for m in rep.mirrors)

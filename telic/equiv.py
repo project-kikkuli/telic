@@ -92,6 +92,28 @@ def _shared_inputs(a: ir.Function, b: ir.Function) -> tuple[dict[str, Val], dict
     return ina, inb, shown, notes
 
 
+def _has_str(ty: ir.Type) -> bool:
+    if isinstance(ty, ir.TStr):
+        return True
+    if isinstance(ty, ir.TList):
+        return _has_str(ty.elem)
+    if isinstance(ty, ir.TOption):
+        return _has_str(ty.inner)
+    if isinstance(ty, ir.TDict):
+        return _has_str(ty.key) or _has_str(ty.val)
+    if isinstance(ty, ir.TRecord):
+        return any(_has_str(t) for _, t in ty.fields)
+    return False
+
+
+def _strings_differ(a: FuncRef, b: FuncRef) -> str:
+    """One symbolic string means code points in Python, UTF-16 code units in
+    JavaScript and bytes in Rust, so across languages strings are only tested."""
+    if a.module.language != b.module.language and any(_has_str(t) for t in [p.ty for p in a.fn.params + b.fn.params] + [a.fn.ret, b.fn.ret]):
+        return f"strings are encoded differently in {a.module.language} and {b.module.language}"
+    return ""
+
+
 def _has_loops(fn: ir.Function) -> bool:
     return any(isinstance(s, (ir.While, ir.ForRange, ir.ForEach)) for s in ir.walk_stmts(fn.body))
 
@@ -155,6 +177,8 @@ def mirror_lemma(program: Program, a: FuncRef, b: FuncRef) -> L.Term | None:
     try:
         ina, inb, shown, _ = _shared_inputs(a.fn, b.fn)
     except Incomparable:
+        return None
+    if _strings_differ(a, b):
         return None
     if any(isinstance(v, ListVal) for _, v in shown):
         return None
@@ -311,7 +335,7 @@ def gen_value(ty: ir.Type, rnd: random.Random) -> Any:
     if isinstance(ty, ir.TBool):
         return rnd.random() < 0.5
     if isinstance(ty, ir.TStr):
-        return rnd.choice(["", "a", "b", "x"])
+        return rnd.choice(["", "a", "b", "x", "\u00e9", "\ue000", "\U0001f600"])
     if isinstance(ty, ir.TList):
         return [gen_value(ty.elem, rnd) for _ in range(rnd.choice([0, 1, 2, 3, 4, 6]))]
     if isinstance(ty, ir.TRecord):
@@ -363,7 +387,9 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
         rep.reason = str(e)
         return rep
     rep.explanation = explain_difference(a.fn, b.fn, notes)
-    if not _has_loops(a.fn) and not _has_loops(b.fn) and not a.fn.unsupported and not b.fn.unsupported:
+    rep.reason = _strings_differ(a, b)
+    symbolic = not rep.reason
+    if symbolic and not _has_loops(a.fn) and not _has_loops(b.fn) and not a.fn.unsupported and not b.fn.unsupported:
         try:
             ra, reqa, xa = result_term(program, a, ina, "a")
             rb, reqb, xb = result_term(program, b, inb, "b")
@@ -401,7 +427,7 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
             rep.reason = f"solver: {res.reason}"
         except (Incomparable, VCError) as e:
             rep.reason = str(e)
-    if proved is not None and a.key in proved and b.key in proved:
+    if symbolic and proved is not None and a.key in proved and b.key in proved:
         try:
             if agree_by_contracts(program, theory, a, b, ina, inb, loc, timeout_ms, lemmas):
                 rep.status, rep.method, rep.reason = "proved", "contracts", ""
