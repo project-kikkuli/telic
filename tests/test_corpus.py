@@ -42,17 +42,22 @@ def verdict_table(rep, got, expect):
     return rows
 
 
-def test_python_corpus():
+@pytest.fixture(scope="module")
+def python_corpus():
+    return run(CASES / "corpus.py")
+
+
+def test_python_corpus(python_corpus):
     path = CASES / "corpus.py"
-    rep, got = run(path)
+    rep, got = python_corpus
     assert not [p for m in rep.modules for p in m.problems]
     bad = verdict_table(rep, got, expectations(path))
     assert not bad, "\n".join(bad)
 
 
-def test_python_refutations_are_confirmed_by_execution():
+def test_python_refutations_are_confirmed_by_execution(python_corpus):
     path = CASES / "corpus.py"
-    rep, got = run(path)
+    _, got = python_corpus
     for name, want in expectations(path).items():
         if want != "refuted":
             continue
