@@ -31,7 +31,9 @@ This project states aims and contracts in comments and verifies them with
    - trusted base growing: annotate types (opaque values prove nothing about
      themselves) and put contracts on the functions you call.
 4. Run `telic gaps <files>` and strengthen `#@ ensures` until no mutant survives
-   (or the surviving freedom is intentional, and you say so).
+   (or the surviving freedom is intentional, and you say so). `propose` lines
+   are clauses telic already verified against the original and the mutants.
+   A `vacuous-risk` aim needs a lemma that says what the code still does.
 5. Never add `#@ assume` or `#@ trusted`, and never weaken a contract, just to
    make telic pass.
 

@@ -136,8 +136,19 @@ code, or naming its functions in `by:`. It only parses; nothing is proved.
 **Status** says what the lemmas establish:
 
 `backed` (every lemma proved) · `broken` (a lemma refuted) · `partial` (some
-open) · `unbacked` (declared, nothing cites it) · `undeclared` (cited, never
-declared).
+open) · `vacuous-risk` (see below) · `unbacked` (declared, nothing cites it) ·
+`undeclared` (cited, never declared).
+
+**Safety needs liveness.** An aim that forbids something ("shall never",
+"shall not", "must not") is easy to back with lemmas an empty function also
+meets: `ensures result >= 0` holds of `return 0`. For each such aim that is
+otherwise backed, telic checks stubs of every function its lemmas sit on (an
+immediate `return` of a default value, and an immediate `raise`) against
+that function's whole contract. If a stub passes for every one of them, the
+aim is `vacuous-risk` and the stub is named. Add a lemma that says what the
+function still does (`ensures result == a + b`, or a `@raises` that pins
+down when it fails); a mirror or ui lemma counts too. A `vacuous-risk` aim
+can't be `--accept`ed.
 
 **Coverage** is a separate question: do the lemmas cover the requirement? A
 prover can't answer it, so telic records an answer instead:
@@ -148,6 +159,11 @@ telic aims --accept REFUND-CAP      # you reviewed it: pinned to a digest of
 telic aims --judge                  # an oracle's opinion, cached by the same
                                        # digest, labelled "judged" with who and p
 ```
+
+A judgment also answers each part of the EARS response on its own.
+`telic aims --json` carries them under `coverage.parts` (condition, `p`, and
+the oracle that answered), and `telic report` lists them under the aim with
+the oracle and probability.
 
 **How the layers line up.** An aim says *what* the system must do, in
 words. A contract clause says one precise, checkable thing about one function.
@@ -178,9 +194,11 @@ A review goes stale when either the sentence or the lemma set changes.
 
 ## Oracles
 
-Two steps need judgment no proof gives: whether an aim's lemmas cover it,
-and which proved facts read as requirements. Both go through one protocol:
-typed questions about a state, the shape of a System One classifier.
+Some steps need judgment no proof gives: whether an aim's lemmas cover it,
+which proved facts read as requirements, and, in `telic gaps`, what a
+realistic bug looks like and what a stronger contract would say. All go
+through one protocol: typed questions about a state, the shape of a System
+One classifier.
 
 ```json
 {"task": "coverage",
@@ -210,11 +228,43 @@ and anything between is "uncertain".
 | `NAME[:ARG]` | a plugin under the `telic.oracles` entry point group |
 
 Chain backends with `then` (`jev then anthropic`); the builtin always ends
-the chain. `TELIC_ORACLE_COVERAGE` and `TELIC_ORACLE_CLASSIFY_FACTS` override
-one task. With nothing set, telic uses `TELIC_JUDGE_CMD`, then Jev, then
-Anthropic, whichever credentials are present, and the builtin otherwise.
+the chain. `TELIC_ORACLE_COVERAGE`, `TELIC_ORACLE_CLASSIFY_FACTS`,
+`TELIC_ORACLE_MUTATE` and `TELIC_ORACLE_STRENGTHEN` override one task. With
+nothing set, telic uses `TELIC_JUDGE_CMD`, then Jev, then Anthropic,
+whichever credentials are present, and the builtin otherwise; with Jev set
+and the `claude` CLI on the PATH, `claude -p` follows Jev for what it
+leaves unanswered. The two generative tasks, `mutate` and `strengthen`,
+which Jev can't answer, use `llm-cmd:claude -p` by default.
 Answers are cached under `.telic/`, so CI asks once per change. `telic oracle
 --probe` shows what answers each task and sends one sample question.
+
+## Gaps
+
+`telic gaps PATHS` attacks the contracts of proved functions. Each mutant is
+checked against the unchanged contract; one that still proves, and that a
+witness input shows behaves differently, is a gap.
+
+- *Operators*, always, and deterministic: flip a comparison, shift a
+  constant, delete an update, return something else, negate a condition;
+  and one realistic bug per category, made by deleting the first matching
+  guard or unwrapping the first `try`: a missing None check, a skipped
+  validation, a skipped authorization check, removed error handling, a
+  deleted guard clause.
+- *Model mutants*, only with `--llm` (task `mutate`, `claude -p` by
+  default): the model sees the function, its contract and the aims it cites,
+  and writes the whole function with one bug per category. A mutant that
+  edits the contract, renames the function or falls outside the supported
+  subset is counted as unusable, never as killed.
+- *Proposals* (task `strengthen`): for the gaps that survive, telic proposes
+  `@ensures` clauses: the template facts `telic propose` tries, or with
+  `--llm` the model's clauses and, if the function cites an aim, a rewritten
+  aim. A clause is shown only if the original still proves with it and it
+  rejects at least one surviving mutant; the output says how many. An aim
+  rewrite is a sentence and is shown as unchecked. Nothing is written to
+  your code.
+
+`--oracle SPEC` picks the model (and implies `--llm`); `--no-propose` skips
+proposals. Answers are cached under `.telic/`.
 
 ## Mirrors
 

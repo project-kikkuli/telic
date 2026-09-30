@@ -539,10 +539,11 @@ class Renderer:
             "broken": p.red("broken"),
             "vacuous": p.red("vacuous"),
             "partial": p.yellow("partial"),
+            "vacuous-risk": p.yellow("vacuous risk"),
             "unbacked": p.gray("unbacked"),
             "undeclared": p.yellow("undeclared"),
         }
-        glyph = {"backed": p.green("●"), "broken": p.red("✗"), "vacuous": p.red("∅"), "partial": p.yellow("◐"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
+        glyph = {"backed": p.green("●"), "broken": p.red("✗"), "vacuous": p.red("∅"), "partial": p.yellow("◐"), "vacuous-risk": p.yellow("∅"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
         for i in self.r.aims:
             n = len(i.lemmas)
             ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
@@ -578,6 +579,8 @@ class Renderer:
                     out.append(f"      {pad('', nw)}{p.dim(d)}")
             if cov is not None and cov.get("kind") == "judged" and cov.get("verdict") != "sufficient" and cov.get("missing"):
                 out.append(f"    {p.yellow('judge')}  {p.dim('missing: ' + cov['missing'])}")
+            for msg in i.stubs:
+                out.append(f"    {p.yellow('stub')}   {msg}; add a lemma that says what it still does")
             for msg in i.assumes:
                 out.append(f"    {p.yellow('rests')}  {msg}")
             for msg in i.pointers:

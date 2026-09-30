@@ -18,6 +18,9 @@ An aim's status says what its lemmas establish:
     backed    every lemma is proved (and so is everything they rest on)
     broken    a lemma is refuted: the code contradicts part of the requirement
     partial   some lemma is open or its function is not checkable
+    vacuous-risk  a safety aim ("never X", "shall not") whose lemmas are all
+              met by a stub that returns at once or raises: nothing says
+              the code still does its job
     unbacked  declared, but no lemma cites it
     undeclared cited, but never declared
 
@@ -108,6 +111,7 @@ class AimReport:
     scope: str | None = None  # declared in <scope>/aims/<ID>.md ('' = the root); None = a comment
     advice: list[str] = field(default_factory=list)  # findings that do not fail
     assumes: list[str] = field(default_factory=list)  # unproved code a lemma's proof rests on
+    stubs: list[str] = field(default_factory=list)  # trivial implementations its lemmas accept
 
     # counts kept for the ledger and older callers
     @property
@@ -239,6 +243,48 @@ def build(rep: Any) -> list[AimReport]:
             r.coverage = {"kind": "reviewed", "by": rv.get("by", ""), "fresh": rv.get("digest") == r.digest}
         out.append(r)
     return out
+
+
+_SAFETY = re.compile(r"\b(never|shall not|must not|at no time)\b", re.I)
+
+
+def is_safety(text: str) -> bool:
+    """A prohibition: 'never X', 'shall not X'."""
+    return bool(_SAFETY.search(text))
+
+
+def flag_vacuous_risk(rep: Any, opts: Any) -> None:
+    """A backed safety aim is ``vacuous-risk`` when, for every function its
+    lemmas sit on, a stub (return a default at once, or raise) meets that
+    function's whole contract: an empty implementation would satisfy the
+    aim. A lemma that says what the function still does (liveness) rules the
+    stub out, and so does a mirror or a ui lemma."""
+    import dataclasses
+
+    from .gaps import trivially_met
+
+    by_key = {f.ref.key: f for f in rep.functions}
+    quiet = dataclasses.replace(opts, replay=False, lean=False, receipts=False, progress=None, only=None, ui=False)
+    seen: dict[str, str | None] = {}
+    for r in rep.aims:
+        if r.status != "backed" or not r.text or not is_safety(r.text):
+            continue
+        if any(x.kind in ("mirror", "ui") for x in r.lemmas):
+            continue
+        stubs = []
+        for key in dict.fromkeys(x.func for x in r.lemmas):
+            f = by_key.get(key)
+            if f is None:
+                break
+            if key not in seen:
+                seen[key] = trivially_met(f.fn, f.ref.module, rep.modules, rep.root or ".", quiet)
+            if seen[key] is None:
+                break
+            stubs.append(f"{f.fn.name}: `{seen[key]}` meets every lemma")
+        else:
+            if stubs:
+                r.status = "vacuous-risk"
+                r.stubs = stubs
 
 
 def _within(path: str, scope: str) -> bool:
@@ -427,6 +473,7 @@ def judge(root: str, reports: list[AimReport], oracle: str | None = None) -> lis
                 "p": round(p, 2),
                 "missing": "; ".join(weak) if weak else ("" if p >= 0.5 else "not named"),
                 "model": got.answers["covers"].get("by", got.oracle),
+                "parts": [_part(c, got.answers.get(k)) for k, c in parts.items()],
             }
         j = cache[key]
         if r.coverage is None or r.coverage.get("kind") != "reviewed" or not r.coverage.get("fresh"):
@@ -435,6 +482,13 @@ def judge(root: str, reports: list[AimReport], oracle: str | None = None) -> lis
     with open(path, "w") as fh:
         json.dump(cache, fh, indent=2, sort_keys=True)
     return notes
+
+
+def _part(condition: str, a: dict[str, Any] | None) -> dict[str, Any]:
+    from . import oracle as oracles
+
+    p = oracles.noul(a)
+    return {"condition": condition, "p": None if p is None else round(p, 2), "by": (a or {}).get("by")}
 
 
 def attach_cached_judgments(root: str, reports: list[AimReport]) -> None:
@@ -536,7 +590,8 @@ def cmd_aims(args: Any, options: Any) -> int:
                 print(f"telic: no aim {iid}")
                 return 2
             if r.status != "backed":
-                print(f"telic: {iid} is {r.status}; only a backed aim's coverage can be reviewed")
+                why = f" ({'; '.join(r.stubs)}: add a lemma that says what it still does)" if r.stubs else ""
+                print(f"telic: {iid} is {r.status}{why}; only a backed aim's coverage can be reviewed")
                 return 1
             accept(root, r, who)
             r.coverage = {"kind": "reviewed", "by": who, "fresh": True}
@@ -589,6 +644,7 @@ def _aim_json(r: AimReport) -> dict[str, Any]:
         "ears": r.ears,
         "scope": r.scope,
         "advice": r.advice,
+        "stubs": r.stubs,
         "coverage": r.coverage,
         "digest": r.digest,
     }

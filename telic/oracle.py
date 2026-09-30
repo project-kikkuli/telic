@@ -38,7 +38,11 @@ for one task):
 
 Specs can be chained with `` then ``, e.g. ``jev then anthropic``: questions
 one oracle leaves unanswered go to the next, and ``builtin`` always ends the
-chain.
+chain. Judgments default to Jev when its key is set, with ``claude -p`` as
+the fallback for what Jev leaves unanswered. The generative tasks
+(``GENERATIVE``: writing mutants, proposing contracts), which Jev can't
+answer, default to ``llm-cmd:claude -p`` when the ``claude`` CLI is on the
+PATH.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field
@@ -57,6 +62,8 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
 LLM_MODEL = "claude-haiku-4-5-20251001"
 TIMEOUT_S = 90
+CLAUDE_CMD = "claude -p"
+GENERATIVE = ("mutate", "strengthen")
 
 Questions = dict[str, dict[str, Any]]
 Answers = dict[str, dict[str, Any]]
@@ -85,7 +92,6 @@ class Builtin(Oracle):
     abstain on tasks and questions they have no rule for."""
 
     name: str = "builtin"
-    kinds: frozenset[str] = frozenset(("noul", "choice", "score"))
 
     def ask(self, task: str, state: Any, questions: Questions) -> Answers:
         fn = BUILTIN_TASKS.get(task)
@@ -191,11 +197,18 @@ def llm_prompt(task: str, state: Any, questions: Questions) -> str:
         crit = q.get("criteria")
         crit_s = f"\n  criteria: {json.dumps(crit)}" if crit else ""
         qs.append(f"- {key} ({q['type']}): {_instr(q)}{crit_s}\n  answer with {fmt[q['type']]}")
+    role = ROLES.get(task, f"You are a careful classifier for a program verifier (task: {task}).")
     return (
-        f"You are a careful classifier for a program verifier (task: {task}). Read the state and answer every "
+        f"{role} Read the state and answer every "
         "question. Answer with one JSON object mapping each question key to its answer, and nothing else.\n\n"
         f"State:\n{json.dumps(state, indent=1)}\n\nQuestions:\n" + "\n".join(qs)
     )
+
+
+ROLES = {
+    "mutate": "You are a mutation testing expert working for a program verifier (task: mutate).",
+    "strengthen": "You are a specification expert working for a program verifier (task: strengthen).",
+}
 
 
 def anthropic(model: str | None = None) -> Llm:
@@ -267,10 +280,15 @@ def resolve(spec: str | None = None, task: str | None = None) -> Chain:
         parts = [p.strip() for p in re.split(r"\s+then\s+", spec) if p.strip()]
     else:
         parts = []
+        claude = shutil.which(CLAUDE_CMD.split()[0]) is not None
         if os.environ.get("TELIC_JUDGE_CMD"):
             parts.append("llm-cmd:" + os.environ["TELIC_JUDGE_CMD"])
-        if os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY"):
+        elif task in GENERATIVE and claude:
+            parts.append("llm-cmd:" + CLAUDE_CMD)
+        if task not in GENERATIVE and (os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")):
             parts.append("jev")
+            if claude and not os.environ.get("TELIC_JUDGE_CMD"):
+                parts.append("llm-cmd:" + CLAUDE_CMD)  # only for what Jev leaves unanswered
         if os.environ.get("ANTHROPIC_API_KEY"):
             parts.append("anthropic")
     for p in parts:
@@ -547,7 +565,7 @@ def _classify(state: Any, questions: Questions) -> Answers:
 # ---------------------------------------------------------------------------
 # CLI: telic oracle
 
-TASKS = ("coverage", "classify-facts")
+TASKS = ("coverage", "classify-facts", *GENERATIVE)
 
 
 def cmd_oracle(args: Any) -> int:

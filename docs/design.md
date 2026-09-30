@@ -73,9 +73,15 @@ compiled with `rustc` and run.
 **5. The contract is attacked too.** A proof certifies code against a spec, and a
 weak spec certifies wrong code. `telic gaps` mutates proved code and re-verifies
 it. A surviving mutant that demonstrably differs from the original, shown as a
-diff plus an input, is exactly the missing `@ensures`. This is how telic narrows
-the gap between the English aim and its formalization, which no verifier can
-close alone.
+diff plus an input, is exactly the missing `@ensures`. Besides small operator
+mutations, it deletes guard, validation and authorization checks, and with
+`--llm` a model writes realistic bugs too. For what survives, it proposes a
+stronger `@ensures` and verifies it against the original and the mutants
+before showing it.
+A safety aim ("shall never") is checked the same way from the other side: if
+a stub that returns at once meets all its lemmas, it is `vacuous-risk`. This
+is how telic narrows the gap between the English aim and its formalization,
+which no verifier can close alone.
 
 **6. Strict where it counts, silent where nothing is claimed.** Following
 Rust and OCaml rather than Python, a function that makes a claim is held to

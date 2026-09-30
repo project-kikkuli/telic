@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = """#@ aim CAP: A result never exceeds the cap.
+SRC = """#@ aim CAP: The result shall be at most the cap.
 
 def capped(x: int, cap: int) -> int:
     #@ requires cap >= 0
@@ -57,7 +57,7 @@ CITES_OTHER = "def f(x: int) -> int:\n    #@ aim {iid}\n    #@ ensures result ==
     "files, problem",
     [
         ({"lib/cap.py": SRC.replace("the cap.", "the cap. by: capped, gone")}, "'gone' is listed in by:"),
-        ({"lib/unrelated.py": "#@ aim CAP: A result never exceeds the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
+        ({"lib/unrelated.py": "#@ aim CAP: The result shall be at most the cap.\n\n" + CITES_OTHER.format(iid="CAP")}, "declared more than once"),
         ({"lib/aims/ORPH.md": "The shop shall log.\n"}, "nothing backs it"),
         ({"lib/sub/aims/SUBX.md": "The shop shall log.\n", "lib/unrelated.py": CITES_OTHER.format(iid="SUBX")}, "is outside lib/sub/"),
         ({"lib/aims/Overview.md": "prose\n"}, "not an aim ID"),

@@ -21,6 +21,7 @@ CREDENTIALS = ("TELIC_ORACLE", "TELIC_ORACLE_COVERAGE", "TELIC_ORACLE_T", "JEV_A
 def clean_env(monkeypatch):
     for v in CREDENTIALS:
         monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr("telic.oracle.shutil.which", lambda name: None)  # the claude CLI is a default too
 
 
 def test_default_is_builtin_and_builtin_ends_every_chain(monkeypatch):

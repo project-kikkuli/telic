@@ -101,6 +101,7 @@ def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val]) -> tuple
     g = VCGen(program, ref, inputs=inputs)
     g.definitional_mode = True
     env = dict(inputs)
+    g.heap_init(env)  # both sides start from the same heap; a call havocs it
     g.entry = dict(env)
     rctx = Ctx(base=[], env=env, module=ref.module, spec=True, quiet=True)
     reqs = [g.ev(r.expr, rctx) for r in ref.fn.requires]

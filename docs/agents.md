@@ -32,9 +32,13 @@ invariant, or a Lean goal.
      and say why.
 4. **Run `telic gaps`** on what you proved. Each surviving mutant is a wrong
    implementation your contract accepts. Strengthen `@ensures` until none survive,
-   or until you decide the remaining freedom is intended.
+   or until you decide the remaining freedom is intended. A `propose` line is a
+   clause telic has already checked: the original proves it and it rejects the
+   mutants it names. Adopting it is still your decision.
 5. **Check the aims with `telic aims`.** Each should be `backed` (every
-   lemma proved) with its links intact. Whether the lemmas cover the sentence is
+   lemma proved) with its links intact. A `vacuous-risk` aim forbids something
+   and a stub meets all its lemmas: add a lemma that says what the code still
+   does. Whether the lemmas cover the sentence is
    the user's review (`--accept`), or at most an oracle's labelled judgment
    (`--judge`); never claim an aim is proved.
 6. **Commit when `telic check --strict` passes.**

@@ -157,8 +157,10 @@ ACTS: list[Step] = [
     Step(
         title="the whole shop",
         say="""
-        Put the proof back and check everything. Every aim: proved, with the
-        evidence one command away.
+        Put the proof back and check everything. Every aim is backed but one, and
+        telic says why: "never a negative total" is also met by `return 0`. A
+        prohibition needs a lemma that says what the code still does, or an
+        empty function satisfies it.
         """,
         edits=[("server/referrals.py", "return level_bonus(b + a) == level_bonus(a) * level_bonus(b)", "return level_bonus(a + b) == level_bonus(a) * level_bonus(b)")],
         run=["check", ".", "--timeout", "2"],

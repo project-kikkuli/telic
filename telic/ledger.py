@@ -40,7 +40,7 @@ from .checker import Report, check, language_of
 from .contracts import AIM_ID
 
 LEDGER = "telic.ledger.json"
-RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "unsupported": 2, "error": 1, "vacuous": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
+RANK = {"proved": 4, "backed": 4, "trusted": 3, "open": 2, "partial": 2, "vacuous-risk": 2, "unsupported": 2, "error": 1, "vacuous": 1, "unbacked": 1, "unformalized": 1, "undeclared": 1, "refuted": 0, "broken": 0}
 
 
 # ---------------------------------------------------------------------------

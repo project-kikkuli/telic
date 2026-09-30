@@ -30,9 +30,10 @@ STATUS_WORD = {
     "backed": "backed",
     "broken": "broken",
     "partial": "partial",
+    "vacuous-risk": "vacuous risk",
     "unbacked": "unbacked",
 }
-MARK = {"proved": "✓", "refuted": "✗", "vacuous": "∅", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "unbacked": "○"}
+MARK = {"proved": "✓", "refuted": "✗", "vacuous": "∅", "open": "?", "unconfirmed": "?", "unknown": "?", "unsupported": "⊘", "trusted": "◇", "error": "!", "unformalized": "○", "undeclared": "!", "backed": "●", "broken": "✗", "partial": "◐", "vacuous-risk": "∅", "unbacked": "○"}
 
 CSS = """
 /* Layout: a ledger. Aims summary on top, then one panel per function:
@@ -90,7 +91,7 @@ header.top { display: grid; gap: 10px; }
 .pill.open, .pill.unknown, .pill.unconfirmed, .pill.undeclared { color: var(--open); background: var(--open-bg); }
 .pill.backed { color: var(--proved); background: var(--proved-bg); }
 .pill.broken, .pill.vacuous { color: var(--refuted); background: var(--refuted-bg); }
-.pill.partial, .pill.unbacked { color: var(--open); background: var(--open-bg); }
+.pill.partial, .pill.unbacked, .pill.vacuous-risk { color: var(--open); background: var(--open-bg); }
 .aim ul { margin: 6px 0 0; padding-left: 1.1rem; list-style: none; }
 .pill.unsupported, .pill.trusted, .pill.unformalized, .pill.error { color: var(--quiet); background: var(--quiet-bg); }
 section { display: grid; gap: 14px; }
@@ -324,6 +325,11 @@ def ui_section(rep: Report) -> str:
     return "<section><h2>UI</h2>" + "".join(apps) + "".join(ui_card(r) for r in ui.results) + "</section>"
 
 
+def _p(part: dict) -> str:
+    p = part.get("p")
+    return f"p={p:.2f}" + (f" by {part['by']}" if part.get("by") else "") if isinstance(p, (int, float)) else "not answered"
+
+
 def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = True) -> str:
     fs = rep.functions
     counts = {s: sum(1 for f in fs if f.status == s) for s in ("proved", "refuted", "vacuous", "open", "unsupported", "trusted", "error")}
@@ -355,13 +361,17 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         if cov.get("kind") == "reviewed":
             ev.append(f"reviewed by {cov.get('by') or 'a person'}" if cov.get("fresh") else "review stale")
         elif cov.get("kind") == "judged":
-            ev.append("judged " + cov.get("verdict", "") + (f" (missing: {cov['missing']})" if cov.get("verdict") != "sufficient" and cov.get("missing") else ""))
+            prob = f" p={cov['p']:.2f}" if isinstance(cov.get("p"), (int, float)) else ""
+            ev.append(f"judged {cov.get('verdict', '')} by {cov.get('model') or 'an oracle'}{prob}, not proof" + (f" (missing: {cov['missing']})" if cov.get("verdict") != "sufficient" and cov.get("missing") else ""))
         lemmas = "".join(
             f"<li>{MARK.get(x.status, '?')} <code>{e(x.name)}</code> {e(x.text if x.kind == 'mirror' else x.kind + ' ' + x.text)}{' · ' + e(x.detail) if x.detail else ''}</li>" for x in i.lemmas
         )
         if i.loc:
             ev.append(f"declared in {i.loc[0]}:{i.loc[1]}")
-        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.assumes) + "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
+        judged = "".join(
+            f"<li>{'✓' if (x.get('p') or 0) >= 0.5 else '?'} judged <q>{e(x['condition'])}</q> {e(_p(x))}</li>" for x in (cov.get("parts") or []) if cov.get("kind") == "judged"
+        )
+        issues = judged + "".join(f"<li>∅ {e(m)}; add a lemma that says what it still does</li>" for m in i.stubs) + "".join(f"<li>⚠ {e(m)}</li>" for m in i.assumes) + "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
         aims.append(
             f'<div class="aim"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
             f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}<ul>{lemmas}{issues}</ul></span></div>"

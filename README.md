@@ -58,7 +58,8 @@ Then follow this loop, or have your coding agent follow it:
 | crashes | `None` where a value is needed, missing dict key, index out of range, division by zero, an unintended `raise`; each one proved impossible or reproduced |
 | races | `⚡ RACE`: state checked before an `await` and used after it, when another task can change it in between |
 | frontend/backend drift | `//@ mirrors ../server/billing.py::discounted_total`: the two must agree on every input, or telic shows the input where they don't (e.g. banker's rounding vs `Math.round`) |
-| contracts that say too little | `telic gaps` mutates proved code; a mutant the contract still accepts is a bug the contract would let through |
+| contracts that say too little | `telic gaps` mutates proved code, with deterministic operators (including deleted guard, validation and auth checks) and, with `--llm`, bugs a model writes; a mutant the contract still accepts is a bug the contract would let through, and a proposed `@ensures` is shown only once telic has checked it closes the gap |
+| safety aims an empty function meets | an aim that says "never" is `vacuous-risk` when a stub that returns at once meets all its lemmas |
 
 It works on ordinary code: classes, optionals, dicts/Maps, enums, pydantic
 models, async, try/except, comprehensions, imports between your files. Anything

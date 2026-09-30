@@ -34,7 +34,7 @@ def test_list_alias_is_rejected():
 
 def test_aims_declared_linked_and_statused(tmp_path):
     src = """
-#@ aim CAP: Results never exceed the cap.
+#@ aim CAP: The result shall be at most the cap.
 #@ aim LATER: Something nobody formalized yet.
 
 def capped(x: int, cap: int) -> int:

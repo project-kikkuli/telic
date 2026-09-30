@@ -615,7 +615,13 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
     opts = opts or CheckOptions()
     t0 = time.perf_counter()
     modules = load_modules(paths, root)
-    return check_modules(modules, opts, t0=t0, root=root, ui=scan(paths, root or os.getcwd()))
+    rep = check_modules(modules, opts, t0=t0, root=root, ui=scan(paths, root or os.getcwd()))
+    if rep.aims:
+        from .aim import flag_vacuous_risk
+
+        flag_vacuous_risk(rep, opts)
+        rep.seconds = time.perf_counter() - t0
+    return rep
 
 
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None, ui: Any = None) -> Report:

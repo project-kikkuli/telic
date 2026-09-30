@@ -38,3 +38,11 @@ def checker(tmp_path):
         return run_check(tmp_path, files, **kw)
 
     return go
+
+
+@pytest.fixture(autouse=True)
+def _offline_generative_oracles(monkeypatch):
+    """Writing mutants and proposing contracts default to `claude -p` when it
+    is installed; tests use the builtin rules unless they pass an oracle."""
+    for task in ("MUTATE", "STRENGTHEN"):
+        monkeypatch.setenv(f"TELIC_ORACLE_{task}", "builtin")
