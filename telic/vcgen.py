@@ -90,6 +90,10 @@ class TypedView:
 
 Val = Union[L.Term, ListVal, OptVal, DictVal]
 NONE_V = L.Const("None", L.Sort("None"))
+# the objects of a class a function has written a field of (a ghost set, not heap:
+# callees and other tasks do not add to it)
+WRITTEN = "%written."
+NO_WRITES = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
 
 
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
@@ -380,8 +384,8 @@ class VCGen:
         self.assumptions: list[tuple[ir.Loc, str]] = []
         self.definitional_mode = False
         self.raise_paths: list[list[L.Term]] = []
-        # (path condition, object, class, where) for every field write
-        self.written: list[tuple[L.Term, L.Term, str, ir.Loc]] = []
+        # lines of the field writes to each class with an invariant
+        self.written: dict[str, list[int]] = {}
         self.loop_notes: list[tuple[int, str]] = []
 
     # -- naming -----------------------------------------------------------
@@ -436,6 +440,43 @@ class VCGen:
                 for key, srt in self.heap_keys(cname, fname):
                     env.setdefault(key, L.Const(key[1:], srt))
         env.setdefault("@alloc", L.Const("alloc", L.ARRAY(L.BOOL)))
+
+    def has_invariants(self, cls: str) -> bool:
+        return any(self.program.classes[c].invariants for c in self.program.mro(cls))
+
+    def written_claims(self, cls: str, env: dict[str, Val], base: list[L.Term]) -> list[tuple[ir.Clause, L.Term]]:
+        """Every object of ``cls`` this function wrote a field of, other than
+        the parameters (checked on their own), satisfies each invariant."""
+        w = env[WRITTEN + cls]
+        r = L.Const(f"r!{next(self.counter)}", L.INT)
+        others = [L.not_(L.eq(r, p)) for p in self.checked_params(cls)]
+        held = L.and_(L.select(w, r), *others)  # type: ignore[arg-type]
+        # (a trigger only where the set is a havocked constant: in a goal it is not needed)
+        pats = ((L.select(w, r),),) if isinstance(w, L.Const) else ()  # type: ignore[arg-type]
+        return [(inv, L.Quant("forall", (r,), L.implies(held, t), patterns=pats)) for inv, t in self.class_invariants(cls, r, env, base)]
+
+    def checked_params(self, cls: str) -> list[L.Term]:
+        """Parameters whose own return check covers every invariant of ``cls``."""
+        return [self.entry[p.name] for p in self.fn.params if isinstance(p.ty, ir.TClass) and cls in self.program.mro(p.ty.name)]  # type: ignore[misc]
+
+    def written_in(self, names: set[str]) -> list[str]:
+        return [c for c in self.program.classes if WRITTEN + c in names]
+
+    def check_written(self, classes: list[str], st: State, site: ir.Loc, entry: bool) -> None:
+        """Objects a loop writes keep their invariants from one iteration to
+        the next: the loop's exit state is a havocked head, so the
+        conditions under which a write happened no longer describe it."""
+        for cls in classes:
+            if entry and st.env[WRITTEN + cls] is NO_WRITES:
+                continue
+            when = "when the loop starts" if entry else "after each iteration"
+            ctx = Ctx(base=st.facts, env=st.env, module=self.module, spec=True)
+            for inv, t in self.written_claims(cls, st.env, st.facts):
+                self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds {when} for every object written so far", site=site, clause=inv)
+
+    def assume_written(self, classes: list[str], st: State) -> None:
+        for cls in classes:
+            st.facts.extend(t for _, t in self.written_claims(cls, st.env, st.facts))
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
         keys = self.heap_keys(cls, fname, strict=True)
@@ -528,6 +569,9 @@ class VCGen:
         env: dict[str, Val] = {}
         facts: list[L.Term] = []
         self.heap_init(env)
+        for cname in self.program.classes:
+            if self.has_invariants(cname):
+                env[WRITTEN + cname] = NO_WRITES
         for p in fn.params:
             v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
             env[p.name] = v
@@ -641,15 +685,16 @@ class VCGen:
                     for inv, t in self.class_invariants(p.ty.name, ref, ex.env, st.facts):  # type: ignore[arg-type]
                         self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' on return", site=ex.loc, clause=inv)
             # ... and so must every other object it wrote a field of.
-            param_refs = {self.entry[p.name] for p in fn.params if isinstance(p.ty, ir.TClass)}
-            seen: set = set()
-            for pc, ref, cls, wloc in self.written:
-                if ref in param_refs or (ref, cls) in seen:
+            for cls in self.program.classes:
+                lines = self.written.get(cls)
+                if not lines:
                     continue
-                seen.add((ref, cls))
+                if ex.env[WRITTEN + cls] is NO_WRITES:
+                    continue  # (written only on paths that do not reach this exit)
+                at = ", ".join(str(n) for n in sorted(set(lines)))
                 ctx = Ctx(base=st.facts, env=ex.env, module=self.module, spec=True)
-                for inv, t in self.class_invariants(cls, ref, ex.env, st.facts):
-                    self.oblige("class.inv", ctx, L.implies(pc, t), inv.loc, f"invariant of {cls} ('{inv.text}') holds on return for the object written at line {wloc.line}", site=ex.loc, clause=inv)
+                for inv, t in self.written_claims(cls, ex.env, st.facts):
+                    self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds on return for every object written at line {at}", site=ex.loc, clause=inv)
             if fn.raises:
                 ctx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ctx) for r in fn.raises])
@@ -682,7 +727,10 @@ class VCGen:
             ref = self.ev(s.obj, ctx)
             v = coerce(self.ev(s.value, ctx), self.program.classes[s.cls].field_type(s.field))
             self.heap_write(st.env, s.cls, s.field, ref, v)  # type: ignore[arg-type]
-            self.written.append((L.and_(*st.facts), ref, s.cls, s.loc))  # type: ignore[arg-type]
+            if self.has_invariants(s.cls) and ref not in self.checked_params(s.cls):
+                key = WRITTEN + s.cls
+                st.env[key] = L.store(st.env[key], ref, L.TRUE)  # type: ignore[arg-type]
+                self.written.setdefault(s.cls, []).append(s.loc.line)
             return st
         if isinstance(s, ir.DictDel):
             d = st.env[s.name]
@@ -845,6 +893,8 @@ class VCGen:
                 appends.add(s.name)
             elif isinstance(s, ir.FieldAssign):
                 names.update(k for k, _ in self.heap_keys(s.cls, s.field))
+                if self.has_invariants(s.cls):
+                    names.add(WRITTEN + s.cls)
             for e in ir.stmt_exprs(s):
                 for sub in ir.walk_expr(e):
                     if isinstance(sub, ir.New):
@@ -894,6 +944,10 @@ class VCGen:
             if name not in h.env:
                 continue
             old = h.env[name]
+            if name.startswith(WRITTEN):
+                assert isinstance(old, L.Term)
+                h.env[name] = L.Const(f"{name[1:]}@{next(self.counter)}", old.sort)
+                continue
             if name.startswith("@"):
                 assert not isinstance(old, (ListVal, OptVal, DictVal))
                 new = L.Const(f"{name[1:]}@{next(self.counter)}", old.sort)
@@ -952,8 +1006,11 @@ class VCGen:
         invs = self.invariants_for(s.loc.line, s.invariants)
         self.check_invs(invs, st, "inv.entry", s.loc)
         names, appends = self.modified(list(s.body) + list(s.step) + [ir.ExprStmt(s.loc, s.cond)])
+        wrote = self.written_in(names)
+        self.check_written(wrote, st, s.loc, entry=True)
         head = self.havoc(st, names, appends)
         self.assume_invs(invs, head)
+        self.assume_written(wrote, head)
         c = self.ev(s.cond, self.ctx(head))
         body_st = head.copy()
         body_st.facts.append(c)
@@ -978,6 +1035,7 @@ class VCGen:
             if not it_end.alive:
                 continue
             self.check_invs(invs, it_end, "inv.step", s.loc)
+            self.check_written(wrote, it_end, s.loc, entry=False)
             if v0 is not None:
                 vctx = self.ctx(it_end, spec=True)
                 v1 = self.ev(variant, vctx)  # type: ignore[arg-type]
@@ -1010,6 +1068,8 @@ class VCGen:
         self.check_invs(invs, entry, "inv.entry", s.loc, view_entry)
         names, appends = self.modified(s.body)
         names = set(names) | {counter}
+        wrote = self.written_in(names)
+        self.check_written(wrote, entry, s.loc, entry=True)
         self.fn.locals.setdefault(counter, ir.INT)
         head = self.havoc(entry, names, appends)
         k = head.env[counter]
@@ -1019,6 +1079,7 @@ class VCGen:
         head.facts.append(L.le(k, L.max_(lo_v, hi_v)))
         view = {idx: k}
         self.assume_invs(invs, head, view)
+        self.assume_written(wrote, head)
         c = L.lt(k, hi_v)
         body_st = head.copy()
         body_st.facts.append(c)
@@ -1030,6 +1091,7 @@ class VCGen:
             k1 = L.add(k, L.ONE)
             it_end.env[counter] = k1
             self.check_invs(invs, it_end, "inv.step", s.loc, {idx: k1})
+            self.check_written(wrote, it_end, s.loc, entry=False)
         out = head.copy()
         out.facts.append(L.not_(c))
         return self.merge([out] + frame.breaks)

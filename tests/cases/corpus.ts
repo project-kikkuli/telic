@@ -351,3 +351,18 @@ export function livesLeft(p: Pet): number {
   if (p.species === "dog") return p.good ? 1 : 0;
   return Math.max(p.lives, 0) + p.name.length * 0;
 }
+
+export class Wallet {
+  //@ invariant this.cents >= 0
+  cents = 0;
+}
+
+// expect: proved
+export function fillWallets(ws: Wallet[], c: number): void {
+  //@ requires c >= 0
+  for (const w of ws) {
+    if (w.cents < c) {
+      w.cents = c;
+    }
+  }
+}

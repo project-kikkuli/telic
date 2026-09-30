@@ -264,7 +264,7 @@ type gen = {
   mutable assumptions : (int * string) list;
   mutable loop_notes : (int * string) list;
   mutable definitional_mode : bool;
-  mutable written : (term * term * string * Ir.loc) list;  (** (path condition, object, class, where), reversed *)
+  mutable written : (string * int) list;  (** (class, line) of each field write to a class with an invariant, reversed *)
 }
 
 let next g =
@@ -432,6 +432,19 @@ let rec reaches_objects (t : Ir.ty) = match t with TClass _ | TOpaque -> true | 
 let extern_touches_heap g (args : Ir.expr list) = g.prog.classes <> [] && List.exists (fun (a : Ir.expr) -> reaches_objects a.ty) args
 
 let fresh_expr (e : Ir.expr option) = match e with Some { e = ListLit _ | Call _ | New _; _ } -> true | Some { e = Builtin (("slice" | "dict_lit"), _); _ } -> true | _ -> false
+
+(* the objects of a class a function has written a field of (a ghost set, not
+   heap: callees and other tasks do not add to it) *)
+let written_key cls = "%written." ^ cls
+let is_written_key k = String.length k > 9 && String.sub k 0 9 = "%written."
+let no_writes = const_array (Array (Int, Bool)) ff
+let has_invariants g cls = List.exists (fun c -> match class_of g c with Some ci -> ci.cinvs <> [] | None -> false) (mro g cls)
+
+(* parameters whose own return check covers every invariant of cls *)
+let checked_params g cls =
+  List.filter_map (fun (p, (ty : Ir.ty)) -> match (ty, SM.find_opt p g.entry) with TClass c, Some (T r) when List.mem cls (mro g c) -> Some r | _ -> None) g.info.fn.params
+
+let written_in g names = List.filter_map (fun c -> if List.mem (written_key c.cname) names then Some c.cname else None) g.prog.classes
 
 let monotone_alloc pre_ new_ r = quant "forall" [ r ] (implies (select pre_ r) (select new_ r)) [ [| select new_ r |] ]
 
@@ -1146,7 +1159,11 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     let r = term_of loc (ev g ctx obj) in
     let x = coerce (ev g ctx v) (Some (field_type g cls f)) in
     st.env <- heap_write g st.env cls f r x;
-    g.written <- (and_ (Dynarray.to_list st.facts), r, cls, loc) :: g.written;
+    if has_invariants g cls && not (List.memq r (checked_params g cls)) then begin
+      let key = written_key cls in
+      (match SM.find_opt key st.env with Some (T w) -> st.env <- SM.add key (T (store w r tt)) st.env | _ -> ());
+      g.written <- (cls, loc.line) :: g.written
+    end;
     st
   | DictDel (loc, name, k, strict) -> (
     match SM.find_opt name st.env with
@@ -1320,7 +1337,9 @@ and modified g body =
       (match s with
        | Append (_, n, _) -> adda n
        | Assign (_, n, _) -> ( match Hashtbl.find_opt g.info.fn.locals n with Some (TList _) -> adda n | _ -> ())
-       | FieldAssign (_, _, cls, f, _) -> List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f)
+       | FieldAssign (_, _, cls, f, _) ->
+         List.iter (fun (hk, _) -> addn hk) (heap_keys g cls f);
+         if has_invariants g cls then addn (written_key cls)
        | _ -> ());
       List.iter
         (fun e ->
@@ -1367,6 +1386,7 @@ and havoc g (st : state) names appends : state =
     (fun name ->
       match SM.find_opt name h.env with
       | None -> ()
+      | Some (T o) when is_written_key name -> h.env <- SM.add name (T (const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort)) h.env
       | Some old when is_heap name -> (
         match old with
         | T o ->
@@ -1411,6 +1431,34 @@ and assume_invs g invs (st : state) overrides =
       Dynarray.add_last st.facts (term_of inv.cloc (ev g ctx inv.cexpr)))
     invs
 
+(* every object of cls this function wrote a field of, other than the
+   parameters (checked on their own), satisfies each invariant *)
+and written_claims g cls env base =
+  let w = match SM.find_opt (written_key cls) env with Some (T w) -> w | _ -> raise (Vc_error ("no written set for " ^ cls, Ir.noloc)) in
+  let r = const (Printf.sprintf "r!%d" (next g)) Int in
+  let held = and_ (select w r :: List.map (fun p -> not_ (eq r p)) (checked_params g cls)) in
+  (* a trigger only where the set is a havocked constant: in a goal it is not needed *)
+  let pats = match w.node with Const _ -> [ [| select w r |] ] | _ -> [] in
+  List.map (fun (inv, t) -> (inv, quant "forall" [ r ] (implies held t) pats)) (class_invariants g cls r env base)
+
+(* objects a loop writes keep their invariants from one iteration to the next:
+   the loop's exit state is a havocked head, so the conditions under which a
+   write happened no longer describe it *)
+and check_written g classes (st : state) (site : Ir.loc) ~entry =
+  List.iter
+    (fun cls ->
+      if not (entry && (match SM.find_opt (written_key cls) st.env with Some (T w) -> w == no_writes | _ -> false)) then begin
+        let when_ = if entry then "when the loop starts" else "after each iteration" in
+        let ctx = spec_ctx g ~quiet:false ~base:st.facts ~env:st.env () in
+        List.iter
+          (fun ((inv : Ir.clause), t) ->
+            oblige g ~site ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds %s for every object written so far" cls inv.text when_))
+          (written_claims g cls st.env st.facts)
+      end)
+    classes
+
+and assume_written g classes (st : state) = List.iter (fun cls -> List.iter (fun (_, t) -> Dynarray.add_last st.facts t) (written_claims g cls st.env st.facts)) classes
+
 and run_iteration g body st =
   let frame = { breaks = []; continues = [] } in
   g.loops <- frame :: g.loops;
@@ -1424,8 +1472,11 @@ and loop_while g (w : Ir.stmt) (st : state) : state =
   let invs = invariants_for g loc.line invariants in
   check_invs g invs st "inv.entry" loc [];
   let names, appends = modified g (body @ step @ [ Ir.ExprStmt (loc, cond) ]) in
+  let wrote = written_in g names in
+  check_written g wrote st loc ~entry:true;
   let head = havoc g st names appends in
   assume_invs g invs head [];
+  assume_written g wrote head;
   let c = term_of loc (ev g (state_ctx g head) cond) in
   let body_st = copy_state head in
   Dynarray.add_last body_st.facts c;
@@ -1449,6 +1500,7 @@ and loop_while g (w : Ir.stmt) (st : state) : state =
         let it_end = block g step it_end in
         if it_end.alive then begin
           check_invs g invs it_end "inv.step" loc [];
+          check_written g wrote it_end loc ~entry:false;
           match (v0, variant) with
           | Some v0, Some v ->
             let vctx = state_ctx g ~spec:true it_end in
@@ -1471,12 +1523,15 @@ and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bi
   check_invs g invs entry "inv.entry" loc [ (idx, T lo_v) ];
   let names, appends = modified g body in
   let names = if List.mem counter names then names else counter :: names in
+  let wrote = written_in g names in
+  check_written g wrote entry loc ~entry:true;
   if not (Hashtbl.mem g.info.fn.locals counter) then Hashtbl.replace g.info.fn.locals counter TInt;
   let head = havoc g entry names appends in
   let k = match SM.find_opt counter head.env with Some (T k) -> k | _ -> assert false in
   Dynarray.add_last head.facts (le lo_v k);
   Dynarray.add_last head.facts (le k (max_ lo_v hi_v));
   assume_invs g invs head [ (idx, T k) ];
+  assume_written g wrote head;
   let c = lt k hi_v in
   let body_st = copy_state head in
   Dynarray.add_last body_st.facts c;
@@ -1487,7 +1542,8 @@ and counted_loop g (loc : Ir.loc) invariants body (st : state) lo_v hi_v idx (bi
       if it_end.alive then begin
         let k1 = add k one in
         it_end.env <- SM.add counter (T k1) it_end.env;
-        check_invs g invs it_end "inv.step" loc [ (idx, T k1) ]
+        check_invs g invs it_end "inv.step" loc [ (idx, T k1) ];
+        check_written g wrote it_end loc ~entry:false
       end)
     (end_ :: List.rev frame.continues);
   let out = copy_state head in
@@ -1581,12 +1637,10 @@ let check_exits g =
             oblige g ~site:ex.eloc ~clause:en "ensures" ctx gl en.cloc (Printf.sprintf "postcondition '%s'" en.text))
           fn.ensures;
         (* objects the function could have changed satisfy their invariants again *)
-        let param_refs = ref [] in
         List.iter
           (fun (p, (ty : Ir.ty)) ->
             match (ty, SM.find_opt p g.entry) with
             | TClass c, Some (T r) ->
-              param_refs := r :: !param_refs;
               let ctx = spec_ctx g ~quiet:false ~base:facts ~env:ex.eenv () in
               List.iter
                 (fun ((inv : Ir.clause), t) ->
@@ -1594,19 +1648,22 @@ let check_exits g =
                 (class_invariants g c r ex.eenv facts)
             | _ -> ())
           fn.params;
-        let seen = ref [] in
         List.iter
-          (fun (pc, r, cls, (wloc : Ir.loc)) ->
-            if not (List.memq r !param_refs || List.exists (fun (r', c') -> r' == r && c' = cls) !seen) then begin
-              seen := (r, cls) :: !seen;
+          (fun c ->
+            let cls = c.cname in
+            let lines = List.sort_uniq compare (List.filter_map (fun (c', l) -> if c' = cls then Some l else None) g.written) in
+            let unwritten = match SM.find_opt (written_key cls) ex.eenv with Some (T w) -> w == no_writes | _ -> true in
+            (* (written only on paths that do not reach this exit) *)
+            if lines <> [] && not unwritten then begin
+              let at = String.concat ", " (List.map string_of_int lines) in
               let ctx = spec_ctx g ~quiet:false ~base:facts ~env:ex.eenv () in
               List.iter
                 (fun ((inv : Ir.clause), t) ->
-                  oblige g ~site:ex.eloc ~clause:inv "class.inv" ctx (implies pc t) inv.cloc
-                    (Printf.sprintf "invariant of %s ('%s') holds on return for the object written at line %d" cls inv.text wloc.line))
-                (class_invariants g cls r ex.eenv facts)
+                  oblige g ~site:ex.eloc ~clause:inv "class.inv" ctx t inv.cloc
+                    (Printf.sprintf "invariant of %s ('%s') holds on return for every object written at line %s" cls inv.text at))
+                (written_claims g cls ex.eenv facts)
             end)
-          (List.rev g.written);
+          g.prog.classes;
         if fn.raises <> [] then begin
           let ctx = spec_ctx g ~base:facts ~env:g.entry () in
           let cond = or_ (List.map (fun (r : Ir.clause) -> term_of r.cloc (ev g ctx r.cexpr)) fn.raises) in
@@ -1630,6 +1687,7 @@ let run g =
     (fun c -> List.iter (fun (f, _) -> List.iter (fun (k, srt) -> if not (SM.mem k st.env) then st.env <- SM.add k (T (const (String.sub k 1 (String.length k - 1)) srt)) st.env) (heap_keys g c.cname f)) c.cfields)
     g.prog.classes;
   st.env <- SM.add "@alloc" (T (const "alloc" (Array (Int, Bool)))) st.env;
+  List.iter (fun c -> if has_invariants g c.cname then st.env <- SM.add (written_key c.cname) (T no_writes) st.env) g.prog.classes;
   List.iter
     (fun (p, ty) ->
       let v = param_val p ty in

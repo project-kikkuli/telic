@@ -435,3 +435,24 @@ def helper_without_claim(n: int) -> int:
     if n == 0:
         return 0
     return claims_through_helper(n + 1)
+
+
+class Wallet:
+    #@ invariant self.cents >= 0
+
+    def __init__(self):
+        self.cents = 0
+
+
+# expect: refuted
+def empty_wallets(ws: list[Wallet]) -> None:
+    for w in ws:
+        w.cents = -1
+
+
+# expect: proved
+def fill_wallets(ws: list[Wallet], c: int) -> None:
+    #@ requires c >= 0
+    for i in range(len(ws)):
+        if ws[i].cents < c:
+            ws[i].cents = c

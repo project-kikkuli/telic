@@ -419,7 +419,8 @@ them up. In TypeScript a `number` is an integer when telic can show it
 counterexamples show it (`f(a=<Box v=0>, b=a)`). A class invariant (`#@ invariant`
 in the class body, over `self`/`this` only) is assumed for objects passed in,
 proved when they are handed back or passed on, and proved for any object a
-function writes. A call changes only the fields the callee may write, and only
+function writes. Inside a loop, the objects written so far must satisfy it
+after every iteration. A call changes only the fields the callee may write, and only
 on objects it can reach. Dataclasses, pydantic models, TypeScript parameter
 properties, getters and setters work as in the language.
 
