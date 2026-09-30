@@ -507,6 +507,21 @@ def replay_verdicts(program: Program, rep) -> None:
         )
     # The solver's state was unreachable? Search for a real failing input.
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
+    # The solver gave up? A random input may still break the clause.
+    stuck = [v for v in rep.verdicts if v.status == "unknown" and v.ob.kind in ("ensures", "inv.entry", "inv.step", "lifecycle") and v.ob.clause is not None]
+    if stuck and not pending and lang not in ("rust", "swift"):
+        out = fuzz(full, fn, lang, module=rep.ref.module)
+        if out.get("found") and not out.get("stand_in") and out.get("violation"):
+            text = " ".join(str(out.get("text", "")).split())
+            call = f"{fn.name}({out['args_repr']})"
+            runtime = "node" if lang == "typescript" else "python"
+            for v in stuck:
+                if text == v.ob.clause.text:  # type: ignore[union-attr]
+                    v.status = "refuted"
+                    v.replay = Replay(ran=True, confirmed=True, summary=f"{runtime}: '@{out['violation']} {text}' fails", violation=str(out["violation"]), runtime=runtime)
+                    v.replay.fuzz_witness = call  # type: ignore[attr-defined]
+                    v.replay.fuzz_desc = v.replay.summary  # type: ignore[attr-defined]
+                    v.replay.fuzz_summary = f"the solver gave up, but a real input breaks it: {call}"  # type: ignore[attr-defined]
     if pending and lang not in ("rust", "swift"):
         out = fuzz(full, fn, lang, module=rep.ref.module)
         if out.get("found") and out.get("stand_in"):

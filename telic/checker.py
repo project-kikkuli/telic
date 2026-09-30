@@ -956,7 +956,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
         from .replay import replay_verdicts
 
-        to_replay = [rep for rep, _, _ in staged if any(v.status == "refuted" for v in rep.verdicts)]
+        to_replay = [rep for rep, _, _ in staged if any(v.status == "refuted" or (v.status == "unknown" and v.ob.kind in ("ensures", "inv.entry", "inv.step", "lifecycle")) for v in rep.verdicts)]
         if to_replay:
             with take_jobs(opts.jobs, len(to_replay)) as workers, ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(lambda r: replay_verdicts(program, r), to_replay))

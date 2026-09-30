@@ -184,6 +184,13 @@ class FunctionInstrumenter:
                     if not (i == 0 and fn.name.endswith(".__init__")):
                         pre.append(_check_stmt(e, "requires", inv, name))
                     inv_post.append(_check_stmt(copy.deepcopy(e), "class.inv", inv, name))
+            elif isinstance(p.ty, ir.TList) and isinstance(p.ty.elem, ir.TClass) and p.ty.elem.name in self.classes:
+                # and so must the objects in a list passed in
+                for inv in self.classes[p.ty.elem.name].invariants:
+                    e, _ = self.spec(inv, {"self": "__telic_x"})
+                    every = ast.Call(func=ast.Name(id="all", ctx=ast.Load()), args=[ast.GeneratorExp(elt=e, generators=[ast.comprehension(target=ast.Name(id="__telic_x", ctx=ast.Store()), iter=ast.Name(id=p.name, ctx=ast.Load()), ifs=[], is_async=0)])], keywords=[])
+                    pre.append(_check_stmt(every, "requires", inv, name))
+                    inv_post.append(_check_stmt(copy.deepcopy(every), "class.inv", inv, name))
         for r in fn.requires:
             e, _ = self.spec(r)
             pre.append(_check_stmt(e, "requires", r, name))
@@ -211,7 +218,29 @@ class FunctionInstrumenter:
             shown = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="show", ctx=ast.Load()), args=[ast.Name(id="__telic_r", ctx=ast.Load())], keywords=[])
             detail = ast.JoinedStr([ast.Constant("returned "), ast.FormattedValue(shown, -1)])
             post_checks.append(_check_stmt(e, "ensures", en, name, detail))
-        # Objects passed in change only as their lifecycles allow.
+        # Objects passed in change only as their lifecycles allow, and so do
+        # the objects in a list passed in.
+        for p in fn.params:
+            if not (isinstance(p.ty, ir.TList) and isinstance(p.ty.elem, ir.TClass)):
+                continue
+            items = f"__telic_items_{p.name}"
+            pre.append(ast.Assign(targets=[ast.Name(id=items, ctx=ast.Store())], value=ast.Call(func=ast.Name(id="list", ctx=ast.Load()), args=[ast.Name(id=p.name, ctx=ast.Load())], keywords=[])))
+            for owner, lc in _lifecycles(self.classes, p.ty.elem.name):
+                sp = _Specs()
+                e = _Rename({"self": "__telic_x"}).visit(sp.visit(_parse_clause(f"not isinstance(self, {ir.source_name(owner)}) or ({lc.code})")))
+                names = [ast.Name(id="__telic_x", ctx=ast.Store())]
+                olds = [ast.Name(id=items, ctx=ast.Load())]
+                renum = {}
+                for k, o in enumerate(sp.olds):
+                    nm = f"__telic_old{old_k}"
+                    old_k += 1
+                    renum[f"__telic_old{k}"] = f"{nm}_x"
+                    snap = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="snapshot", ctx=ast.Load()), args=[_Rename({"self": "__telic_x"}).visit(o)], keywords=[])
+                    pre.append(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=ast.ListComp(elt=snap, generators=[ast.comprehension(target=ast.Name(id="__telic_x", ctx=ast.Store()), iter=ast.Name(id=items, ctx=ast.Load()), ifs=[], is_async=0)])))
+                    names.append(ast.Name(id=f"{nm}_x", ctx=ast.Store()))
+                    olds.append(ast.Name(id=nm, ctx=ast.Load()))
+                every = ast.Call(func=ast.Name(id="all", ctx=ast.Load()), args=[ast.GeneratorExp(elt=_Rename(renum).visit(e), generators=[ast.comprehension(target=ast.Tuple(elts=names, ctx=ast.Store()), iter=ast.Call(func=ast.Name(id="zip", ctx=ast.Load()), args=olds, keywords=[]), ifs=[], is_async=0)])], keywords=[])
+                inv_post.append(_check_stmt(every, "lifecycle", lc.clause, name))
         for i, p in enumerate(fn.params):
             if not isinstance(p.ty, ir.TClass) or (i == 0 and fn.name.endswith((".__init__", ".__post_init__"))):
                 continue

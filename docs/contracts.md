@@ -219,7 +219,8 @@ state nothing reaches.
 ...`); it is a lemma for the aim, and `by:` names the class.
 
 **At runtime** (replay, `telic run`), a method's receiver (Python: every
-object parameter) is checked against its class's lifecycles when it returns.
+object parameter, and every object in a list parameter) is checked against
+its class's lifecycles when it returns.
 Unchecked code is assumed to change objects only as their lifecycles allow;
 the report lists that under *trusted base*.
 

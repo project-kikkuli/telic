@@ -684,10 +684,10 @@ def advance_all(t: Ticket, u: Ticket) -> None:
     advance_ticket(t)
 
 
-# expect: open
+# expect: refuted
 def reopen_first(ts: list[Ticket]) -> None:
-    # an object reached through a list: the solver refutes it, the runtime
-    # checks only parameters, so the counterexample is not confirmed
+    # an object reached through a list: the runtime checks the objects in
+    # a list parameter too, so the counterexample is confirmed
     if len(ts) > 0:
         t = ts[0]
         t.state = 0

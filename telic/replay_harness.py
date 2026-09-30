@@ -88,6 +88,8 @@ def gen(ty: dict, rnd, module: Any, depth: int = 0) -> Any:
     if k == "dict":
         n = rnd.choice([0, 1, 1, 2, 3])
         return {gen(ty["key"], rnd, module, depth + 1): gen(ty["val"], rnd, module, depth + 1) for _ in range(n)}
+    if k == "enum":
+        return getattr(getattr(module, ty["name"]), rnd.choice(ty["members"]))
     if k == "class":
         cls = getattr(module, ty["name"])
         obj = object.__new__(cls)

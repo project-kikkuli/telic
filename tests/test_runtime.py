@@ -90,3 +90,53 @@ def test_pytest_plugin_enforces_contracts(tmp_path):
     out = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "telic.pytest_plugin", str(tmp_path)], capture_output=True, text=True, cwd=tmp_path)
     assert "1 failed, 1 passed" in out.stdout, out.stdout
     assert "@ensures result > x" in out.stdout
+
+
+LISTED = """
+    from enum import Enum
+
+
+    class Status(Enum):
+        OPEN = 1
+        DONE = 2
+
+
+    class Task:
+        #@ invariant self.left >= 0
+        #@ lifecycle status: Status.OPEN -> Status.DONE
+
+        def __init__(self, left: int, status: Status):
+            #@ requires left >= 0
+            self.left = left
+            self.status = status
+
+
+    def reopen(ts: list[Task]) -> None:
+        for t in ts:
+            t.status = Status.OPEN
+
+
+    def drain(ts: list[Task]) -> None:
+        for t in ts:
+            t.left = -1
+"""
+
+
+@pytest.mark.parametrize(
+    "call,kind",
+    [
+        ("m.reopen([m.Task(-1, m.Status.OPEN)])", "requires"),  # an object handed in must satisfy its invariants
+        ("m.reopen([m.Task(1, m.Status.DONE)])", "lifecycle"),
+        ("m.drain([m.Task(1, m.Status.OPEN)])", "class.inv"),
+    ],
+)
+def test_objects_in_a_list_are_checked_like_objects(tmp_path, call, kind):
+    m = load_instrumented(write(tmp_path, LISTED), "m_listed")
+    bad = m.Task.__new__(m.Task)
+    object.__setattr__(bad, "left", -1)
+    object.__setattr__(bad, "status", m.Status.OPEN)
+    call = call.replace("m.Task(-1, m.Status.OPEN)", "bad")
+    with pytest.raises(ContractViolation) as e:
+        eval(call, {"m": m, "bad": bad})
+    assert e.value.kind == kind
+    m.reopen([m.Task(1, m.Status.OPEN)])
