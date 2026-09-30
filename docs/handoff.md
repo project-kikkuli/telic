@@ -18,23 +18,36 @@ done looks like. Soundness items come first: they can make telic say
 - **Vacuity is checked at entry only.** A function whose `@requires` and
   object-parameter invariants are unsatisfiable is `vacuous`
   (`Vacuity` in `telic/checker.py`). Not checked: an `@assume` or a
-  `@trusted` callee's `@ensures` that is unsatisfiable mid-body; an entry
-  check Z3 cannot decide leaves the verdict alone.
+  `@trusted` callee's `@ensures` that is unsatisfiable only in the
+  context of a call; an entry check Z3 cannot decide leaves the verdict
+  alone. A trusted function's own contract is checked for satisfiability
+  (`VCGen.contract_probe`), unfolding predicates once round their
+  recursion group; a contradiction deeper unfoldings reveal is missed.
+- **Calls inside impure comprehensions are not checked.** When a
+  comprehension's body calls a function that is not definitional
+  (`[pos(x) for x in xs]` where `pos` prints), `VCGen.comprehension`
+  havocs and skips the body, so the callee's `@requires` is never an
+  obligation. Done: evaluate the body under the element binding for its
+  obligations even when its value stays unknown.
 
 ## Dogfooding (task 15)
 
 `docs/field-notes.md` has the numbers and the triage. Remaining:
 
-1. Refuted, needing modelling telic lacks: a recursive JSON schema over
-   `Any` (`typescript._type`/`_expr`), a property's annotated return type
-   and immutable frozen-dataclass fields (`ModelCheck.replay`,
-   `Prop.__str__`).
-2. 70 open: facts about objects and dicts held in fields, callee contracts,
+1. Refuted, needing modelling telic lacks: a property's annotated return
+   type and immutable frozen-dataclass fields (`ModelCheck.replay`,
+   `Prop.__str__`). `typescript._type`/`_expr` are proved with trusted
+   predicates (`wf_type`, `wf_expr`, `json_depth`).
+2. Counterexamples over unchecked values print as `…` and are not
+   replayed (`smt.decode` gives opaque values no structure). Rebuilding a
+   JSON value from the model's `isinstance`/`getitem`/`unbox` functions
+   would turn those open verdicts into replayed refutations.
+3. 70 open: facts about objects and dicts held in fields, callee contracts,
    and termination measures over ASTs (opaque). Few are loop invariants.
-3. Put contracts and aims on the pure helpers (`telic/phrase.py`,
+4. Put contracts and aims on the pure helpers (`telic/phrase.py`,
    `ears_problems`, `ears_conditions`, `split_by`, `oracle._one`), then add a
    CI job that ratchets `telic.ledger.json` for telic itself.
-4. Replaying telic's own counterexamples fails on relative imports inside
+5. Replaying telic's own counterexamples fails on relative imports inside
    the `telic` package ("could not run").
 
 ## Frontends

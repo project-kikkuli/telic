@@ -357,6 +357,8 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
     for i in rep.aims:
         ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
         ev = [f"{ok}/{len(i.lemmas)} lemmas proved"] if i.lemmas else ["no lemma cites this aim yet"]
+        if i.trusted:
+            ev.append(f"assuming trusted {', '.join(i.trusted)}")
         cov = i.coverage or {}
         if cov.get("kind") == "reviewed":
             ev.append(f"reviewed by {cov.get('by') or 'a person'}" if cov.get("fresh") else "review stale")

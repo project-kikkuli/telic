@@ -45,6 +45,45 @@ def ensure_installed() -> None:
 # JSON -> IR
 
 
+#@ trusted
+#@ ensures result >= 0
+def json_depth(v: Any) -> int:
+    if isinstance(v, dict):
+        return 1 + max((json_depth(x) for x in v.values()), default=0)
+    if isinstance(v, list):
+        return 1 + max((json_depth(x) for x in v), default=0)
+    return 0
+
+
+#@ trusted
+#@ ensures result == (isinstance(t, dict) and "k" in t and (
+#@     t["k"] == "int" or t["k"] == "real" or t["k"] == "bool" or t["k"] == "str" or t["k"] == "none"
+#@     or t["k"] == "opaque"
+#@     or t["k"] == "list" and "elem" in t and wf_type(t["elem"]) and json_depth(t["elem"]) < json_depth(t)
+#@     or t["k"] == "record" and "name" in t and "fields" in t and isinstance(t["fields"], list)
+#@         and all(isinstance(f, list) and len(f) == 2 and wf_type(f[1]) and json_depth(f[1]) < json_depth(t) for f in t["fields"])
+#@     or t["k"] == "option" and "inner" in t and wf_type(t["inner"]) and json_depth(t["inner"]) < json_depth(t)
+#@     or t["k"] == "dict" and "key" in t and "val" in t and wf_type(t["key"]) and wf_type(t["val"])
+#@         and json_depth(t["key"]) < json_depth(t) and json_depth(t["val"]) < json_depth(t)
+#@     or t["k"] == "class" and "name" in t
+#@     or t["k"] == "enum" and "name" in t and "members" in t))
+def wf_type(t: Any) -> bool:
+    """A type as ``lower.mjs`` writes it."""
+    if not (isinstance(t, dict) and "k" in t):
+        return False
+    need = {"list": ["elem"], "record": ["name", "fields"], "option": ["inner"], "dict": ["key", "val"], "class": ["name"], "enum": ["name", "members"]}
+    k = t["k"]
+    if k not in need and k not in ("int", "real", "bool", "str", "none", "opaque"):
+        return False
+    if not all(f in t for f in need.get(k, [])):
+        return False
+    if k == "record":
+        return isinstance(t["fields"], list) and all(isinstance(f, list) and len(f) == 2 and wf_type(f[1]) for f in t["fields"])
+    return all(wf_type(t[f]) for f in ("elem", "inner", "key", "val") if f in need.get(k, []))
+
+
+#@ requires wf_type(t)
+#@ decreases json_depth(t)
 def _type(t: dict[str, Any]) -> ir.Type:
     k = t["k"]
     if k == "int":
@@ -60,7 +99,9 @@ def _type(t: dict[str, Any]) -> ir.Type:
     if k == "list":
         return ir.TList(_type(t["elem"]))
     if k == "record":
-        return ir.TRecord(t["name"], tuple((n, _type(ft)) for n, ft in t["fields"]), t.get("tag", ""), tuple((k, tuple(v)) for k, v in (t.get("variants") or {}).items()))
+        variants = t.get("variants")
+        cases = tuple((v, tuple(ms)) for v, ms in variants.items()) if variants else ()
+        return ir.TRecord(t["name"], tuple((n, _type(ft)) for n, ft in t["fields"]), t.get("tag", ""), cases)
     if k == "option":
         return ir.TOption(_type(t["inner"]))
     if k == "dict":
@@ -80,6 +121,68 @@ def _loc(l: Any) -> ir.Loc:
     return ir.Loc(int(l or 0))
 
 
+_EXPR_KEYS = {
+    "Lit": ["value"], "Var": ["name"], "Result": [], "Old": ["expr"], "Unary": ["op", "arg"], "Binary": ["op", "left", "right"],
+    "Ite": ["cond", "then", "orelse"], "Call": ["func", "args"], "Builtin": ["name", "args"], "Index": ["seq", "idx", "wrap"],
+    "Field": ["obj", "name"], "Quant": ["kind", "idx", "lo", "hi", "body"], "ListLit": ["elems"], "RecordLit": ["fields"],
+    "New": ["cls", "args"], "Extern": ["name", "args"],
+}
+_EXPR_CHILDREN = ["expr", "arg", "left", "right", "cond", "then", "orelse", "seq", "idx", "obj", "lo", "hi", "body"]
+
+
+#@ trusted
+#@ ensures result == (isinstance(d, dict) and "e" in d and "ty" in d and wf_type(d["ty"]) and (
+#@     d["e"] == "Lit" and "value" in d
+#@     or d["e"] == "Var" and "name" in d
+#@     or d["e"] == "Result"
+#@     or d["e"] == "Old" and "expr" in d and wf_expr(d["expr"]) and json_depth(d["expr"]) < json_depth(d)
+#@     or d["e"] == "Unary" and "op" in d and "arg" in d and wf_expr(d["arg"]) and json_depth(d["arg"]) < json_depth(d)
+#@     or d["e"] == "Binary" and "op" in d and "left" in d and "right" in d
+#@         and wf_expr(d["left"]) and json_depth(d["left"]) < json_depth(d)
+#@         and wf_expr(d["right"]) and json_depth(d["right"]) < json_depth(d)
+#@     or d["e"] == "Ite" and "cond" in d and "then" in d and "orelse" in d
+#@         and wf_expr(d["cond"]) and json_depth(d["cond"]) < json_depth(d)
+#@         and wf_expr(d["then"]) and json_depth(d["then"]) < json_depth(d)
+#@         and wf_expr(d["orelse"]) and json_depth(d["orelse"]) < json_depth(d)
+#@     or (d["e"] == "Call" and "func" in d or d["e"] == "Builtin" and "name" in d or d["e"] == "New" and "cls" in d
+#@         or d["e"] == "Extern" and "name" in d)
+#@         and "args" in d and isinstance(d["args"], list) and all(wf_expr(a) and json_depth(a) < json_depth(d) for a in d["args"])
+#@     or d["e"] == "Index" and "seq" in d and "idx" in d and "wrap" in d
+#@         and wf_expr(d["seq"]) and json_depth(d["seq"]) < json_depth(d)
+#@         and wf_expr(d["idx"]) and json_depth(d["idx"]) < json_depth(d)
+#@     or d["e"] == "Field" and "obj" in d and "name" in d and wf_expr(d["obj"]) and json_depth(d["obj"]) < json_depth(d)
+#@     or d["e"] == "Quant" and "kind" in d and "idx" in d and "lo" in d and "hi" in d and "body" in d
+#@         and wf_expr(d["lo"]) and json_depth(d["lo"]) < json_depth(d)
+#@         and wf_expr(d["hi"]) and json_depth(d["hi"]) < json_depth(d)
+#@         and wf_expr(d["body"]) and json_depth(d["body"]) < json_depth(d)
+#@         and implies("seq" in d and bool(d["seq"]), wf_expr(d["seq"]) and json_depth(d["seq"]) < json_depth(d))
+#@     or d["e"] == "ListLit" and "elems" in d and isinstance(d["elems"], list)
+#@         and all(wf_expr(a) and json_depth(a) < json_depth(d) for a in d["elems"])
+#@     or d["e"] == "RecordLit" and "fields" in d and isinstance(d["fields"], list)
+#@         and all(isinstance(f, list) and len(f) == 2 and wf_expr(f[1]) and json_depth(f[1]) < json_depth(d) for f in d["fields"])))
+def wf_expr(d: Any) -> bool:
+    """An expression as ``lower.mjs`` writes it."""
+    if not (isinstance(d, dict) and "e" in d and "ty" in d and wf_type(d["ty"]) and d["e"] in _EXPR_KEYS):
+        return False
+    if not all(k in d for k in _EXPR_KEYS[d["e"]]):
+        return False
+    kids = [d[k] for k in _EXPR_CHILDREN if k in _EXPR_KEYS[d["e"]] and not (d["e"] == "Quant" and k == "idx")]
+    if d["e"] == "Quant" and d.get("seq"):
+        kids.append(d["seq"])
+    for k in ("args", "elems"):
+        if k in _EXPR_KEYS[d["e"]]:
+            if not isinstance(d[k], list):
+                return False
+            kids += d[k]
+    if d["e"] == "RecordLit":
+        if not (isinstance(d["fields"], list) and all(isinstance(f, list) and len(f) == 2 for f in d["fields"])):
+            return False
+        kids += [f[1] for f in d["fields"]]
+    return all(wf_expr(k) for k in kids)
+
+
+#@ requires wf_expr(d)
+#@ decreases json_depth(d)
 def _expr(d: dict[str, Any]) -> ir.Expr:
     kind = d["e"]
     ty = _type(d["ty"])
@@ -137,6 +240,7 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
     raise ValueError(f"unknown expression {kind}")
 
 
+#@ requires d is None or ("expr" in d and wf_expr(d["expr"]))
 def _clause(d: dict[str, Any] | None) -> ir.Clause | None:
     if d is None:
         return None

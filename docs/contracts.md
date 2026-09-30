@@ -70,6 +70,62 @@ every report under *trusted base*.
 **`trusted`**: the function's contract is assumed and its body not verified
 (FFI, performance hacks). Also listed under *trusted base*.
 
+### Trusted predicates: the shape of JSON
+
+A `@trusted` function that returns a `bool`, `int`, `float` or `str` and has
+an `@ensures` is a *predicate*: specs may call it, and its parameters may be
+untyped (`Any`, `any`). Its `@ensures` describes one level of a shape and may
+call the predicate again on the parts:
+
+```python
+#@ trusted
+#@ ensures result >= 0
+def depth(v: Any) -> int: ...              # the body is the runtime check
+
+#@ trusted
+#@ ensures result == (isinstance(t, dict) and "kind" in t and (
+#@     t["kind"] == "leaf" and "value" in t and isinstance(t["value"], int)
+#@     or t["kind"] == "node" and "left" in t and wf_tree(t["left"])
+#@         and depth(t["left"]) < depth(t)))
+def wf_tree(t: Any) -> bool: ...
+
+#@ requires wf_tree(t)
+#@ decreases depth(t)
+def leaves(t: dict[str, Any]) -> int:
+    if t["kind"] == "leaf":
+        return 1
+    return leaves(t["left"])               # "left" is present, the call's precondition holds
+```
+
+- **Unfolding.** Each application `wf_tree(x)` in a proof gets its `@ensures`
+  at `x` as a fact. Applications that fact creates of a predicate in the same
+  recursion group are not unfolded again, so the facts stay finite and
+  quantifier-free apart from `all(...)`; other predicates it calls are
+  unfolded too. A proof that needs two levels states the second one in a
+  `@requires`, or calls the predicate on the part in code.
+- **Unchecked values in specs.** On an `Any` value, `k in x`, `x[k]`,
+  `x[i]`, `len(x)`, `isinstance(x, dict|list|str|int|bool)`, `x == "lit"`,
+  comparisons with an `int`, and `all(p(e) for e in x)` work in specs. When
+  the same object is used at a checked type (`t: dict[str, Any]`,
+  `items: list[Any]`, `n: int = x["n"]`), telic relates the two views: key
+  membership, indexing and length agree, a string literal is equal to that
+  string only, and an `int` compares as one.
+- **Assumptions are shown.** Every function whose proof unfolds a predicate
+  lists `trusted predicate 'wf_tree' holds exactly as its @ensures says`
+  under *trusted base*. An aim whose lemmas rest on a trusted function is
+  still `backed`, and says so: `backed · assuming trusted wf_tree` in
+  `telic aims`, `"trusted": ["wf_tree"]` in `--json`, and in the HTML report.
+- **Inconsistent predicates are vacuous.** telic checks that a trusted
+  function's `@requires` and `@ensures` can hold together, unfolding a
+  predicate once round its recursion group. `result == (not p(t))` is
+  reported `vacuous`, and so is every function that requires it. A
+  contradiction only deeper unfoldings reveal is not detected.
+- **Counterexamples** that hold unchecked values are shown with `…` and not
+  replayed, so a failed obligation there stays open rather than refuted.
+
+The same works in TypeScript (`t: any`, `"k" in t`, `t.k`, `typeof t.v ===
+"number"`) and Rust (a trusted `fn` over any value types).
+
 ## Aims
 
 An aim is a top-level requirement, written for a reviewer as one EARS
@@ -405,6 +461,8 @@ Everything the code can say, plus:
 | filter | `all(p(x) for x in xs if q(x))` | `xs.every(x => !q(x) \|\| p(x))` | `xs.iter().all(\|x\| !q(x) \|\| p(x))` | `xs.allSatisfy { !q($0) \|\| p($0) }` |
 | sum / count | `sum(xs)`, `sum(xs[a:b])`, `xs.count(v)` | `sum(xs)`, `count(xs, v)`, `xs.reduce((a, b) => a + b, 0)` | `xs.iter().sum::<u64>()`, `.filter(...).count()` | `xs.reduce(0, +)`, `xs.filter { q($0) }.count` |
 | membership | `v in xs` | `xs.includes(v)` | `xs.contains(&v)` | `xs.contains(v)` |
+| unchecked JSON | `k in x`, `x[k]`, `isinstance(x, dict)`, `all(p(e) for e in x)` on `x: Any` | `k in x`, `x.k`, `typeof x.k` on `x: any` | | |
+| trusted predicates | `p(x)` for a `@trusted` `p` (see [Trusted predicates](#trusted-predicates-the-shape-of-json)) | same | same | same |
 | slices | `xs[a:b]`, `xs[-1]` | `xs.slice(a, b)`, `xs.at(-1)` | `xs[a..b]` | `xs[a..<b]` |
 | pure helpers | any loop-free, mutation-free function in the program, e.g. `ensures result == fib(n)` | same | same | same |
 

@@ -550,6 +550,8 @@ class Renderer:
             summary = [label[i.status]]
             if n:
                 summary.append(f"{ok}/{n} lemma{'s' * (n != 1)} proved")
+            if i.trusted:
+                summary.append(p.blue(f"assuming trusted {', '.join(i.trusted)}"))
             cov = i.coverage
             if cov is not None and cov.get("kind") == "reviewed":
                 summary.append(p.green(f"reviewed by {cov.get('by') or 'a person'}") if cov.get("fresh") else p.yellow("review stale (lemmas or wording changed)"))

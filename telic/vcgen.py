@@ -389,6 +389,16 @@ class VCGen:
         self.written: dict[str, list[int]] = {}
         self._self_escapes: bool | None = None
         self.loop_notes: list[tuple[int, str]] = []
+        # Facts valid in every state: one-level unfoldings of trusted
+        # predicates and what boxing a value tells about it. Every
+        # obligation assumes them.
+        self.lemmas: list[L.Term] = []
+        self.unfolded: set[L.Term] = set()
+        self.lemma_set: set[L.Term] = set()
+        self.lemma_info: list[tuple[L.Term, tuple[L.Term, ...], frozenset[str] | None, str | None]] = []
+        self.unfolding_stack: list[str] = []
+        self.fuel = PREDICATE_FUEL
+        self.probes_contract = False
 
     # -- naming -----------------------------------------------------------
 
@@ -602,7 +612,7 @@ class VCGen:
                 loc=loc,
                 site=site,
                 message=message,
-                hyps=ctx.hyps(),
+                hyps=ctx.hyps() + self.relevant_lemmas(ctx.hyps() + [goal]),
                 goal=goal,
                 clause=clause,
                 aims=clause.aims if clause else (),
@@ -666,8 +676,30 @@ class VCGen:
             # Preconditions must be well-defined given the earlier ones.
             t = self.ev(r.expr, ctx.sub(label="requires"))
             st.facts.append(t)
-        self.entry_facts = list(st.facts)
+        self.entry_facts = list(st.facts) + self.relevant_lemmas(st.facts)
         return st
+
+    def contract_probe(self) -> None:
+        """For a trusted function: ``entry_facts`` become its preconditions
+        and postconditions together, which must be satisfiable for what it
+        promises to be assumable."""
+        st = self.enter()
+        fn = self.fn
+        ctx = self.ctx(st, spec=True, quiet=True)
+        if self.ref.key in self.program.predicates:
+            # deep enough to go once round a cycle of predicates defined through each other
+            group = [k for k in self.program.predicates if k == self.ref.key or self.program.same_scc(self.ref.key, k)]
+            self.fuel = min(len(group), 3) + 1
+            flat = [t for p in fn.params for t in flatten(st.env[p.name])]
+            r: Val = L.Fn(self.program.logic_names[self.ref.key], tuple(flat), sort_of(fn.ret))
+            self.unfold(self.ref, {p.name: st.env[p.name] for p in fn.params}, r, ctx, fn.loc)  # type: ignore[arg-type]
+        else:
+            r = self.fresh("result", fn.ret) if fn.ret != ir.NONE else NONE_V
+            ectx = Ctx(base=st.facts, env=st.env, module=self.module, old_env=dict(self.entry), result=None if r is NONE_V else r, spec=True, quiet=True)
+            for en in fn.ensures:
+                st.facts.append(self.ev(en.expr, ectx))
+        self.entry_facts = list(st.facts) + self.lemmas  # every unfolding: the fuel set above is the bound
+        self.probes_contract = True
 
     def entry_inputs(self) -> list[tuple[str, Val]]:
         """The inputs as counterexamples show them (what ``run`` records)."""
@@ -1496,8 +1528,11 @@ class VCGen:
             (x,) = args
             ty = e.ty
             tag = str(ty).replace(" ", "")
+            if isinstance(x, L.Fn) and x.name == f"box.{tag}":
+                return pack(ty, list(x.args))  # the same object, seen at its own type again
             comps = [L.Fn(f"unbox.{tag}.{suffix}", tuple(flatten(x)), srt) for suffix, srt in components(ty)]
             v = pack(ty, comps)
+            self.box_facts(x, v, ty, ctx, known=False)  # type: ignore[arg-type]
             if isinstance(v, ListVal):
                 ctx.assume(L.le(L.ZERO, v.len))
             if ctx.state is not None:
@@ -1510,8 +1545,15 @@ class VCGen:
             return v
         if name == "to_opaque":
             (x,) = args
-            tag = str(e.args[0].ty).replace(" ", "")
-            return L.Fn(f"box.{tag}", tuple(flatten(x)), L.OPAQUE)
+            ty = e.args[0].ty
+            tag = str(ty).replace(" ", "")
+            flat = flatten(x)
+            prefix = f"unbox.{tag}."
+            if all(isinstance(c, L.Fn) and c.name.startswith(prefix) for c in flat) and len({c.args for c in flat}) == 1 and len(flat[0].args) == 1:  # type: ignore[attr-defined]
+                return flat[0].args[0]  # type: ignore[attr-defined]
+            b = L.Fn(f"box.{tag}", flat, L.OPAQUE)
+            self.box_facts(b, x, ty, ctx, known=True)
+            return b
         if name == "opaque_op":
             # An operation involving an opaque value: some deterministic,
             # otherwise unknown result.
@@ -1521,6 +1563,21 @@ class VCGen:
             for a in args[1:]:
                 flat.extend(flatten(a))
             srt = sort_of(e.ty)
+            cmp = {"cmp.lt": L.lt, "cmp.le": L.le, "cmp.lte": L.le, "cmp.gt": L.gt, "cmp.ge": L.ge, "cmp.gte": L.ge, "cmp.eq": L.eq, "cmp.ne": L.ne, "cmp.noteq": L.ne}
+            if op.value in cmp and len(flat) == 2 and [x.sort for x in flat] in ([L.OPAQUE, L.INT], [L.INT, L.OPAQUE]):
+                # against an int: an int compares as one; anything else stays unknown
+                x = flat[0] if flat[0].sort == L.OPAQUE else flat[1]
+                ux = L.Fn("unbox.int.", (x,), L.INT)
+                a, b = (ux, flat[1]) if flat[0].sort == L.OPAQUE else (flat[0], ux)
+                return L.ite(L.Fn("opaque.isinstance.Bool", (x, L.StrV("int")), L.BOOL), cmp[op.value](a, b), L.Fn(f"opaque.{op.value}.{srt.name}", tuple(flat), srt))
+            if op.value in ("cmp.eq", "cmp.ne", "cmp.noteq") and len(flat) == 2 and {x.sort for x in flat} == {L.OPAQUE, L.STR} and any(isinstance(x, L.StrV) for x in flat):
+                # equal to a string literal: that very string, so no other
+                x, lit = (flat[0], flat[1]) if isinstance(flat[1], L.StrV) else (flat[1], flat[0])
+                boxed = L.Fn("box.str", (lit,), L.OPAQUE)
+                self.lemma(L.eq(L.Fn("unbox.str.", (boxed,), L.STR), lit), ctx, (boxed,))
+                self.lemma(L.Fn("opaque.isinstance.Bool", (boxed, L.StrV("str")), L.BOOL), ctx, (boxed,))
+                same = L.eq(x, boxed)
+                return same if op.value == "cmp.eq" else L.not_(same)
             r = L.Fn(f"opaque.{op.value}.{srt.name}", tuple(flat), srt)
             if not ctx.spec and not ctx.quiet:
                 self.note(e.loc, "operations on values from unchecked code do not raise")
@@ -1776,7 +1833,7 @@ class VCGen:
                 return False
             if isinstance(sub, ir.Call):
                 tgt = self.program.resolve(self.module, sub.func)
-                if tgt is None or tgt.key not in self.program.definitional:
+                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates):
                     return False
         return True
 
@@ -1812,7 +1869,10 @@ class VCGen:
                 ctx.assume(L.Quant("forall", (r,), L.implies(L.select(alloc0, r), t), patterns=((sels[0],),)))  # type: ignore[arg-type]
 
     def note(self, loc: ir.Loc, text: str) -> None:
-        """Record an assumption the proof rests on (shown as trusted base)."""
+        """Record an assumption the proof rests on (shown as trusted base).
+        Inside a trusted predicate's unfolding, the predicate is the assumption."""
+        if self.unfolding_stack:
+            return
         text = "assumed: " + text
         if (loc, text) not in self.assumptions:
             self.assumptions.append((loc, text))
@@ -1932,7 +1992,8 @@ class VCGen:
                 raise VCError(f"'{fn.name}' mutates its list parameter '{p.name}'; pass a variable (or a copy) so the change is tracked", loc)
         pmap: dict[str, Val] = {p.name: a for p, a in zip(fn.params, args)}
         heap_pre = self.heap_env(ctx.env) if ctx.state is None else self.heap_env(ctx.state.env)
-        definitional = callee.key in self.program.definitional
+        predicate = callee.key in self.program.predicates
+        definitional = callee.key in self.program.definitional or predicate
         if ctx.spec and not definitional:
             raise VCError(f"specs may only call pure (loop-free, mutation-free) functions; '{fn.name}' is not", loc)
         # Callee preconditions (which may read object fields).
@@ -1955,8 +2016,12 @@ class VCGen:
             self.recursion_check(callee, pmap, ctx, loc)
         self.deps.add(callee.key)
         # Result.
-        if definitional:
-            r: Val = self.apply_def(callee, args, heap_pre)
+        if predicate:
+            flat = [t for a in args for t in flatten(a)]
+            r: Val = L.Fn(self.program.logic_names[callee.key], tuple(flat), sort_of(fn.ret))
+            self.unfold(callee, pmap, r, ctx, loc)
+        elif definitional:
+            r = self.apply_def(callee, args, heap_pre)
         elif fn.ret == ir.NONE:
             r = NONE_V
         else:
@@ -1968,7 +2033,7 @@ class VCGen:
         if ctx.state is not None and not ctx.spec:
             post.update(self.call_effects(callee, args, arg_exprs, ctx, new_self))
         # Assume the postcondition (code context; spec calls use lemma axioms).
-        if not ctx.spec and fn.ensures and not self.definitional_mode:
+        if not ctx.spec and fn.ensures and not self.definitional_mode and not predicate:
             ectx = Ctx(base=ctx.base, env=post, module=callee.module, guard=ctx.guard, old_env={**heap_pre, **pmap}, result=r if r is not NONE_V else None, spec=True, quiet=True)
             for en in fn.ensures:
                 ctx.assume(self.ev(en.expr, ectx))
@@ -2026,6 +2091,115 @@ class VCGen:
             exprs: list[ir.Expr | None] = list(c.args)
             self.call_effects(callee, args, exprs, ctx, new_self=callee.fn.name.endswith(".__init__"), returned=False)
         return NONE_V
+
+    def unfold(self, callee: FuncRef, pmap: dict[str, Val], r: L.Term, ctx: Ctx, loc: ir.Loc) -> None:
+        """A trusted predicate's '@ensures' at this one application, as a
+        lemma. Inside it, applications of predicates in its own recursion
+        group are unfolded only ``fuel`` deep (others always: they form a
+        DAG), so the facts stay finite and need no recursive axiom."""
+        depth = sum(1 for k in self.unfolding_stack if k == callee.key or self.program.same_scc(k, callee.key))
+        if depth >= self.fuel or r in self.unfolded:
+            return
+        self.unfolded.add(r)
+        self.note(loc, f"trusted predicate '{callee.fn.name}' holds exactly as its @ensures says")
+        self.unfolding_stack.append(callee.key)
+        try:
+            scratch: list[L.Term] = []
+            ectx = Ctx(base=scratch, env=dict(pmap), module=callee.module, old_env=dict(pmap), result=r, spec=True, quiet=True)
+            req = [self.ev(rq.expr, ectx) for rq in callee.fn.requires]
+            goals = [self.ev(en.expr, ectx) for en in callee.fn.ensures]
+        finally:
+            self.unfolding_stack.pop()
+        self.lemma(L.implies(L.and_(*req), L.and_(*scratch, *goals)), ctx, (r,), pred=callee.key)
+
+    def lemma(self, fact: L.Term, ctx: Ctx, about: tuple[L.Term, ...], pred: str | None = None) -> None:
+        """Record a fact valid in every state, about the terms ``about``.
+        Inside a quantifier it is about the bound variables, so it holds for
+        all of them, triggered by ``about``."""
+        bound = {c for v in ctx.bound.values() if isinstance(v, L.Term) for c in L.consts(v) if "!" in c.name}
+        vs = tuple(sorted({c for t in about for c in L.consts(t)} & bound, key=lambda c: c.name))
+        if vs:
+            fact = L.Quant("forall", vs, fact, patterns=(about,) if _triggerable(about) else ())
+        if fact not in self.lemma_set:
+            self.lemma_set.add(fact)
+            self.lemmas.append(fact)
+            heads = frozenset(x.name for t in about for x in L.iter_terms(t) if isinstance(x, L.Fn)) if vs else None
+            self.lemma_info.append((fact, about, heads, pred))
+
+    def relevant_lemmas(self, terms: list[L.Term]) -> list[L.Term]:
+        """The lemmas about terms the obligation mentions, and what those
+        lemmas mention in turn, except applications of predicates in the
+        unfolded one's own recursion group (the fuel bound, per obligation)."""
+        if not self.lemma_info:
+            return []
+        present: set[L.Term] = set()
+        heads: set[str] = set()
+        preds = {self.program.logic_names[k]: k for k in self.program.predicates}
+
+        def mention(t: L.Term, pred: str | None) -> None:
+            for x in L.iter_terms(t):
+                if isinstance(x, L.Fn):
+                    k = preds.get(x.name)
+                    if pred is not None and k is not None and (k == pred or self.program.same_scc(k, pred)):
+                        continue
+                    heads.add(x.name)
+                present.add(x)
+
+        for t in terms:
+            mention(t, None)
+        todo = list(range(len(self.lemma_info)))
+        chosen: set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            for i in list(todo):
+                fact, about, hs, pred = self.lemma_info[i]
+                if (hs is not None and (not hs or hs & heads)) or (hs is None and any(a in present for a in about)):
+                    todo.remove(i)
+                    chosen.add(i)
+                    mention(fact, pred)
+                    changed = True
+        return [self.lemma_info[i][0] for i in sorted(chosen)]
+
+    def box_facts(self, b: L.Term, v: Val, ty: ir.Type, ctx: Ctx, known: bool) -> None:
+        """How a checked value ``v`` of type ``ty`` looks through the
+        operations telic leaves uninterpreted on its unchecked view ``b``
+        (the same object): membership, indexing, length, isinstance. Unless
+        ``known``, only where ``b`` is an instance of that type."""
+        n = next(self.counter)
+        facts: list[L.Term] = []
+        kind = None
+        if isinstance(v, DictVal) and isinstance(ty, ir.TDict) and isinstance(ty.val, ir.TOpaque):
+            kind = "dict"
+            k = L.Const(f"k!{n}", sort_of(ty.key))
+            for op, held in (("opaque.cmp.in.Bool", True), ("opaque.in.Bool", True), ("opaque.cmp.notin.Bool", False)):
+                mem = L.Fn(op, (k, b), L.BOOL)
+                has = L.select(v.has, k)
+                facts.append(L.Quant("forall", (k,), L.eq(mem, has if held else L.not_(has)), patterns=((mem,),) if _triggerable((mem,)) else ()))
+            get = L.Fn("opaque.getitem.Opaque", (b, k), L.OPAQUE)
+            facts.append(L.Quant("forall", (k,), L.implies(L.select(v.has, k), L.eq(get, L.select(v.vals, k))), patterns=((get,),) if _triggerable((get,)) else ()))
+        elif isinstance(v, ListVal) and isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TOpaque):
+            kind = "list"
+            i = L.Const(f"i!{n}", L.INT)
+            facts.append(L.eq(L.Fn("opaque.len.Int", (b,), L.INT), v.len))
+            get = L.Fn("opaque.getitem.Opaque", (b, i), L.OPAQUE)
+            facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), L.eq(get, v.at(i))), patterns=((get,),) if _triggerable((get,)) else ()))
+        elif isinstance(ty, ir.TStr):
+            kind = "str"
+        elif isinstance(ty, ir.TInt):
+            kind = "int"
+        elif isinstance(ty, ir.TBool):
+            kind = "bool"
+        if kind is None:
+            return
+        is_kind = L.Fn("opaque.isinstance.Bool", (b, L.StrV(kind)), L.BOOL)
+        if known:
+            facts.append(is_kind)
+            fact = L.and_(*facts)
+        else:
+            fact = L.implies(is_kind, L.and_(*facts)) if facts else L.TRUE
+        if fact != L.TRUE:
+            self.lemma(fact, ctx, (b,))
 
     def havoc_call(self, callee: FuncRef, args: list[Val], new_self: bool, ctx: Ctx) -> None:
         """The heap after a call: only the fields the callee may write change,
@@ -2089,6 +2263,14 @@ class VCGen:
 
 # ---------------------------------------------------------------------------
 # Language arithmetic in terms of Euclidean division
+
+
+PREDICATE_FUEL = 1
+
+
+def _triggerable(ts: tuple[L.Term, ...]) -> bool:
+    """Can these terms be an SMT trigger (no connectives or ite inside)?"""
+    return not any(isinstance(x, L.Quant) or (isinstance(x, L.App) and x.op not in ("select", "add", "sub", "field")) for t in ts for x in L.iter_terms(t))
 
 
 def floordiv(a: L.Term, b: L.Term) -> L.Term:

@@ -200,6 +200,7 @@ class FunctionReport:
     deps: set[str] = field(default_factory=set)
     open_deps: set[str] = field(default_factory=set)
     context_deps: set[str] = field(default_factory=set)
+    trusted_deps: set[str] = field(default_factory=set)  # trusted contracts the proof assumes, transitively
     seconds: float = 0.0
     from_receipt: bool = False
 
@@ -550,6 +551,9 @@ class Vacuity:
             fn = rep.fn
             classes = sorted({p.ty.name for p in fn.params if isinstance(p.ty, ir.TClass)})
             inv_unsat = False
+            if gen.probes_contract:
+                out[rep.ref.key] = f"its @requires and @ensures can never hold together, so every proof that uses '{fn.name}' is vacuous; fix its contract"
+                continue
             if gen.invariant_facts and fn.requires:
                 ob = _unsat_probe(gen, gen.invariant_facts)
                 key = "sat:" + obligation_key(ob, theory)
@@ -581,7 +585,7 @@ def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
 def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache") -> Vacuity:
     v = Vacuity()
     for rep, gen in entries:
-        if not (gen.fn.requires or gen.invariant_facts):
+        if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract):
             continue
         ob = _unsat_probe(gen, gen.entry_facts)
         key = "sat:" + obligation_key(ob, theory)
@@ -673,7 +677,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if use_engine:
         # Cached inferences are rebuilt locally; the rest run in the engine,
         # and whatever it cannot decide falls back to Python.
-        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference"]
+        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference" and k not in program.predicate_users]
         by_engine = _engine.infer(program, theory, [r for _, r in fresh], min(opts.timeout_ms, 1000), opts.jobs)
         inf_results = [(k, inference_key(program, k), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
         done = {k for k, _, _ in inf_results}
@@ -773,6 +777,13 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if fn.trusted:
             rep.status = "trusted"
             reports.append(rep)
+            if fn.ensures:
+                probe = VCGen(program, ref)
+                try:
+                    probe.contract_probe()
+                    entry_checks.append((rep, probe))
+                except VCError:
+                    pass  # its callers report the same error when they evaluate the contract
             continue
         inf = inferred.get(key) or Inferred()
         rep.inferred = inf
@@ -784,7 +795,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             rep.from_receipt = True
             reports.append(rep)
             continue
-        if use_engine and program.ambiguity(ref) is None:
+        if use_engine and program.ambiguity(ref) is None and key not in program.predicate_users:
             engine_tasks.append((rep, ref, inf, fkey, ft))
             reports.append(rep)
             continue
@@ -874,6 +885,11 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if fkey and rep.status == "proved" and not rep.problems:
             cache.put(fkey, make_receipt(rep))
 
+    for r in reports:
+        if r.status == "trusted" and r.ref.key in vacuous:
+            r.status = "vacuous"
+            r.problems.append((vacuous[r.ref.key], r.fn.loc))
+
     # Transitive dependency status: a proof that assumes an unproved contract
     # is only as good as that contract.
     by_key = {r.ref.key: r for r in reports}
@@ -889,6 +905,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             if dr is None and d in program.funcs and program.funcs[d].module.context:
                 r.context_deps.add(d)  # checked on its own; its contract is what this proof uses
                 continue
+            if dr is not None and dr.status == "trusted":
+                r.trusted_deps.add(d)
             if dr is None or dr.status not in ("proved",):
                 if dr is None or dr.status != "trusted":
                     r.open_deps.add(d)

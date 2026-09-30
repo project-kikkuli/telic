@@ -33,6 +33,12 @@ class Program:
     scc_of: dict[str, int] = field(default_factory=dict)
     recursive: set[str] = field(default_factory=set)
     definitional: set[str] = field(default_factory=set)
+    # '@trusted' functions returning a scalar with an '@ensures': specs may
+    # call them, and each use is unfolded one level through the '@ensures'
+    predicates: set[str] = field(default_factory=set)
+    # functions whose proofs may unfold a predicate (their own contracts,
+    # body, or a callee's contract calls one)
+    predicate_users: set[str] = field(default_factory=set)
     mutated: dict[str, set[str]] = field(default_factory=dict)
     appends: dict[str, set[str]] = field(default_factory=dict)
     logic_names: dict[str, str] = field(default_factory=dict)
@@ -58,6 +64,9 @@ class Program:
         p.ambiguous = {m.path: dict(m.ambiguous_classes) for m in modules if m.ambiguous_classes}
         for m in modules:
             for f in m.functions.values():
+                if f.trusted:
+                    # a trusted body is never checked: only its contract must be understood
+                    f.unsupported = [(msg, loc) for msg, loc in f.unsupported if msg.startswith("contract:")]
                 ref = FuncRef(m, f)
                 p.funcs[ref.key] = ref
         p._unawaited()
@@ -72,6 +81,7 @@ class Program:
         p._sccs()
         p._mutation()
         p._heap()
+        p._predicates()
         p._definitional()
         p._names()
         return p
@@ -477,6 +487,17 @@ class Program:
                 out.append(f"@{decl.field_owner(f)}.{f}" + (f".{suffix}" if suffix else ""))
         return out
 
+    def _predicates(self) -> None:
+        scalar = (ir.TBool, ir.TInt, ir.TReal, ir.TStr)
+        for key, ref in self.funcs.items():
+            fn = ref.fn
+            if fn.trusted and fn.ensures and isinstance(fn.ret, scalar) and not any(isinstance(p.ty, ir.TClass) for p in fn.params):
+                self.predicates.add(key)
+        if not self.predicates:
+            return
+        direct = {k for k, cs in self.callees.items() if cs & self.predicates}
+        self.predicate_users = direct | {k for k, cs in self.callees.items() if cs & direct}
+
     def _definitional(self) -> None:
         """A function is definitional if its body is loop-free, mutation-free,
         free of raises, and only calls other definitional functions. Its body
@@ -503,7 +524,7 @@ class Program:
         while changed:
             changed = False
             for key in list(cand):
-                if not self.callees[key] <= cand:
+                if not self.callees[key] <= cand | self.predicates:
                     cand.discard(key)
                     changed = True
         self.definitional = cand

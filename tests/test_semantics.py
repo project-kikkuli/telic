@@ -172,3 +172,49 @@ def test_python_value_idioms_match_cpython(e):
     assert not mod.functions["f"].unsupported, (e, mod.functions["f"].unsupported)
     for a, b in INPUTS:
         assert model_value(mod, "f", a, b) == eval(e, {"a": a, "b": b}), (e, a, b)
+
+
+OPAQUE_IDIOMS = [("x == 'a'", str), ("x != 'a'", str), ("x == 'b' or x == 'a'", str), ("x > 3", int), ("x <= b", int), ("x == 2", int), ("x != b", int)]
+OPAQUE_INPUTS = ["a", "b", "", 2, 3, 5, -1]
+
+
+def forced_value(module, fname, x, b):
+    """What the model says ``fname(x, b)`` returns, given only what telic
+    knows about ``x`` as an unchecked value (its type and its value)."""
+    program = Program.build([module])
+    ref = program.resolve(module, fname)
+    kind, lit = ("str", L.StrV(x)) if isinstance(x, str) else ("int", L.IntV(x))
+    boxed = L.Fn(f"box.{kind}", (lit,), L.OPAQUE)
+    g = VCGen(program, ref, inputs={"x": boxed, "b": L.IntV(b)})
+    g.definitional_mode = True
+    g.run()
+    (ex,) = [e for e in g.exits if e.value is not None]
+    known = [L.eq(L.Fn(f"unbox.{kind}.", (boxed,), lit.sort), lit), L.Fn("opaque.isinstance.Bool", (boxed, L.StrV(kind)), L.BOOL)]
+    enc = Z3Encoder([])
+    out = []
+    for guess in (True, False):
+        s = z3.Solver(ctx=enc.ctx)
+        for f in known + g.lemmas + ex.facts:
+            s.add(enc.term(f))
+        s.add(enc.term(L.eq(ex.value, L.BoolV(guess))))
+        if s.check() != z3.unsat:
+            out.append(guess)
+    return out
+
+
+@pytest.mark.parametrize("e,same", OPAQUE_IDIOMS)
+def test_python_unchecked_comparisons_match_cpython(e, same):
+    """An unchecked value compared with a string or an int: the model forces
+    CPython's answer when the types match, and never the opposite one."""
+    src = f"from typing import Any\n\ndef f(x: Any, b: int) -> bool:\n    return {e}\n"
+    mod = lower_python("o.py", src)
+    for x in OPAQUE_INPUTS:
+        for b in (0, 2, 4):
+            try:
+                want = eval(e, {"x": x, "b": b})
+            except TypeError:
+                continue
+            got = forced_value(mod, "f", x, b)
+            assert want in got, (e, x, b, got)
+            if type(x) is same:
+                assert got == [want], (e, x, b, got)

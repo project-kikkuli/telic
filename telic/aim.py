@@ -112,6 +112,7 @@ class AimReport:
     advice: list[str] = field(default_factory=list)  # findings that do not fail
     assumes: list[str] = field(default_factory=list)  # unproved code a lemma's proof rests on
     stubs: list[str] = field(default_factory=list)  # trivial implementations its lemmas accept
+    trusted: list[str] = field(default_factory=list)  # trusted functions the lemmas rest on
 
     # counts kept for the ledger and older callers
     @property
@@ -237,6 +238,7 @@ def build(rep: Any) -> list[AimReport]:
             r.status = "backed"
         else:
             r.status = "partial"
+        r.trusted = sorted({f.fn.name for f in fns if f.status == "trusted"} | {d.split("::")[-1] for f in fns for d in f.trusted_deps})
         r.digest = digest(r)
         rv = reviews.get(iid)
         if rv is not None:
@@ -645,6 +647,7 @@ def _aim_json(r: AimReport) -> dict[str, Any]:
         "scope": r.scope,
         "advice": r.advice,
         "stubs": r.stubs,
+        "trusted": r.trusted,
         "coverage": r.coverage,
         "digest": r.digest,
     }

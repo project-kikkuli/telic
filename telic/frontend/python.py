@@ -2661,6 +2661,8 @@ class ExprLowerer:
                         body = ir.Binary(ir.BOOL, loc, "implies" if kind == "forall" else "and", self.cond(cond), body)
                     zero = ir.Lit(ir.INT, loc, 0)
                     return ir.Quant(ir.BOOL, loc, kind, idx, zero, zero, body, elem, seq)
+                if isinstance(seq.ty, ir.TOpaque):
+                    seq = ir.Builtin(ir.TList(ir.TOpaque("")), loc, "from_opaque", (seq,))  # an unchecked value iterated as a list
                 if not isinstance(seq.ty, ir.TList):
                     raise self.err("generator must range over range(...), a list or a dict", n)
                 lo = ir.Lit(ir.INT, loc, 0)

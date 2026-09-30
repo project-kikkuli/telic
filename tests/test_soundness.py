@@ -108,6 +108,10 @@ VACUOUS = [
     ("t24.py", "Counter.below_zero"),
     ("t25.ts", "contradictory"),
     ("t26.rs", "contradictory"),
+    ("json_liar.py", "liar"),
+    ("json_liar.py", "use_liar"),
+    ("json_liar.py", "p"),
+    ("json_liar.py", "q"),
 ]
 
 

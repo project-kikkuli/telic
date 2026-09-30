@@ -362,6 +362,16 @@ def describe(out: dict[str, Any], runtime: str) -> str:
     return f"{runtime}: returned {out.get('returned_repr')}"
 
 
+def _opaque_inside(ty: ir.Type) -> bool:
+    if isinstance(ty, ir.TOpaque):
+        return True
+    if isinstance(ty, (ir.TList, ir.TOption)):
+        return _opaque_inside(ty.elem if isinstance(ty, ir.TList) else ty.inner)
+    if isinstance(ty, ir.TDict):
+        return _opaque_inside(ty.val)
+    return False
+
+
 def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool, str, str | None]:
     """(confirmed, summary, violation). Confirmed only if the runtime failure
     is this obligation's failure: same clause, same kind of crash."""
@@ -373,6 +383,8 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
     if "harness_error" in out:
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
     if out.get("violation") == "requires" and out.get("func") == ir.source_name(fn.name) and ob.kind != "call":
+        if any(_opaque_inside(p.ty) for p in fn.params):
+            return False, f"{runtime}: not replayed: the counterexample holds unchecked values telic cannot rebuild (shown as …)", None
         return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
     summary = describe(out, runtime)
     if out.get("stand_in"):

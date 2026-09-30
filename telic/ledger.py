@@ -128,6 +128,7 @@ class Change:
     file: str | None = None
 
 
+#@ requires "aims" in new and "functions" in new and "mirrors" in new
 def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> list[Change]:
     out: list[Change] = []
 
