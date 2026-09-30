@@ -225,8 +225,14 @@ def build(rep: Any) -> list[AimReport]:
                     if not any(_ui_match(item, res.lemma) for res in uis.get(iid, [])):
                         r.pointers.append(f"'{item}' is listed in by: but that ui lemma does not cite {iid}")
                 elif not hit:
-                    if not context:  # an ancestor's aim file may list code outside this check
+                    path = item.split("::")[0] if "::" in item else None
+                    checked = {m.path for m in rep.modules}
+                    if not context or (path is not None and path in checked):
                         r.pointers.append(f"'{item}' is listed in by: but no checked function has that name")
+                    elif path is not None and not os.path.exists(os.path.join(getattr(rep, "root", None) or ".", path)):
+                        r.pointers.append(f"'{item}' is listed in by: but {path} does not exist")
+                    elif path is not None:  # an ancestor's aim file may list code outside this check
+                        r.advice.append(f"'{item}' is outside this check: 'telic check' the whole project to see it")
                 elif not any(iid in f.fn.aims for f in hit):
                     r.pointers.append(f"'{item}' is listed in by: but does not cite {iid}")
             for f in fns:

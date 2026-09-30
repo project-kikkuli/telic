@@ -247,3 +247,10 @@ def test_an_aim_in_an_imported_module_is_not_reported_by_a_partial_check(tmp_pat
     assert "CAP" not in got
     rep, got = report(tmp_path)
     assert got["CAP"].status == "backed" and not got["CAP"].pointers
+
+
+def test_a_partial_check_names_by_items_it_did_not_see(tmp_path):
+    tree(tmp_path, {"a.py": fn("charge", "PAY"), "b.py": fn("refund", "PAY"), **aims("", ("PAY", SAME, "a.py::charge, b.py::refund, c.py::gone"))})
+    _, got = report(tmp_path, ("a.py",))
+    assert any("'b.py::refund' is outside this check" in a for a in got["PAY"].advice)
+    assert any("c.py does not exist" in p for p in got["PAY"].pointers)
