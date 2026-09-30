@@ -281,7 +281,7 @@ def propose(paths: list[str], root: str, opts: Any, only: set[str] | None = None
             props[key].crashes = bad
 
     # 1. Houdini over candidate postconditions
-    cands = {k: [f"ensures {c}" for c in ensures_candidates(fn, program, m.language)] for m, fn in targets if not fn.unsupported and (k := (m.path, fn.name))}
+    cands = {k: [f"ensures {c}" for c in ensures_candidates(fn, program, m.language) if _norm(c) not in _stated(fn, program)] for m, fn in targets if not fn.unsupported and (k := (m.path, fn.name))}
     cands = {k: v for k, v in cands.items() if v}
     for rnd in range(MAX_ROUNDS):
         if not cands:
@@ -299,8 +299,9 @@ def propose(paths: list[str], root: str, opts: Any, only: set[str] | None = None
         cands = {k: v for k, v in cands.items() if v}
         if not failed:
             break
+    stated = {(m.path, fn.name): _stated(fn, program) for m, fn in targets}
     for key, cs in cands.items():
-        props[key].facts = _prune(cs)
+        props[key].facts = _prune(cs, stated.get(key, set()))
 
     # 2. preconditions that remove every crash, one candidate at a time
     reqs = {key: requires_candidates(fn, m.language) for m, fn in targets if (key := (m.path, fn.name)) in crashes and not fn.unsupported}
@@ -322,23 +323,43 @@ def propose(paths: list[str], root: str, opts: Any, only: set[str] | None = None
     return [p for p in props.values()]
 
 
+def _norm(text: str) -> str:
+    """Spacing and the names of generator variables do not matter."""
+    text = re.sub(r"\s+", " ", text.strip())
+    for v in re.findall(r"\bfor (\w+) in\b", text):
+        text = re.sub(rf"\b{v}\b", "_", text)
+    return text.replace(" ", "")
+
+
+def _stated(fn: ir.Function, program: Any) -> set[str]:
+    """What the contract already says: its @ensures, and for a method the
+    invariants of its class (both as written)."""
+    out = {_norm(c.text) for c in fn.ensures}
+    self_p = next((p for p in fn.params if p.name in ("self", "this")), None)
+    if self_p is not None and isinstance(self_p.ty, ir.TClass):
+        for cls in program.mro(self_p.ty.name) if self_p.ty.name in program.classes else []:
+            out |= {_norm(c.text) for c in program.classes[cls].invariants}
+    return out
+
+
 def _kind(k: str) -> str:
     return {"div": "division by zero", "index": "index out of bounds", "none": "None used as a value", "key": "missing key", "overflow": "overflow"}.get(k, k)
 
 
-def _prune(cs: list[str]) -> list[str]:
-    """Drop facts another kept fact implies (x > 0 makes x >= 0 redundant, == makes <= and >= redundant)."""
-    keep = list(cs)
-    text = set(c[len("ensures ") :] for c in cs)
+def _prune(cs: list[str], stated: set[str] = frozenset()) -> list[str]:  # type: ignore[assignment]
+    """Drop facts another kept or already stated fact implies (x > 0 makes
+    x >= 0 redundant, == makes <= and >= redundant). ``stated`` is
+    normalized (see _norm)."""
+    known = {_norm(c[len("ensures ") :]) for c in cs} | set(stated)
     out = []
-    for c in keep:
+    for c in cs:
         t = c[len("ensures ") :]
         m = re.fullmatch(r"(.+?) (>=|<=) (.+)", t)
-        if m and (f"{m.group(1)} == {m.group(3)}" in text or f"{m.group(1)} === {m.group(3)}" in text):
+        if m and (_norm(f"{m.group(1)} == {m.group(3)}") in known or _norm(f"{m.group(1)} === {m.group(3)}") in known):
             continue
-        if m and m.group(2) == ">=" and f"{m.group(1)} > {m.group(3)}" in text:
+        if m and m.group(2) == ">=" and _norm(f"{m.group(1)} > {m.group(3)}") in known:
             continue
-        if m and m.group(2) == "<=" and f"{m.group(1)} < {m.group(3)}" in text:
+        if m and m.group(2) == "<=" and _norm(f"{m.group(1)} < {m.group(3)}") in known:
             continue
         out.append(c)
     return out

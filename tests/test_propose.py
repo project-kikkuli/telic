@@ -106,3 +106,29 @@ def test_drafted_aims_with_builtin_oracle(tmp_path, monkeypatch):
     assert d["oracle"] == "builtin" and d["aims"] and not d["unbacked"]
     assert all(not i["lint"] for i in d["aims"])
     assert not any("old(self.owner)" in d["facts"][i["facts"][0]]["clause"] for i in d["aims"])  # frame facts are details
+
+
+STATED = """
+def double(xs: list[int]) -> list[int]:
+    #@ ensures len(result)   == len(xs)
+    #@ ensures all(v >= 0 for v in result) or not all(w >= 0 for w in xs)
+    return [x * 2 for x in xs]
+
+
+class Tab:
+    #@ invariant self.total >= 0
+    def __init__(self) -> None:
+        self.total = 0
+
+    def add(self, n: int) -> None:
+        #@ requires n >= 0
+        self.total = self.total + n
+"""
+
+
+def test_facts_the_contract_states_are_not_proposed_again(tmp_path):
+    (tmp_path / "s.py").write_text(STATED)
+    got = {p.func: p.facts for p in propose([str(tmp_path / "s.py")], str(tmp_path), opts())}
+    assert not any("len(result)" in f for f in got["double"])  # == is stated, so <= says nothing new
+    assert "ensures self.total >= 0" not in got["Tab.add"]
+    assert "ensures self.total >= old(self.total)" in got["Tab.add"]
