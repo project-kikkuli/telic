@@ -75,6 +75,8 @@ def _lit(v: Any, ty: ir.Type, rtype: str) -> str | None:
         base = "HashMap" if not m or rt.startswith("HashMap") else "BTreeMap"
         return ref + f"std::collections::{base}::from([{', '.join(pairs)}])"
     if isinstance(ty, ir.TEnum):
+        if isinstance(v, dict) and "member" in v:
+            v = v["member"]
         name = v if isinstance(v, str) and v in ty.members else ty.members[int(v) if isinstance(v, int) and 0 <= v < len(ty.members) else 0]
         return ref + f"{ty.name}::{name}"
     return None
@@ -217,9 +219,26 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
             continue
         cond = re.sub(r"\bresult\b", "__v", c.text)
         checks.append(f"if !({cond}) {{ println!(\"TELIC_VIOLATION ensures {i}\"); }}")
+    # the receiver changes only as its lifecycles allow
+    lcs = []
+    if any(p.name == "self" for p in fn.params):
+        from ..runtime import _lifecycles
+
+        lcs = _lifecycles(fe.module.classes, info.owner or "")
+    snaps: list[str] = []
+    lcs = [lc for _, lc in lcs]
+    for i, lc in enumerate(lcs):
+        cond, olds = _extract_old(re.sub(r"\bself\b", "__self", lc.code))
+        for k, o in enumerate(olds):
+            snaps.append(f"let __o{i}_{k} = ({o}).clone();")
+            cond = cond.replace(f"__OLD{k}__", f"__o{i}_{k}")
+        checks.append(f"if !({cond}) {{ println!(\"TELIC_VIOLATION lifecycle {i}\"); }}")
+    if snaps:
+        setup = setup + snaps
     variants = []
     if checks:
         variants.append(f"let __r = std::panic::catch_unwind(move || {{ {' '.join(setup)} let __v = {call}; {' '.join(checks)} format!(\"{{:?}}\", __v) }}); if let Ok(s) = __r {{ println!(\"TELIC_RETURNED {{}}\", s); }}")
+        setup = setup[: len(setup) - len(snaps)]
     variants += [
         f"let __r = std::panic::catch_unwind(move || {{ {' '.join(setup)} let __v = {call}; format!(\"{{:?}}\", __v) }}); if let Ok(s) = __r {{ println!(\"TELIC_RETURNED {{}}\", s); }}",
         f"let __r = std::panic::catch_unwind(move || {{ {' '.join(setup)} let _ = {call}; }}); if __r.is_ok() {{ println!(\"TELIC_RETURNED (value)\"); }}",
@@ -239,6 +258,8 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
             if line.startswith("TELIC_VIOLATION ensures "):
                 c = fn.ensures[int(line.split()[-1])]
                 return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip()}
+            if line.startswith("TELIC_VIOLATION lifecycle "):
+                return {"violation": "lifecycle", "func": ir.source_name(fn.name), "text": lcs[int(line.split()[-1])].clause.text}
         return out
     return _compile_error(err)
 
@@ -285,6 +306,22 @@ def run_rust_batch(path: str, fn: ir.Function, models: list[dict[str, Any]]) -> 
             for i in range(len(models))
         ]
     return [_compile_error(err)] * len(models)
+
+
+def _extract_old(text: str) -> tuple[str, list[str]]:
+    """``old(e)`` -> ``__OLDk__``, with the ``e`` texts in order."""
+    out, olds, i = "", [], 0
+    for m in re.finditer(r"\bold\(", text):
+        if m.start() < i:
+            continue
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        out += text[i : m.start()] + f"__OLD{len(olds)}__"
+        olds.append(text[m.end() : j - 1])
+        i = j
+    return out + text[i:], olds
 
 
 def _parse(out: str) -> dict[str, Any]:

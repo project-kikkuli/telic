@@ -66,6 +66,7 @@ Then follow this loop, or have your coding agent follow it:
 | broken promises | `✗ REFUTED` with an executed counterexample, as above |
 | crashes | `None` where a value is needed, missing dict key, index out of range, division by zero, an unintended `raise`; each one proved impossible or reproduced |
 | races | `⚡ RACE`: state checked before an `await` and used after it, when another task can change it in between |
+| state that goes backwards | `#@ lifecycle status: PENDING -> PAID -> SHIPPED` (or `never`, `monotonic`, `once`) in a class: every method is proved to keep it, so no sequence of calls can un-ship an order; transitions no method takes are listed ([example](examples/subscription.py)) |
 | frontend/backend drift | `//@ mirrors ../server/billing.py::discounted_total`: the two must agree on every input, or telic shows the input where they don't (e.g. banker's rounding vs `Math.round`) |
 | contracts that say too little | `telic gaps` mutates proved code, with deterministic operators (including deleted guard, validation and auth checks) and, with `--llm`, bugs a model writes; a mutant the contract still accepts is a bug the contract would let through, and a proposed `@ensures` is shown only once telic has checked it closes the gap |
 | safety aims an empty function meets | an aim that says "never" is `vacuous-risk` when a stub that returns at once meets all its lemmas |

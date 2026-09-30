@@ -174,9 +174,19 @@ function extractOld(text) {
   return [out, olds];
 }
 
+// Specs see the module's own names (enums, classes, functions) unless a
+// parameter shadows them; compiled on first use, once the module is loaded.
 function compileSpec(params, text) {
   const js = toJs(text);
-  return new Function(...params, "result", "__old", ...Object.keys(helpers), `return (${js});`);
+  let f = null;
+  return function (...args) {
+    if (!f) {
+      const bound = new Set([...params, "result", "__old", ...Object.keys(helpers)]);
+      const names = Object.keys(SCOPE).filter((n) => !bound.has(n) && /^[A-Za-z_$][\w$]*$/.test(n));
+      f = new Function(...params, "result", "__old", ...Object.keys(helpers), "__scope", `const { ${names.join(", ")} } = __scope; return (${js});`);
+    }
+    return f.call(this, ...args, SCOPE);
+  };
 }
 
 // Class invariants hold of the objects a function is passed, on entry and
@@ -222,13 +232,16 @@ function wrap(name, fn, c) {
   const pinv = (c.invs || []).map(([p, texts]) => [p, invFns(texts)]);
   const cinv = Object.fromEntries(Object.entries(c.classes || {}).map(([k, texts]) => [k, invFns(texts)]));
   const tracks = Object.keys(cinv).length > 0;
-  if (!c.requires.length && !c.ensures.length && !pinv.length && !tracks) return fn;
+  const lcs = c.lifecycles || [];
+  if (!c.requires.length && !c.ensures.length && !pinv.length && !tracks && !lcs.length) return fn;
   const params = c.params[0] === "self" ? c.params.slice(1) : c.params;
   const reqs = c.requires.map((t) => [t, compileSpec(params, t)]);
-  const ens = c.ensures.map((t) => {
-    const [rewritten, olds] = extractOld(t);
+  const twoState = (t, code) => {
+    const [rewritten, olds] = extractOld(code);
     return [t, compileSpec(params, rewritten), olds.map((o) => compileSpec(params, o))];
-  });
+  };
+  // a method's receiver changes only as its class's lifecycles allow: checked like an ensures
+  const ens = c.ensures.map((t) => [...twoState(t, t), "ensures"]).concat(lcs.map(([t, code]) => [...twoState(t, code), "lifecycle"]));
   const H = Object.values(helpers);
   return function (...args) {
     const self = this;
@@ -263,8 +276,8 @@ function wrap(name, fn, c) {
       thrown(e);
     }
     const done = (v) => {
-      ens.forEach(([t, f], k) => {
-        if (!f.call(self, ...args, v, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(v)}`);
+      ens.forEach(([t, f, , kind], k) => {
+        if (!f.call(self, ...args, v, olds[k], ...H)) throw new Violation(kind, t, name, `returned ${show(v)}`);
       });
       invariants(v);
       return v;

@@ -247,6 +247,11 @@ def _clause(d: dict[str, Any] | None) -> ir.Clause | None:
     return ir.Clause(d["kind"], _expr(d["expr"]), _loc(d["loc"]), d["text"], tuple(d.get("aims") or ()))
 
 
+def _lifecycle(d: dict[str, Any]) -> ir.Lifecycle:
+    probes = tuple(ir.Probe(p["label"], _expr(p["step"]), _expr(p["created"]) if p.get("created") else None) for p in d["probes"])
+    return ir.Lifecycle(d["kind"], _clause(d["clause"]), d["code"], probes)  # type: ignore[arg-type]
+
+
 def _stmts(xs: list[dict[str, Any]]) -> tuple[ir.Stmt, ...]:
     return tuple(_stmt(x) for x in xs)
 
@@ -325,6 +330,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
         m.functions[fn.name] = fn
     for cname, c in (d.get("classes") or {}).items():
         m.classes[cname] = ir.ClassDecl(cname, [(n, _type(t)) for n, t in c["fields"]], [_clause(x) for x in c.get("invariants", [])], _loc(c.get("loc")), bases=list(c.get("bases") or []), owner=dict(c.get("owner") or {}))  # type: ignore[misc]
+        m.classes[cname].lifecycles = [_lifecycle(x) for x in c.get("lifecycles") or []]
     m.imports = {k: (v[0], v[1]) for k, v in (d.get("imports") or {}).items()}
     m.class_origin = dict(d.get("class_origin") or {})
     m.opaque_subclasses = [(s, b, ir.Loc(int(line))) for s, b, line in d.get("opaque_subclasses", [])]

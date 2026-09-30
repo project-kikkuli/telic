@@ -17,6 +17,7 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { LifecycleError, lifecycleTexts, parseLifecycle } from "./lifecycle.mjs";
 
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
@@ -48,7 +49,7 @@ class LowerError extends Error {
 // ---------------------------------------------------------------------------
 // Contract comments (mirrors telic/contracts.py)
 
-const CLAUSE_KW = new Set(["requires", "ensures", "invariant", "decreases", "assert", "assume", "raises"]);
+const CLAUSE_KW = new Set(["requires", "ensures", "invariant", "decreases", "assert", "assume", "raises", "lifecycle"]);
 const DIRECTIVE_KW = new Set(["aim", "index", "mirrors", "trusted", "pure"]);
 const FUNCTION_KW = new Set(["requires", "ensures", "decreases", "raises", "aim", "mirrors", "trusted", "pure"]);
 const LOOP_KW = new Set(["invariant", "decreases", "index"]);
@@ -301,7 +302,7 @@ class ModuleLowerer {
     for (const [cname, c] of Object.entries(this.classes)) {
       if (c.home !== this) continue;
       const { fields, owner } = this.flatFields(cname);
-      const decl = { fields, owner, bases: c.base ? [c.base.name] : [], invariants: this.classInvariants(cname, c), loc: this.loc(c.node) };
+      const decl = { fields, owner, bases: c.base ? [c.base.name] : [], invariants: this.classInvariants(cname, c), lifecycles: this.lifecycles, loc: this.loc(c.node) };
       if (!c.abstract) {
         const missing = this.chain(cname).flatMap((a) => [...a.abstracts]).filter((m) => !this.chain(cname).some((a) => a.home.sigs[`${a.name}.${m}`] && !a.abstracts.has(m)));
         if (missing.length) this.module.problems.push([`class ${cname}: does not implement abstract method '${missing[0]}'`, this.line(c.node)]);
@@ -457,30 +458,56 @@ class ModuleLowerer {
 
   classInvariants(cname, c) {
     const out = [];
+    this.lifecycles = [];
     const start = c.node.getStart(this.sf), end = c.node.getEnd();
     const inMember = (pos) => c.node.members.some((m) => (ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) && m.body && pos > m.body.getStart(this.sf) && pos < m.body.getEnd());
     for (const cl of this.contracts) {
-      if (cl.consumed || cl.keyword !== "invariant" || cl.pos < start || cl.pos > end || inMember(cl.pos)) continue;
+      if (cl.consumed || (cl.keyword !== "invariant" && cl.keyword !== "lifecycle") || cl.pos < start || cl.pos > end || inMember(cl.pos)) continue;
       cl.consumed = true;
+      const walk = (x) => {
+        if (!x || typeof x !== "object") return;
+        const what = cl.keyword === "lifecycle" ? "a lifecycle" : "a class invariant";
+        if (x.e === "Field" && x.obj.ty.k === "class" && !(x.obj.e === "Var" && x.obj.name === "self")) throw new LowerError(`${what} may only read fields of 'this', not of other objects`, cl.line);
+        if (x.e === "Quant" && (x.idx === "self" || x.elem === "self")) throw new LowerError(`${what} may not rebind 'self'`, cl.line);
+        if (x.e === "Call" && x.args.some((a) => reachesObject(a.ty))) throw new LowerError(`${what} may not call functions on objects (they could read other objects); write the condition on this's fields`, cl.line);
+        for (const v of Object.values(x)) if (Array.isArray(v)) v.forEach(walk);
+        else if (v && typeof v === "object") walk(v);
+      };
       try {
         const fl = new FunctionLowerer(this, { name: `${cname}.<invariant>`, node: null, cls: cname, invariantScope: true });
+        if (cl.keyword === "lifecycle") {
+          this.lifecycles.push(this.lifecycle(fl, cl, walk));
+          continue;
+        }
         const cls = fl.clause(cl, "invariant", cl.tags);
-        const walk = (x) => {
-          if (!x || typeof x !== "object") return;
-          if (x.e === "Field" && x.obj.ty.k === "class" && !(x.obj.e === "Var" && x.obj.name === "self")) throw new LowerError("a class invariant may only read fields of 'this', not of other objects", cl.line);
-          if (x.e === "Quant" && (x.idx === "self" || x.elem === "self")) throw new LowerError("a class invariant may not rebind 'self'", cl.line);
-          if (x.e === "Call" && x.args.some((a) => reachesObject(a.ty))) throw new LowerError("a class invariant may not call functions on objects (they could read other objects); write the condition on this's fields", cl.line);
-          for (const v of Object.values(x)) if (Array.isArray(v)) v.forEach(walk);
-          else if (v && typeof v === "object") walk(v);
-        };
         walk(cls.expr);
         out.push(cls);
       } catch (e) {
-        if (!(e instanceof LowerError)) throw e;
-        this.module.problems.push([`class ${cname}: invariant: ${e.message}`, e.line || cl.line]);
+        if (!(e instanceof LowerError) && !(e instanceof LifecycleError)) throw e;
+        this.module.problems.push([`class ${cname}: ${cl.keyword}: ${e.message}`, e.line || cl.line]);
       }
     }
     return out;
+  }
+
+  lifecycle(fl, cl, walk) {
+    const form = parseLifecycle(cl.payload);
+    const t = lifecycleTexts(form);
+    const lower = (text, twoState) => {
+      fl.allowOld = twoState;
+      try {
+        const e = fl.clause({ ...cl, payload: text }, "lifecycle", cl.tags).expr;
+        walk(e);
+        return e;
+      } finally {
+        fl.allowOld = false;
+      }
+    };
+    const text = cl.payload.split(/\s+/).filter(Boolean).join(" ");
+    const loc = [cl.line, cl.payloadCol, cl.payload.includes("\n") ? 0 : cl.payloadCol + cl.payload.length];
+    const clause = { kind: "lifecycle", expr: lower(t.relation, true), loc, text, aims: cl.tags };
+    const probes = t.probes.map(([label, step, created]) => ({ label, step: lower(step, true), created: created === null ? null : lower(created, false) }));
+    return { kind: form.kind, clause, code: t.relation, probes };
   }
 
   record(name, members, node) {
@@ -2710,7 +2737,7 @@ class FunctionLowerer {
     }
     const name = c.text;
     if (this.spec && name === "old") {
-      if (!this.resultTy) throw this.err("old(...) is only allowed in '@ensures'", this.nline(n));
+      if (!this.resultTy && !this.allowOld) throw this.err("old(...) is only allowed in '@ensures'", this.nline(n));
       const x = this.expr(args[0]);
       return { e: "Old", ty: x.ty, loc, expr: x };
     }

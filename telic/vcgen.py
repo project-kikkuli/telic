@@ -399,6 +399,11 @@ class VCGen:
         self.unfolding_stack: list[str] = []
         self.fuel = PREDICATE_FUEL
         self.probes_contract = False
+        # objects this call allocated, and the states lifecycle coverage asks
+        # about: (facts, path condition, object, class, env, created)
+        self.created: set = set()
+        self.lc_written: list[str] = []  # classes of the non-parameter objects it writes a field of
+        self.lc_sites: list[tuple[list[L.Term], L.Term, L.Term, str, dict[str, Val], bool]] = []
 
     # -- naming -----------------------------------------------------------
 
@@ -582,6 +587,34 @@ class VCGen:
             out += [(inv, self.ev(inv.expr, ctx)) for i, inv in enumerate(decl.invariants) if (c, i) not in skip]
         return out
 
+    def class_lifecycles(self, cls: str, ref: L.Term, pre: dict[str, Val], post: dict[str, Val], ctx_base: list[L.Term]) -> list[tuple[ir.Lifecycle, L.Term]]:
+        """Each lifecycle of ``cls`` as a relation between the object ``ref``
+        in heap ``pre`` and in heap ``post``."""
+        out = []
+        typed = L.and_(*self.enum_facts(cls, ref, pre), *self.enum_facts(cls, ref, post))
+        for owner, lc in self.program.lifecycles_for(cls):
+            out.append((lc, L.implies(typed, self.two_state(lc.clause.expr, owner, ref, pre, post, ctx_base))))
+        return out
+
+    def enum_facts(self, cls: str, ref: L.Term, env: dict[str, Val]) -> list[L.Term]:
+        """An enum field of an object holds one of its members."""
+        out: list[L.Term] = []
+        for fname, fty in self.program.classes[cls].fields:
+            if (isinstance(fty, ir.TEnum) or (isinstance(fty, ir.TOption) and isinstance(fty.inner, ir.TEnum))) and self.heap_keys(cls, fname):
+                out += self.alloc_facts(self.heap_read(env, cls, fname, ref), fty, env)
+        return out
+
+    def two_state(self, e: ir.Expr, owner: str, ref: L.Term, pre: dict[str, Val] | None, post: dict[str, Val], ctx_base: list[L.Term]) -> L.Term:
+        """A class-scope spec over ``self`` (``old(...)`` reads ``pre``)."""
+        old_env = {**self.heap_env(pre), "self": ref} if pre is not None else None
+        ctx = Ctx(base=ctx_base, env={**self.heap_env(post), "self": ref}, module=self.program.class_module[owner], old_env=old_env, spec=True, quiet=True)
+        return self.ev(e, ctx)  # type: ignore[return-value]
+
+    @property
+    def fresh_self(self) -> bool:
+        """Is ``self`` an object this call is building?"""
+        return self.fn.name.endswith((".__init__", ".__post_init__"))
+
     # -- obligations ------------------------------------------------------
 
     def oblige(
@@ -640,6 +673,7 @@ class VCGen:
         if st.alive:
             self.exits.append(Exit(list(st.facts), None, dict(st.env), ir.Loc(fn.end_line)))
         self.check_exits()
+        self.ran = True
         return self.obligations
 
     def enter(self) -> State:
@@ -782,6 +816,7 @@ class VCGen:
             # Objects this function could have changed must satisfy their
             # class invariants again when it returns.
             self.check_objects(State(ex.env, st.facts), ex.loc, "on return")
+            self.check_lifecycles(ex.env, st.facts, ex.loc)
             if fn.raises:
                 ctx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ctx) for r in fn.raises])
@@ -795,6 +830,35 @@ class VCGen:
                     site=ex.loc,
                     clause=fn.raises[0],
                 )
+
+    def check_lifecycles(self, env: dict[str, Val], facts: list[L.Term], site: ir.Loc, probe: bool = True) -> None:
+        """Objects that existed at entry changed only as their lifecycles
+        allow when control leaves: the parameters, and every object of a
+        class written here (quantified: a write's path condition inside a
+        loop says nothing about the state after it)."""
+        fn = self.fn
+        alloc0 = self.entry["@alloc"]
+        ctx = Ctx(base=facts, env=env, module=self.module, spec=True)
+        for p in fn.params:
+            if isinstance(p.ty, ir.TClass):
+                ref = self.entry[p.name]
+                created = self.fresh_self and p.name == "self"
+                if probe and self.program.lifecycles_for(p.ty.name, never=True):
+                    self.lc_sites.append((list(facts), L.TRUE, ref, p.ty.name, dict(env), created))  # type: ignore[arg-type]
+                if created:
+                    continue
+                for lc, t in self.class_lifecycles(p.ty.name, ref, self.entry, env, facts):  # type: ignore[arg-type]
+                    self.oblige("lifecycle", ctx, t, lc.clause.loc, f"'{p.name}' changes only as the lifecycle of {p.ty.name} allows ('{lc.clause.text}')", site=site, clause=lc.clause)
+        for cls in self.lc_written:
+            if not self.program.lifecycles_for(cls, never=True):
+                continue
+            if probe:
+                some = L.Const(f"{cls}@some{next(self.counter)}", L.INT)
+                self.lc_sites.append((list(facts), L.select(alloc0, some), some, cls, dict(env), False))  # type: ignore[arg-type]
+            r = L.Const(f"r!{next(self.counter)}", L.INT)
+            for lc, t in self.class_lifecycles(cls, r, self.entry, env, facts):
+                goal = L.forall([r], L.implies(L.select(alloc0, r), t))  # type: ignore[arg-type]
+                self.oblige("lifecycle", ctx, goal, lc.clause.loc, f"every {cls} written here changes only as its lifecycle allows ('{lc.clause.text}')", site=site, clause=lc.clause)
 
     # -- statements -------------------------------------------------------
 
@@ -814,6 +878,8 @@ class VCGen:
             ref = self.ev(s.obj, ctx)
             v = coerce(self.ev(s.value, ctx), self.program.classes[s.cls].field_type(s.field))
             self.heap_write(st.env, s.cls, s.field, ref, v)  # type: ignore[arg-type]
+            if ref not in self.created and all(ref != self.entry[p.name] for p in self.fn.params if isinstance(p.ty, ir.TClass)) and s.cls not in self.lc_written:
+                self.lc_written.append(s.cls)
             if self.has_invariants(s.cls) and ref not in self.checked_params(s.cls):
                 key = WRITTEN + s.cls
                 st.env[key] = L.store(st.env[key], ref, L.TRUE)  # type: ignore[arg-type]
@@ -931,6 +997,7 @@ class VCGen:
             # (without a contract, an explicit raise is what the function does, not a failure)
             if not self.is_init:  # (an object whose initializer raises never reaches the caller)
                 self.check_objects(st, s.loc, "when it raises")
+                self.check_lifecycles(st.env, st.facts, s.loc, probe=False)
             st.alive = False
             return st
         if isinstance(s, ir.ExprStmt):
@@ -1914,6 +1981,8 @@ class VCGen:
                 self.havoc_heap(ctx)
                 if any(c.invariants for c in self.program.classes.values()):
                     self.note(e.loc, "unchecked code leaves objects satisfying their class invariants")
+                if any(d.lifecycles for d in self.program.classes.values()):
+                    self.note(e.loc, "unchecked code changes objects only as their lifecycles allow")
         r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
         if isinstance(r, ListVal):
             ctx.assume(L.le(L.ZERO, r.len))
@@ -1961,6 +2030,7 @@ class VCGen:
         env = ctx.state.env
         alloc = env["@alloc"]
         r = L.Const(f"{e.cls}@new{next(self.counter)}", L.INT)
+        self.created.add(r)
         ctx.assume(L.not_(L.select(alloc, r)))  # type: ignore[arg-type]
         env["@alloc"] = L.store(alloc, r, L.TRUE)  # type: ignore[arg-type]
         if init is not None:
@@ -1979,6 +2049,8 @@ class VCGen:
             self.call(post, [r], [None], ctx, e.loc, new_self=True)
             return r
         self.new_invariants(e.cls, r, env, ctx, e.loc)
+        if self.program.lifecycles_for(e.cls, never=True):
+            self.lc_sites.append((list(ctx.base), L.and_(*ctx.guard), r, e.cls, dict(env), True))
         return r
 
     def new_invariants(self, cls: str, r: L.Term, env: dict[str, Val], ctx: Ctx, loc: ir.Loc) -> None:
@@ -2059,6 +2131,7 @@ class VCGen:
         muts = self.program.mutated.get(callee.key, set())
         post: dict[str, Val] = {}
         env = ctx.state.env
+        heap_pre = self.heap_env(env)
         for p, a_expr in zip(fn.params, arg_exprs):
             if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
                 nd = self.fresh(a_expr.name, p.ty)
@@ -2082,6 +2155,10 @@ class VCGen:
         for i, p in enumerate(fn.params):
             if isinstance(p.ty, ir.TClass) and (returned or not (new_self and i == 0)):
                 for _, t in self.class_invariants(p.ty.name, args[i], env, ctx.base):  # type: ignore[arg-type]
+                    ctx.assume(t)
+            # ... changed only as their lifecycles allow
+            if isinstance(p.ty, ir.TClass) and not (new_self and i == 0):
+                for _, t in self.class_lifecycles(p.ty.name, args[i], heap_pre, env, ctx.base):  # type: ignore[arg-type]
                     ctx.assume(t)
         return post
 

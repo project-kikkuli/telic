@@ -598,3 +598,57 @@ def leaves(t: Tree) -> int:
     if isinstance(t, Leaf):
         return 1
     return leaves(t.left) + leaves(t.right)
+
+
+class Ticket:
+    #@ lifecycle state: 0 -> 1 -> 2, 0 | 1 -> 3
+    #@ lifecycle never state: 2 -> 0
+    #@ lifecycle monotonic self.version
+    #@ lifecycle once self.state == 2
+    def __init__(self) -> None:
+        self.state = 0
+        self.version = 0
+
+
+# expect: proved
+def advance_ticket(t: Ticket) -> None:
+    # every call keeps the lifecycle, so no sequence of calls reopens a closed ticket
+    if t.state == 0 or t.state == 1:
+        t.state = t.state + 1
+        t.version = t.version + 1
+
+
+# expect: proved
+def cancel_twice(t: Ticket) -> None:
+    # 0 -> 1 -> 3 in one call: a path in the lifecycle, so allowed
+    if t.state == 0:
+        t.state = 1
+        t.state = 3
+
+
+# expect: refuted
+def reopen_ticket(t: Ticket) -> None:
+    if t.state == 2:
+        t.state = 0
+
+
+# expect: refuted
+def rewind_version(t: Ticket) -> None:
+    t.version = t.version - 1
+
+
+# expect: proved
+def advance_all(t: Ticket, u: Ticket) -> None:
+    # callees keep the lifecycle, so their composition does
+    advance_ticket(t)
+    advance_ticket(u)
+    advance_ticket(t)
+
+
+# expect: open
+def reopen_first(ts: list[Ticket]) -> None:
+    # an object reached through a list: the solver refutes it, the runtime
+    # checks only parameters, so the counterexample is not confirmed
+    if len(ts) > 0:
+        t = ts[0]
+        t.state = 0

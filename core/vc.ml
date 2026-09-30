@@ -181,6 +181,7 @@ type classinfo = {
   post_init : string option;
   cbases : string list;  (** checked base classes *)
   owner : (string * string) list;  (** field -> the class that introduced it *)
+  clcs : (string * Ir.clause) list;  (** (owner, relation) for every lifecycle its objects keep *)
 }
 
 type program = {
@@ -268,6 +269,8 @@ type gen = {
   mutable loop_notes : (int * string) list;
   mutable definitional_mode : bool;
   mutable written : (string * int) list;  (** (class, line) of each field write to a class with an invariant, reversed *)
+  mutable created : term list;  (** objects this call allocated *)
+  mutable lc_written : string list;  (** classes of the non-parameter objects it writes a field of *)
 }
 
 let next g =
@@ -304,6 +307,9 @@ let finfo_of g key = try Hashtbl.find g.prog.funcs key with Not_found -> raise (
 let resolve g modpath name = Option.map (finfo_of g) (Hashtbl.find_opt g.prog.resolve_tbl (modpath, name))
 let class_of g name = Hashtbl.find_opt g.prog.by_name name
 let is_init g = let n = g.info.fn.name in String.length n >= 9 && String.sub n (String.length n - 9) 9 = ".__init__"
+
+(* is 'self' an object this call is building? *)
+let fresh_self g = is_init g || (let n = g.info.fn.name in String.length n >= 14 && String.sub n (String.length n - 14) 14 = ".__post_init__")
 
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
 let is_heap k = String.length k > 0 && k.[0] = '@'
@@ -664,6 +670,31 @@ and class_invariants ?(skip = []) g cls r env base =
       | _ -> [])
     (mro g cls)
 
+(* an enum field of an object holds one of its members *)
+and enum_facts g cls r env =
+  match class_of g cls with
+  | None -> []
+  | Some c ->
+    List.concat_map
+      (fun (f, (fty : Ir.ty)) ->
+        match fty with
+        | (TEnum _ | TOption (TEnum _)) when heap_keys g cls f <> [] -> alloc_facts g (heap_read g env cls f r) fty env
+        | _ -> [])
+      c.cfields
+
+(* each lifecycle of cls as a relation between object r in heap pre and in heap post *)
+and class_lifecycles g cls r pre post base =
+  match class_of g cls with
+  | None -> []
+  | Some c ->
+    let typed = and_ (enum_facts g cls r pre @ enum_facts g cls r post) in
+    List.map
+      (fun (owner, (cl : Ir.clause)) ->
+        let modpath = match class_of g owner with Some o -> o.cmod | None -> c.cmod in
+        let ctx = spec_ctx g ~modpath ~old_env:(SM.add "self" (T r) (heap_env pre)) ~base ~env:(SM.add "self" (T r) (heap_env post)) () in
+        (cl, implies typed (term_of cl.cloc (ev g ctx cl.cexpr))))
+      c.clcs
+
 and builtin g ctx (e : Ir.expr) name args =
   let loc = e.loc in
   let tm x = term_of loc x in
@@ -1007,7 +1038,8 @@ and extern g ctx (e : Ir.expr) name args =
        touched;
      if extern_touches_heap g args || (g.prog.classes <> [] && fn.escaped <> []) then begin
        havoc_heap g ctx;
-       if List.exists (fun c -> c.cinvs <> []) g.prog.classes then note_assumed g loc "unchecked code leaves objects satisfying their class invariants"
+       if List.exists (fun c -> c.cinvs <> []) g.prog.classes then note_assumed g loc "unchecked code leaves objects satisfying their class invariants";
+       if List.exists (fun c -> c.clcs <> []) g.prog.classes then note_assumed g loc "unchecked code changes objects only as their lifecycles allow"
      end
    | None -> ());
   let r =
@@ -1032,6 +1064,7 @@ and new_object g ctx loc cls args =
   let vals = List.map (fun (a, t) -> coerce (ev g ctx a) (Some t)) (zip args ptys) in
   let alloc = alloc_of st.env in
   let r = const (Printf.sprintf "%s@new%d" cls (next g)) Int in
+  g.created <- r :: g.created;
   assume ctx (not_ (select alloc r));
   st.env <- SM.add "@alloc" (T (store alloc r tt)) st.env;
   let check_invariants () =
@@ -1133,6 +1166,7 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
   let fn = callee.fn in
   let muts = callee.mutated in
   let post = ref SM.empty in
+  let heap_pre = heap_env st.env in
   List.iter
     (fun ((p, pty), a_e) ->
       match a_e with
@@ -1156,6 +1190,13 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
     (fun i ((_, pty), a) ->
       match (pty, a) with
       | Ir.TClass c, T r when returned || not (new_self && i = 0) -> List.iter (fun (_, t) -> assume ctx t) (class_invariants g c r st.env ctx.base)
+      | _ -> ())
+    (zip fn.params args);
+  (* ... changed only as their lifecycles allow *)
+  List.iteri
+    (fun i ((_, pty), a) ->
+      match (pty, a) with
+      | Ir.TClass c, T r when not (new_self && i = 0) -> List.iter (fun (_, t) -> assume ctx t) (class_lifecycles g c r heap_pre st.env ctx.base)
       | _ -> ())
     (zip fn.params args);
   SM.union (fun _ _ b -> Some b) !post (heap_env st.env)
@@ -1259,6 +1300,32 @@ and written_claims g cls env base =
    field of, satisfy their invariants when control leaves it: on return, on
    raise, and while it is suspended (other tasks, or a generator's consumer,
    run then) *)
+(* objects that existed at entry changed only as their lifecycles allow when control
+   leaves: the parameters, and every object of a class written here (quantified: a
+   write's path condition inside a loop says nothing about the state after it) *)
+and check_lifecycles g facts env (site : Ir.loc) =
+  let alloc0 = alloc_of g.entry in
+  let lctx = spec_ctx g ~quiet:false ~base:facts ~env () in
+  List.iter
+    (fun (p, (ty : Ir.ty)) ->
+      match (ty, SM.find_opt p g.entry) with
+      | TClass c, Some (T r) when not (fresh_self g && p = "self") ->
+        List.iter
+          (fun ((cl : Ir.clause), t) ->
+            oblige g ~site ~clause:cl "lifecycle" lctx t cl.cloc (Printf.sprintf "'%s' changes only as the lifecycle of %s allows ('%s')" p c cl.text))
+          (class_lifecycles g c r g.entry env facts)
+      | _ -> ())
+    g.info.fn.params;
+  List.iter
+    (fun cls ->
+      let r = const (Printf.sprintf "r!%d" (next g)) Int in
+      List.iter
+        (fun ((cl : Ir.clause), t) ->
+          oblige g ~site ~clause:cl "lifecycle" lctx (forall [ r ] (implies (select alloc0 r) t)) cl.cloc
+            (Printf.sprintf "every %s written here changes only as its lifecycle allows ('%s')" cls cl.text))
+        (class_lifecycles g cls r g.entry env facts))
+    (List.rev g.lc_written)
+
 and check_objects g ?(guard = []) facts env (site : Ir.loc) when_ =
   let ctx = spec_ctx g ~quiet:false ~guard ~base:facts ~env () in
   let calling = String.length when_ >= 12 && String.sub when_ 0 12 = "when calling" in
@@ -1318,6 +1385,8 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     let r = term_of loc (ev g ctx obj) in
     let x = coerce (ev g ctx v) (Some (field_type g cls f)) in
     st.env <- heap_write g st.env cls f r x;
+    let params = List.filter_map (fun (p, (ty : Ir.ty)) -> match (ty, SM.find_opt p g.entry) with Ir.TClass _, Some (T pr) -> Some pr | _ -> None) g.info.fn.params in
+    if not (List.memq r params || List.memq r g.created || List.mem cls g.lc_written) then g.lc_written <- cls :: g.lc_written;
     if has_invariants g cls && not (List.memq r (checked_params g cls)) then begin
       let key = written_key cls in
       (match SM.find_opt key st.env with Some (T w) -> st.env <- SM.add key (T (store w r tt)) st.env | _ -> ());
@@ -1431,7 +1500,10 @@ and stmt g (s : Ir.stmt) (st : state) : state =
          oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable (add '@raises <condition>' if intended)" what)
        (* without a contract, an explicit raise is what the function does, not a failure *));
       (* (an object whose initializer raises never reaches the caller) *)
-      if not (is_init g) then check_objects g st.facts st.env loc "when it raises";
+      if not (is_init g) then begin
+        check_objects g st.facts st.env loc "when it raises";
+        check_lifecycles g st.facts st.env loc
+      end;
       st.alive <- false;
       st
     end
@@ -1802,6 +1874,7 @@ let check_exits g =
           fn.ensures;
         (* objects the function could have changed satisfy their invariants again *)
         check_objects g facts ex.eenv ex.eloc "on return";
+        check_lifecycles g facts ex.eenv ex.eloc;
         if fn.raises <> [] then begin
           let ctx = spec_ctx g ~base:facts ~env:g.entry () in
           let cond = or_ (List.map (fun (r : Ir.clause) -> term_of r.cloc (ev g ctx r.cexpr)) fn.raises) in
@@ -1814,7 +1887,7 @@ let check_exits g =
 let make prog info opts =
   {
     prog; info; opts; obligations = []; exits = []; loops = []; counter = 0; ids = Hashtbl.create 32; deps = []; entry = SM.empty;
-    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; written = [];
+    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; written = []; created = []; lc_written = [];
   }
 
 let run g =

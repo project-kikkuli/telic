@@ -227,6 +227,7 @@ class Report:
     cache_hits: int = 0
     solved: int = 0
     ui: Any = None  # ui.run.UiReport
+    lifecycles: list[Any] = field(default_factory=list)  # history.LifecycleReport
 
     def all_verdicts(self) -> list[Verdict]:
         return [v for f in self.functions for v in f.verdicts]
@@ -235,7 +236,7 @@ class Report:
     def ok(self) -> bool:
         return not any(f.status in ("refuted", "error") for f in self.functions) and not any(
             m.status == "refuted" for m in self.mirrors
-        ) and not any(p for m in self.modules for p in m.problems) and not (
+        ) and not any(lc.status == "refuted" for lc in self.lifecycles) and not any(p for m in self.modules for p in m.problems) and not (
             self.ui is not None and (self.ui.problems or any(r.status == "refuted" for r in self.ui.results))
         )
 
@@ -409,7 +410,7 @@ def _lowered(program: Program, key: str) -> str:
 def _classes(program: Program) -> str:
     memo = program.__dict__.setdefault("_lowered", {})
     if "" not in memo:
-        decls = {n: {"fields": [[f, irjson.ty(t)] for f, t in c.fields], "invariants": [i.text for i in c.invariants], "bases": c.bases, "owner": c.owner} for n, c in program.classes.items()}
+        decls = {n: {"fields": [[f, irjson.ty(t)] for f, t in c.fields], "invariants": [i.text for i in c.invariants], "lifecycles": [lc.clause.text for lc in c.lifecycles], "bases": c.bases, "owner": c.owner} for n, c in program.classes.items()}
         memo[""] = json.dumps(decls, sort_keys=True, default=str)
     return memo[""]
 
@@ -950,6 +951,11 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 todo.extend(dr.deps)
             todo.extend(program.dispatch.get(d, ()))  # a call through a base may run any override
 
+    from . import history
+
+    gens = {r.ref.key: g for r, g in entry_checks}
+    lifecycles = history.check(program, reports, gens, lambda obs: solve_all(obs, theory, opts.timeout_ms, opts.jobs), cache, lambda ob: obligation_key(ob, theory))
+
     mirrors = []
     if any(f.mirrors for m in modules for f in m.functions.values()):
         from .equiv import check_mirrors
@@ -958,6 +964,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     cache.save()
     rep = Report(modules, program, reports, [], mirrors, time.perf_counter() - t0, hits, solved)
+    rep.lifecycles = lifecycles
     rep.root = program.root  # type: ignore[attr-defined]
     if ui is not None and (ui.lemmas or ui.aims):
         from .ui.run import run as run_ui

@@ -546,6 +546,32 @@ class AimDecl:
     loc: Loc
 
 
+@dataclass(frozen=True)
+class Probe:
+    """A step a lifecycle names, asked of every method: can any call take
+    an object from before to after this way (``step``, over ``old(...)``),
+    or create one this way (``created``, over the new object)?"""
+
+    label: str
+    step: Expr
+    created: Expr | None = None
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    """How an object may change from one call to the next (a history
+    constraint): ``clause.expr`` relates the object before a call
+    (``old(...)``) to after it. ``never`` lines are consequences of the
+    others, proved once for the class; the rest are proved for every
+    function that may change the object. ``code`` is the relation in the
+    host language, for runtime checks."""
+
+    kind: str  # graph | never | monotonic | once | step
+    clause: Clause
+    code: str
+    probes: tuple[Probe, ...] = ()
+
+
 @dataclass
 class ClassDecl:
     """A mutable class: typed fields, invariants over ``self``, methods
@@ -558,6 +584,7 @@ class ClassDecl:
     loc: Loc = NOLOC
     bases: list[str] = field(default_factory=list)  # checked base classes
     owner: dict[str, str] = field(default_factory=dict)  # field -> the class that introduced it
+    lifecycles: list[Lifecycle] = field(default_factory=list)  # its own; bases' apply too
 
     def field_type(self, name: str) -> Type | None:
         for f, t in self.fields:

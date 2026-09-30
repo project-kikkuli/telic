@@ -37,6 +37,8 @@ from ..contracts import (
     parse_comment_lines,
     parse_aim_directive,
 )
+from ..lifecycle import LifecycleError
+from ..lifecycle import build as build_lifecycle
 
 RUST_ASSUMPTIONS = [
     "f32/f64 are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
@@ -162,6 +164,8 @@ class RustFrontend:
             s.record = s.copy and scalar and s.name not in mutating_impls
         for s in self.structs.values():
             self._declare_struct(s)
+        for s in self.structs.values():
+            self._lifecycles(s)
         for it, _ in items:
             if it.type == "function_item":
                 self._signature(it, None)
@@ -273,6 +277,33 @@ class RustFrontend:
             self.module.records[s.name] = ir.TRecord(s.name, tuple(typed))
         else:
             self.module.classes[s.name] = ir.ClassDecl(s.name, [(f, t) for f, t in typed], [], ir.Loc(s.node.start_point[0] + 1, s.node.start_point[1]))
+
+    def _lifecycles(self, s: StructInfo) -> None:
+        """Lifecycle lines inside a struct's braces or in the comments right above it."""
+        lo, hi = s.node.start_point[0] + 1, s.node.end_point[0] + 1
+        while lo > 1 and self.lines[lo - 2].strip().startswith(("//", "#[")):
+            lo -= 1
+        mine = [cl for cl in self.contract_lines if not cl.consumed and cl.keyword == "lifecycle" and lo <= cl.line <= hi]
+        if not mine:
+            return
+        decl = self.module.classes.get(s.name)
+        info = FnInfo(f"{s.name}.<lifecycle>", s.node, [ir.Param("self", ir.TClass(s.name))], ir.NONE, None, {}, "mut", s.name, set())
+        for cl in mine:
+            cl.consumed = True
+            if decl is None:
+                self.module.problems.append((f"struct {s.name}: lifecycle: a Copy struct of scalars is a value, so it has no lifecycle; give it a '&mut self' method or drop Copy", ir.Loc(cl.line, cl.col)))
+                continue
+            fl = FunctionLowerer(self, info)
+
+            def lower(text: str, two_state: bool, cl: ContractLine = cl) -> ir.Expr:
+                line = ContractLine(cl.keyword, text, cl.line, cl.col, cl.payload_col, cl.tags)
+                return fl.clause(line, "lifecycle" if two_state else "lifecycle.new").expr
+
+            loc = ir.Loc(cl.line, cl.payload_col, cl.payload_col + len(cl.payload) if "\n" not in cl.payload else 0)
+            try:
+                decl.lifecycles.append(build_lifecycle(cl.payload, loc, tuple(cl.tags), "rust", lower))
+            except (LowerError, ContractSyntaxError, LifecycleError) as e:
+                self.module.problems.append((f"struct {s.name}: lifecycle: {e}", ir.Loc(cl.line, cl.col)))
 
     def _enum(self, it: Any) -> None:
         name = _text(it.child_by_field_name("name"))
@@ -555,7 +586,7 @@ class FunctionLowerer:
         body = fn.child_by_field_name("body")
         stmt = next(c for c in body.children if c.is_named)
         node = stmt.children[0] if stmt.type == "expression_statement" else stmt
-        el = ExprLowerer(self, spec=True, line_offset=cl.line - 2, col_offset=cl.payload_col, allow_old=kind in ("ensures", "invariant"))
+        el = ExprLowerer(self, spec=True, line_offset=cl.line - 2, col_offset=cl.payload_col, allow_old=kind in ("ensures", "invariant", "lifecycle"))
         e = el.expr(node, expect)
         if el.pre:
             raise LowerError(f"'@{kind}' must be a pure expression", cl.line)

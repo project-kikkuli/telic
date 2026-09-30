@@ -255,7 +255,10 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
 
     classes = {ir.source_name(c): invs(c) for c in module.classes}
     classes = {c: ts for c, ts in classes.items() if ts}
+    from .runtime import _lifecycles
+
     for f in module.functions.values():
+        recv = f.params[0].ty if f.params and f.params[0].name == "self" and not f.name.endswith(".__init__") else None
         out[ir.source_name(f.name)] = {
             "params": [p.name for p in f.params],
             "lists": [i for i, p in enumerate(f.params) if isinstance(p.ty, ir.TList)],
@@ -264,6 +267,7 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
             # class invariants: of the objects passed in, and of every object it changes
             "invs": [[p.name, invs(p.ty.name)] for p in f.params if isinstance(p.ty, ir.TClass) and invs(p.ty.name)],
             "classes": classes if classes and any(isinstance(s, ir.FieldAssign) for s in ir.walk_stmts(f.body)) else {},
+            "lifecycles": [[lc.clause.text, f"!(this instanceof {ir.source_name(owner)}) || ({lc.code})"] for owner, lc in _lifecycles(module.classes, recv.name)] if isinstance(recv, ir.TClass) else [],
         }
     out["__classes__"] = classes
     return out
@@ -289,6 +293,7 @@ EXPECTED = {
     "none": ("crash", "TypeError"),
     "key": ("crash", "KeyError"),
     "class.inv": ("violation", "class.inv"),
+    "lifecycle": ("violation", "lifecycle"),
 }
 
 
@@ -329,6 +334,8 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
         return crash == "KeyError" or bool(out.get("missing_key"))
     if k == "class.inv":
         return v == "class.inv" and out.get("func") == ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
+    if k == "lifecycle":
+        return v == "lifecycle" and out.get("func") == ir.source_name(fn.name) and _same(out.get("text", ""), ob.clause)
     if k == "raise":
         return crash is not None and crash not in ("RecursionError",)
     if k == "raises":
@@ -349,6 +356,8 @@ def describe(out: dict[str, Any], runtime: str) -> str:
         if kind == "class.inv":
             how = "raises" if str(out.get("detail", "")) == "raised" else "returns"
             return f"{runtime}: class invariant '{text}' is false when {where.split('.')[-1]}() {how}"
+        if kind == "lifecycle":
+            return f"{runtime}: {where.split('.')[-1]}() changed an object in a way its lifecycle '{text}' forbids"
         if kind == "invariant":
             return f"{runtime}: invariant '{text}' is false at runtime -- the invariant itself is wrong"
         return f"{runtime}: '@{kind} {text}' failed" + (f" at line {out.get('line')}" if out.get("line") else "")

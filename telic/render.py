@@ -116,6 +116,7 @@ KIND_NOUN = {
     "raises": "raises",
     "return": "return",
     "assert": "assertion",
+    "lifecycle": "lifecycle",
 }
 
 
@@ -223,6 +224,7 @@ class Renderer:
         for mr in self.r.mirrors:
             if mr.status != "proved" or self.verbose:
                 out += self.mirror_detail(mr)
+        out += self.lifecycle_section()
         out += self.ui_section()
         out += self.aim_table()
         out += self.function_table()
@@ -269,6 +271,11 @@ class Renderer:
             bits = [f"{us.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous") if us.count(k)]
             color = p.bred if "refuted" in us or "vacuous" in us else p.byellow if "open" in us else p.bgreen
             parts.append(color("ui: " + ", ".join(bits)))
+        if r.lifecycles:
+            ls = [x.status for x in r.lifecycles]
+            bits = [f"{ls.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous") if ls.count(k)]
+            color = p.bred if "refuted" in ls or "vacuous" in ls else p.byellow if "open" in ls else p.bgreen
+            parts.append(color("lifecycles: " + ", ".join(bits)))
         if empty:
             parts.append(p.gray(f"{len(empty)} with nothing to check"))
         unsup = [f for f in r.functions if f.status == "unsupported"]
@@ -468,6 +475,36 @@ class Renderer:
             out.append(p.dim("   proved: equal results for every input both accept"))
         elif mr.reason:
             out.append(f"   {p.dim(mr.reason)}")
+        out.append("")
+        return out
+
+    # -- lifecycles ----------------------------------------------------------
+
+    def lifecycle_section(self) -> list[str]:
+        """Each lifecycle: what backs it, what breaks it, and which of the
+        steps it names no function takes."""
+        p = self.p
+        lcs = self.r.lifecycles
+        if not lcs:
+            return []
+        out = [self.rule("lifecycles", f"{len(lcs)}"), ""]
+        nw = max(len(ir.source_name(r.cls)) for r in lcs) + 2
+        for r in lcs:
+            where = f"{r.module.path}:{r.clause.loc.line}"
+            n = len(r.functions)
+            if r.status == "proved":
+                desc = p.dim(f"kept by {n} function{'s' * (n != 1)}" if r.lc.kind != "never" else f"follows from the others, kept by {n} function{'s' * (n != 1)}")
+            else:
+                desc = {"refuted": p.red("refuted"), "vacuous": p.red("vacuous")}.get(r.status, p.yellow(r.status))
+            room = self.width - nw - 8
+            text = r.clause.text if visible_len(r.clause.text) <= room else r.clause.text[: max(10, room - 1)] + "…"
+            out.append(f"  {mark(p, r.status)} {pad(ir.source_name(r.cls), nw)}{text}")
+            out.append(f"    {pad('', nw)}{desc}  {p.dim(where)}")
+            for msg in dict.fromkeys(r.problems):
+                out.append(f"    {pad('', nw)}{p.red(msg) if r.status == 'refuted' else p.yellow(msg)}")
+            idle = [s.label for s in r.steps if not s.by and not s.unknown]
+            if idle and r.status != "vacuous":
+                out.append(f"    {pad('', nw)}{p.dim('no function takes: ' + ', '.join(idle))}")
         out.append("")
         return out
 

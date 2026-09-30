@@ -23,6 +23,7 @@ CLAUSE_KEYWORDS = {
     "assert",
     "assume",
     "raises",
+    "lifecycle",
 }
 DIRECTIVE_KEYWORDS = {"aim", "index", "mirrors", "trusted", "pure"}
 KEYWORDS = CLAUSE_KEYWORDS | DIRECTIVE_KEYWORDS

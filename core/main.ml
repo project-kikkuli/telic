@@ -420,6 +420,7 @@ let () =
           post_init = opt "post_init";
           cbases = (match Json.member "bases" c with Json.List l -> List.map Json.to_str l | _ -> []);
           owner = (match Json.member "owner" c with Json.Assoc kvs -> List.map (fun (f, o) -> (f, Json.to_str o)) kvs | _ -> []);
+          clcs = (match Json.member "lifecycles" c with Json.List l -> List.map (fun x -> (Json.to_str (Json.member "owner" x), Ir.clause_of (Json.member "clause" x))) l | _ -> []);
         })
       (match Json.member "classes" req with Json.List l -> l | _ -> [])
   in

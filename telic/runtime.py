@@ -211,6 +211,22 @@ class FunctionInstrumenter:
             shown = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="show", ctx=ast.Load()), args=[ast.Name(id="__telic_r", ctx=ast.Load())], keywords=[])
             detail = ast.JoinedStr([ast.Constant("returned "), ast.FormattedValue(shown, -1)])
             post_checks.append(_check_stmt(e, "ensures", en, name, detail))
+        # Objects passed in change only as their lifecycles allow.
+        for i, p in enumerate(fn.params):
+            if not isinstance(p.ty, ir.TClass) or (i == 0 and fn.name.endswith((".__init__", ".__post_init__"))):
+                continue
+            for owner, lc in _lifecycles(self.classes, p.ty.name):
+                sp = _Specs()
+                # a subclass's lifecycle binds only objects of that subclass
+                e = _Rename({"self": p.name}).visit(sp.visit(_parse_clause(f"not isinstance(self, {ir.source_name(owner)}) or ({lc.code})")))
+                renum = {}
+                for k, o in enumerate(sp.olds):
+                    nm = f"__telic_old{old_k}"
+                    renum[f"__telic_old{k}"] = nm
+                    old_k += 1
+                    snap = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="snapshot", ctx=ast.Load()), args=[_Rename({"self": p.name}).visit(o)], keywords=[])
+                    pre.append(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=snap))
+                inv_post.append(_check_stmt(_Rename(renum).visit(e), "lifecycle", lc.clause, name))
         self.track_writes = any(isinstance(st, ir.FieldAssign) for st in ir.walk_stmts(fn.body)) and any(c.invariants for c in self.classes.values())
         if self.track_writes:
             pre.append(ast.Assign(targets=[ast.Name(id="__telic_w__", ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load())))
@@ -368,6 +384,17 @@ class FunctionInstrumenter:
         if not s.orelse:
             s.orelse = exit_checks
         return prelude + [s]
+
+
+def _lifecycles(classes: dict[str, ir.ClassDecl], cname: str) -> list[tuple[str, ir.Lifecycle]]:
+    """(owner, lifecycle) for what an object of static type ``cname`` may
+    keep: its classes' and, when it is one, its subclasses' (never lines
+    are consequences)."""
+    def up(c: str) -> list[str]:
+        return [c] + [x for b in classes[c].bases if b in classes for x in up(b)] if c in classes else []
+
+    owners = up(cname) + [c for c in classes if c != cname and cname in up(c)]
+    return [(c, lc) for c in dict.fromkeys(owners) for lc in classes[c].lifecycles if lc.kind != "never"]
 
 
 def _with_inherited_contracts(module: ir.Module) -> ir.Module:

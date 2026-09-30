@@ -175,9 +175,14 @@ def build(rep: Any) -> list[AimReport]:
             for i in res.lemma.aims:
                 uis.setdefault(i, []).append(res)
     ui_names = {res.lemma.name for rs in uis.values() for res in rs}
+    lcs: dict[str, list[Any]] = {}
+    for lr in getattr(rep, "lifecycles", []):
+        for i in lr.aims:
+            lcs.setdefault(i, []).append(lr)
+    lc_classes = {lr.cls for lr in getattr(rep, "lifecycles", [])}
     reviews = _load_reviews(getattr(rep, "root", None))
     out: list[AimReport] = []
-    shown = {k for k, d in decls.items() if not d[4]} | set(citing) | set(mirrors) | set(uis)
+    shown = {k for k, d in decls.items() if not d[4]} | set(citing) | set(mirrors) | set(uis) | set(lcs)
     for iid in sorted(shown):
         text, loc, by, scope, context = decls.get(iid, (None, None, [], None, False))
         fns = citing.get(iid, [])
@@ -198,11 +203,18 @@ def build(rep: Any) -> list[AimReport]:
             r.lemmas.append(Lemma(mr.a.key, f"{mr.a.fn.name} ≡ {mr.b.fn.name}", mr.a.module.path, mr.a.fn.loc.line, "mirror", "agree on every input", st))
         for res in uis.get(iid, []):
             r.lemmas.append(_ui_lemma(rep, res, r))
+        for lr in lcs.get(iid, []):
+            detail = "; ".join(dict.fromkeys(lr.problems))
+            r.lemmas.append(Lemma(f"{lr.module.path}::{lr.cls}", _src(lr.cls), lr.module.path, lr.clause.loc.line, "lifecycle", lr.clause.text, lr.status, detail))
         # Two-sided pointers.
         if by:
             for item in by:
                 hit = [f for f in rep.functions if _match(item, f.ref.key, f.fn.name)]
-                if item.removeprefix("ui:") in ui_names:
+                classes = [c for c in lc_classes if _match(item, f"{rep.program.class_module[c].path}::{c}", _src(c))]
+                if classes and not hit:
+                    if not any(_match(item, f"{lr.module.path}::{lr.cls}", _src(lr.cls)) for lr in lcs.get(iid, [])):
+                        r.pointers.append(f"'{item}' is listed in by: but none of its lifecycles cites {iid}")
+                elif item.removeprefix("ui:") in ui_names:
                     if not any(res.lemma.name == item.removeprefix("ui:") for res in uis.get(iid, [])):
                         r.pointers.append(f"'{item}' is listed in by: but that ui lemma does not cite {iid}")
                 elif not hit:
@@ -213,6 +225,9 @@ def build(rep: Any) -> list[AimReport]:
             for f in fns:
                 if not any(_match(item, f.ref.key, f.fn.name) for item in by):
                     r.pointers.append(f"{f.fn.name} cites {iid} but is not in its by: list")
+            for lr in lcs.get(iid, []):
+                if not any(_match(item, f"{lr.module.path}::{lr.cls}", _src(lr.cls)) for item in by):
+                    r.pointers.append(f"the lifecycle of {_src(lr.cls)} cites {iid} but {_src(lr.cls)} is not in its by: list")
             for res in uis.get(iid, []):
                 if res.lemma.name not in {item.removeprefix("ui:") for item in by}:
                     r.pointers.append(f"ui {res.lemma.name} cites {iid} but is not in its by: list")
@@ -287,6 +302,12 @@ def flag_vacuous_risk(rep: Any, opts: Any) -> None:
             if stubs:
                 r.status = "vacuous-risk"
                 r.stubs = stubs
+
+
+def _src(name: str) -> str:
+    from .ir import source_name
+
+    return source_name(name)
 
 
 def _within(path: str, scope: str) -> bool:

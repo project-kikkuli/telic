@@ -22,6 +22,7 @@ for the known gaps.
 | `telic/equiv.py`, `telic/gaps.py` | `@mirrors` and spec-gap mutation |
 | `telic/checker.py`, `telic/render.py`, `telic/cli.py` | pipeline, receipts (obligation + function level, bound to the toolchain), output |
 | `telic/ledger.py` | `telic.ledger.json`, the CI ratchet, exact affected-file scope, `telic init` |
+| `telic/lifecycle.py`, `telic/history.py` | lifecycles (`@lifecycle`): the grammar and host-syntax relations; class-level checks (reflexive, transitive, `never`), coverage and vacuity |
 | `telic/aim.py` | aims: EARS lint, two-sided `by:` links, backed/broken status, reviews and judgments |
 | `telic/propose.py`, `telic/phrase.py` | `telic propose`: proved facts, crash-free preconditions, facts rendered as EARS drafts |
 | `telic/ui/` | UI lemmas (`@ui`): grammar (`spec.py`), the accessibility-tree driver interface (`driver.py`) and its adapters (`web.py`, Playwright; `ios.py` and `sim.py`, the iOS Simulator through AXe), model learning (`learn.py`), checking and replay (`check.py`), app start-up, config and caching (`app.py`, `config.py`, `run.py`) |

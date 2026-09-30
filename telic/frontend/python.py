@@ -29,6 +29,8 @@ from ..contracts import (
     parse_comment_lines,
     parse_aim_directive,
 )
+from ..lifecycle import LifecycleError
+from ..lifecycle import build as build_lifecycle
 
 PY_ASSUMPTIONS = [
     "float is modelled as exact rational arithmetic (rounding error ignored)",
@@ -668,17 +670,28 @@ class PythonFrontend:
         lo, hi = node.lineno, node.end_lineno or node.lineno
         stub = _ClassScope(self, node.name)
         for cl in self.contract_lines:
-            if cl.consumed or not (lo <= cl.line <= hi) or cl.keyword != "invariant":
+            if cl.consumed or not (lo <= cl.line <= hi) or cl.keyword not in ("invariant", "lifecycle"):
                 continue
             if any(a + 1 < cl.line <= b for a, b in methods):
                 continue  # inside a method: a loop invariant
             cl.consumed = True
             try:
+                if cl.keyword == "lifecycle":
+                    decl.lifecycles.append(self._lifecycle(stub, cl))
+                    continue
                 c = stub.clause(cl, "invariant", tuple(cl.tags))
                 _own_fields_only(c.expr, node.name, cl.line)
                 decl.invariants.append(c)
-            except (LowerError, ContractSyntaxError) as e:
-                self.module.problems.append((f"class {node.name}: invariant: {e}", ir.Loc(cl.line, cl.col)))
+            except (LowerError, ContractSyntaxError, LifecycleError) as e:
+                self.module.problems.append((f"class {node.name}: {cl.keyword}: {e}", ir.Loc(cl.line, cl.col)))
+
+    def _lifecycle(self, stub: "_ClassScope", cl: ContractLine) -> ir.Lifecycle:
+        def lower(text: str, two_state: bool) -> ir.Expr:
+            line = ContractLine(cl.keyword, text, cl.line, cl.col, cl.payload_col, cl.tags)
+            return stub.clause(line, "lifecycle" if two_state else "lifecycle.new").expr
+
+        loc = ir.Loc(cl.line, cl.payload_col, cl.payload_col + len(cl.payload) if "\n" not in cl.payload else 0)
+        return build_lifecycle(cl.payload, loc, tuple(cl.tags), "python", lower)
 
     def _lower_safely(self, node: ast.FunctionDef, cname: str | None, key: str) -> ir.Function:
         #@ requires key in self.signatures
@@ -962,7 +975,7 @@ class FunctionLowerer:
         except SyntaxError as e:
             raise LowerError(f"cannot parse '@{kind}' as a Python expression: {e.msg}", line=cl.line)
         el = ExprLowerer(self, spec=True, result_ty=result_ty, line_offset=cl.line, col_offset=cl.payload_col - 1)
-        el.allow_old = kind == "invariant" and not isinstance(self, _ClassScope)
+        el.allow_old = (kind == "invariant" and not isinstance(self, _ClassScope)) or kind == "lifecycle"
         if expect == ir.BOOL:
             e = el.cond(tree.body)
         else:

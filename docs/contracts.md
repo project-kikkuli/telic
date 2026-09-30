@@ -18,6 +18,7 @@ telic never ignores a contract silently.
 |---|---|---|
 | `requires`, `ensures`, `decreases`, `raises`, `aim`, `mirrors`, `trusted` | a function | contiguous comment lines directly above the `def`/`function`, or the first lines of its body |
 | `invariant`, `decreases`, `index` | a loop | directly above the loop header, or the first lines of its body |
+| `invariant`, `lifecycle` | a class | the class body, outside its methods (Rust: inside the struct's braces or directly above it) |
 | `assert`, `assume` | a statement position | anywhere inside a block |
 | `aim ID: sentence` | the module | anywhere outside a function |
 | sentence | a directory | an `aims/<ID>.md` file (see [Cross-file aims](#cross-file-aims)) |
@@ -135,6 +136,63 @@ def leaves(t: dict[str, Any]) -> int:
 
 The same works in TypeScript (`t: any`, `"k" in t`, `t.k`, `typeof t.v ===
 "number"`) and Rust (a trusted `fn` over any value types).
+
+## Lifecycles
+
+A class invariant constrains one state. A **lifecycle** constrains how an
+object changes from one call to the next: a relation between the object
+before any call and after it. Write it in the class body:
+
+```python
+class Order:
+    #@ lifecycle status: Status.PENDING -> Status.PAID -> Status.SHIPPED,
+    #@   Status.PENDING | Status.PAID -> Status.CANCELLED
+    #@ lifecycle never status: Status.SHIPPED -> Status.PENDING
+    #@ lifecycle monotonic self.refunded
+    #@ lifecycle once self.status == Status.DELIVERED
+    #@ lifecycle implies(old(self.closed), self.closed)
+```
+
+| form | a call may change the object only if |
+|---|---|
+| `FIELD: A -> B -> C, D \| E -> F` | the field goes along a path of the listed transitions (or stays) |
+| `never FIELD: A -> B` | never `A` before and `B` after: proved from the class's other lifecycles, not per call |
+| `monotonic E` | `E` does not decrease (`monotonic -E`: does not increase) |
+| `once P` | once `P` holds, it keeps holding |
+| any spec with `old(...)` | the relation holds, `old(...)` read before the call |
+
+States are expressions in the host language (`Status.PAID`, `Status::Paid`,
+`"paid"`, `2`); a lifecycle reads only the object's own fields.
+
+**What is proved.** Every function that may change an object keeps each
+lifecycle from its entry to its return: for its object parameters, and for
+every object of a class it writes. A call to a checked function is assumed
+to keep them too. On top of that, once per class, telic proves that each
+relation is reflexive and transitive (every form above is, by
+construction; a general relation must be) and that each `never` follows from
+the others. Together these make the lifecycle hold across any sequence of
+calls, which is what "an order never goes from shipped back to pending"
+means. A lifecycle on a class also binds objects of its subclasses, so a base
+class method that runs on a subclass object is checked against it.
+
+A lifecycle is `proved`, `refuted` (a function breaks it, the relation does
+not compose, or a `never` does not follow), `open` (a function that may
+change the object is unproved or not checked), or `vacuous`.
+
+**Coverage.** For each listed transition telic asks whether some function
+can take it (a satisfiable path from entry to return), and reports those no
+function takes. A lifecycle nothing exercises is `vacuous`, not proved: no
+transition taken, a `monotonic` quantity that never grows, a `once` predicate
+nothing makes true (and no object is created with), or a `never` whose start
+state nothing reaches.
+
+**Aims.** Tag a lifecycle with an aim like any clause (`#@ [ID] lifecycle
+...`); it is a lemma for the aim, and `by:` names the class.
+
+**At runtime** (replay, `telic run`), a method's receiver (Python: every
+object parameter) is checked against its class's lifecycles when it returns.
+Unchecked code is assumed to change objects only as their lifecycles allow;
+the report lists that under *trusted base*.
 
 ## Aims
 

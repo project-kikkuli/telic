@@ -427,3 +427,36 @@ export function totalCents(ws: Wallet[]): number {
   }
   return t;
 }
+
+enum Stage { Draft, Review, Published, Archived }
+
+export class Post {
+  //@ lifecycle stage: Stage.Draft -> Stage.Review -> Stage.Published -> Stage.Archived, Stage.Review -> Stage.Draft
+  //@ lifecycle never stage: Stage.Published -> Stage.Draft
+  //@ lifecycle monotonic this.edits
+  stage: Stage;
+  edits: number;
+  constructor() {
+    this.stage = Stage.Draft;
+    this.edits = 0;
+  }
+}
+
+// expect: proved
+export function publish(p: Post): void {
+  if (p.stage === Stage.Review) p.stage = Stage.Published;
+}
+
+// expect: proved
+export function edit(p: Post): void {
+  if (p.stage === Stage.Draft || p.stage === Stage.Review) {
+    p.edits = p.edits + 1;
+    p.stage = Stage.Draft;
+  }
+}
+
+// expect: open
+export function unpublish(p: Post): void {
+  // refuted by the solver; the harness checks lifecycles only on method receivers
+  if (p.stage === Stage.Published) p.stage = Stage.Draft;
+}

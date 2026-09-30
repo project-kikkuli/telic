@@ -107,6 +107,13 @@ class Program:
                 return ref
         return None
 
+    def lifecycles_for(self, cls: str, never: bool = False) -> list[tuple[str, ir.Lifecycle]]:
+        """(owner, lifecycle) for every lifecycle an object of static type
+        ``cls`` keeps: its classes', and its subclasses' (it may be one).
+        ``never`` lines are consequences, not constraints: only on request."""
+        owners = self.mro(cls) + [c for c in self.classes if c != cls and cls in self.mro(c)]
+        return [(c, lc) for c in owners for lc in self.classes[c].lifecycles if never or lc.kind != "never"]
+
     def in_hierarchy(self, cls: str) -> bool:
         """Does ``cls`` share field maps with other classes (bases or subclasses)?"""
         decl = self.classes.get(cls)

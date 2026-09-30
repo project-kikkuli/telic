@@ -91,7 +91,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
     for key, ref in program.funcs.items():
         names |= _calls(ref.fn, extra_by_key.get(key, []))
     for decl in program.classes.values():
-        for c in decl.invariants:
+        for c in decl.invariants + [lc.clause for lc in decl.lifecycles]:
             names |= {x.func for x in ir.walk_expr(c.expr) if isinstance(x, ir.Call)}
     for cname in program.classes:
         names |= {f"{cname}.__init__", f"{cname}.__post_init__"}
@@ -115,6 +115,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "invariants": [irjson.clause(c) for c in decl.invariants],
             "bases": list(decl.bases),
             "owner": dict(decl.owner),
+            "lifecycles": [{"owner": owner, "clause": irjson.clause(lc.clause)} for owner, lc in program.lifecycles_for(cname)],
             "init": member(cname, "__init__"),
             "post_init": member(cname, "__post_init__"),
         }

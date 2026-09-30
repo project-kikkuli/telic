@@ -283,3 +283,48 @@ pub fn unreachable_arm(x: u32) -> u32 {
     }
     x
 }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Phase {
+    Open,
+    Won,
+    Lost,
+}
+
+// A game, once won, stays won: whatever sequence of moves follows.
+//@ lifecycle phase: Phase::Open -> Phase::Won, Phase::Open -> Phase::Lost
+//@ lifecycle once self.phase == Phase::Won
+#[derive(Debug)]
+pub struct Game {
+    //@ lifecycle monotonic self.moves
+    pub phase: Phase,
+    pub moves: u32,
+    pub mines: u32,
+}
+
+impl Game {
+    // expect: proved
+    pub fn reveal(&mut self, mine: bool) {
+        if self.phase == Phase::Open && self.moves < 1000 {
+            self.moves += 1;
+            if mine {
+                self.phase = Phase::Lost;
+            }
+        }
+    }
+
+    // expect: proved
+    pub fn check_win(&mut self) {
+        if self.phase == Phase::Open && self.moves >= self.mines {
+            self.phase = Phase::Won;
+        }
+    }
+
+    // expect: refuted
+    pub fn check_win_unguarded(&mut self) {
+        // stipulate's demo bug: marks a lost game won
+        if self.moves >= self.mines {
+            self.phase = Phase::Won;
+        }
+    }
+}
