@@ -118,6 +118,8 @@ class Harness:
         if k == "user_type":
             name = _base_name(text(tn))
             args = _generic_args(tn)
+            if name in self.free_generics():
+                return "int", "Int"  # an unconstrained type parameter: any type will do
             if name in INT_KINDS:
                 return "int", name
             if name in REAL_TYPES:
@@ -140,10 +142,25 @@ class Harness:
                     return t.kind, t
         raise NotReplayable(f"cannot build a value of type {text(tn)}")
 
+    def free_generics(self) -> set[str]:
+        """Type parameters of the function with no constraint."""
+        out: set[str] = set()
+        for ch in self.info.node.children:
+            if ch.type == "type_parameters":
+                for tp in ch.children:
+                    if tp.type == "type_parameter" and len([c for c in tp.children if c.is_named]) == 1:
+                        out.add(tp.text.decode().strip())
+        if any(ch.type == "type_constraints" for ch in self.info.node.children):
+            return set()
+        return out
+
     def ty_text(self, tn: Any) -> str:
         from .swift_syntax import text
 
-        return text(tn)
+        t = text(tn)
+        for g in self.free_generics():
+            t = re.sub(rf"\b{re.escape(g)}\b", "Int", t)
+        return t
 
     def decoder(self, tn: Any) -> str:
         """The name of a function (TelicJ) -> T for the type node."""
@@ -290,6 +307,12 @@ class Harness:
             out.append((text(pn), tnode[-1], mods is not None and "inout" in text(mods)))
         return out
 
+    def invariants(self) -> list[str]:
+        owner = self.pj.types.get(self.info.owner) if self.info.owner else None
+        if owner is None or owner.kind not in ("struct", "class"):
+            return []
+        return [" ".join(cl.payload.split()) for cl in self.pj.invariant_lines(owner)]
+
     def return_node(self) -> Any:
         from .swift import _return_type
 
@@ -306,8 +329,10 @@ class Harness:
 
         info = self.info
         fn = self.fn
-        if info.kind in ("requirement", "field-getter") or info.alias_of or getattr(info, "generics", None) and any(isinstance(t, ir.TOpaque) for g, t in info.generics.items() if not (self.pj.types.get(info.owner) and g in self.pj.types[info.owner].generics)):
+        if info.kind in ("requirement", "field-getter") or info.alias_of:
             raise NotReplayable("not callable on its own")
+        if any(isinstance(t, ir.TClass) for t in info.generics.values()):
+            raise NotReplayable("a generic function constrained by a protocol")
         owner = self.pj.types.get(info.owner) if info.owner else None
         if owner is not None and owner.generics:
             raise NotReplayable("a method of a generic type")
@@ -382,11 +407,11 @@ class Harness:
                 else:
                     self.decls.append(f"func __telicEns{i}({allp}) -> Bool {{ {body} }}")
                     checks_code.append(f"if !__telicEns{i}({vargs}) {{ print(\"TELIC_VIOLATION ensures {i}\") }}")
-            decl = self.pj.files[owner.path].module.classes.get(owner.name) if owner is not None else None
-            if decl is not None and decl.invariants and (recv or info.kind == "init"):
+            invs = self.invariants()
+            if invs and (recv or info.kind == "init"):
                 target = "__self" if recv else "__v"
-                for i, inv in enumerate(decl.invariants):
-                    self.decls.append(f"extension {host} {{ func __telicInv{i}() -> Bool {{ {inv.text} }} }}")
+                for i, inv in enumerate(invs):
+                    self.decls.append(f"extension {host} {{ func __telicInv{i}() -> Bool {{ {inv} }} }}")
                     checks_code.append(f"if !{target}.__telicInv{i}() {{ print(\"TELIC_VIOLATION class.inv {i}\") }}")
         if info.kind == "init" and info.failable:
             checks_code = [f"if let __v = __v {{ {' '.join(checks_code)} }}"] if checks_code else []
@@ -684,9 +709,7 @@ def describe(out: dict[str, Any], fn: ir.Function, h: Harness) -> dict[str, Any]
         c = fn.ensures[out["index"]]
         return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip(), "returned_repr": out.get("returned_repr")}
     if out.get("violation") == "class.inv":
-        owner = h.pj.types[h.info.owner]
-        inv = h.pj.files[owner.path].module.classes[owner.name].invariants[out["index"]]
-        return {"violation": "class.inv", "func": ir.source_name(fn.name), "text": inv.text, "returned_repr": out.get("returned_repr")}
+        return {"violation": "class.inv", "func": ir.source_name(fn.name), "text": h.invariants()[out["index"]], "returned_repr": out.get("returned_repr")}
     return out
 
 

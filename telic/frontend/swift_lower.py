@@ -1050,6 +1050,9 @@ class FunctionLowerer:
         out.append(ir.ForEach(loc, ename, idx, seq, invs, tuple(b), idx_visible=visible))
 
     def _stride(self, cx: X, names: list[str], item: Any, clauses: Any, body_fn: Any, out: list[ir.Stmt], loc: ir.Loc) -> None:
+        """``for i in stride(from: a, to: b, by: step)``: invariants see ``i``
+        as the value of the next iteration (so it is past the end after the
+        last one), as for a range loop."""
         args = dict((lbl, a) for lbl, a in cx.args)
         if set(args) not in ({"from", "to", "by"}, {"from", "through", "by"}) or len(names) != 1:
             raise self.err("stride(from:to:by:) / stride(from:through:by:) with one loop variable", item)
@@ -1065,27 +1068,27 @@ class FunctionLowerer:
         end = el.hoist_var(el.expr(args.get("to") or args["through"], ir.INT))
         out.extend(el.pre)
         inclusive = "through" in args
-        k = self.fresh("k", ir.INT)
-        out.append(ir.Assign(loc, k, lo))
-        kv = ir.Var(ir.INT, loc, k)
-        op = ("le" if inclusive else "lt") if step > 0 else ("ge" if inclusive else "gt")
-        cond = ir.Binary(ir.BOOL, loc, op, kv, end)
         self.push_scope()
         try:
-            v = self.declare(names[0] if names[0] != "_" else "_i", ir.INT, item, let=True)
-            self.kinds[v] = "Int"
+            v = self.declare(names[0] if names[0] != "_" else "_i", ir.INT, item)
+            out.append(ir.Assign(loc, v, lo))
+            kv = ir.Var(ir.INT, loc, v)
             invs = clauses()
-            b: list[ir.Stmt] = [ir.Assign(loc, v, kv), ir.Assign(loc, k, ir.Binary(ir.INT, loc, "add", kv, ir.Lit(ir.INT, loc, step)))]
+            b: list[ir.Stmt] = []
             body_fn(b)
         finally:
             self.pop_scope()
-        if _has_continue_ir(b):
-            pass  # the step already happened: 'continue' is fine
+        op = ("le" if inclusive else "lt") if step > 0 else ("ge" if inclusive else "gt")
+        cond = ir.Binary(ir.BOOL, loc, op, kv, end)
         measure = ir.Binary(ir.INT, loc, "sub", end, kv) if step > 0 else ir.Binary(ir.INT, loc, "sub", kv, end)
-        dec = ir.Clause("decreases", ir.Binary(ir.INT, loc, "add", measure, ir.Lit(ir.INT, loc, abs(step))), loc, "end - k", inferred=True)
-        out.append(ir.While(loc, cond, invs, dec, tuple(b)))
+        dec = ir.Clause("decreases", ir.Binary(ir.INT, loc, "add", measure, ir.Lit(ir.INT, loc, abs(step))), loc, "end - i", inferred=True)
+        # (the stride stops before stepping past Int's range)
+        step_s = (ir.Assign(loc, v, ir.Binary(ir.INT, loc, "add", kv, ir.Lit(ir.INT, loc, step))),)
+        out.append(ir.While(loc, cond, invs, dec, tuple(b), step=step_s))
 
     def _countdown(self, rng: X, name: str, item: Any, clauses: Any, body_fn: Any, out: list[ir.Stmt], loc: ir.Loc) -> None:
+        """``for i in (a..<b).reversed()``: invariants see ``i`` as the value of
+        the last iteration (``b`` before the first one, ``a`` after the last)."""
         el = ExprLowerer(self)
         lo = el.hoist_var(el.expr(rng.lo, ir.INT))
         hi = el.hoist_var(el.expr(rng.hi, ir.INT))
@@ -1093,19 +1096,17 @@ class FunctionLowerer:
         out.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Binary(ir.BOOL, loc, "le", lo, hi), loc, "range lower bound <= upper bound"), native=True))
         if rng.op == "...":
             hi = ir.Binary(ir.INT, loc, "add", hi, ir.Lit(ir.INT, loc, 1))
-        k = self.fresh("k", ir.INT)
-        out.append(ir.Assign(loc, k, hi))
-        kv = ir.Var(ir.INT, loc, k)
         self.push_scope()
         try:
-            v = self.declare(name if name != "_" else "_i", ir.INT, item, let=True)
-            self.kinds[v] = "Int"
+            v = self.declare(name if name != "_" else "_i", ir.INT, item)
+            out.append(ir.Assign(loc, v, hi))
+            kv = ir.Var(ir.INT, loc, v)
             invs = clauses()
-            b: list[ir.Stmt] = [ir.Assign(loc, k, ir.Binary(ir.INT, loc, "sub", kv, ir.Lit(ir.INT, loc, 1))), ir.Assign(loc, v, kv)]
+            b: list[ir.Stmt] = [ir.Assign(loc, v, ir.Binary(ir.INT, loc, "sub", kv, ir.Lit(ir.INT, loc, 1)))]
             body_fn(b)
         finally:
             self.pop_scope()
-        dec = ir.Clause("decreases", ir.Binary(ir.INT, loc, "sub", kv, lo), loc, "k - lo", inferred=True)
+        dec = ir.Clause("decreases", ir.Binary(ir.INT, loc, "sub", kv, lo), loc, "i - lo", inferred=True)
         out.append(ir.While(loc, ir.Binary(ir.BOOL, loc, "lt", lo, kv), invs, dec, tuple(b)))
 
     # switch
@@ -1230,6 +1231,8 @@ class FunctionLowerer:
     # do / catch
 
     def do_stmt(self, s: Any, out: list[ir.Stmt]) -> None:
+        """do/catch: an error thrown in the body skips the rest of it and runs
+        a catch clause from the state at the throw."""
         loc = self.loc(s)
         body_n = next((c for c in s.children if c.type == "statements"), None)
         catches = [c for c in s.children if c.type == "catch_block"]
@@ -1245,35 +1248,37 @@ class FunctionLowerer:
         if not catches:
             out.extend(body)
             return
-        handlers: list[tuple[ir.Stmt, ...]] = []
+        flag = self.fresh("thrown", ir.BOOL)
+        out.append(ir.Assign(loc, flag, ir.Lit(ir.BOOL, loc, False)))
+        out.extend(_catchify(body, flag, False, loc))
+        handlers: list[list[ir.Stmt]] = []
         exhaustive = False
         for c in catches:
             pat = c.child_by_field_name("error")
-            if pat is None:
+            if pat is None or re.fullmatch(r"\s*let\s+\w+\s*", text(pat)):
                 exhaustive = True
             self.push_scope()
             try:
                 h: list[ir.Stmt] = []
-                if pat is None:
-                    irn = self.declare("error", ir.TOpaque("Error"), c, let=True)
+                names = ["error"] if pat is None else re.findall(r"\b(?:let|var)\s+(\w+)", text(pat))
+                for nm in names:
+                    irn = self.declare(nm, ir.TOpaque("Error"), c, let=True)
                     h.append(ir.Assign(loc, irn, ir.Extern(ir.TOpaque("Error"), loc, "caught exception", ())))
-                else:
-                    names = re.findall(r"\blet\s+(\w+)", text(pat)) + re.findall(r"\bvar\s+(\w+)", text(pat))
-                    for nm in names:
-                        irn = self.declare(nm, ir.TOpaque("Error"), c, let=True)
-                        h.append(ir.Assign(loc, irn, ir.Extern(ir.TOpaque("Error"), loc, "caught exception", ())))
-                    if re.fullmatch(r"\s*let\s+\w+\s*", text(pat)):
-                        exhaustive = True
                 hb = next((x for x in c.children if x.type == "statements"), None)
                 if hb is not None:
                     self.block(hb, h)
-                handlers.append(tuple(h))
+                handlers.append(h)
             finally:
                 self.pop_scope()
-        if not exhaustive:
-            # an error no catch clause matches goes on to the caller
-            handlers.append((ir.Raise(loc, "an error no catch clause matches", caught=self.do_depth > 0),))
-        out.append(ir.Try(loc, tuple(body), tuple(handlers)))
+            if exhaustive:
+                break
+        # which clause matches the error is not modelled: any may
+        chain: tuple[ir.Stmt, ...] = tuple(handlers[-1]) if exhaustive else (ir.Raise(loc, "an error no catch clause matches", caught=self.do_depth > 0),)
+        rest = handlers[:-1] if exhaustive else handlers
+        for i, h in reversed(list(enumerate(rest))):
+            choice = ir.Builtin(ir.BOOL, loc, "opaque_op", (ir.Lit(ir.STR, loc, "catch clause matches"), ir.Lit(ir.INT, loc, self.tmp), ir.Lit(ir.INT, loc, i)))
+            chain = (ir.If(loc, choice, tuple(h), chain),)
+        out.append(ir.If(loc, ir.Var(ir.BOOL, loc, flag), chain, ()))
 
     # return / break / continue / throw
 
@@ -1310,6 +1315,36 @@ class FunctionLowerer:
         if t.startswith("fallthrough"):
             raise self.err("fallthrough is not supported", s)
         raise self.err(f"unsupported statement '{t[:30]}'", s)
+
+
+def _has_throw(stmts: Any) -> bool:
+    return any(isinstance(s, ir.Raise) and s.caught for s in ir.walk_stmts(stmts))
+
+
+def _catchify(stmts: list[ir.Stmt] | tuple, flag: str, in_loop: bool, loc: ir.Loc) -> list[ir.Stmt]:
+    """Turn the throws of a do body into setting ``flag`` and skipping the
+    rest of the body: out of loops by 'break', past the rest of a block by
+    guarding it with the flag."""
+    stmts = list(stmts)
+    fv = ir.Var(ir.BOOL, loc, flag)
+    not_thrown = ir.Unary(ir.BOOL, loc, "not", fv)
+    for i, s in enumerate(stmts):
+        if isinstance(s, ir.Raise) and s.caught:
+            return stmts[:i] + [ir.Assign(s.loc, flag, ir.Lit(ir.BOOL, s.loc, True))] + ([ir.Break(s.loc)] if in_loop else [])
+        if not _has_throw([s]):
+            continue
+        rest = stmts[i + 1 :]
+        if isinstance(s, ir.If):
+            s2: ir.Stmt = ir.If(s.loc, s.cond, tuple(_catchify(s.then, flag, in_loop, loc)), tuple(_catchify(s.orelse, flag, in_loop, loc)))
+        elif isinstance(s, (ir.While, ir.ForRange, ir.ForEach)):
+            inv = ir.Clause("invariant", not_thrown, s.loc, "nothing thrown yet", inferred=True)
+            s2 = dataclasses.replace(s, body=tuple(_catchify(s.body, flag, True, loc)), invariants=tuple(s.invariants) + (inv,))
+        else:
+            raise LowerError("a throw inside this construct is not supported in a do body", s.loc.line)
+        if in_loop:
+            return stmts[:i] + [s2, ir.If(loc, fv, (ir.Break(loc),), tuple(_catchify(rest, flag, True, loc)))]
+        return stmts[:i] + [s2] + ([ir.If(loc, not_thrown, tuple(_catchify(rest, flag, False, loc)), ())] if rest else [])
+    return stmts
 
 
 def _pattern_names(item: Any) -> list[str] | None:

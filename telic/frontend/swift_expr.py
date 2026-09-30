@@ -479,6 +479,8 @@ class ExprLowerer:
         if t in (ir.INT, ir.REAL, ir.BOOL) or isinstance(t, ir.TEnum):
             return ir.Binary(ir.BOOL, loc, "eq", a, b)
         if t == ir.STR:
+            if any(isinstance(e, ir.Lit) and e.value == "" for e in (a, b)):
+                return ir.Binary(ir.BOOL, loc, "eq", a, b)  # only the empty string is equivalent to ""
             return ir.Binary(ir.BOOL, loc, "eq", self.nfd(a), self.nfd(b))
         if isinstance(t, ir.TOption):
             if isinstance(a, ir.Lit) and a.value is None:
@@ -2126,7 +2128,7 @@ class _Pat:
         if w == "_" and not re.match(r"_\w", self.s[self.i:]):
             self.i += 1
             return self._opt(("wild",))
-        if self.peek("."):
+        if self.peek(".") and not self.peek(".."):
             self.eat(".")
             name = self.word()
             if name is None:

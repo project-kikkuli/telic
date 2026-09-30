@@ -2152,6 +2152,8 @@ def default_value(s: L.Sort) -> L.Term:
         return L.StrV("")
     if s.name == "Rec":
         return L.mkrec(s, tuple(default_value(fs) for _, fs in s.fields))
+    if s == L.OPAQUE:
+        return L.Const("opaque!default", L.OPAQUE)
     raise VCError(f"no default value for {s}")
 
 

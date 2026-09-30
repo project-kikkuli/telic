@@ -519,6 +519,12 @@ class Project:
         for t in self.types.values():
             if t.kind in ("struct", "class") and not t.open_why:
                 self._declare_class(t)
+            elif t.kind == "protocol" and not t.open_why:
+                # a protocol is a base class of its conformers, with no fields
+                self.files[t.path].module.classes[t.name] = ir.ClassDecl(t.name, [], [], ir.Loc(_line(t.node), t.node.start_point[1]))
+                for f in self.files.values():
+                    if f.path != t.path:
+                        f.module.class_origin[t.name] = t.path
 
     def _model_enum(self, t: TypeInfo) -> None:
         raw = next((c for c in t.conforms if c in INT_KINDS or c in STR_TYPES), None)
@@ -942,20 +948,25 @@ class Project:
                         self.fns[d.key] = d
                         self.fns[reqs[0].key] = reqs[0]
 
+    def invariant_lines(self, t: TypeInfo) -> list[ContractLine]:
+        """The '@invariant' lines in a type's body (outside its members)."""
+        f = self.files[t.path]
+        body = t.node.child_by_field_name("body")
+        if body is None:
+            return []
+        lo, hi = _line(body), body.end_point[0] + 1
+        inside = [(_line(m), m.end_point[0] + 1) for m in named(body) if m.type in ("function_declaration", "init_declaration", "property_declaration", "subscript_declaration")]
+        return [cl for cl in f.contracts if cl.keyword == "invariant" and lo <= cl.line <= hi and not any(a <= cl.line <= b for a, b in inside)]
+
     def _invariants(self, t: TypeInfo) -> None:
         if t.kind not in ("struct", "class") or t.ir_type is None or not isinstance(t.ir_type, ir.TClass):
             return
         f = self.files[t.path]
-        body = t.node.child_by_field_name("body")
-        if body is None:
-            return
-        lo, hi = _line(body), body.end_point[0] + 1
-        inside = [(_line(m), m.end_point[0] + 1) for m in named(body) if m.type in ("function_declaration", "init_declaration", "property_declaration", "subscript_declaration")]
         decl = f.module.classes[t.name]
         from .swift_lower import FunctionLowerer
 
-        for cl in f.contracts:
-            if cl.consumed or cl.keyword != "invariant" or not (lo <= cl.line <= hi) or any(a <= cl.line <= b for a, b in inside):
+        for cl in self.invariant_lines(t):
+            if cl.consumed:
                 continue
             cl.consumed = True
             info = FnInfo(f"{t.name}.invariant", "invariant", t.node, t.path, t.name, False, False, [ir.Param("self", ir.TClass(t.name))], [], [], ir.BOOL, None, {}, {}, set(), False)

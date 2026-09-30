@@ -307,7 +307,7 @@ def norm(n: Any) -> X:
             raise Unsupported(f"unsupported member access '{text(n)}'", n)
         if target is None:  # '.member' after a type (Int.max) is still a target; this is not
             raise Unsupported(f"unsupported member access '{text(n)}'", n)
-        return _postfix(norm(target), lambda b: X("member", n, base=b, name=text(name_n), opt=opt))
+        return _suffixed(target, lambda b: X("member", n, base=b, name=text(name_n), opt=opt), n)
     if t == "call_expression" and n.children and n.children[0].type in ("-", "+", "~", "bang"):
         # '-(a * b)' and '!(a && b)' come back as calls of the operator
         va = next((c for s in n.children if s.type == "call_suffix" for c in s.children if c.type == "value_arguments"), None)
@@ -328,8 +328,8 @@ def norm(n: Any) -> X:
         subscript = va is not None and any(c.type == "[" for c in va.children)
         args = _arguments(va) if va is not None else []
         if subscript:
-            return _postfix(norm(callee_n), lambda b: X("subscript", n, base=b, args=args, opt=opt))
-        return _postfix(norm(callee_n), lambda b: X("call", n, callee=b, args=args, trailing=trailing, opt=opt))
+            return _suffixed(callee_n, lambda b: X("subscript", n, base=b, args=args, opt=opt), n)
+        return _suffixed(callee_n, lambda b: X("call", n, callee=b, args=args, trailing=trailing, opt=opt), n)
     if t == "postfix_expression":
         op = n.child_by_field_name("operation")
         target = n.child_by_field_name("target")
@@ -337,7 +337,7 @@ def norm(n: Any) -> X:
         if target is None:
             target = named(n)[0]
         if o == "!":
-            return _postfix(norm(target), lambda b: X("force", n, e=b))
+            return _suffixed(target, lambda b: X("force", n, e=b), n)
         if o in ("++", "--"):
             raise Unsupported(f"'{o}' does not exist in Swift", n)
         raise Unsupported(f"unsupported postfix operator '{o}'", n)
@@ -361,6 +361,20 @@ def norm(n: Any) -> X:
     if t == "if_statement" or t == "switch_statement":
         return X("stmt_expr", n, node=n)
     raise Unsupported(f"unsupported expression: {t.replace('_', ' ')}", n)
+
+
+def _suffixed(target: Any, make: Any, whole: Any) -> X:
+    """A postfix operation (call, member, subscript, '!') on ``target``. When
+    tree-sitter hands it an operator sequence (``a && xs.allSatisfy { ... }``
+    comes back as a call of ``a && xs.allSatisfy``), it belongs to the
+    sequence's last operand."""
+    if target.type in BINARY:
+        seq = flatten(target)
+        if not isinstance(seq[-1], X):
+            raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
+        seq[-1] = _postfix(seq[-1], make)
+        return _span(fold(seq), whole)
+    return _postfix(norm(target), make)
 
 
 def _postfix(base: X, make: Any) -> X:
