@@ -315,6 +315,29 @@ def test_the_model_does_not_depend_on_which_browser_is_quicker(budget):
     assert all(run(j) == first for j in (2, 3))
 
 
+def test_actions_a_walk_reveals_are_explored_before_the_model_is_complete():
+    # one screen whose "Clear" button only shows after two adds: only a walk gets there
+    screens = {"home:0": (None, {"Add": "home:1"}), "home:1": (None, {"Add": "home:2"}), "home:2": (None, {"Add": "home:2", "Clear": "home:0"})}
+    model, _ = learn(FakeApp(screens, start="home:0"), [("r", "reachable home")], abstraction="screens", walks=10)
+    assert 'button "Clear"' in model.states[0].actions
+    assert model.complete and 'button "Clear"' in model.states[0].fired
+
+
+def test_the_screens_pass_gets_the_whole_time_budget():
+    from types import SimpleNamespace
+
+    from telic.ui.run import learn_auto
+
+    passes = []
+
+    def learn(s):
+        passes.append(s)
+        return None, SimpleNamespace(stop="stopped at the state budget (100)" if s.abstraction == "controls" else "", seconds=590.0, notes=[]), {}
+
+    learn_auto(learn, Settings(max_seconds=600.0))
+    assert [(p.abstraction, p.max_seconds) for p in passes] == [("controls", 600.0), ("screens", 600.0)]
+
+
 # ---------------------------------------------------------------------------
 # The fixture web app in a real browser
 
@@ -387,6 +410,24 @@ def test_a_banner_that_covers_the_menu_on_phones_only(tmp_path):
     r = got["menu-visible"]
     assert r.status == "refuted" and "at 390x844" in r.detail and 'div.banner "We use cookies"' in r.detail
     assert [v["status"] for v in r.viewports] == ["refuted", "proved"]
+
+
+@pytest.mark.parametrize(
+    "toml, says",
+    [
+        ('command = "exit 3"', "exited (3)"),
+        ('static = "missing"', "does not exist"),
+        ('url = "http://127.0.0.1:9"', "nothing answers"),
+    ],
+)
+def test_an_app_that_does_not_run_is_an_error_not_a_verdict(tmp_path, toml, says):
+    d = tmp_path / "app"
+    shutil.copytree(APP, d)
+    (d / "telic.toml").write_text(f'[ui]\n{toml}\nviewports = ["390x844"]\n')
+    rep, got = run_ui(d)
+    assert {r.status for r in got.values()} == {"error"}
+    assert all(says in r.detail for r in got.values())
+    assert {a.status for a in rep.aims} == {"partial"}
 
 
 @pytest.mark.parametrize("viewports, ok", [('["390x844"]', True), ("[]", False)])

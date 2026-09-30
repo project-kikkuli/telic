@@ -345,7 +345,7 @@ def _check_scope(r: AimReport, targets: list[str], partial: bool, root: str) -> 
         r.advice.append(f"every lemma is in {only}: declare {r.id} there as an '@aim {r.id}: ...' comment")
 
 
-_RANK = {"refuted": 0, "open": 1, "unsupported": 1, "vacuous": 2, "trusted": 3, "proved": 4}
+_RANK = {"refuted": 0, "error": 1, "open": 1, "unsupported": 1, "vacuous": 2, "trusted": 3, "proved": 4}
 
 
 def _ui_lemma(rep: Any, res: Any, r: AimReport) -> Lemma:

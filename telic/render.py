@@ -283,8 +283,8 @@ class Renderer:
         parts.append(p.bgreen(f"{len(proved)} proved"))
         if r.ui is not None and r.ui.results:
             us = [x.status for x in r.ui.results]
-            bits = [f"{us.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous") if us.count(k)]
-            color = p.bred if "refuted" in us or "vacuous" in us else p.byellow if "open" in us else p.bgreen
+            bits = [f"{us.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous", "error") if us.count(k)]
+            color = p.bred if "refuted" in us or "vacuous" in us or "error" in us else p.byellow if "open" in us else p.bgreen
             parts.append(color("ui: " + ", ".join(bits)))
         if r.lifecycles:
             ls = [x.status for x in r.lifecycles]
@@ -563,7 +563,7 @@ class Renderer:
                 lem = r.lemma
                 where = p.dim(f"{lem.path}:{lem.line}")
                 out.append(f"  {mark(p, r.status)} {pad(lem.name, nw)}{lem.text}  {where}")
-                how = {"proved": p.green, "refuted": p.red, "vacuous": p.red}.get(r.status, p.yellow)
+                how = {"proved": p.green, "refuted": p.red, "vacuous": p.red, "error": p.red}.get(r.status, p.yellow)
                 label = ui_label(r.status, r.method)
                 text = f"{label} · {r.detail}" if r.detail else label
                 for k, line in enumerate(_wrap(text, self.width - nw - 6)):

@@ -18,6 +18,7 @@ from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
 from .driver import DriverError
+from .learn import Settings
 from .spec import Scan, UiDecl, UiLemma
 
 CACHE = os.path.join(".telic", "ui.json")
@@ -29,7 +30,7 @@ VERSION = 1
 class UiResult:
     lemma: UiLemma
     app: str  # the telic.toml it ran under ('' when none)
-    status: str  # proved | refuted | open | vacuous
+    status: str  # proved | refuted | open | vacuous | error (the app did not run)
     method: str = ""
     detail: str = ""
     trace: list[str] | None = None
@@ -212,7 +213,7 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
                 done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, facts, job[0], job[1], log), jobs))
     except (AppError, DriverError) as e:
         app.error = str(e)
-        return {lem.name: UiResult(lem, cfg.path, "open", "", f"the app did not run: {e}") for lem in lems}
+        return {lem.name: UiResult(lem, cfg.path, "error", "", f"the app did not run: {e}") for lem in lems}
     outs: dict[str, list[Outcome]] = {lem.name: [] for lem in lems}
     for model, got in done:
         app.models.append(model)
@@ -275,15 +276,7 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, si
             holder.append(ex)
             return ex, ex.learn(), occl
 
-        s = cfg.settings
-        if s.abstraction == "auto":
-            # the exact abstraction when the app is small enough for it; else screens
-            ex, model, occl = learn(replace(s, abstraction="controls", max_states=min(s.max_states, AUTO_STATES)))
-            if "state budget" in model.stop:
-                ex, model, occl = learn(replace(s, abstraction="screens", max_seconds=max(1.0, s.max_seconds - model.seconds)))
-                model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
-        else:
-            ex, model, occl = learn(s)
+        ex, model, occl = learn_auto(learn, cfg.settings)
         dialogs = sum(getattr(d, "dialogs", 0) for d in drivers)
         if dialogs:
             model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
@@ -315,6 +308,18 @@ def _source_notes(model, facts, watched, read: set[str]) -> None:
         model.notes.append("changed by timers, not waited for: " + ", ".join(f"{h.describe()}, timer at line {', '.join(map(str, h.clock))}" for h in clocked))
     for e in facts.errors[:3]:
         model.notes.append(e)
+
+
+def learn_auto(learn: Callable[[Settings], tuple], s: Settings) -> tuple:
+    """The exact abstraction when the app is small enough for it; else screens.
+    Each pass has the whole time budget, so how long the first took never decides the second."""
+    if s.abstraction != "auto":
+        return learn(s)
+    ex, model, occl = learn(replace(s, abstraction="controls", max_states=min(s.max_states, AUTO_STATES)))
+    if "state budget" in model.stop:
+        ex, model, occl = learn(replace(s, abstraction="screens"))
+        model.notes.insert(0, f"states are screens: telling controls apart gave more than {AUTO_STATES} states (set [ui] abstraction to choose)")
+    return ex, model, occl
 
 
 def _dump(cfg: UiConfig, model) -> None:
