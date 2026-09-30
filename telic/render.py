@@ -18,9 +18,11 @@ from .replay import call_text
 class Paint:
     def __init__(self, enabled: bool | None = None):
         if enabled is None:
-            enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+            enabled = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
             if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"):
                 enabled = True
+            if os.environ.get("NO_COLOR"):
+                enabled = False
         self.on = enabled
 
     def _c(self, code: str, s: str) -> str:

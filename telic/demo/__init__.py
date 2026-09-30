@@ -210,6 +210,8 @@ def run_demo(pause: bool | None = None, color: bool | None = None, workspace: st
     os.chdir(ws)
     if color:
         os.environ["FORCE_COLOR"] = "1"
+    else:
+        os.environ["NO_COLOR"] = "1"  # wins over a FORCE_COLOR the environment sets
     try:
         for i, step in enumerate(ACTS):
             if step.title:
