@@ -65,9 +65,10 @@ def test_inferred_measures_are_reported_and_cached(tmp_path, src, want):
         assert f"inferred @decreases {m}" in out
 
 
-def test_explain_shows_formula(tmp_path):
+@pytest.mark.parametrize("order", [("f", "m.py"), ("m.py", "f")])
+def test_explain_shows_formula(tmp_path, order):
     (tmp_path / "m.py").write_text("def f(x: int) -> int:\n    #@ requires x > 0\n    #@ ensures result > 1\n    return x + 1\n")
-    out = telic("explain", "f", "m.py", "--no-cache", cwd=tmp_path)
+    out = telic("explain", *order, "--no-cache", cwd=tmp_path)
     assert "⊢" in out.stdout and "f/ensures@3>4" in out.stdout
 
 
