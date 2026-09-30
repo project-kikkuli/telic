@@ -278,6 +278,23 @@ class _Target:
             out.append(f"if !({cond}) {{ println!(\"TELIC_VIOLATION ensures {i}\"); }}")
         return out
 
+    def lifecycles(self) -> tuple[list[str], list[str], list[Any]]:
+        """(snapshots taken before the call, checks after it, the lifecycles):
+        the receiver changes only as its lifecycles allow."""
+        if self.info is None or not any(p.name == "self" for p in self.fn.params):
+            return [], [], []
+        from ..runtime import _lifecycles
+
+        lcs = [lc for _, lc in _lifecycles(self.fe.classes, self.info.owner or "")]
+        snaps, checks = [], []
+        for i, lc in enumerate(lcs):
+            cond, olds = _extract_old(re.sub(r"\bself\b", "__self", lc.code))
+            for k, o in enumerate(olds):
+                snaps.append(f"let __o{i}_{k} = ({o}).clone();")
+                cond = cond.replace(f"__OLD{k}__", f"__o{i}_{k}")
+            checks.append(f"if !({cond}) {{ println!(\"TELIC_VIOLATION lifecycle {i}\"); }}")
+        return snaps, checks, lcs
+
     def run(self, bodies: list[str]) -> tuple[str, str] | dict[str, Any]:
         """Build the crate with each body in turn until one compiles; its
         output and the copied root file."""
@@ -301,10 +318,11 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
     if inv is None:
         return None
     setup, call = inv
-    checks = t.checks()
+    snaps, lc_checks, lcs = t.lifecycles()
+    checks = t.checks() + lc_checks
     bodies = []
     if checks:
-        bodies.append(f"let __r = std::panic::catch_unwind(move || {{ {setup} let __v = {call}; {' '.join(checks)} format!(\"{{:?}}\", __v) }}); if let Ok(s) = __r {{ println!(\"TELIC_RETURNED {{}}\", s); }}")
+        bodies.append(f"let __r = std::panic::catch_unwind(move || {{ {setup} {' '.join(snaps)} let __v = {call}; {' '.join(checks)} format!(\"{{:?}}\", __v) }}); if let Ok(s) = __r {{ println!(\"TELIC_RETURNED {{}}\", s); }}")
     bodies += [
         f"let __r = std::panic::catch_unwind(move || {{ {setup} let __v = {call}; format!(\"{{:?}}\", __v) }}); if let Ok(s) = __r {{ println!(\"TELIC_RETURNED {{}}\", s); }}",
         f"let __r = std::panic::catch_unwind(move || {{ {setup} let _ = {call}; }}); if __r.is_ok() {{ println!(\"TELIC_RETURNED (value)\"); }}",
@@ -318,6 +336,8 @@ def run_rust(path: str, fn: ir.Function, model: dict[str, Any]) -> dict[str, Any
         if line.startswith("TELIC_VIOLATION ensures "):
             c2 = fn.ensures[int(line.split()[-1])]
             return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c2.text, "detail": f"returned {out.get('returned_repr', '')}".strip()}
+        if line.startswith("TELIC_VIOLATION lifecycle "):
+            return {"violation": "lifecycle", "func": ir.source_name(fn.name), "text": lcs[int(line.split()[-1])].clause.text}
     return out
 
 
@@ -465,6 +485,22 @@ def _run_many(chosen: list[tuple["_Target", str]]) -> tuple[str, str] | dict[str
     except subprocess.TimeoutExpired:
         return {"timeout": True}
     return r.stdout, root_copy
+
+
+def _extract_old(text: str) -> tuple[str, list[str]]:
+    """``old(e)`` -> ``__OLDk__``, with the ``e`` texts in order."""
+    out, olds, i = "", [], 0
+    for m in re.finditer(r"\bold\(", text):
+        if m.start() < i:
+            continue
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        out += text[i : m.start()] + f"__OLD{len(olds)}__"
+        olds.append(text[m.end() : j - 1])
+        i = j
+    return out + text[i:], olds
 
 
 def _receiver(text: str) -> str:

@@ -39,6 +39,8 @@ from ..contracts import (
     parse_comment_lines,
     parse_aim_directive,
 )
+from ..lifecycle import LifecycleError
+from ..lifecycle import build as build_lifecycle
 from .rust_crate import ModPath, Res
 
 RUST_ASSUMPTIONS = [
@@ -350,6 +352,10 @@ class RustFrontend:
         for s in self.structs.values():
             self._in(s.mod, s.generics)
             self._declare_struct(s)
+        for s in self.structs.values():
+            if next((i.file for i in self.crate.mods[s.mod].items.get(s.src, [])), "") == self.abs:
+                self._in(s.mod, s.generics, s.name)
+                self._lifecycles(s)
         for e in self.data_enums.values():
             self._enum_record(e)
 
@@ -440,6 +446,7 @@ class RustFrontend:
             return
         decl = self.module.classes.get(s.name)
         info = FnInfo(f"{s.name}.<lifecycle>", s.node, [ir.Param("self", ir.TClass(s.name))], ir.NONE, None, {}, "mut", s.name, set())
+        info.mod, info.file = s.mod, self.abs
         for cl in mine:
             cl.consumed = True
             if decl is None:

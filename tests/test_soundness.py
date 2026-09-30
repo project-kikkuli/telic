@@ -82,8 +82,16 @@ TRUE_HELPERS = {
     "t35.ts": {"Acct.__init__", "Checked.__init__"},
     "t36.py": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift", "first_v"},
     "t36.ts": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift"},
-    "t32.rs": {"set"},
+    "lc1.py": {"Counter.__init__", "Counter.bump", "Job.__init__", "Job.start", "Job.finish", "Base.__init__", "Door.__init__", "Door.lock", "Valve.__init__"},
+    "lc1.ts": {"Meter.__init__", "Meter.tick", "Lock.__init__", "Lock.seal", "Stepper.__init__", "Stepper.next"},
     "t31.rs": {"f", "f@two", "Ctr.reset", "E2.from", "Five.w", "Loose.eq", "Tr.w@default", "fails", "wrap"},
+    "t32.rs": {"set"},
+}
+
+# Lifecycles whose claim across calls is true; every other one in these files is false.
+TRUE_LIFECYCLES = {
+    "lc1.py": {"state: 0 -> 1 -> 2"},
+    "lc1.ts": {"stage: 0 -> 1 -> 2"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs", ".swift"))
