@@ -190,12 +190,13 @@ _HANDLERS_JS = """
   for (const t of [window, document, ...document.querySelectorAll('*')]) {
     try { const ls = getEventListeners(t); for (const k in ls) for (const l of ls[k]) add(l.listener); } catch (e) {}
     if (t === window) continue;
-    for (const k of Object.keys(t)) {
+    // handlers a framework keeps on the element: a function, [function, ...args], or {event: function}
+    for (const k of [...Object.keys(t), ...Object.getOwnPropertySymbols(t)]) {
       let v;
       try { v = t[k]; } catch (e) { continue; }
       if (typeof v === 'function') add(v);
       else if (Array.isArray(v)) v.forEach(add);
-      else if (v && typeof v === 'object' && k.startsWith('__reactProps$')) Object.values(v).forEach(add);
+      else if (v && typeof v === 'object' && (typeof k === 'symbol' || k.startsWith('__reactProps$'))) Object.values(v).forEach((x) => Array.isArray(x) ? x.forEach(add) : add(x));
     }
   }
   return [...fns];
