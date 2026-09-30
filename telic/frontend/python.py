@@ -2136,6 +2136,8 @@ class ExprLowerer:
             vs = [self.expr(v) for v in n.values]
             if not isinstance(expect, ir.TDict) and (len({k.ty for k in ks}) > 1 or len({v.ty for v in vs}) > 1) and not all(ir.is_numeric(v.ty) for v in vs):
                 return self.opaque("dict", ks + vs, ir.TOpaque("dict"), loc)  # mixed value types: a JSON-like payload
+            if not isinstance(expect, ir.TDict) and any(isinstance(v.ty, (ir.TList, ir.TDict, ir.TOption)) for v in vs):
+                return self.opaque("dict", ks + vs, ir.TOpaque("dict"), loc)  # containers as values: a JSON-like payload
             if isinstance(expect, ir.TDict):
                 dt = expect
             elif ks:

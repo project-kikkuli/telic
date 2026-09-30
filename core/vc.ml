@@ -190,6 +190,7 @@ type program = {
   resolve_tbl : (string * string, string) Hashtbl.t;  (** (module, name) -> function key *)
   heap_writes : (string, (string * string list) list) Hashtbl.t;  (** key -> [Cls.field, targets] *)
   allocates : (string, unit) Hashtbl.t;
+  hands_out : (string, unit) Hashtbl.t;  (** may hand a checked object to unchecked code *)
   def_heap : (string, string list) Hashtbl.t;  (** definitional key -> heap keys its body reads *)
   by_name : (string, classinfo) Hashtbl.t;  (** classes by name *)
   hkeys : (string * string, (string * sort) list option) Hashtbl.t;  (** heap_keys, memoized (None: not modelled) *)
@@ -561,6 +562,9 @@ let written_in g names = List.filter_map (fun c -> if List.mem (written_key c.cn
 
 let monotone_alloc pre_ new_ r = quant "forall" [ r ] (implies (select pre_ r) (select new_ r)) [ [| select new_ r |] ]
 
+(* an object this call created ([alloc] now, not at entry) keeps its field *)
+let created_kept alloc0 alloc old new_ r = quant "forall" [ r ] (implies (and_ [ select alloc r; not_ (select alloc0 r) ]) (eq (select new_ r) (select old r))) [ [| select new_ r |] ]
+
 let rec first_select_on r (t : term) =
   match t.node with
   | App ("select", [| _; i |]) when i == r -> Some t
@@ -855,6 +859,21 @@ and builtin g ctx (e : Ir.expr) name args =
       let ty = e.ty in
       let tag = ty_str ty in
       let v = pack ty (List.map (fun (suffix, srt) -> fn (Printf.sprintf "unbox.%s.%s" tag suffix) (Array.of_list (flatten x)) srt) (components ty)) in
+      let scalar = function Ir.TInt -> Some "int" | TStr -> Some "str" | TBool -> Some "bool" | _ -> None in
+      let v =
+        match (x, ty, v) with
+        | L xl, TList et, L vl when scalar et <> None ->
+          (* a list of unchecked values seen at list[int]: element by element,
+             where an element is one (whether it is is for the code to check) *)
+          let kind = Option.get (scalar et) in
+          let vl = { vl with off = zero; len = xl.len } in
+          let i = const (Printf.sprintf "i!%d" (next g)) Int in
+          let b = at (xl.arr, xl.off) i in
+          assume_ (quant "forall" [ i ] (implies (and_ [ le zero i; lt i xl.len ]) (implies (fn "opaque.isinstance.Bool" [| b; str kind |] Bool) (eq (fn (Printf.sprintf "unbox.%s." kind) [| b |] (sort_of et)) (at (vl.arr, zero) i)))) [ [| at (vl.arr, zero) i |] ]);
+          L vl
+        | _ -> v
+      in
+      (match x with T b -> box_facts g ctx b v ty false | _ -> ());
       (match v with L l -> assume_ (le zero l.len) | _ -> ());
       (match ctx.state with
        | Some st ->
@@ -868,6 +887,7 @@ and builtin g ctx (e : Ir.expr) name args =
       let tag = ty_str aty in
       let comps = flatten x in
       let b = fn ("box." ^ tag) (Array.of_list comps) Opaque in
+      box_facts g ctx b x aty true;
       (* unboxed at the type it was boxed at, a value is itself (a generic function's T) *)
       if aty <> TNone then List.iter2 (fun (suffix, srt) c -> assume_ (eq (fn (Printf.sprintf "unbox.%s.%s" tag suffix) [| b |] srt) c)) (components aty) comps;
       T b
@@ -876,6 +896,15 @@ and builtin g ctx (e : Ir.expr) name args =
       let srt = sort_of e.ty in
       let part = String.length op > 5 && String.sub op 0 5 = "part." in
       let sym = if part then "attr." ^ String.sub op 5 (String.length op - 5) else op in
+      let cmp = match op with "cmp.lt" -> Some lt | "cmp.le" | "cmp.lte" -> Some le | "cmp.gt" -> Some gt | "cmp.ge" | "cmp.gte" -> Some ge | "cmp.eq" -> Some eq | "cmp.ne" | "cmp.noteq" -> Some ne | _ -> None in
+      (match (cmp, flat_rest) with
+      | Some f, [ a; b ] when (a.sort = Opaque && b.sort = Int) || (a.sort = Int && b.sort = Opaque) ->
+        (* against an int: an int compares as one; anything else stays unknown *)
+        let x = if a.sort = Opaque then a else b in
+        let ux = fn "unbox.int." [| x |] Int in
+        let l, r = if a.sort = Opaque then (ux, b) else (a, ux) in
+        T (ite (fn "opaque.isinstance.Bool" [| x; str "int" |] Bool) (f l r) (fn (Printf.sprintf "opaque.%s.%s" op (sort_name srt)) (Array.of_list flat_rest) srt))
+      | _ ->
       let r = fn (Printf.sprintf "opaque.%s.%s" sym (sort_name srt)) (Array.of_list flat_rest) srt in
       if (not ctx.spec) && not ctx.quiet then note_assumed g loc "operations on values from unchecked code do not raise";
       if e.ty = TInt && op = "len" then assume_ (le zero r);
@@ -884,7 +913,7 @@ and builtin g ctx (e : Ir.expr) name args =
          assume_ (lt (depth r) (depth x));
          if (not ctx.spec) && not ctx.quiet then note_assumed g loc "a frozen dataclass or NamedTuple holds values built before it"
        | _ -> ());
-      T r
+      T r)
     | "depth", [ x ] ->
       let x = tm x in
       assume_ (le zero (depth x));
@@ -1058,11 +1087,17 @@ and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
   (match Option.map container src with
    | Some { e = Var n; ty = TList _ | TDict _; _ } when List.mem n names -> raise (Vc_error (Printf.sprintf "the comprehension changes '%s' while iterating over it" n, loc))
    | _ -> ());
+  let framed =
+    if Hashtbl.mem g.prog.hands_out g.info.key || g.info.fn.escaped <> [] then []
+    else
+      let checked, _ = modified ~extern_heap:false g (List.map (fun x -> Ir.ExprStmt (loc, x)) parts) in
+      List.filter (fun n -> is_heap n && n <> "@alloc" && not (List.mem n checked)) names
+  in
   let havoc_here () =
     match ctx.state with
     | Some st ->
       let n0 = Dynarray.length st.facts in
-      let h = havoc g st names appends in
+      let h = havoc ~framed g st names appends in
       for k = n0 to Dynarray.length h.facts - 1 do assume ctx (Dynarray.get h.facts k) done;
       st.env <- h.env
     | None -> ()
@@ -1074,7 +1109,7 @@ and run_each g ctx loc (src : Ir.expr option) rng binds body cond =
   ignore (ev g sub body);
   havoc_here ()
 
-and modified g body =
+and modified ?(extern_heap = true) g body =
   (* sets kept as lists (their order names the havocked constants) plus a
      table for membership: a program with many classes has thousands of heap
      keys, and list membership made this quadratic *)
@@ -1120,7 +1155,7 @@ and modified g body =
                 | None -> ())
               | Extern (_, args) ->
                 List.iter (fun (a : Ir.expr) -> match (a.e, a.ty) with Var n, (TList _ | TDict _) -> addn n; adda n | _ -> ()) args;
-                if extern_touches_heap g args then begin
+                if extern_heap && extern_touches_heap g args then begin
                   addn "@alloc";
                   List.iter addn (all_heap_keys g)
                 end
@@ -1142,8 +1177,12 @@ and modified g body =
     body;
   (!names, !appends)
 
-and havoc g (st : state) names appends : state =
+(* [framed]: heap components only unchecked code changes, which cannot reach
+   the objects this call created (it hands none out) *)
+and havoc ?(framed = []) g (st : state) names appends : state =
   let h = copy_state st in
+  let alloc0 = alloc_of g.entry in
+  let fresh_l = fresh_lists g in
   List.iter
     (fun name ->
       match SM.find_opt name h.env with
@@ -1165,6 +1204,10 @@ and havoc g (st : state) names appends : state =
             let r = const (Printf.sprintf "r!%d" (next g)) Int in
             Dynarray.add_last h.facts (monotone_alloc o nw r)
           end
+          else if List.mem name framed then (
+            match o.sort with
+            | Array (Int, _) -> Dynarray.add_last h.facts (created_kept alloc0 (alloc_of st.env) o nw (const (Printf.sprintf "r!%d" (next g)) Int))
+            | _ -> ())
         | _ -> ())
       | Some old -> (
         match Hashtbl.find_opt g.info.fn.locals name with
@@ -1177,9 +1220,34 @@ and havoc g (st : state) names appends : state =
             let nv = match keep with None -> Dynarray.add_last h.facts (le zero nv.len); nv | Some k -> { nv with off = o.off; len = k } in
             h.env <- SM.add name (L nv) h.env
           | _ -> h.env <- SM.add name (fresh g name ty ()) h.env);
-          if SM.mem "@alloc" h.env then List.iter (Dynarray.add_last h.facts) (alloc_facts g (SM.find name h.env) ty h.env)))
+          if SM.mem "@alloc" h.env then List.iter (Dynarray.add_last h.facts) (alloc_facts g (SM.find name h.env) ty h.env);
+          (* its objects were all created by this call *)
+          match SM.find name h.env with
+          | L nv when List.mem name fresh_l ->
+            let i = const (Printf.sprintf "i!%d" (next g)) Int in
+            Dynarray.add_last h.facts (quant "forall" [ i ] (implies (and_ [ le zero i; lt i nv.len ]) (not_ (select alloc0 (at (nv.arr, nv.off) i)))) [ [| at (nv.arr, nv.off) i |] ])
+          | _ -> ()))
     (List.sort compare names);
   h
+
+(* local lists of objects that only ever hold objects this call creates:
+   assigned only list literals of new objects, appended only new objects,
+   never handed to unchecked code *)
+and fresh_lists g =
+  let fn = g.info.fn in
+  let ok = ref (Hashtbl.fold (fun n (t : Ir.ty) acc -> match t with TList (TClass _) when not (List.mem_assoc n fn.params) -> n :: acc | _ -> acc) fn.locals []) in
+  let drop n = ok := List.filter (fun x -> x <> n) !ok in
+  Ir.walk_stmts
+    (fun (st : Ir.stmt) ->
+      (match st with
+       | Assign (_, n, { e = ListLit es; _ }) when List.for_all (fun (x : Ir.expr) -> match x.e with New _ -> true | _ -> false) es -> ignore n
+       | Assign (_, n, _) -> drop n
+       | Append (_, n, { e = New _; _ }) -> ignore n
+       | Append (_, n, _) | IndexAssign (_, n, _, _, _) -> drop n
+       | _ -> ());
+      List.iter (fun e -> Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Extern (_, args) -> List.iter (fun (a : Ir.expr) -> match a.e with Var n -> drop n | _ -> ()) args | _ -> ()) e) (Ir.stmt_exprs st))
+    fn.body;
+  !ok
 
 (* a loop that suspends splits its stretches at its head: each part keeps the
    lifecycles (checked on the way in and after each iteration), and the part
@@ -1253,6 +1321,34 @@ and comprehension g ctx (e : Ir.expr) seq =
             [ [| select arr k |] ]));
     L { arr = !comp_arr; off = zero; len = ln; lty = e.ty }
   end
+
+(* how a checked value [v] of type [ty] looks through the operations telic
+   leaves uninterpreted on its unchecked view [b] (the same object): length,
+   indexing, isinstance; unless [known], only where [b] is an instance of that
+   type (lists and scalars; the Python core also relates dicts) *)
+and box_facts g ctx b v (ty : Ir.ty) known =
+  let n = next g in
+  let scalar = function Ir.TInt -> Some "int" | TStr -> Some "str" | TBool -> Some "bool" | _ -> None in
+  let kind, facts =
+    match (v, ty) with
+    | L l, TList et when et = TOpaque || scalar et <> None ->
+      let i = const (Printf.sprintf "i!%d" n) Int in
+      let get = fn "opaque.getitem.Opaque" [| b; i |] Opaque in
+      let rng = and_ [ le zero i; lt i l.len ] in
+      let elem =
+        match scalar et with
+        | None -> quant "forall" [ i ] (implies rng (eq get (at (l.arr, l.off) i))) [ [| get |] ]
+        | Some k -> quant "forall" [ i ] (implies rng (implies (fn "opaque.isinstance.Bool" [| get; str k |] Bool) (eq (fn (Printf.sprintf "unbox.%s." k) [| get |] (sort_of et)) (at (l.arr, l.off) i)))) [ [| get |]; [| at (l.arr, l.off) i |] ]
+      in
+      (Some "list", [ eq (fn "opaque.len.Int" [| b |] Int) l.len; elem ])
+    | _, t -> (scalar t, [])
+  in
+  match kind with
+  | None -> ()
+  | Some k ->
+    let is_kind = fn "opaque.isinstance.Bool" [| b; str k |] Bool in
+    let fact = if known then and_ (is_kind :: facts) else if facts = [] then tt else implies is_kind (and_ facts) in
+    if fact != tt then assume ctx fact
 
 (* int(s)/float(s) (Python), parseInt(s)/parseFloat(s) (JavaScript) on a
    string: exact on plain decimal digits, otherwise a number telic does not
@@ -1370,20 +1466,29 @@ and await_havoc g ctx (loc : Ir.loc) =
         g.prog.classes
     end
 
-and havoc_heap g ctx =
+(* unchecked code may change any object; with [keep_created], not those this
+   call created (it hands none out, so none it created can be reached) *)
+and havoc_heap ?(keep_created = false) g ctx =
   match ctx.state with
   | None -> ()
   | Some st ->
+    let alloc0 = alloc_of g.entry and alloc = alloc_of st.env in
     SM.iter
       (fun key v ->
         match v with
-        | T old when is_heap key && key <> "@alloc" -> st.env <- SM.add key (T (const (Printf.sprintf "%s@%d" (String.sub key 1 (String.length key - 1)) (next g)) old.sort)) st.env
+        | T old when is_heap key && key <> "@alloc" ->
+          let nw = const (Printf.sprintf "%s@%d" (String.sub key 1 (String.length key - 1)) (next g)) old.sort in
+          st.env <- SM.add key (T nw) st.env;
+          (* (whether or not the code runs: unguarded) *)
+          (match old.sort with
+           | Array (Int, _) when keep_created && alloc != alloc0 -> Dynarray.add_last ctx.base (created_kept alloc0 alloc old nw (const (Printf.sprintf "r!%d" (next g)) Int))
+           | _ -> ())
         | _ -> ())
       st.env;
-    let pre_ = alloc_of st.env in
     let na = const (Printf.sprintf "alloc@%d" (next g)) (Array (Int, Bool)) in
     let r = const (Printf.sprintf "r!%d" (next g)) Int in
-    assume ctx (monotone_alloc pre_ na r);
+    (* (allocation only grows, whether or not the code runs: unguarded) *)
+    Dynarray.add_last ctx.base (monotone_alloc alloc na r);
     st.env <- SM.add "@alloc" (T na) st.env
 
 and extern g ctx (e : Ir.expr) name args =
@@ -1425,7 +1530,7 @@ and extern g ctx (e : Ir.expr) name args =
          | _ -> ())
        touched;
      if extern_touches_heap g args || (g.prog.classes <> [] && fn.escaped <> []) then begin
-       havoc_heap g ctx;
+       havoc_heap ~keep_created:((not (Hashtbl.mem g.prog.hands_out g.info.key)) && fn.escaped = []) g ctx;
        if List.exists (fun c -> c.cinvs <> []) g.prog.classes then note_assumed g loc "unchecked code leaves objects satisfying their class invariants";
        if List.exists (fun c -> c.clcs <> []) g.prog.classes then note_assumed g loc "unchecked code changes objects only as their lifecycles allow"
      end

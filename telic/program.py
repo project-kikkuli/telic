@@ -50,6 +50,9 @@ class Program:
     views: dict[str, set[str]] = field(default_factory=dict)
     # functions that may change an object unchecked values can reach
     unchecked_writers: set[str] = field(default_factory=set)
+    # functions that may hand a checked object to unchecked code (or store one
+    # where unchecked code may reach it), directly or through calls
+    hands_out: set[str] = field(default_factory=set)
     logic_names: dict[str, str] = field(default_factory=dict)
     classes: dict[str, ir.ClassDecl] = field(default_factory=dict)
     class_module: dict[str, ir.Module] = field(default_factory=dict)
@@ -104,6 +107,7 @@ class Program:
         p._sccs()
         p._mutation()
         p._unchecked_writes()
+        p._hands_out()
         p._heap()
         p._predicates()
         p._definitional()
@@ -575,6 +579,43 @@ class Program:
                     self.unchecked_writers.add(key)
                     changed = True
 
+    def _hands_out(self) -> None:
+        direct: set[str] = set()
+        calls: dict[str, set[str]] = {}
+        for key, ref in self.funcs.items():
+            calls[key] = set()
+            params = {p.name for p in ref.fn.params}
+            for s in ir.walk_stmts(ref.fn.body):
+                if isinstance(s, ir.FieldAssign) and reaches_class(s.value.ty):
+                    direct.add(key)
+                # into a container the caller, or unchecked code, may also hold
+                if isinstance(s, (ir.Append, ir.IndexAssign)) and reaches_class(s.value.ty) and (s.name in params or s.name in self.views.get(key, set())):
+                    direct.add(key)
+                for e in ir.stmt_exprs(s):
+                    for sub in ir.walk_expr(e):
+                        if isinstance(sub, ir.Extern) and any(reaches_class(a.ty) or (isinstance(a.ty, ir.TOpaque) and a.ty.why == "closure") for a in sub.args):
+                            direct.add(key)
+                        elif isinstance(sub, ir.Builtin) and sub.name in ("to_opaque", "await") and any(reaches_class(a.ty) for a in sub.args):
+                            direct.add(key)
+                        elif isinstance(sub, ir.Call):
+                            tgt = self.resolve(ref.module, sub.func)
+                            if tgt is None:
+                                direct.add(key)
+                            else:
+                                calls[key].add(tgt.key)
+                        elif isinstance(sub, ir.New):
+                            init = self.member(sub.cls, "__init__")
+                            if init is not None:
+                                calls[key].add(init.key)
+        self.hands_out = set(direct)
+        changed = True
+        while changed:
+            changed = False
+            for key, cs in calls.items():
+                if key not in self.hands_out and cs & self.hands_out:
+                    self.hands_out.add(key)
+                    changed = True
+
     def python_only(self, key: str) -> bool:
         """Only the Python core unfolds trusted predicates and forgets what
         a change to an unchecked value may have broken."""
@@ -1020,6 +1061,21 @@ def unchecked_constructor(e: ir.Extern) -> bool:
     """``Name(...)`` or ``new Name(...)``: assumed to leave what it is handed unchanged."""
     last = e.name.removeprefix("new ").split(".")[-1]
     return last[:1].isupper()
+
+
+def reaches_class(t: ir.Type) -> bool:
+    """Can a value of type ``t`` hold (or be) a checked object?"""
+    if isinstance(t, ir.TClass):
+        return True
+    if isinstance(t, ir.TList):
+        return reaches_class(t.elem)
+    if isinstance(t, ir.TDict):
+        return reaches_class(t.val)
+    if isinstance(t, ir.TOption):
+        return reaches_class(t.inner)
+    if isinstance(t, ir.TRecord):
+        return any(reaches_class(ft) for _, ft in t.fields)
+    return False
 
 
 def reaches_unchecked(t: ir.Type) -> bool:

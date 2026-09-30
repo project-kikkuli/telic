@@ -412,6 +412,7 @@ class VCGen:
         # lines of the field writes to each class with an invariant
         self.written: dict[str, list[int]] = {}
         self._self_escapes: bool | None = None
+        self._fresh_lists: set[str] | None = None
         self.loop_notes: list[tuple[int, str]] = []
         # Facts valid in every state: one-level unfoldings of trusted
         # predicates and what boxing a value tells about it. Every
@@ -1115,8 +1116,11 @@ class VCGen:
 
     # -- loops ------------------------------------------------------------
 
-    def modified(self, stmts) -> tuple[set[str], set[str]]:
-        """(names possibly reassigned/mutated, list names possibly appended)."""
+    def modified(self, stmts, unchecked_writes: bool = True, extern_heap: bool = True) -> tuple[set[str], set[str]]:
+        """(names possibly reassigned/mutated, list names possibly appended);
+        without ``unchecked_writes``, not counting what unchecked code may
+        change through the values it is handed, and without ``extern_heap``
+        the objects it may reach."""
         names = ir.assigned_names(stmts)
         appends: set[str] = set()
         for s in ir.walk_stmts(stmts):
@@ -1151,10 +1155,10 @@ class VCGen:
                             if isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
                                 names.add(a.name)
                                 appends.add(a.name)
-                        if self.program.extern_writes_unchecked(sub, self.fn, self.views):
+                        if unchecked_writes and self.program.extern_writes_unchecked(sub, self.fn, self.views):
                             names.update(self.shared)
                             appends.update(self.shared)
-                        if self.program.extern_touches_heap(sub):
+                        if extern_heap and self.program.extern_touches_heap(sub):
                             names.add("@alloc")
                             names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Call):
@@ -1186,7 +1190,9 @@ class VCGen:
         ref = self.program.member(cls, "__init__") if cls in self.program.classes else None
         return ref.key if ref is not None else None
 
-    def havoc(self, st: State, names: set[str], appends: set[str]) -> State:
+    def havoc(self, st: State, names: set[str], appends: set[str], framed: set[str] = frozenset()) -> State:  # type: ignore[assignment]
+        """``framed``: heap components only unchecked code changes, which
+        cannot reach the objects this call created (it hands none out)."""
         h = st.copy()
         for name in sorted(names):
             if name == SEGMENT:
@@ -1204,6 +1210,11 @@ class VCGen:
                 assert not isinstance(old, (ListVal, OptVal, DictVal))
                 new = L.Const(f"{name[1:]}@{next(self.counter)}", old.sort)
                 h.env[name] = new
+                alloc0 = self.entry.get("@alloc")
+                if name in framed and isinstance(alloc0, L.Term) and old.sort.name == "Array" and (old.sort.index or L.INT) == L.INT:
+                    r = L.Const(f"r!{next(self.counter)}", L.INT)
+                    created = L.and_(L.select(st.env["@alloc"], r), L.not_(L.select(alloc0, r)))  # type: ignore[arg-type]
+                    h.facts.append(L.Quant("forall", (r,), L.implies(created, L.eq(L.select(new, r), L.select(old, r))), patterns=((L.select(new, r),),)))
                 if name == "@alloc":
                     r = L.Const(f"r!{next(self.counter)}", L.INT)
                     h.facts.append(L.Quant("forall", (r,), L.implies(L.select(old, r), L.select(new, r)), patterns=((L.select(new, r),),)))
@@ -1224,7 +1235,33 @@ class VCGen:
                 h.env[name] = self.fresh(name, ty)
             if "@alloc" in h.env:
                 h.facts.extend(self.alloc_facts(h.env[name], ty, h.env))
+            nv = h.env[name]
+            if name in self.fresh_lists and isinstance(nv, ListVal) and isinstance(self.entry.get("@alloc"), L.Term):
+                # its objects were all created by this call
+                i = L.Const(f"i!{next(self.counter)}", L.INT)
+                h.facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, nv.len)), L.not_(L.select(self.entry["@alloc"], nv.at(i)))), patterns=((nv.at(i),),)))  # type: ignore[arg-type]
         return h
+
+    @property
+    def fresh_lists(self) -> set[str]:
+        """Local lists of objects that only ever hold objects this call
+        creates: assigned only list literals of new objects, appended only
+        new objects."""
+        if self._fresh_lists is None:
+            params = {p.name for p in self.fn.params}
+            ok = {n for n, t in self.fn.locals.items() if isinstance(t, ir.TList) and isinstance(t.elem, ir.TClass) and n not in params}
+            for st in ir.walk_stmts(self.fn.body):
+                if isinstance(st, ir.Assign) and st.name in ok and not (isinstance(st.value, ir.ListLit) and all(isinstance(x, ir.New) for x in st.value.elems)):
+                    ok.discard(st.name)
+                elif isinstance(st, ir.Append) and st.name in ok and not isinstance(st.value, ir.New):
+                    ok.discard(st.name)
+                elif isinstance(st, (ir.IndexAssign, ir.ForEach, ir.ForRange)) and getattr(st, "name", getattr(st, "elem", None)) in ok:
+                    ok.discard(getattr(st, "name", getattr(st, "elem", None)))
+            for n in list(ok):
+                if any(isinstance(x, ir.Extern) and any(isinstance(a, ir.Var) and a.name == n for a in x.args) for st in ir.walk_stmts(self.fn.body) for e in ir.stmt_exprs(st) for x in ir.walk_expr(e)):
+                    ok.discard(n)  # (unchecked code may put anything in it)
+            self._fresh_lists = ok
+        return self._fresh_lists
 
     def cut(self, names: set[str], st: State, site: ir.Loc, at_head: bool = False) -> None:
         """A loop that suspends splits its stretches at its head: each part
@@ -1719,6 +1756,11 @@ class VCGen:
                 return pack(ty, list(x.args))  # the same object, seen at its own type again
             comps = [L.Fn(f"unbox.{tag}.{suffix}", tuple(flatten(x)), srt) for suffix, srt in components(ty)]
             v = pack(ty, comps)
+            if isinstance(x, ListVal) and isinstance(ty, ir.TList) and isinstance(v, ListVal) and _SCALAR_KIND.get(type(ty.elem)):
+                # a list of unchecked values seen at list[int]: element by element
+                v = ListVal(v.arr, L.ZERO, x.len, ty)
+                i = L.Const(f"i!{next(self.counter)}", L.INT)
+                ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, x.len)), _unboxed(x.at(i), v.at(i), ty.elem)), patterns=((v.at(i),),)))
             if isinstance(x, L.Term):  # a list[opaque] seen at list[T] is no box
                 self.box_facts(x, v, ty, ctx, known=False)
             if isinstance(v, ListVal):
@@ -2173,9 +2215,17 @@ class VCGen:
         while isinstance(src, ir.Builtin) and src.name in ("dict_keys", "from_opaque"):
             src = src.args[0]
         if isinstance(src, ir.Var) and isinstance(src.ty, (ir.TList, ir.TDict)) and src.name in names:
-            raise VCError(f"the comprehension changes '{src.name}' while iterating over it", loc)
+            direct, _ = self.modified([ir.ExprStmt(loc, x) for x in parts], unchecked_writes=False)
+            if src.name in direct or src.name not in self.shared:
+                raise VCError(f"the comprehension changes '{src.name}' while iterating over it", loc)
+            # only unchecked code the body calls could, through values it is handed
+            self.note(loc, f"unchecked code the comprehension calls does not change '{src.name}' while it is iterated")
+        framed: set[str] = set()
+        if self.ref.key not in self.program.hands_out and not self.fn.escaped:
+            checked, _ = self.modified([ir.ExprStmt(loc, x) for x in parts], extern_heap=False)
+            framed = {n for n in names if n.startswith("@") and n != "@alloc" and n not in checked}
         if ctx.state is not None:
-            self.havoc_here(ctx, names, appends)
+            self.havoc_here(ctx, names, appends, framed)
         sub = ctx.sub(rng)
         sub.bound.update(binds)
         if cond is not None:
@@ -2183,11 +2233,11 @@ class VCGen:
             sub = sub.sub(c)  # type: ignore[arg-type]
         self.ev(body, sub)
         if ctx.state is not None:
-            self.havoc_here(ctx, names, appends)
+            self.havoc_here(ctx, names, appends, framed)
 
-    def havoc_here(self, ctx: Ctx, names: set[str], appends: set[str]) -> None:
+    def havoc_here(self, ctx: Ctx, names: set[str], appends: set[str], framed: set[str] = frozenset()) -> None:  # type: ignore[assignment]
         assert ctx.state is not None
-        h = self.havoc(ctx.state, names, appends)
+        h = self.havoc(ctx.state, names, appends, framed)
         for fact in h.facts[len(ctx.state.facts) :]:
             ctx.assume(fact)
         ctx.state.env.update(h.env)
@@ -2320,7 +2370,7 @@ class VCGen:
             elif unchecked_constructor(e) and any(reaches_unchecked(a.ty) for a in e.args):
                 self.note(e.loc, f"'{e.name}' leaves the values it is handed unchanged")
             if self.program.extern_touches_heap(e) or (self.program.classes and self.fn.escaped):
-                self.havoc_heap(ctx)
+                self.havoc_heap(ctx, keep_created=self.ref.key not in self.program.hands_out and not self.fn.escaped)
                 if any(c.invariants for c in self.program.classes.values()):
                     self.note(e.loc, "unchecked code leaves objects satisfying their class invariants")
                 if any(d.lifecycles for d in self.program.classes.values()):
@@ -2336,17 +2386,27 @@ class VCGen:
                     ctx.assume(t)
         return r
 
-    def havoc_heap(self, ctx: Ctx) -> None:
+    def havoc_heap(self, ctx: Ctx, keep_created: bool = False) -> None:
+        """Unchecked code may change any object; with ``keep_created``, not
+        those this call created (it hands no object to unchecked code, so
+        none it created can be reached)."""
         assert ctx.state is not None
         env = ctx.state.env
+        alloc0, alloc_now = self.entry.get("@alloc"), env["@alloc"]
         for key in [k for k in env if k.startswith("@") and k != "@alloc"]:
             old = env[key]
             assert isinstance(old, L.Term)
             env[key] = L.Const(f"{key[1:]}@{next(self.counter)}", old.sort)
+            if keep_created and isinstance(alloc0, L.Term) and alloc_now != alloc0 and old.sort.name == "Array" and (old.sort.index or L.INT) == L.INT:
+                r = L.Const(f"r!{next(self.counter)}", L.INT)
+                new = env[key]
+                # (whether or not the code runs: unguarded)
+                ctx.base.append(L.Quant("forall", (r,), L.implies(L.and_(L.select(alloc_now, r), L.not_(L.select(alloc0, r))), L.eq(L.select(new, r), L.select(old, r))), patterns=((L.select(new, r),),)))  # type: ignore[arg-type]
         alloc_pre = env["@alloc"]
         new_alloc = L.Const(f"alloc@{next(self.counter)}", L.ARRAY(L.BOOL))
         r = L.Const(f"r!{next(self.counter)}", L.INT)
-        ctx.assume(L.Quant("forall", (r,), L.implies(L.select(alloc_pre, r), L.select(new_alloc, r)), patterns=((L.select(new_alloc, r),),)))  # type: ignore[arg-type]
+        # (allocation only grows, whether or not the code runs: unguarded)
+        ctx.base.append(L.Quant("forall", (r,), L.implies(L.select(alloc_pre, r), L.select(new_alloc, r)), patterns=((L.select(new_alloc, r),),)))  # type: ignore[arg-type]
         env["@alloc"] = new_alloc
 
     def ev_Call(self, e: ir.Call, ctx: Ctx) -> Val:
@@ -2626,6 +2686,13 @@ class VCGen:
             facts.append(L.eq(L.Fn("opaque.len.Int", (b,), L.INT), v.len))
             get = L.Fn("opaque.getitem.Opaque", (b, i), L.OPAQUE)
             facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), L.eq(get, v.at(i))), patterns=((get,),) if _triggerable((get,)) else ()))
+        elif isinstance(v, ListVal) and isinstance(ty, ir.TList) and _SCALAR_KIND.get(type(ty.elem)):
+            # list[int] seen through its unchecked view: each element, unboxed
+            kind = "list"
+            i = L.Const(f"i!{n}", L.INT)
+            facts.append(L.eq(L.Fn("opaque.len.Int", (b,), L.INT), v.len))
+            get = L.Fn("opaque.getitem.Opaque", (b, i), L.OPAQUE)
+            facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), _unboxed(get, v.at(i), ty.elem)), patterns=tuple(p for p in ((get,), (v.at(i),)) if _triggerable(p))))
         elif isinstance(ty, ir.TStr):
             kind = "str"
         elif isinstance(ty, ir.TInt):
@@ -2797,6 +2864,16 @@ def _nonneg_under(i: L.Term, guard: tuple[L.Term, ...]) -> bool:
         elif isinstance(g, L.App) and g.op == "le" and g.args[1] == i and isinstance(g.args[0], L.IntV) and g.args[0].value >= 0:
             return True
     return False
+
+
+_SCALAR_KIND = {ir.TInt: "int", ir.TStr: "str", ir.TBool: "bool"}
+
+
+def _unboxed(b: L.Term, v: L.Term, ty: ir.Type) -> L.Term:
+    """Where the unchecked value ``b`` is a scalar of type ``ty``, it is ``v``
+    (whether it is one is for the code to check)."""
+    kind = _SCALAR_KIND[type(ty)]
+    return L.implies(L.Fn("opaque.isinstance.Bool", (b, L.StrV(kind)), L.BOOL), L.eq(L.Fn(f"unbox.{kind}.", (b,), sort_of(ty)), v))
 
 
 def _shorter(a: L.Term, b: L.Term) -> L.Term:

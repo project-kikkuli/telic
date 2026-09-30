@@ -887,3 +887,36 @@ def parse_float_digits(s: str) -> float:
     #@ requires s == "3"
     #@ ensures result == 3.0
     return float(s)
+
+
+def _counts_total(xs: list[int]) -> int:
+    #@ requires all(x >= 0 for x in xs)
+    #@ ensures result >= 0
+    out = 0
+    for x in xs:
+        #@ invariant out >= 0
+        out += x
+    return out
+
+
+# expect: proved
+def counts_from_json(body: dict) -> int:
+    # untyped JSON checked with isinstance, then handed to a contracted function
+    xs = body["xs"]
+    if not isinstance(xs, list) or not all(isinstance(x, int) and x >= 0 for x in xs):
+        raise ValueError("xs must be a list of counts")
+    return _counts_total(xs)
+
+
+# expect: proved
+def items_from_json(body: dict, n: int) -> list[Item]:
+    # objects built from JSON keep what the loop says of them across
+    # unchecked calls: the function hands none of them out
+    #@ requires n >= 0
+    #@ ensures all(t.qty == n for t in result)
+    out: list[Item] = []
+    for e in body["items"]:
+        #@ invariant all(t.qty == n for t in out)
+        price = int(e["price"])
+        out.append(Item(price, n))
+    return out

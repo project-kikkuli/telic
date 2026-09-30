@@ -459,7 +459,9 @@ let () =
   (match Json.member "def_heap" req with Json.Assoc kvs -> List.iter (fun (k, v) -> Hashtbl.replace def_heap k (List.map Json.to_str (Json.to_list v))) kvs | _ -> ());
   let by_name = Hashtbl.create 64 in
   List.iter (fun (c : Vc.classinfo) -> if not (Hashtbl.mem by_name c.cname) then Hashtbl.add by_name c.cname c) classes;
-  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; def_heap; by_name; hkeys = Hashtbl.create 256 } in
+  let hands_out = Hashtbl.create 16 in
+  (match Json.member "hands_out" req with Json.List l -> List.iter (fun k -> Hashtbl.replace hands_out (Json.to_str k) ()) l | _ -> ());
+  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; hands_out; def_heap; by_name; hkeys = Hashtbl.create 256 } in
   let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 60000 in
   let budget = (timeout, match Json.member "rlimit" req with Json.Int r -> r | _ -> 2_000_000) in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in
