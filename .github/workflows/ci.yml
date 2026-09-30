@@ -16,11 +16,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install Lean 4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-${{ hashFiles('telic/lean/lean-toolchain') }}
+      - name: Install Lean 4 (the toolchain pinned in telic/lean/lean-toolchain)
         run: |
-          curl -sSL -o lean.zip https://releases.lean-lang.org/lean4/v4.34.1/lean-4.34.1-linux.zip
-          unzip -q lean.zip -d "$HOME/lean"
-          echo "$HOME/lean/lean-4.34.1-linux/bin" >> "$GITHUB_PATH"
+          test -x ~/.elan/bin/elan || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none --no-modify-path
+          ~/.elan/bin/elan toolchain install "$(cat telic/lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install
         run: |
           pip install -e '.[test]'
@@ -32,6 +36,6 @@ jobs:
       - name: Build the native engine
         run: opam exec -- make -C core
       - name: Test
-        run: pytest -q
+        run: pytest -q -rs
       - name: Demo
         run: telic demo --no-pause --color never

@@ -1,9 +1,16 @@
+import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 from telic import logic as L
-from telic.lean import extract_proof, find_lean, read_sidecar
+from telic.lean import find_lean, read_sidecar
+from telic.prover import extract_proof
+from telic.prover import resolve as resolve_prover
 
 from conftest import needs_lean, run_check
 
@@ -127,11 +134,33 @@ def square_sum(a: int, b: int) -> int:
     assert f.status == "proved"
 
 
-def test_extract_proof_keeps_inner_have_blocks():
-    reply = "```lean\nhave k : 1 = 1 := by\n  rfl\nexact k\n```"
-    assert extract_proof(reply) == "have k : 1 = 1 := by\n  rfl\nexact k"
-    full = "```lean\ntheorem x : True := by\n  trivial\n```"
-    assert extract_proof(full).strip() == "trivial"
+@pytest.mark.parametrize(
+    "reply, proof",
+    [
+        ("```lean\nhave k : 1 = 1 := by\n  rfl\nexact k\n```", "have k : 1 = 1 := by\n  rfl\nexact k"),
+        ("```lean\ntheorem x : True := by\n  trivial\n```", "trivial"),
+        ('{"proof": "  omega\\n"}', "omega"),
+        ('{"lean": "def f := 1\\ntheorem t_1 (x : Int) : x = x := by\\n  rfl\\n"}', "rfl"),
+        ('{"text": "```lean\\nsimp\\n```"}', "simp"),
+        ("no code here", None),
+    ],
+)
+def test_extract_proof(reply, proof):
+    assert extract_proof(reply, "t_1") == proof
+
+
+@pytest.mark.parametrize(
+    "spec, name",
+    [
+        ("claude -p", "cmd:claude -p"),
+        ("cmd:claude -p --model x", "cmd:claude -p --model x"),
+        ("http://localhost:8000/prove", "http:http://localhost:8000/prove"),
+        ("https://prover.example/v1", "http:https://prover.example/v1"),
+        ("py:json:dumps", "py:json:dumps"),
+    ],
+)
+def test_prover_specs(spec, name):
+    assert resolve_prover(spec).name == name
 
 
 @needs_lean
@@ -147,3 +176,25 @@ def test_proof_cannot_escape_its_theorem():
     assert not r2.ok
     (r3,), _ = check_attempts(lean, "", [Attempt("vc_d", " (x : Int) (h : 0 < x) : 0 ≤ x", "omega")])
     assert r3.ok and not r3.errors
+
+
+def tactic_prover(request):
+    return "```lean\n" + PROOF + "\n```"
+
+
+def file_prover(request):
+    return json.dumps({"lean": request["document"].replace("sorry", PROOF.strip())})
+
+
+@needs_lean
+@pytest.mark.parametrize("prover", ["tactic_prover", "file_prover"])
+def test_prove_saves_what_the_prover_found(tmp_path, prover):
+    (tmp_path / "hard.py").write_text(POW)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent)}
+    out = subprocess.run(
+        [sys.executable, "-m", "telic", "prove", "hard.py", "--no-cache", "--agent", f"py:test_lean:{prover}", "--attempts", "1"],
+        capture_output=True, text=True, cwd=tmp_path, env=env,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    rep = run_check(tmp_path, {"hard.py": POW}, replay=False, timeout_ms=1500)
+    assert next(f for f in rep.functions if f.fn.name == "pow2_add").status == "proved"

@@ -137,6 +137,9 @@ Z3 can't do induction. telic turns the stuck obligation into a Lean 4 theorem, a
 an agent can prove it: `telic prove --agent "claude -p"`. The Lean kernel checks
 the proof, and `#print axioms` rules out `sorry` and any smuggled axiom. The
 proof is saved next to the code and reused until the code it's about changes.
+The prover is pluggable (a command, an HTTP service, or a Python function), and
+the Lean version is pinned in `telic/lean/lean-toolchain`; see
+[Proving in Lean with an agent](docs/agents.md#proving-in-lean-with-an-agent).
 
 ## Commands
 

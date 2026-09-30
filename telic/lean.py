@@ -8,7 +8,7 @@ tries, in order:
    (``pricing.py`` -> ``pricing.py.proof.lean``), if its statement still
    matches the current code;
 2. an automatic tactic ladder (omega, grind, simp, induction...);
-3. with ``telic prove --agent CMD``, an agent that writes the proof, with
+3. with ``telic prove --agent SPEC``, an agent that writes the proof, with
    Lean's error messages fed back to it until the kernel accepts one.
 
 A proof counts only if Lean accepts it *and* ``#print axioms`` shows nothing
@@ -70,10 +70,21 @@ class LeanUnsupported(Exception):
 # Toolchain
 
 
+TOOLCHAIN = Path(__file__).parent / "lean" / "lean-toolchain"
+
+
+def pinned_toolchain() -> str:
+    return TOOLCHAIN.read_text().strip()
+
+
 def find_lean() -> str | None:
     env = os.environ.get("TELIC_LEAN")
     if env and os.path.exists(env):
         return env
+    elan = os.environ.get("ELAN_HOME", os.path.expanduser("~/.elan"))
+    pinned = os.path.join(elan, "toolchains", pinned_toolchain().replace("/", "--").replace(":", "---"), "bin", "lean")
+    if os.path.exists(pinned):
+        return pinned
     found = shutil.which("lean")
     if found:
         return found
@@ -731,32 +742,17 @@ The proof must be tactics only: no top-level commands (no `theorem`, `lemma`, `o
 {feedback}"""
 
 
-def extract_proof(text: str) -> str | None:
-    blocks = re.findall(r"```(?:lean4?|)\s*\n(.*?)```", text, re.S)
-    if not blocks:
-        return None
-    proof = blocks[-1].strip("\n")
-    # Accept a full theorem by mistake: keep only what follows its ':= by'
-    if re.match(r"\s*(theorem|lemma|example)\b", proof) and ":= by" in proof:
-        proof = proof.split(":= by", 1)[1]
-    lines = proof.splitlines()
-    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
-    cut = min(indents) if indents else 0
-    return "\n".join(l[cut:] for l in lines).strip("\n")
-
-
-def run_agent(cmd: str, prompt: str, timeout: float = 600) -> str:
-    import shlex
-
-    p = subprocess.run(shlex.split(cmd), input=prompt, capture_output=True, text=True, timeout=timeout)
-    return p.stdout
-
-
 def cmd_prove(args) -> int:
+    from . import prover as P
     from .checker import build_theory, check
     from .render import Paint
 
     paint = Paint()
+    try:
+        agent = P.resolve(args.agent)
+    except (P.ProverError, ImportError, AttributeError) as e:
+        print(f"telic prove: {e}")
+        return 2
     root = os.path.abspath(args.root or os.getcwd())
     lean = find_lean()
     if lean is None:
@@ -778,7 +774,7 @@ def cmd_prove(args) -> int:
     for f, v in todo:
         ob = v.ob
         print(f"{paint.bold(ob.id)}  {paint.dim(ob.message)}")
-        if not args.agent:
+        if agent is None:
             reason = v.lean.summary if v.lean else "open"
             print(f"  {paint.yellow('?')} {reason}")
             continue
@@ -802,12 +798,22 @@ def cmd_prove(args) -> int:
                 document=doc,
                 feedback=feedback,
             )
+            request = {
+                "prompt": prompt,
+                "document": doc,
+                "theorem": theorem_name(ob),
+                "statement": stmt,
+                "lean_version": version,
+                "obligation": ob.id,
+                "message": ob.message,
+                "attempt": attempt,
+                "feedback": feedback,
+            }
             try:
-                reply = run_agent(args.agent, prompt)
-            except (OSError, subprocess.TimeoutExpired) as e:
-                print(f"  {paint.red('!')} agent failed: {e}")
+                proof = agent.prove(request)
+            except P.ProverError as e:
+                print(f"  {paint.red('!')} {agent.name} failed: {e}")
                 break
-            proof = extract_proof(reply)
             if not proof:
                 feedback = "\nYour previous reply had no ```lean code block. Reply with only the proof in one."
                 print(f"  {paint.dim(f'attempt {attempt}: no proof in reply')}")
@@ -851,7 +857,7 @@ def add_commands(sub, common, options) -> None:
 
     p = sub.add_parser("prove", help="discharge open obligations in Lean")
     common(p)
-    p.add_argument("--agent", metavar="CMD", help="command that reads a prompt on stdin and prints a proof, e.g. \"claude -p\"")
+    p.add_argument("--agent", metavar="SPEC", help="prover: a command that reads a prompt on stdin (\"claude -p\"), http:URL or py:MODULE:FUNC; default $TELIC_PROVER")
     p.add_argument("--attempts", type=int, default=4, help="attempts per obligation (default 4)")
     p.add_argument("--id", action="append", help="only these obligation ids")
     p.set_defaults(func=cmd_prove, _options=options)

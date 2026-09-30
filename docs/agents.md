@@ -62,10 +62,36 @@ Copy [`skills/telic/SKILL.md`](../skills/telic/SKILL.md) into your project's
 
 ## Proving in Lean with an agent
 
+telic checks proofs with the Lean toolchain pinned in
+[`telic/lean/lean-toolchain`](../telic/lean/lean-toolchain). Install it with
+[elan](https://github.com/leanprover/elan):
+
+```bash
+elan toolchain install "$(cat telic/lean/lean-toolchain)"   # found in ~/.elan; TELIC_LEAN overrides
+```
+
 ```bash
 telic prove --agent "claude -p"            # any command that reads a prompt on stdin
 telic prove --agent "claude -p" --id 'f/ensures@12>18' --attempts 6
 ```
+
+`--agent` (or `TELIC_PROVER`) picks the prover:
+
+| spec | what telic does |
+|---|---|
+| `COMMAND`, `cmd:COMMAND` | sends the prompt on stdin, reads the reply on stdout |
+| `http:URL`, `https://…` | POSTs the request as JSON; `TELIC_PROVER_TOKEN` is sent as a bearer token |
+| `py:MODULE:FUNC` | calls `FUNC(request)` |
+| `NAME[:ARG]` | a plugin under the `telic.provers` entry point: `NAME(ARG)` returns `FUNC(request)` |
+
+The request carries `prompt`, `document` (the Lean file ending in the theorem
+with `sorry`), `theorem`, `statement`, `lean_version`, `obligation`, `message`,
+`attempt` and `feedback` (Lean's errors on the previous attempt). The reply is
+text with a ```` ```lean ```` block, or JSON `{"proof": tactics}` or
+`{"lean": the document with sorry filled in}`. A whole-file prover such as
+Harmonic's Aristotle fits the last shape: wrap its API in an HTTP service or a
+`py:` function that submits `document` and returns `{"lean": ...}`. The
+[`telic/prover.py`](../telic/prover.py) docstring is the reference.
 
 The agent receives the source function, the obligation, and the complete Lean
 file (definitions, unfolding lemmas, and the theorem with `sorry`). It must reply
