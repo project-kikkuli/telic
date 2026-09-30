@@ -76,6 +76,7 @@ def total2(xs: list[int]) -> int:
 SPLIT_PY = """
 def share(amount: int, parts: int, i: int) -> int:
     #@ requires amount >= 0 and parts >= 1 and 0 <= i < parts
+    #@ ensures result >= 0
     if i < amount % parts:
         return amount // parts + 1
     return amount // parts
@@ -158,3 +159,10 @@ def test_gaps_close_when_contract_is_strengthened(tmp_path):
     (fg,) = res
     assert not fg.gaps
     assert fg.killed >= 8
+
+
+def test_gaps_leave_specification_helpers_to_the_contracts_using_them(tmp_path):
+    (tmp_path / "s.py").write_text(SPLIT_PY)
+    res = {fg.ref.fn.name: fg for fg in find_gaps([str(tmp_path / "s.py")], CheckOptions(cache_path=None), str(tmp_path))}
+    assert res["split"].total and not res["split"].gaps
+    assert "specification" in res["share"].skipped

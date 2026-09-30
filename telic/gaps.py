@@ -725,6 +725,21 @@ def trivially_met(fn: ir.Function, mod: ir.Module, modules: list[ir.Module], roo
     return None
 
 
+def _used_in_specs(program: Program) -> dict[str, str]:
+    """Functions another function's contract calls: their body is part of
+    that contract's meaning (key -> one function that uses it)."""
+    out: dict[str, str] = {}
+    for ref in program.funcs.values():
+        clauses = ref.fn.requires + ref.fn.ensures + [c for st in ir.walk_stmts(ref.fn.body) for c in getattr(st, "invariants", [])]
+        for c in clauses:
+            for e in ir.walk_expr(c.expr):
+                if isinstance(e, ir.Call):
+                    callee = program.resolve(ref.module, e.func)
+                    if callee is not None and callee.key != ref.key:
+                        out.setdefault(callee.key, ref.fn.name)
+    return out
+
+
 def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, oracle: str | None = None, llm: bool = False, propose: bool = True) -> list[FunctionGaps]:
     """``llm``: also ask the oracle (a model) for realistic mutants and for
     the stronger contract; without it, proposals come from the builtin
@@ -732,9 +747,10 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
     from .equiv import check_pair
     from .checker import build_theory
 
-    base_opts = CheckOptions(timeout_ms=opts.timeout_ms, replay=False, lean=False, infer=True, cache_path=opts.cache_path, only=opts.only)
+    base_opts = CheckOptions(timeout_ms=opts.timeout_ms, replay=False, lean=opts.lean, infer=True, cache_path=opts.cache_path, only=opts.only)  # lean: saved proofs count
     modules = load_modules(paths, root)
     report = check_modules(modules, base_opts, root=root)
+    in_specs = _used_in_specs(report.program)
     results: list[FunctionGaps] = []
     tmp = tempfile.mkdtemp(prefix="telic-gaps-")
     try:
@@ -746,6 +762,9 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
             results.append(fg)
             if frep.status != "proved":
                 fg.skipped = f"not proved yet ({frep.status}); gaps only make sense for proved functions"
+                continue
+            if frep.ref.key in in_specs:
+                fg.skipped = f"a specification: {in_specs[frep.ref.key]} states its contract through it, so a mutant changes that contract too"
                 continue
             if mod.language not in ("python", "typescript", "rust"):
                 fg.skipped = f"gaps run on Python, TypeScript and Rust; {mod.language} mutants cannot be lowered yet"
@@ -816,6 +835,9 @@ def render_gaps(results: list[FunctionGaps], seconds: float) -> str:
         loc = f"{r.ref.module.path}:{fn.loc.line}"
         if r.skipped:
             out.append(f"  {p.gray('·')} {pad(fn.name, 20)}{p.dim(loc)}  {p.dim(r.skipped)}")
+            continue
+        if not r.gaps and not r.total:
+            out.append(f"  {p.gray('·')} {pad(fn.name, 20)}{p.dim(loc)}  {p.dim('no mutants to try: nothing in the body to change')}")
             continue
         if not r.gaps:
             out.append(f"  {p.green('✓')} {pad(fn.name, 20)}{p.dim(loc)}  {p.dim(f'every mutant is rejected by the contract ({r.killed} killed, {r.equivalent} equivalent)')}")
