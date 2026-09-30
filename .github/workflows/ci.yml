@@ -115,9 +115,6 @@ jobs:
         run: pytest -q -rs --durations=25 ${{ matrix.tests }}
         env:
           TELIC_UI_SLOTS: "2"
-      - name: Demo
-        if: steps.verdict.outputs.cache-hit != 'true' && matrix.group == 'core'
-        run: telic demo --no-pause --color never
       - name: Record the verdict
         if: steps.verdict.outputs.cache-hit != 'true'
         run: mkdir -p .verdict && echo "${{ github.sha }}" > .verdict/passed

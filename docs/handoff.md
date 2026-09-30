@@ -29,18 +29,33 @@ verdict semantics are in [contracts.md](contracts.md); the architecture is in
 
 ## CI
 
-Goal: a push whose tests are unchanged finishes in 30 seconds.
-`.github/workflows/ci.yml` runs 11 parallel jobs. Each hashes its inputs
-(every tracked file except `docs/` and top-level `*.md`, the pins in
-`.github/constraints.txt`, the runner image version and the apt z3 version)
-and skips everything after checkout when a passing verdict for that hash is
-in the Actions cache. See the latest runs with
+Principle: telic replaces test batteries with reused proofs. CI for telic
+should be `telic ci` over telic's own ledger, the corpus verdict pins, the
+soundness exploits and the differential semantics cases, each rerun only when
+its inputs change. Goal: 30 seconds when nothing relevant changed.
+
+Now: `.github/workflows/ci.yml` runs 11 parallel jobs over the existing
+pytest suite. Each hashes its inputs (every tracked file except `docs/` and
+top-level `*.md`, the pins in `.github/constraints.txt`, the runner image
+version and the apt z3 version) and skips everything after checkout when a
+passing verdict for that hash is in the Actions cache. Latest runs:
 `gh run list -R project-kikkuli/telic`.
 
-The key is coarse: any code change reruns every job, and the slowest UI
-tests then set the wall time (several minutes). Finer keys need each test's
-real inputs; tests and the demo work in temporary directories, so telic's
-own obligation store (`.telic/`) is not reused across runs.
+Open:
+
+- The key is coarse: any code change reruns every job, and the slowest UI
+  tests (`test_concurrent_browsers_never_exceed_the_machine_budget`, about
+  7 minutes) set the wall time.
+- There is no `telic.ledger.json` for telic itself. `telic ledger telic`
+  ran over 10 minutes locally without finishing; find the slow functions
+  before making `telic ci` the main CI job.
+- Tests and the demo run in temporary directories, so telic's obligation
+  store (`.telic/`) is not reused across CI runs.
+
+Removed as duplicates or change detectors: the CI `telic demo` step
+(`tests/test_cli.py::test_demo_runs_green` runs it) and the exact-string
+assertion in `tests/test_phrase.py` (it now checks that each rendering is
+valid EARS).
 
 ## Unmerged branches
 

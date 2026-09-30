@@ -40,12 +40,18 @@ branches and blockers.
 
 ## Rules
 
+- **Verify through telic and the pinned corpora, not new tests.** telic exists
+  to replace test batteries with reused proofs. A behavior change is shown by a
+  verdict pin in `tests/cases/corpus.*`, a soundness exploit in
+  `tests/cases/soundness/`, or a differential case in `tests/test_semantics.py`.
+  Do not add test files, change-detector tests, or full-suite runs; CI reruns
+  only what changed.
 - **Soundness first.** A change that can make telic report `proved` for a false
   claim is a bug, whatever else it fixes. When a construct can't be modelled
   exactly, make it opaque with a conservative effect and record the assumption
   (`VCGen.note`), or reject it with a reason and a line. Add an exploit to
   `tests/cases/soundness/` for every such case.
-- **New semantics need differential tests.** Any operator or builtin you add to a
+- **New semantics need differential cases.** Any operator or builtin you add to a
   frontend gets cases in `tests/test_semantics.py`, compared against the real
   interpreter.
 - **New theory lemmas need Lean proofs** in `telic/lean/Theory.lean` under the
@@ -64,7 +70,7 @@ branches and blockers.
 
 ```bash
 pip install -e '.[test]'
-pytest -q                           # Lean tests skip if Lean is not installed
+pytest -q tests/test_corpus.py tests/test_soundness.py tests/test_semantics.py   # the pins you touched
 telic demo --no-pause               # the end-to-end story must stay green
 make -C core                        # native engine; any OCaml >= 5.1 (OxCaml 5.2.0+ox adds flambda2)
 ```

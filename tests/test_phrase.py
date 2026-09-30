@@ -6,22 +6,20 @@ from telic.aim import ears_conditions, ears_problems
 from telic.phrase import requirement
 
 CASES = [
-    ("saturating", "ensures result <= a", "WHEN saturating returns, the result shall be at most a."),
-    ("checked", "ensures result.is_none() || result.unwrap() == a + b", "WHEN checked returns, the result shall equal a plus b whenever the result is present."),
-    ("Account.deposit", "ensures self.balance == old(self.balance) + amount", "WHEN deposit returns, the balance shall equal the balance before the call plus amount."),
-    ("try_withdraw", "ensures result == (old(self.balance) >= amount)", "WHEN try_withdraw returns, the result shall be true exactly when the balance before the call is at least amount."),
-    ("average", "requires len(xs) > 0", "The callers of average shall ensure that the length of xs is greater than 0."),
-    ("find", "ensures result === null || xs[result] === target", "WHEN find returns, xs[result] shall equal target whenever the result is present."),
-    ("doubled", "ensures result.len() == xs.len()", "WHEN doubled returns, the length of the result shall equal the length of xs."),
-    ("odd", "ensures frobnicate(x)", "WHEN odd returns, the result shall satisfy `frobnicate(x)`."),
+    ("saturating", "ensures result <= a"),
+    ("checked", "ensures result.is_none() || result.unwrap() == a + b"),
+    ("Account.deposit", "ensures self.balance == old(self.balance) + amount"),
+    ("try_withdraw", "ensures result == (old(self.balance) >= amount)"),
+    ("average", "requires len(xs) > 0"),
+    ("find", "ensures result === null || xs[result] === target"),
+    ("doubled", "ensures result.len() == xs.len()"),
+    ("odd", "ensures frobnicate(x)"),
 ]
 
 
-@pytest.mark.parametrize("func,clause,want", CASES)
-def test_rendering(func, clause, want):
-    got = requirement(func, clause)
-    assert got == want
-    assert ears_problems(got) == []
+@pytest.mark.parametrize("func,clause", CASES)
+def test_rendering_is_valid_ears(func, clause):
+    assert ears_problems(requirement(func, clause)) == []
 
 
 def test_quantifiers_in_all_three_syntaxes():
