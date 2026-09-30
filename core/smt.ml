@@ -70,6 +70,22 @@ let rec sort_smt = function
   | Array (i, e) -> Printf.sprintf "(Array %s %s)" (sort_smt i) (sort_smt e)
   | Rec (n, _) -> q_rec n
 
+(* UTF-8, extended to lone surrogates (a JavaScript string's code units) *)
+let add_code_point b cp =
+  if cp < 0x80 then Buffer.add_char b (Char.chr cp)
+  else if cp < 0x800 then (Buffer.add_char b (Char.chr (0xC0 lor (cp lsr 6))); Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F))))
+  else if cp < 0x10000 then begin
+    Buffer.add_char b (Char.chr (0xE0 lor (cp lsr 12)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F)))
+  end
+  else begin
+    Buffer.add_char b (Char.chr (0xF0 lor (cp lsr 18)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F)))
+  end
+
 (* strings arrive as UTF-8 (surrogates as their own 3-byte sequences): one
    SMT character per code point, not per byte *)
 let str_lit s =
@@ -297,7 +313,7 @@ let parse_sx (s : string) : sx list =
           let j = String.index_from s !i '}' in
           let hex = String.sub s (!i + 3) (j - !i - 3) in
           let cp = int_of_string ("0x" ^ hex) in
-          if cp < 128 then Buffer.add_char b (Char.chr cp) else Buffer.add_utf_8_uchar b (Uchar.of_int cp);
+          add_code_point b cp;
           i := j + 1
         end
         else (Buffer.add_char b s.[!i]; incr i)
