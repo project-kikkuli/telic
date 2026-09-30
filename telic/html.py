@@ -132,6 +132,7 @@ section { display: grid; gap: 14px; }
 .cex { display: grid; gap: 2px; margin-top: 6px; font-size: 0.82rem; }
 .cex .mono { overflow-wrap: anywhere; }
 .problem { padding: 10px 18px 14px; color: var(--muted); font-size: 0.88rem; }
+.mirror ol { margin: 0; padding-left: 1.4rem; font-family: var(--font-mono); font-size: 0.84rem; }
 .mirror { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 18px; display: grid; gap: 10px; }
 .mirror .pair { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; font-family: var(--font-mono); font-size: 0.9rem; }
 .mirror dl { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 4px 16px; margin: 0; font-size: 0.88rem; }
@@ -289,6 +290,38 @@ def mirror_card(m) -> str:
     return f'<div class="mirror">{"".join(parts)}</div>'
 
 
+def ui_card(r) -> str:
+    """One ui lemma: its verdict, what the verdict rests on, and the replayed trace."""
+    from .render import ui_label
+
+    lem = r.lemma
+    parts = [
+        f'<div class="pair">{pill(r.status, ui_label(r.status, r.method))}<span>{e(lem.name)}</span>'
+        f'<span class="muted">{e(lem.text)}</span><span class="where">{e(lem.path)}:{lem.line}</span></div>',
+        f'<div class="muted">{e(r.detail)}</div>',
+    ]
+    if r.status != "proved" and r.trace:
+        parts.append("<ol>" + "".join(f"<li>{e(step)}</li>" for step in r.trace) + "</ol>")
+    if r.status != "proved" and r.replay:
+        parts.append(f"<dl><dt>replayed</dt><dd>{'✓ ' if r.replay.get('confirmed') else ''}{e(r.replay.get('summary', ''))}</dd></dl>")
+    return f'<div class="mirror">{"".join(parts)}</div>'
+
+
+def ui_section(rep: Report) -> str:
+    ui = getattr(rep, "ui", None)
+    if ui is None or not ui.results:
+        return ""
+    from .render import Paint, model_line
+
+    plain = Paint(False)
+    apps = []
+    for a in ui.apps:
+        rows = "".join(f"<dt>model</dt><dd>{e(model_line(m, plain))}</dd>" for m in a.models)
+        head = f"<dt>app</dt><dd>{e(a.config)} · {e(a.error or a.url)}{' (cached)' if a.cached else ''}</dd>"
+        apps.append(f'<div class="mirror"><dl>{head}{rows}</dl></div>')
+    return "<section><h2>UI</h2>" + "".join(apps) + "".join(ui_card(r) for r in ui.results) + "</section>"
+
+
 def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = True) -> str:
     fs = rep.functions
     counts = {s: sum(1 for f in fs if f.status == s) for s in ("proved", "refuted", "vacuous", "open", "unsupported", "trusted", "error")}
@@ -322,7 +355,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         elif cov.get("kind") == "judged":
             ev.append("judged " + cov.get("verdict", "") + (f" (missing: {cov['missing']})" if cov.get("verdict") != "sufficient" and cov.get("missing") else ""))
         lemmas = "".join(
-            f"<li>{MARK.get(x.status, '?')} <code>{e(x.name)}</code> {e(x.text if x.kind == 'mirror' else x.kind + ' ' + x.text)}</li>" for x in i.lemmas
+            f"<li>{MARK.get(x.status, '?')} <code>{e(x.name)}</code> {e(x.text if x.kind == 'mirror' else x.kind + ' ' + x.text)}{' · ' + e(x.detail) if x.detail else ''}</li>" for x in i.lemmas
         )
         if i.loc:
             ev.append(f"declared in {i.loc[0]}:{i.loc[1]}")
@@ -351,6 +384,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
   </header>
   {"<section><h2>Aims</h2><div class='aims'>" + "".join(aims) + "</div></section>" if aims else ""}
   {"<section><h2>Mirrors</h2>" + "".join(mirror_card(m) for m in rep.mirrors) + "</section>" if rep.mirrors else ""}
+  {ui_section(rep)}
   <section>
     <h2>Functions</h2>
     <div class="filters" role="group" aria-label="Show functions">

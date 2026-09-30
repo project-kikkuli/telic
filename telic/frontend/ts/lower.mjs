@@ -51,6 +51,7 @@ const DIRECTIVE_KW = new Set(["aim", "index", "mirrors", "trusted", "pure"]);
 const FUNCTION_KW = new Set(["requires", "ensures", "decreases", "raises", "aim", "mirrors", "trusted", "pure"]);
 const LOOP_KW = new Set(["invariant", "decreases", "index"]);
 const STMT_KW = new Set(["assert", "assume"]);
+const FOREIGN_KW = new Set(["ui"]);
 const AIM_ID = "[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*";
 const TAG_RE = new RegExp(`^\\[\\s*(${AIM_ID}(?:\\s*,\\s*${AIM_ID})*)\\s*\\]\\s*`);
 const AIM_DECL_RE = new RegExp(`^(${AIM_ID})\\s*(?::\\s*(.*))?$`);
@@ -79,6 +80,7 @@ function collectComments(sf) {
 
 function parseContractLines(comments) {
   const out = [];
+  let foreign = -1;
   for (const c of comments) {
     if (!c.text.startsWith("//@")) continue;
     const body = c.text.slice(3);
@@ -94,6 +96,10 @@ function parseContractLines(comments) {
       stripped = stripped.slice(m[0].length);
     }
     const word = stripped.split(/\s+/)[0] || "";
+    if (FOREIGN_KW.has(word) || (foreign === c.line - 1 && !CLAUSE_KW.has(word) && !DIRECTIVE_KW.has(word) && !tags.length)) {
+      foreign = c.line;
+      continue;
+    }
     if (CLAUSE_KW.has(word) || DIRECTIVE_KW.has(word)) {
       const rest = stripped.slice(word.length);
       const pl = rest.length - rest.trimStart().length;

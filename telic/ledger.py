@@ -50,7 +50,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
     aims: dict[str, Any] = {}
     by_key = {f.ref.key: f for f in rep.functions}
     for i in rep.aims:
-        clauses = []
+        clauses = [f"ui {x.name}: {x.text}" for x in i.lemmas if x.kind == "ui"]
         for key in i.functions:
             f = by_key[key]
             for c in f.fn.ensures + f.fn.raises:
@@ -69,9 +69,10 @@ def snapshot(rep: Report) -> dict[str, Any]:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))
         functions[f.ref.key] = {"status": f.status, "obligations": len(f.verdicts), **({"lean": lean} if lean else {})}
     mirrors = {f"{m.a.key} ~ {m.b.key}": m.status for m in rep.mirrors}
+    ui = {f"{r.lemma.path}::{r.lemma.name}": r.status for r in rep.ui.results} if rep.ui is not None else {}
     from . import __version__
 
-    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors}
+    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors, **({"ui": ui} if ui else {})}
 
 
 def write_ledger(path: str, data: dict[str, Any]) -> None:
@@ -88,7 +89,7 @@ def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> d
     """Entries for files outside the checked scope are carried over."""
     if files is None or old is None:
         return new
-    out = {"telic": new["telic"], "aims": {}, "functions": {}, "mirrors": {}}
+    out = {"telic": new["telic"], "aims": {}, "functions": {}, "mirrors": {}, "ui": {}}
 
     def in_scope(key: str) -> bool:
         return key.split("::")[0] in files
@@ -101,6 +102,12 @@ def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> d
         if not any(in_scope(part.strip()) for part in k.split(" ~ ")):
             out["mirrors"][k] = v
     out["mirrors"].update(new["mirrors"])
+    for k, v in old.get("ui", {}).items():
+        if not in_scope(k):
+            out["ui"][k] = v
+    out["ui"].update(new.get("ui", {}))
+    if not out["ui"]:
+        del out["ui"]
     for k, v in old.get("aims", {}).items():
         if not any(in_scope(f) for f in v.get("functions", []) + [v.get("declared", "")]) and k not in new["aims"]:
             out["aims"][k] = v
@@ -167,6 +174,20 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
     for key, n in new["mirrors"].items():
         if key not in old.get("mirrors", {}) and n == "refuted":
             out.append(Change(key, "regression", f"mirror {key} is new and diverges"))
+    for key, o in old.get("ui", {}).items():
+        if not scoped(key):
+            continue
+        n = new.get("ui", {}).get(key)
+        path = key.split("::")[0]
+        if n is None:
+            out.append(Change(key, "regression", f"ui lemma {key} was removed (it was {o})", path))
+        elif RANK.get(n, 0) < RANK.get(o, 0):
+            out.append(Change(key, "regression", f"ui {key}: {o} → {n}", path))
+        elif RANK.get(n, 0) > RANK.get(o, 0):
+            out.append(Change(key, "improvement", f"ui {key}: {o} → {n}", path))
+    for key, n in new.get("ui", {}).items():
+        if key not in old.get("ui", {}):
+            out.append(Change(key, "regression" if n == "refuted" else "new", f"ui {key} is new ({n})", key.split("::")[0]))
     return out
 
 
@@ -210,6 +231,7 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     changed = {aim_entry(f) or f for f in changed}
     files = {f for f in changed if (language_of(f) or is_aim_file(f)) and os.path.exists(os.path.join(root, f))}
     deleted = {f for f in changed if (language_of(f) or is_aim_file(f)) and not os.path.exists(os.path.join(root, f))}
+    files |= ui_lemma_files(root, changed)
     # an edited aim file affects the code backing its aims, before and after, and the code its by: names
     md = {f for f in files | deleted if is_aim_file(f)}
     decls = [d for f in md & files for d in lower_aim_entry(f, os.path.join(root, f)).aims]
@@ -274,6 +296,16 @@ def affected_files(root: str, changed: set[str], ledger: dict[str, Any] | None) 
     return files | deleted
 
 
+def ui_lemma_files(root: str, changed: set[str]) -> set[str]:
+    """A change anywhere in an app with a [ui] section can change how it
+    behaves: every file there declaring a ui lemma is affected."""
+    from .ui.config import find
+    from .ui.spec import scan
+
+    apps = {os.path.dirname(c) for f in changed if os.path.exists(os.path.join(root, f)) and (c := find(os.path.join(root, f), root))}
+    return {lem.path for d in apps for lem in scan([d], root).lemmas}
+
+
 # ---------------------------------------------------------------------------
 # Commands
 
@@ -296,7 +328,8 @@ def cmd_ledger(args) -> int:
     data = merge(old, new, scope) if old else new
     write_ledger(path, data)
     n = len(data["functions"])
-    print(f"wrote {LEDGER}: {len(data['aims'])} aims, {n} functions, {len(data['mirrors'])} mirrors")
+    ui = f", {len(data['ui'])} ui lemmas" if data.get("ui") else ""
+    print(f"wrote {LEDGER}: {len(data['aims'])} aims, {n} functions, {len(data['mirrors'])} mirrors{ui}")
     return 0
 
 
@@ -319,7 +352,7 @@ def cmd_ci(args) -> int:
     regressions = [c for c in changes if c.kind == "regression"]
     unaccepted = [c for c in regressions if c.id not in accepted]
     # The full report for anything that is not fine.
-    if any(f.status in ("refuted", "vacuous", "open", "error") for f in rep.functions) or any(m.status != "proved" for m in rep.mirrors):
+    if any(f.status in ("refuted", "vacuous", "open", "error") for f in rep.functions) or any(m.status != "proved" for m in rep.mirrors) or (rep.ui is not None and any(r.status != "proved" for r in rep.ui.results)):
         print(Renderer(rep, p).render())
         print()
     scope_txt = f"{len(paths)} affected file{'s' * (len(paths) != 1)} (since {args.since})" if scope is not None else f"{len(rep.modules)} files"
@@ -354,6 +387,9 @@ def cmd_ci(args) -> int:
                 if v.status == "refuted":
                     line = (v.ob.site or v.ob.loc).line
                     print(f"::error file={fr.ref.module.path},line={line},title=telic: {v.ob.kind} refuted::{v.ob.message}")
+        for r in rep.ui.results if rep.ui is not None else []:
+            if r.status == "refuted":
+                print(f"::error file={r.lemma.path},line={r.lemma.line},title=telic: ui {r.lemma.name} refuted::{r.detail}")
     stale = any(c.kind in ("improvement", "new", "removed") for c in changes) or bool(regressions)
     if args.update and not unaccepted and not links:
         write_ledger(path, merge(old or {}, new, scope) if old else new)

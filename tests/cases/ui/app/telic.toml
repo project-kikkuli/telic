@@ -1,0 +1,4 @@
+[ui]
+static = "."
+viewports = ["390x844", "1280x800"]
+settle_ms = 60

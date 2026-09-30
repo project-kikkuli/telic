@@ -21,6 +21,7 @@ telic never ignores a contract silently.
 | `assert`, `assume` | a statement position | anywhere inside a block |
 | `aim ID: sentence` | the module | anywhere outside a function |
 | sentence | a directory | an `aims/<ID>.md` file (see [Cross-file aims](#cross-file-aims)) |
+| `[ID] ui NAME: property` | the running app | a comment in any file of the app (see [UI lemmas](#ui-lemmas)) |
 
 ## Clauses
 
@@ -225,6 +226,96 @@ The path is relative to the declaring file; the named file is loaded
 automatically. The two functions must take the same number of parameters (matched
 by position) and must agree on every input both preconditions accept. An `int`
 parameter against a `number` parameter is compared on integers.
+
+## UI lemmas
+
+A UI lemma is a property of the running app, checked through its
+accessibility tree (roles, names, states), whatever the framework. It is a
+contract line with the `ui` keyword, written in a comment in any file of the
+app (`//@`, `#@`, `--@` or `<!--@ ... -->`, so `.svelte`, `.jsx` and `.html`
+files work too), and it cites its aims with a tag:
+
+```ts
+//@ aim ESCAPE: WHILE a dialog or menu is open, the app shall let the user
+//@   return to the home screen.
+//@   by: escape
+//@ [ESCAPE] ui escape: always reachable home from overlay
+```
+
+`by:` names ui lemmas like functions; both directions are checked. An
+`@aim ID: sentence` in a file no language frontend reads (a `.svelte` or
+`.jsx` file) is picked up too.
+
+| property | holds when |
+|---|---|
+| `always reachable P [from Q]` | from every reachable state (where `Q` holds), some sequence of actions reaches `P` |
+| `reachable P` | some reachable state satisfies `P` |
+| `always P [while Q]` / `never P [while Q]` | every reachable state (where `Q` holds) satisfies `P` / not `P` |
+| `unobscured T [while Q]` | wherever `T` renders, its center and four corners hit `T` (or its label) at every viewport |
+| `persists T` | changing control `T` and reopening the app (stored data kept) shows the new value |
+
+Any property can end with `via FUNC`: the function that handles the change.
+Its own verdict then counts toward the lemma (a refuted handler refutes it).
+
+Predicates: `home` (the first screen, nothing open), `overlay` or `overlay
+"Name"` (a dialog, alert dialog or menu is open), `screen "/notes/*"` (glob),
+`ROLE "name"` (present), `ROLE "name" is enabled|disabled|checked|unchecked|
+expanded|collapsed|selected|pressed`, `ROLE "name" == "value"`, joined with
+`not`, `and`, `or` and parentheses. A name is exact (`"Close"`) or a regex
+(`/close|done/i`); a role alone matches any name.
+
+**How it is checked.** telic starts the app, and learns its state graph from
+it: from a fresh start (new browser profile) it fires every action a user
+has (click, type, choose, `Escape`) in every state it finds, and abstracts
+each screen to the route, the open overlays, the controls and their states,
+and the lemmas' predicates. Returning to a state replays its path from a
+fresh start. Then random walks through the model are replayed in the app;
+a step the model did not predict is added to it and learning resumes. The
+model is judged by the app, never the other way round. Items of a list are
+acted on through the first item only, and the list's length counts as 1 or
+more than 1, so data does not make the model infinite.
+
+**Statuses** say what they rest on:
+
+| status | means |
+|---|---|
+| proved on the learned model | holds in every state of a *complete* model (every action fired in every state); routes the model promises are replayed in the app |
+| proved by a replayed witness | `reachable`: the path was replayed in the app |
+| unobscured wherever it renders | hit-tested in every state where it renders, at every viewport ("uncovered in 23/23 states") |
+| passed the test | `persists`: changed, reopened, still changed |
+| refuted | with the action trace, replayed in the app before it is reported |
+| open | exploration stopped at a budget, or a trace did not replay |
+| vacuous | no reachable state made it relevant: never counted as passed |
+
+Each model is shown with its size, whether exploration finished, how
+conformance testing went, and how many transitions were nondeterministic
+(hidden state the abstraction does not see). The whole model is written to
+`.telic/ui-model-<viewport>.json` next to the app.
+
+**The app.** The nearest `telic.toml` with a `[ui]` section above the lemma
+says how to run it:
+
+```toml
+[ui]
+command = "npm run dev -- --port {port}"   # started on a free port; or:
+# static = "dist"                          # a directory telic serves (with build = "npm run build")
+# url = "https://staging.example.com/"     # an app already running
+viewports = ["390x844", "1280x800"]         # each explored separately
+max_states = 150                            # budgets; hitting one leaves verdicts open
+max_depth = 12
+max_seconds = 300
+workers = 3                                 # browsers per viewport
+keys = ["Escape"]                           # keys a user may press anywhere
+ignore = ['button "Sign out"']              # actions never fired (regexes)
+text = "telic"                              # what is typed into text fields
+seed = false                                # true: an oracle proposes paths from the source first
+```
+
+Verdicts are cached in `.telic/ui.json` by the app's sources (every file
+under the `telic.toml`'s directory except dependencies and build output),
+the `[ui]` section, the lemma and telic's own UI code. `--no-ui` skips
+running the app; cached verdicts still show. The web driver needs
+`pip install 'telic[ui]'` and `playwright install chromium`.
 
 ## Spec expressions
 

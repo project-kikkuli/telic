@@ -86,9 +86,10 @@ class Lemma:
     name: str  # function name as written
     path: str
     line: int
-    kind: str  # ensures | raises | invariant | mirror
+    kind: str  # ensures | raises | invariant | mirror | ui
     text: str
-    status: str  # proved | refuted | open | trusted | unsupported
+    status: str  # proved | refuted | open | trusted | unsupported | vacuous
+    detail: str = ""  # for a ui lemma: what the verdict rests on
 
 
 @dataclass
@@ -155,9 +156,22 @@ def build(rep: Any) -> list[AimReport]:
     for mr in rep.mirrors:
         for i in mr.aims:
             mirrors.setdefault(i, []).append(mr)
+    ui = getattr(rep, "ui", None)
+    uis: dict[str, list[Any]] = {}
+    if ui is not None:
+        for d in ui.decls:
+            text, by = split_by(d.text)
+            if d.id in decls:
+                twice.setdefault(d.id, []).append(f"{d.path}:{d.line}")
+            else:
+                decls[d.id] = (text, (d.path, d.line), by, None, False)
+        for res in ui.results:
+            for i in res.lemma.aims:
+                uis.setdefault(i, []).append(res)
+    ui_names = {res.lemma.name for rs in uis.values() for res in rs}
     reviews = _load_reviews(getattr(rep, "root", None))
     out: list[AimReport] = []
-    shown = {k for k, d in decls.items() if not d[4]} | set(citing) | set(mirrors)
+    shown = {k for k, d in decls.items() if not d[4]} | set(citing) | set(mirrors) | set(uis)
     for iid in sorted(shown):
         text, loc, by, scope, context = decls.get(iid, (None, None, [], None, False))
         fns = citing.get(iid, [])
@@ -176,11 +190,16 @@ def build(rep: Any) -> list[AimReport]:
         for mr in mirrors.get(iid, []):
             st = {"proved": "proved", "refuted": "refuted"}.get(mr.status, "open")
             r.lemmas.append(Lemma(mr.a.key, f"{mr.a.fn.name} ≡ {mr.b.fn.name}", mr.a.module.path, mr.a.fn.loc.line, "mirror", "agree on every input", st))
+        for res in uis.get(iid, []):
+            r.lemmas.append(_ui_lemma(rep, res, r))
         # Two-sided pointers.
         if by:
             for item in by:
                 hit = [f for f in rep.functions if _match(item, f.ref.key, f.fn.name)]
-                if not hit:
+                if item.removeprefix("ui:") in ui_names:
+                    if not any(res.lemma.name == item.removeprefix("ui:") for res in uis.get(iid, [])):
+                        r.pointers.append(f"'{item}' is listed in by: but that ui lemma does not cite {iid}")
+                elif not hit:
                     if not context:  # an ancestor's aim file may list code outside this check
                         r.pointers.append(f"'{item}' is listed in by: but no checked function has that name")
                 elif not any(iid in f.fn.aims for f in hit):
@@ -188,6 +207,9 @@ def build(rep: Any) -> list[AimReport]:
             for f in fns:
                 if not any(_match(item, f.ref.key, f.fn.name) for item in by):
                     r.pointers.append(f"{f.fn.name} cites {iid} but is not in its by: list")
+            for res in uis.get(iid, []):
+                if res.lemma.name not in {item.removeprefix("ui:") for item in by}:
+                    r.pointers.append(f"ui {res.lemma.name} cites {iid} but is not in its by: list")
         if scope is not None:
             _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context, root=getattr(rep, "root", None) or ".")
         if text is not None:
@@ -236,6 +258,29 @@ def _check_scope(r: AimReport, targets: list[str], partial: bool, root: str) -> 
     if len(files) == 1 and not partial and not outside and set(targets) <= files:
         (only,) = files
         r.advice.append(f"every lemma is in {only}: declare {r.id} there as an '@aim {r.id}: ...' comment")
+
+
+_RANK = {"refuted": 0, "open": 1, "unsupported": 1, "vacuous": 2, "trusted": 3, "proved": 4}
+
+
+def _ui_lemma(rep: Any, res: Any, r: AimReport) -> Lemma:
+    """A ui lemma; with 'via F', F's own verdict counts too (the control is
+    reachable, and the handler behind it does what its contract says)."""
+    lem = res.lemma
+    status, detail = res.status, res.detail
+    if res.method and status != "open":
+        detail = f"{res.method}: {detail}"
+    if lem.via:
+        hit = [f for f in rep.functions if _match(lem.via, f.ref.key, f.fn.name)]
+        if not hit:
+            r.pointers.append(f"ui {lem.name}: 'via {lem.via}' names no checked function")
+            status = min(status, "open", key=lambda s: _RANK.get(s, 1))
+        else:
+            fs = hit[0].status if not hit[0].open_deps or hit[0].status != "proved" else "open"
+            fs = {"proved": "proved", "trusted": "trusted", "refuted": "refuted"}.get(fs, "open")
+            detail += f"; handler {hit[0].fn.name} {fs}"
+            status = min(status, fs, key=lambda s: _RANK.get(s, 1))
+    return Lemma(f"ui:{lem.name}", lem.name, lem.path, lem.line, "ui", lem.text, status, detail)
 
 
 def _loop_invariants(fn: Any):
@@ -534,7 +579,7 @@ def _aim_json(r: AimReport) -> dict[str, Any]:
         "status": r.status,
         "at": f"{r.loc[0]}:{r.loc[1]}" if r.loc else None,
         "by": r.by,
-        "lemmas": [{"function": x.name, "at": f"{x.path}:{x.line}", "kind": x.kind, "text": x.text, "status": x.status} for x in r.lemmas],
+        "lemmas": [{"function": x.name, "at": f"{x.path}:{x.line}", "kind": x.kind, "text": x.text, "status": x.status, **({"detail": x.detail} if x.detail else {})} for x in r.lemmas],
         "links": r.pointers,
         "ears": r.ears,
         "scope": r.scope,

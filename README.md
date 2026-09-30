@@ -108,6 +108,28 @@ classifier such as TypeSafe's Jev (`--oracle jev`, with `JEV_API_KEY`), an
 LLM, an HTTP endpoint, a command, or a Python function. Their answers are
 labelled and never count as proof. See [docs/contracts.md](docs/contracts.md#oracles).
 
+## UI aims: the running app is the judge
+
+Some requirements are about what a user can do, not what a function
+returns. A `ui` lemma states one over the app's accessibility tree, in any
+framework:
+
+```ts
+//@ aim ESCAPE: WHILE a dialog or menu is open, the app shall let the user
+//@   return to the home screen.
+//@   by: escape, menu-visible
+//@ [ESCAPE] ui escape: always reachable home from overlay
+//@ [ESCAPE] ui menu-visible: unobscured button "Menu"
+```
+
+telic starts the app (a `[ui]` section in `telic.toml` says how), learns its
+state graph by driving it in a browser at each viewport, conformance-tests
+the model against the app, and checks the lemma on it. Every counterexample
+is an action trace replayed in the app ("stuck at screen / with dialog
+"Help" open", "covered by div.banner at 390x844"); a lemma no reachable state
+makes relevant is vacuous, never passed. See [UI lemmas](docs/contracts.md#ui-lemmas)
+and [the workflow](docs/ui.md).
+
 ## When the solver can't decide
 
 Z3 can't do induction. telic turns the stuck obligation into a Lean 4 theorem, and

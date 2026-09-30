@@ -212,6 +212,7 @@ class Report:
     seconds: float = 0.0
     cache_hits: int = 0
     solved: int = 0
+    ui: Any = None  # ui.run.UiReport
 
     def all_verdicts(self) -> list[Verdict]:
         return [v for f in self.functions for v in f.verdicts]
@@ -220,7 +221,9 @@ class Report:
     def ok(self) -> bool:
         return not any(f.status in ("refuted", "error") for f in self.functions) and not any(
             m.status == "refuted" for m in self.mirrors
-        ) and not any(p for m in self.modules for p in m.problems)
+        ) and not any(p for m in self.modules for p in m.problems) and not (
+            self.ui is not None and (self.ui.problems or any(r.status == "refuted" for r in self.ui.results))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +427,7 @@ class CheckOptions:
     jobs: int | None = None  # solver threads (default: every core)
     # "ox": the native engine (core/), where it applies
     engine: str = field(default_factory=lambda: os.environ.get("TELIC_ENGINE", "python"))
+    ui: bool = True  # run ui lemmas against the app (cached verdicts are shown either way)
 
 
 _POOL: dict[str, Any] = {}
@@ -579,13 +583,15 @@ def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory
 
 
 def check(paths: list[str], opts: CheckOptions | None = None, root: str | None = None) -> Report:
+    from .ui.spec import scan
+
     opts = opts or CheckOptions()
     t0 = time.perf_counter()
     modules = load_modules(paths, root)
-    return check_modules(modules, opts, t0=t0, root=root)
+    return check_modules(modules, opts, t0=t0, root=root, ui=scan(paths, root or os.getcwd()))
 
 
-def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None) -> Report:
+def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None, ui: Any = None) -> Report:
     t0 = t0 or time.perf_counter()
     program = Program.build([m for m in modules if m.language != "aims"])
     _sidecars.clear()
@@ -853,6 +859,11 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     cache.save()
     rep = Report(modules, program, reports, [], mirrors, time.perf_counter() - t0, hits, solved)
     rep.root = program.root  # type: ignore[attr-defined]
+    if ui is not None and (ui.lemmas or ui.aims):
+        from .ui.run import run as run_ui
+
+        rep.ui = run_ui(ui, program.root, enabled=opts.ui)
+        rep.seconds = time.perf_counter() - t0
     rep.aims = aim_reports(rep)
     return rep
 

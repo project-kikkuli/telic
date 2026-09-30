@@ -26,6 +26,8 @@ CLAUSE_KEYWORDS = {
 }
 DIRECTIVE_KEYWORDS = {"aim", "index", "mirrors", "trusted", "pure"}
 KEYWORDS = CLAUSE_KEYWORDS | DIRECTIVE_KEYWORDS
+# lines read by another checker (telic.ui), skipped here with their continuations
+FOREIGN_KEYWORDS = {"ui"}
 
 FUNCTION_KEYWORDS = {"requires", "ensures", "decreases", "raises", "aim", "mirrors", "trusted", "pure"}
 LOOP_KEYWORDS = {"invariant", "decreases", "index"}
@@ -71,6 +73,7 @@ def parse_comment_lines(comments: list[tuple[int, int, str]], marker: str) -> li
     """
     out: list[ContractLine] = []
     prefix = marker + "@"
+    foreign = -1
     for line, col, text in comments:
         if not text.startswith(prefix):
             continue
@@ -87,6 +90,9 @@ def parse_comment_lines(comments: list[tuple[int, int, str]], marker: str) -> li
             base_col += m.end()
             stripped = stripped[m.end():]
         word = stripped.split(None, 1)[0] if stripped else ""
+        if word in FOREIGN_KEYWORDS or (foreign == line - 1 and word not in KEYWORDS and not tags):
+            foreign = line
+            continue
         if word in KEYWORDS:
             payload = stripped[len(word):]
             pl = len(payload) - len(payload.lstrip())

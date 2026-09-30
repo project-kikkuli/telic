@@ -36,6 +36,7 @@ def _options(args: argparse.Namespace, root: str) -> CheckOptions:
         only=set(args.only) if args.only else None,
         jobs=getattr(args, "jobs", None),
         engine=getattr(args, "engine", None) or os.environ.get("TELIC_ENGINE", "python"),
+        ui=not getattr(args, "no_ui", False),
     )
 
 
@@ -49,6 +50,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--root", default=None, help="project root for relative paths and the cache (default: cwd)")
     ap.add_argument("-j", "--jobs", type=int, default=None, help="solver threads (default: every core)")
     ap.add_argument("--engine", choices=["python", "ox"], default=None, help="'ox': the native OxCaml engine (core/), where it applies")
+    ap.add_argument("--no-ui", action="store_true", help="do not run ui lemmas against the app (cached verdicts still show)")
 
 
 def report_json(rep: Report) -> dict[str, Any]:
@@ -106,6 +108,7 @@ def report_json(rep: Report) -> dict[str, Any]:
         ],
         "functions": fns,
         "mirrors": [m.to_json() for m in rep.mirrors],
+        **({"ui": rep.ui.to_json()} if rep.ui is not None else {}),
     }
 
 

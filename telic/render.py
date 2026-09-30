@@ -221,6 +221,7 @@ class Renderer:
         for mr in self.r.mirrors:
             if mr.status != "proved" or self.verbose:
                 out += self.mirror_detail(mr)
+        out += self.ui_section()
         out += self.aim_table()
         out += self.function_table()
         out += self.trust_section()
@@ -234,6 +235,9 @@ class Renderer:
         nob = sum(len(f.verdicts) for f in r.functions) + sum(len(m.verdicts) for m in r.mirrors)
         files = sum(1 for m in r.modules if m.language != "aims")
         stats = f"{files} file{'s' * (files != 1)} · {nfun} function{'s' * (nfun != 1)} · {nob} obligation{'s' * (nob != 1)}"
+        if r.ui is not None and r.ui.results:
+            n = len(r.ui.results)
+            stats += f" · {n} ui lemma{'s' * (n != 1)}"
         if r.cache_hits:
             stats += f" · {r.cache_hits} cached"
         stats += f" · {r.seconds:.1f}s"
@@ -258,6 +262,11 @@ class Renderer:
         if problems:
             parts.append(p.byellow(f"{problems} problem{'s' * (problems != 1)}"))
         parts.append(p.bgreen(f"{len(proved)} proved"))
+        if r.ui is not None and r.ui.results:
+            us = [x.status for x in r.ui.results]
+            bits = [f"{us.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous") if us.count(k)]
+            color = p.bred if "refuted" in us or "vacuous" in us else p.byellow if "open" in us else p.bgreen
+            parts.append(color("ui: " + ", ".join(bits)))
         if empty:
             parts.append(p.gray(f"{len(empty)} with nothing to check"))
         unsup = [f for f in r.functions if f.status == "unsupported"]
@@ -458,6 +467,57 @@ class Renderer:
         out.append("")
         return out
 
+    # -- ui ----------------------------------------------------------------
+
+    def ui_section(self) -> list[str]:
+        """The apps, the models learned from them, and each ui lemma: one
+        line when it holds, the replayed trace when it does not."""
+        ui = self.r.ui
+        if ui is None or not (ui.results or ui.problems):
+            return []
+        p = self.p
+        out: list[str] = []
+        for path, line, msg in ui.problems:
+            out += [self.rule(p.byellow("! PROBLEM"), f"{path}:{line}"), "   " + msg, ""]
+        by_app: dict[str, list] = {}
+        for r in ui.results:
+            by_app.setdefault(r.app, []).append(r)
+        apps = {a.config: a for a in ui.apps}
+        for cfg, results in by_app.items():
+            a = apps.get(cfg)
+            out.append(self.rule("ui", cfg or "no app configured"))
+            if a is not None:
+                if a.error:
+                    out.append(f"  {p.red('app')}    {a.error}")
+                elif a.url:
+                    out.append(f"  {p.dim('app')}    {a.url}" + p.dim("  (verdicts cached: nothing the app is built from has changed)" if a.cached else f"  ({a.seconds:.0f}s)"))
+                for m in a.models:
+                    out.append(f"  {p.dim('model')}  {model_line(m, p)}")
+                    for note in m.get("notes", []):
+                        out.append(f"         {p.dim(note)}")
+            nw = max(len(r.lemma.name) for r in results) + 2
+            for r in results:
+                lem = r.lemma
+                where = p.dim(f"{lem.path}:{lem.line}")
+                out.append(f"  {mark(p, r.status)} {pad(lem.name, nw)}{lem.text}  {where}")
+                how = {"proved": p.green, "refuted": p.red, "vacuous": p.red}.get(r.status, p.yellow)
+                label = ui_label(r.status, r.method)
+                text = f"{label} · {r.detail}" if r.detail else label
+                for k, line in enumerate(_wrap(text, self.width - nw - 6)):
+                    if k == 0 and line.startswith(label):
+                        line = how(label) + (p.dim(line[len(label):]) if r.status == "proved" else line[len(label):])
+                    elif r.status == "proved":
+                        line = p.dim(line)
+                    out.append(f"    {pad('', nw)}{line}")
+                if r.status != "proved" and r.trace:
+                    for k, step in enumerate(r.trace, 1):
+                        out.append(f"    {pad('', nw)}{p.dim(f'{k:>2}.')} {step}")
+                if r.status != "proved" and r.replay:
+                    sym = p.green("✓") if r.replay.get("confirmed") else p.dim("·")
+                    out.append(f"    {pad('', nw)}{p.bold('replayed')} {sym} {r.replay.get('summary', '')}")
+            out.append("")
+        return out
+
     # -- tables --------------------------------------------------------------
 
     def aim_table(self) -> list[str]:
@@ -506,6 +566,9 @@ class Renderer:
                 if visible_len(body) > room:
                     body = body[: max(10, room - 1)] + "…"
                 out.append(f"    {m} {pad(x.name, nw)}{p.dim(body)}")
+                if x.detail:
+                    d = x.detail if visible_len(x.detail) <= room else x.detail[: max(10, room - 1)] + "…"
+                    out.append(f"      {pad('', nw)}{p.dim(d)}")
             if cov is not None and cov.get("kind") == "judged" and cov.get("verdict") != "sufficient" and cov.get("missing"):
                 out.append(f"    {p.yellow('judge')}  {p.dim('missing: ' + cov['missing'])}")
             for msg in i.pointers:
@@ -628,6 +691,32 @@ class Renderer:
                     out.append(f"  {p.dim('·')} {p.dim(lang + ': ' + a)}")
         out.append("")
         return out
+
+
+def ui_label(status: str, method: str) -> str:
+    """What a ui verdict rests on, in its own words."""
+    if status == "proved":
+        return {"learned model": "proved on the learned model", "witness replayed": "proved by a replayed witness", "hit-tested": "unobscured wherever it renders", "tested": "passed the test"}.get(method, "proved")
+    if status == "refuted":
+        return "refuted" + (" on the learned model" if method == "learned model" else "")
+    return status
+
+
+def model_line(m: dict[str, Any], p: Paint) -> str:
+    """One learned model: size, whether exploration finished, conformance."""
+    bits = [f"{m['states']} states", f"{m['transitions']} transitions"]
+    bits.append(p.green("complete") if m.get("complete") else p.yellow(f"incomplete: stopped at the {m.get('stop')}"))
+    if m.get("walks"):
+        conf = f"conformance: {m['walks']} walks of ≤{m['walk_length']} steps, {m['agreed']} steps as predicted"
+        if m.get("disagreed"):
+            conf += f", {len(m['disagreed'])} not (added)"
+        bits.append(conf)
+    if m.get("nondeterministic"):
+        bits.append(p.yellow(f"{m['nondeterministic']} nondeterministic"))
+    if m.get("seeded"):
+        sd = m["seeded"]
+        bits.append(f"oracle seed: {sd.get('steps_agreed', 0)} steps right, {sd.get('steps_wrong', 0)} wrong")
+    return f"{p.bold(m['viewport'])}  " + p.dim(" · ").join(bits)
 
 
 def _wrap(text: str, width: int) -> list[str]:
