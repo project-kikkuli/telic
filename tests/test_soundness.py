@@ -18,7 +18,7 @@ import pytest
 
 from telic.checker import CheckOptions, check
 
-from conftest import needs_node
+from conftest import run_check, needs_node
 
 DIR = Path(__file__).parent / "cases" / "soundness"
 
@@ -254,3 +254,28 @@ def test_recursion_through_a_function_value_really_recurses(name, fn):
     if name.endswith(".ts") and shutil.which("node") is None:
         pytest.skip("Node.js not available")
     assert _raises(name, fn) == ("RecursionError" if name.endswith(".py") else "RangeError")
+
+
+SCHEDULED = """function link(label: string): HTMLElement {
+  const a = document.createElement('a')
+  a.textContent = label
+  a.addEventListener('click', () => render())
+  setTimeout(() => render(), 10)
+  return a
+}
+
+function render(): void {
+  document.body.replaceChildren(link('home'))
+}
+
+function spin(n: number): number {
+  return [n].map((x) => spin(x))[0]
+}
+"""
+
+
+@needs_node
+def test_a_scheduled_callback_is_not_recursion(tmp_path):
+    rep = run_check(tmp_path, {"m.ts": SCHEDULED}, lean=False)
+    open_ = {f.fn.name for f in rep.functions if f.status != "proved" and (f.problems or f.verdicts)}
+    assert open_ == {"spin"}

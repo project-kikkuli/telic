@@ -8,6 +8,8 @@ const ts = require("typescript");
 
 const isFn = (n) => ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) || ts.isMethodDeclaration(n) || ts.isConstructorDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n);
 const READS = new Set(["typeof", "String", "Boolean", "isNaN"]);
+// Calls that schedule the functions they are given instead of running them.
+const SCHEDULES = new Set(["addEventListener", "setTimeout", "setInterval", "requestAnimationFrame", "requestIdleCallback", "queueMicrotask", "then", "catch", "finally"]);
 
 const strip = (e) => {
   while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isTypeAssertionExpression(e) || (ts.isSatisfiesExpression && ts.isSatisfiesExpression(e)))) e = e.expression;
@@ -18,7 +20,7 @@ const strip = (e) => {
 // Calls already; `imports`: names imported from checked modules -> [path,
 // name]; `namespaces`: `import * as ns` of checked modules -> path.
 export function codeGraph(sf, checked, imports, namespaces) {
-  const g = { units: {}, calls: [], bindings: {}, imports: { ...imports }, escaped: [] };
+  const g = { units: {}, calls: [], bindings: {}, imports: { ...imports }, escaped: [], later: [] };
   const escaped = new Set();
   const at = (n) => {
     const p = sf.getLineAndCharacterOfPosition(n.getStart(sf));
@@ -193,10 +195,10 @@ export function codeGraph(sf, checked, imports, namespaces) {
     return new Set(got.map((t) => (t in imports || t.split(".")[0] in namespaces ? `=${t}` : t)));
   };
 
-  const site = (ctx, node, label, targets) => {
+  const site = (ctx, node, label, targets, into = g.calls) => {
     if (!targets.size || ctx.unit === null) return;
     const [line, col] = at(node);
-    g.calls.push([ctx.unit, line, col, label.length <= 40 ? label : label.slice(0, 37) + "...", [...targets].sort()]);
+    into.push([ctx.unit, line, col, label.length <= 40 ? label : label.slice(0, 37) + "...", [...targets].sort()]);
   };
 
   const isValueRef = (n) => ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n) || (ts.isCallExpression(n) && ts.isPropertyAccessExpression(strip(n.expression)) && strip(n.expression).name.text === "bind");
@@ -247,6 +249,7 @@ export function codeGraph(sf, checked, imports, namespaces) {
     }
     const given = new Set();
     const callee = ts.isIdentifier(f) ? f.text : "";
+    const method = ts.isIdentifier(f) ? f.text : ts.isPropertyAccessExpression(f) ? f.name.text : "";
     for (const a of node.arguments || []) {
       const look = (x) => {
         if (isValueRef(x) && valuePosition(x)) for (const t of value(x, ctx)) given.add(t);
@@ -254,7 +257,7 @@ export function codeGraph(sf, checked, imports, namespaces) {
       };
       look(a);
     }
-    if (given.size && !READS.has(callee)) site(ctx, node, `${label} (given ${[...given].map((t) => (t.startsWith("<") ? t.slice(1).split(":")[0] : t)).sort().join(", ")})`, given);
+    if (given.size && !READS.has(callee)) site(ctx, node, `${label} (given ${[...given].map((t) => (t.startsWith("<") ? t.slice(1).split(":")[0] : t)).sort().join(", ")})`, given, SCHEDULES.has(method) ? g.later : g.calls);
   };
 
   const visit = (n, ctx) => {

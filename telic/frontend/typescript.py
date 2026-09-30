@@ -345,6 +345,7 @@ def _module(d: dict[str, Any]) -> ir.Module:
         bindings={k: tuple(v) for k, v in (c.get("bindings") or {}).items()},
         imports={k: (v[0], v[1]) for k, v in (c.get("imports") or {}).items()},
         escaped=set(c.get("escaped") or []),
+        later=[(src, ir.Loc(int(line), int(col)), label, tuple(ts)) for src, line, col, label, ts in c.get("later") or []],
     )
     return m
 

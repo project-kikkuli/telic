@@ -71,6 +71,7 @@ class Program:
     # function key -> (loc, callee as written, keys it may run) for each call
     # through a function value, which no 'Call' names
     code_calls: dict[str, list[tuple[ir.Loc, str, set[str]]]] = field(default_factory=dict)
+    later: dict[str, set[str]] = field(default_factory=dict)  # scheduled only: effects, not recursion
     passthrough: set[str] = field(default_factory=set)  # see ir.CodeGraph.passthrough
 
     @classmethod
@@ -420,6 +421,13 @@ class Program:
                         self.code_calls.setdefault(k, []).append((loc, label, keys))
             for e in m.code.escaped:
                 self.callees.setdefault(ANY, set()).update(res(m, e, set()))
+        for m in self.modules:
+            for src, _, _, targets in m.code.later:
+                keys = set().union(*(res(m, t, set()) for t in targets))
+                for k in res(m, src, set()):
+                    self.later.setdefault(k, set()).update(keys - self.callees.get(k, set()))
+        for k, keys in self.later.items():
+            self.callees.setdefault(k, set()).update(keys)
 
     def describe(self, key: str) -> str:
         """A function, unit or ``ANY`` as a reader knows it."""
@@ -428,6 +436,10 @@ class Program:
         if key == ANY:
             return "a function passed as a value"
         return f"'{ir.source_name(key.split('::')[-1])}'"
+
+    def stack_callees(self, key: str) -> set[str]:
+        """What a call of ``key`` may run before it returns."""
+        return self.callees.get(key, set()) - self.later.get(key, set())
 
     def _sccs(self) -> None:
         index: dict[str, int] = {}
@@ -442,7 +454,7 @@ class Program:
             counter[0] += 1
             stack.append(v)
             on.add(v)
-            for w in self.callees.get(v, ()):
+            for w in self.stack_callees(v):
                 if w not in index:
                     strong(w)
                     low[v] = min(low[v], low[w])
@@ -457,7 +469,7 @@ class Program:
                     members.append(w)
                     if w == v:
                         break
-                if len(members) > 1 or v in self.callees.get(v, ()):
+                if len(members) > 1 or v in self.stack_callees(v):
                     self.recursive.update(members)
                 comp[0] += 1
 

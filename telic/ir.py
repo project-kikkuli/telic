@@ -611,6 +611,10 @@ class CodeGraph:
     bindings: dict[str, tuple[str, ...]] = field(default_factory=dict)
     imports: dict[str, tuple[str, str]] = field(default_factory=dict)  # name -> (module path, name there)
     escaped: set[str] = field(default_factory=set)
+    # calls that only schedule what they are given (addEventListener,
+    # setTimeout, then): it runs later on a fresh stack, so these carry
+    # effects but never recursion
+    later: list[tuple[str, Loc, str, tuple[str, ...]]] = field(default_factory=list)
     # functions whose calls are unchecked (``@wrapper f``) but run the
     # function itself with the same arguments: generators, library decorators
     passthrough: set[str] = field(default_factory=set)
