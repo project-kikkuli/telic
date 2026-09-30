@@ -522,7 +522,9 @@ methods of classes preserve it). An enum without payloads is an enum (with
 `rawValue`); one with payloads is a value whose case is matched by `switch`,
 `if case` and `==`. Optionals, `if let`, `guard let`, `while let`, `?.`, `??`
 and `!` are modelled. `do`/`catch` runs a catch clause from the state where
-the error was thrown; which clause matches is left open.
+the error was thrown; which clause matches is left open. A contract describes
+normal returns only, so after a call throws, whatever the callee could reach
+(its object, its arguments' objects and arrays) is unknown.
 
 A protocol is a base class of its conformers: a call through it is checked
 against the requirement's contract, and every conformer's implementation

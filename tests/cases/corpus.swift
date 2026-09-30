@@ -266,6 +266,7 @@ final class Account {
 
     init(balance: Int) {
         //@ requires balance >= 0
+        //@ ensures result.balance == balance
         self.balance = balance
     }
 
@@ -302,9 +303,10 @@ func sharedAccount(_ a: Account) -> Int {
 }
 
 // expect: proved
-func tryWithdraw(_ a: Account, _ amount: Int) -> Bool {
-    //@ requires amount >= 0
-    //@ ensures result == (amount <= old(a.balance))
+func tryWithdraw(_ start: Int, _ amount: Int) -> Bool {
+    //@ requires start >= 0 && amount >= 0
+    //@ ensures result == (amount <= start)
+    let a = Account(balance: start)
     do {
         try a.withdrawChecked(amount)
         return true

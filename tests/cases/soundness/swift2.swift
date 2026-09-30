@@ -141,3 +141,53 @@ func lazyRead(_ l: Lazy) -> Int {
     l.n = 5
     return l.cached
 }
+
+// A method that throws may have changed its object first: its invariant is
+// not known after the throw.
+enum Oops: Error {
+    case bad
+}
+
+func check(_ x: Int) throws -> Int {
+    //@ raises x < 0
+    if x < 0 {
+        throw Oops.bad
+    }
+    return x
+}
+
+final class Span {
+    //@ invariant lo <= hi
+    var lo: Int
+    var hi: Int
+
+    init() {
+        lo = 0
+        hi = 0
+    }
+
+    func risky(_ x: Int) throws {
+        //@ requires lo < 1000 && hi < 1000
+        //@ raises x < 0
+        lo = hi + 1
+        _ = try check(x)
+        hi = lo
+    }
+}
+
+func afterCatch(_ s: Span) -> Bool {
+    //@ requires s.lo < 10 && s.hi < 10
+    //@ ensures result
+    do {
+        try s.risky(-1)
+    } catch {
+    }
+    return s.lo <= s.hi
+}
+
+func afterTryOptional(_ s: Span) -> Bool {
+    //@ requires s.lo < 10 && s.hi < 10
+    //@ ensures result
+    _ = try? s.risky(-1)
+    return s.lo <= s.hi
+}
