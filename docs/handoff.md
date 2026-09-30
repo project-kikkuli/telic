@@ -1,10 +1,66 @@
-# Handoff: known gaps
+# State of the project
 
-This lists what telic does not do yet, or does only partly, as of `16f1cf5`. Each item says where it lives and what
-done looks like. Soundness items come first: they can make telic say
-`proved` when it shouldn't.
+What works, what does not, and where unfinished work lives. Commands and
+verdict semantics are in [contracts.md](contracts.md); the architecture is in
+[design.md](design.md).
 
-## Soundness
+## What works
+
+- `telic check` on Python, TypeScript, Rust and Swift: contracts, crash
+  freedom, races across `await`, lifecycles, `@mirrors` across languages.
+  Every refutation is replayed in the real runtime before it is reported.
+- Two cores: the Python core (`telic/vcgen.py`) and the OxCaml engine
+  (`core/`, `TELIC_ENGINE=ox`). `tests/test_engine.py` holds them to the same
+  obligations and verdicts.
+- Lean escalation (`telic lean`, `telic prove --agent`) with an axiom audit;
+  every Z3 theory lemma is proved in `telic/lean/Theory.lean`.
+- Aims (EARS requirements with two-sided `by:` links), `telic propose`,
+  `telic gaps`, the CI ratchet (`telic.ledger.json`) and oracles.
+- UI lemmas on web apps through Playwright ([ui.md](ui.md)).
+- Numbers: floats and JavaScript numbers are exact rationals on main (no
+  rounding, NaN or infinities). IEEE doubles are on `wip/floats`.
+
+## Blockers
+
+- **iOS is unverified.** Xcode is not installed on the dev machine, so the
+  iOS adapter (`telic/ui/ios.py`, `telic/ui/sim.py`) has only run against
+  `tests/fake_simulator.py`. Once Xcode is installed, run
+  `sh scripts/ios_e2e.sh`.
+
+## CI
+
+Goal: a push whose tests are unchanged finishes in 30 seconds.
+`.github/workflows/ci.yml` runs 11 parallel jobs. Each hashes its inputs
+(every tracked file except `docs/` and top-level `*.md`, the pins in
+`.github/constraints.txt`, the runner image version and the apt z3 version)
+and skips everything after checkout when a passing verdict for that hash is
+in the Actions cache. See the latest runs with
+`gh run list -R project-kikkuli/telic`.
+
+The key is coarse: any code change reruns every job, and the slowest UI
+tests then set the wall time (several minutes). Finer keys need each test's
+real inputs; tests and the demo work in temporary directories, so telic's
+own obligation store (`.telic/`) is not reused across runs.
+
+## Unmerged branches
+
+Each is on origin, unverified unless stated.
+
+| branch | state | next step |
+|---|---|---|
+| `wip/z3-pin` | pins `z3-solver==5.1.0.0` and makes the engine use the wheel's Z3 instead of the apt one; under Z3 5.1 the engine proves `strunits.ts:emojiAfterBmp`, cause unknown | find why 5.1 proves it (compare the obligation with the Python core), then merge |
+| `wip/floats` | IEEE doubles: rounding, NaN, infinities, `-0.0`, JS integers exact to 2^53 | run the full suite and the soundness exploits, then merge |
+| `wip/seed-runner` | the `by <actions>` UI clause, count-based UI budgets, `examples/ui/run_seeded.py` with 12 seeded bugs (7 caught with the original aims; the 5 misses were spec gaps) and 5 new aims for them | run the seeded bugs against the new aims |
+| `wip/dogfood-errors` | loops, calls and literals telic cannot model report a verdict instead of an error, in both cores | run the corpus and engine tests |
+| `wip/friction2` | a model with `seqsum` opaque counts as a counterexample when replay agrees; a regex model (`telic/regex.py`) | run the suite; add soundness exploits for the regex model |
+| `wip/speed` | a leftover of the CI speed work; its test changes are on main | delete |
+
+## Known gaps
+
+Soundness items come first: they can make telic say `proved` when it
+should not.
+
+### Soundness
 
 - **Classes several files define.** `Program.build` qualifies them
   (`Box@a_shapes`, methods `Box@a_shapes.get`) in the defining module and in
@@ -35,7 +91,7 @@ done looks like. Soundness items come first: they can make telic say
   expression-bodied Python and TypeScript callbacks already are. Still
   unchecked: nested `def`s, and a bound method (`self.f`) used as a value.
 
-## Dogfooding (task 15)
+### Dogfooding telic on itself
 
 `docs/field-notes.md` has the numbers and the triage. Remaining:
 
@@ -54,7 +110,7 @@ done looks like. Soundness items come first: they can make telic say
 5. Replaying telic's own counterexamples fails on relative imports inside
    the `telic` package ("could not run").
 
-## Frontends
+### Frontends
 
 - **Rust.** Enums with data, tuple structs, `Result` with `?`, traits and
   generics, and `mod x;` across files are modelled (`frontend/rust.py`,
@@ -84,11 +140,11 @@ done looks like. Soundness items come first: they can make telic say
   `tests/test_swift.py` compares the result with `swiftc` on random
   expressions. There is no fuzzing for Swift; replay compiles one harness per
   function (cached in the temp directory) and restarts it after a trap.
-- **Dart (task 17).** Not started. The plan: parse with tree-sitter and follow
+- **Dart.** Not started. The plan: parse with tree-sitter and follow
   `frontend/rust.py`: sound null safety and 64-bit ints, a corpus, soundness
   exploits, and replay when `dart` is on the PATH.
 
-## Engine (OxCaml, `core/`)
+### Engine (OxCaml, `core/`)
 
 - **No unboxed types, on evidence.** Built with OxCaml `5.2.0+ox` and
   profiled on `telic/` (581 functions; `TELIC_CORE_DEBUG` prints phase
@@ -104,7 +160,7 @@ done looks like. Soundness items come first: they can make telic say
   obligations are also stored under the Python key, but Python-proved ones
   are not visible to the engine.
 
-## Oracles and aims
+### Oracles and aims
 
 - **Only Jev has been tested live** (coverage and fact classification). The
   `anthropic` backend has not been run against the real API since it moved to
@@ -126,10 +182,10 @@ done looks like. Soundness items come first: they can make telic say
   that returns early from one branch only, or a lemma in a function the
   aim does not list, is not tried.
 
-## Docs
+### Field notes
 
-`docs/field-notes.md` reports four apps measured before the oracle and Rust
-work. Re-run them to refresh the numbers when the frontends change.
+[field-notes.md](field-notes.md) measured four apps before the oracle and Rust
+work. Re-run them when the frontends change.
 
 ## Local setup reminders
 

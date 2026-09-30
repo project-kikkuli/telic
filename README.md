@@ -138,7 +138,8 @@ state graph by driving it in a browser at each viewport, conformance-tests
 the model against the app, and checks the lemma on it. Every counterexample
 is an action trace replayed in the app ("stuck at screen / with dialog
 "Help" open", "covered by div.banner at 390x844"); a lemma no reachable state
-makes relevant is vacuous, never passed. See [UI lemmas](docs/contracts.md#ui-lemmas)
+makes relevant is vacuous, never passed. Web apps run in Playwright; the
+iOS Simulator adapter exists but has not yet run on a real simulator. See [UI lemmas](docs/contracts.md#ui-lemmas)
 and [the workflow](docs/ui.md).
 
 ## When the solver can't decide
@@ -190,4 +191,4 @@ cores / 2) and `TELIC_UI_SLOTS` browsers (default 2), and queue for them.
 
 Counterexamples need no trust: each one is executed before it's reported.
 
-**Docs:** [contracts](docs/contracts.md) · [how it works](docs/design.md) · [CI](docs/ci.md) · [agents](docs/agents.md) · [known gaps](docs/handoff.md) · MIT
+**Docs:** [contracts](docs/contracts.md) · [how it works](docs/design.md) · [CI](docs/ci.md) · [agents](docs/agents.md) · [state of the project](docs/handoff.md) · MIT

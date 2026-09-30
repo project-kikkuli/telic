@@ -88,7 +88,8 @@ library result, an untyped input): that is a runtime check of the
 environment, so it is treated like a `raise`.
 
 **`assume P`** is assumed without proof. It's an escape hatch and is listed in
-every report under *trusted base*.
+every report under *trusted base*; `telic check --trusted` lists every
+assumption a report rests on, by kind and function.
 
 **`trusted`**: the function's contract is assumed and its body not verified
 (FFI, performance hacks). Also listed under *trusted base*.
@@ -480,7 +481,7 @@ Any property can end with `via FUNC`: the function that handles the change.
 Its own verdict then counts toward the lemma (a refuted handler refutes it).
 
 Predicates: `home` (the first screen, nothing open), `overlay` or `overlay
-"Name"` (a dialog, alert dialog or menu is open), `screen "/notes/*"` (glob),
+"Name"` (a dialog, alert dialog or menu is open), `screen "/notes/*"` (glob) or `screen "/groups/:id"` (a route pattern, which also names that screen),
 `ROLE "name"` (present), `ROLE "name" is enabled|disabled|checked|unchecked|
 expanded|collapsed|selected|pressed`, `ROLE "name" == "value"`, joined with
 `not`, `and`, `or` and parentheses. A name is exact (`"Close"`) or a regex
@@ -555,6 +556,7 @@ text = "telic"                              # what is typed into text fields
 fill = { "Coupon" = "SAVE10" }              # by field name (regex); emails, passwords, dates... are guessed
 wait = 5                                    # seconds: a timer the app sets for up to this long is waited for; 0: never
 walk_seed = 0                               # of the random walks that test the model; the same seed, the same model
+routes = ["/groups/:id"]                    # web: route patterns, each naming one screen
 ```
 
 **What the source adds.** The app's source (TypeScript, JavaScript,

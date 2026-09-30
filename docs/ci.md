@@ -24,12 +24,11 @@ hash-identical after a clean rebase. A commit-keyed cache re-runs all of them.
 ## 2. The affected set is exact
 
 `telic ci --since origin/main` checks only what the change can affect. For telic
-this is computed, not guessed: a proof depends on its own body and the
-contracts it calls, so the affected files are the changed files, the files
-that import them, their `@mirrors` partners, and files sharing an aim with
-them. Importers of importers are unaffected. No coverage map is involved.
-(One known hole: a caller that reaches a changed override only through its
-base class in another file; see [handoff.md](handoff.md).)
+this is computed, not guessed (`telic/ledger.py`): the affected files are the
+changed files, the files importing them (transitively), what the TypeScript
+files among them import, the files defining the bases of changed classes (a
+call through a base may run an override) and their importers, `@mirrors`
+partners, and files sharing an aim with them. No coverage map is involved.
 
 ## 3. The ledger ratchets
 
