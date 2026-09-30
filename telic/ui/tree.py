@@ -252,8 +252,25 @@ def value_of(n: Node) -> str | None:
 _ID_SEG = re.compile(r"^(\d+|[A-Za-z_-]{1,3}\d{6,}|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,}|[A-Za-z0-9_-]{16,})$", re.I)
 
 
-def route(path: str) -> str:
+def route(path: str, patterns: tuple[str, ...] = ()) -> str:
     """``/notes/42``, ``/groups/g1790764571078`` -> ``/notes/:id``,
-    ``/groups/:id``: a record's id is data, not a screen."""
+    ``/groups/:id``: a record's id is data, not a screen. A declared
+    pattern (``/groups/:group``) that matches names the screen; otherwise
+    segments that look like ids are folded."""
+    for p in patterns:
+        if route_matches(p, path):
+            return p
     segs = path.split("/")
     return "/".join(":id" if s and _ID_SEG.match(s) and any(ch.isdigit() for ch in s) else s for s in segs)
+
+
+def route_matches(pattern: str, path: str) -> bool:
+    """``/groups/:id`` matches ``/groups/g17`` (a ``:name`` segment is any one
+    segment); a trailing ``/*`` matches the rest of the path."""
+    ps, xs = pattern.split("/"), path.split("/")
+    if ps[-1] == "*":
+        ps = ps[:-1]
+        if len(xs) < len(ps):
+            return False
+        xs = xs[: len(ps)]
+    return len(ps) == len(xs) and all(p == x or (p.startswith(":") and len(p) > 1 and x != "") for p, x in zip(ps, xs))

@@ -136,7 +136,9 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
             rep.problems.append((rel, 1, str(e)))
             rep.results += [UiResult(lem, rel, "open", "", str(e)) for lem in lems]
             continue
-        base = f"{tool_digest()}:{build_digest(cfg)}:{cfg.digest()}"
+        # route patterns the lemmas name also name screens: every lemma's model depends on them
+        cfg = replace(cfg, routes=route_patterns(cfg.routes, lems))
+        base = f"{tool_digest()}:{build_digest(cfg)}:{cfg.digest()}:{','.join(cfg.routes)}"
         keys = {lem.name: hashlib.sha256(f"{base}:{lem.name}:{lem.text}".encode()).hexdigest()[:24] for lem in lems}
         app = UiApp(cfg.path)
         rep.apps.append(app)
@@ -178,6 +180,14 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
     order = {id(lem): i for i, lem in enumerate(sc.lemmas)}
     rep.results.sort(key=lambda r: order.get(id(r.lemma), 0))
     return rep
+
+
+def route_patterns(declared: list[str], lems: list[UiLemma]) -> list[str]:
+    """The [ui] routes, then the route patterns lemmas name (``screen
+    "/groups/:id"``), most specific first: a pattern names the screens it matches."""
+    named = [str(p.args[0]) for lem in lems if lem.prop is not None for p in lem.prop.atoms() if p.op == "screen" and ":" in str(p.args[0])]
+    pats = list(dict.fromkeys([*declared, *named]))
+    return sorted(pats, key=lambda p: (-sum(1 for x in p.split("/") if x and not x.startswith(":") and x != "*"), pats.index(p)))
 
 
 def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
@@ -241,7 +251,7 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, si
             w, h = size  # type: ignore[misc]
             vp = f"{w}x{h}"
             for _ in range(browsers):
-                d = WebDriver(url, settle_ms=cfg.settle_ms, wait_ms=int(cfg.wait * 1000))
+                d = WebDriver(url, settle_ms=cfg.settle_ms, wait_ms=int(cfg.wait * 1000), routes=tuple(cfg.routes))
                 drivers.append(d)
                 d.start()
                 d.viewport(w, h)

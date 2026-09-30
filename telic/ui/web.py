@@ -416,8 +416,9 @@ def _confined(fn):
 class WebDriver(Driver):
     name = "web"
 
-    def __init__(self, url: str, *, settle_ms: int = 50, timeout_ms: int = 3000, headless: bool = True, wait_ms: int = 5000):
+    def __init__(self, url: str, *, settle_ms: int = 50, timeout_ms: int = 3000, headless: bool = True, wait_ms: int = 5000, routes: tuple[str, ...] = ()):
         self.url = url
+        self.routes = routes
         self.origin = "{0.scheme}://{0.netloc}".format(urlsplit(url))
         self.settle_ms = settle_ms
         self.wait_ms = wait_ms
@@ -615,8 +616,8 @@ class WebDriver(Driver):
         u = urlsplit(self.page.url)
         if f"{u.scheme}://{u.netloc}" != self.origin:
             return f"outside:{u.netloc or u.scheme}"
-        frag = route(u.fragment) if u.fragment.startswith("/") and u.fragment != "/" else ""
-        return route(u.path or "/") + (f"#{frag}" if frag else "")
+        frag = route(u.fragment, self.routes) if u.fragment.startswith("/") and u.fragment != "/" else ""
+        return route(u.path or "/", self.routes) + (f"#{frag}" if frag else "")
 
     @_confined
     def observe(self) -> Snapshot:

@@ -5,6 +5,7 @@
     build = "npm run build"                    #  or: url = "http://..." (already running)
     url = "http://127.0.0.1:{port}/"           # with static: the path to open, e.g. "/app/"
     viewports = ["390x844", "1280x800"]
+    routes = ["/groups/:id"]                   # route patterns: each names one screen
     max_states = 300
     max_depth = 30
 
@@ -62,6 +63,7 @@ class UiConfig:
     devices: list[str] = field(default_factory=list)  # ios: device types; empty: the newest plain iPhone
     launch_args: list[str] = field(default_factory=list)
     wait: float = 5.0  # seconds: a timer the app sets for up to this long is waited for, like any action
+    routes: list[str] = field(default_factory=list)  # web: route patterns that name screens, e.g. "/groups/:id"
 
     def digest(self) -> str:
         return hashlib.sha256(json.dumps(self.raw, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -113,7 +115,7 @@ def load(path: str, root: str) -> UiConfig:
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
         "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "witnesses", "settle_ms", "wait",
         "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
-        "walk_seed",
+        "walk_seed", "routes",
     }
     unknown = sorted(set(ui) - known)
     if unknown:
@@ -150,8 +152,12 @@ def load(path: str, root: str) -> UiConfig:
         if not isinstance(ui["fill"], dict):
             raise ConfigError(f"{os.path.relpath(path, root)}: [ui] fill is a table of field-name regex = value, e.g. fill = {{ Email = \"me@example.com\" }}")
         s.fill = tuple((str(k), str(v)) for k, v in ui["fill"].items())
+    routes = ui.get("routes", [])
+    if not isinstance(routes, list) or not all(isinstance(r, str) and r.startswith("/") for r in routes):
+        raise ConfigError(f"{os.path.relpath(path, root)}: [ui] routes is a list of route patterns, e.g. routes = [\"/groups/:id\"]")
     cfg = UiConfig(
         dir=os.path.dirname(os.path.abspath(path)),
+        routes=[str(r) for r in routes],
         path=os.path.relpath(path, root),
         raw=ui,
         url=ui.get("url"),

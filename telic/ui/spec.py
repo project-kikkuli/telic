@@ -21,7 +21,8 @@ and any of them may end with ``via FUNC``: the handler that performs the
 change, whose proof then counts toward the lemma.
 
 Predicates: ``home`` (the start screen with nothing open), ``overlay`` or
-``overlay "Name"`` (a dialog, alert or menu is open), ``screen "/path/*"``,
+``overlay "Name"`` (a dialog, alert or menu is open), ``screen "/path/*"``
+or ``screen "/groups/:id"`` (a route pattern, which also names that screen),
 a target ``ROLE "name"`` (present), ``T is enabled|disabled|checked|
 unchecked|expanded|collapsed|selected|pressed``, ``T == "value"``, combined
 with ``not``, ``and``, ``or`` and parentheses. A name is a string (exact) or
@@ -38,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..contracts import AIM_ID, KEYWORDS
-from .tree import OVERLAYS, Node, Snapshot, value_of
+from .tree import OVERLAYS, Node, Snapshot, route_matches, value_of
 
 # ---------------------------------------------------------------------------
 # Targets and predicates
@@ -94,7 +95,7 @@ class Pred:
             ns = [n for n in snap.nodes() if n.role in OVERLAYS]
             return any(_name_ok(a[0], n.name) for n in ns) if a else bool(ns)
         if op == "screen":
-            return fnmatch.fnmatchcase(snap.screen, a[0])
+            return fnmatch.fnmatchcase(snap.screen, a[0]) or (":" in a[0] and route_matches(a[0], snap.screen))
         if op == "present":
             return bool(a[0].find(snap))
         if op == "is":
