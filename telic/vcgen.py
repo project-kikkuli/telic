@@ -34,7 +34,7 @@ from typing import Union
 
 from . import ir
 from . import logic as L
-from .program import FuncRef, Program
+from .program import FuncRef, Program, in_place, reaches_unchecked, unchecked_constructor
 
 # ---------------------------------------------------------------------------
 # Symbolic values
@@ -411,6 +411,7 @@ class VCGen:
         self.created: set = set()
         self.lc_written: list[str] = []  # classes of the non-parameter objects it writes a field of
         self.lc_sites: list[tuple[list[L.Term], L.Term, L.Term, str, dict[str, Val], bool]] = []
+        self._shared: set[str] | None = None
 
     # -- naming -----------------------------------------------------------
 
@@ -730,7 +731,8 @@ class VCGen:
         fn = self.fn
         ctx = self.ctx(st, spec=True, quiet=True)
         if self.ref.key in self.program.predicates:
-            # deep enough to go once round a cycle of predicates defined through each other
+            # deep enough to go once round a cycle of predicates defined through
+            # each other; deeper contradictions are caught where a proof unfolds them
             group = [k for k in self.program.predicates if k == self.ref.key or self.program.same_scc(self.ref.key, k)]
             self.fuel = min(len(group), 3) + 1
             flat = [t for p in fn.params for t in flatten(st.env[p.name])]
@@ -800,7 +802,13 @@ class VCGen:
         read from the final heap."""
         out: dict[str, Val] = self.heap_env(exit_env)
         for p in self.fn.params:
-            out[p.name] = exit_env[p.name] if isinstance(p.ty, (ir.TList, ir.TDict)) else self.entry[p.name]
+            if isinstance(p.ty, (ir.TList, ir.TDict)):
+                out[p.name] = exit_env[p.name]
+            elif reaches_unchecked(p.ty) and self.ref.key in self.program.unchecked_writers:
+                # the object it was passed, as the call leaves it
+                out[p.name] = self.fresh(p.name, p.ty) if p.name in ir.assigned_names(self.fn.body) else exit_env[p.name]
+            else:
+                out[p.name] = self.entry[p.name]
         return out
 
     def check_exits(self) -> None:
@@ -896,7 +904,10 @@ class VCGen:
 
     def stmt(self, s: ir.Stmt, st: State) -> State:
         if isinstance(s, ir.Assign):
-            st.env[s.name] = coerce(self.ev(s.value, self.ctx(st)), self.fn.locals.get(s.name))
+            ctx = self.ctx(st)
+            st.env[s.name] = coerce(self.ev(s.value, ctx), self.fn.locals.get(s.name))
+            if self.writes_in_place(s):
+                self.havoc_unchecked(ctx, keep=frozenset({s.name}))
             return st
         if isinstance(s, ir.FieldAssign):
             ctx = self.ctx(st)
@@ -918,6 +929,7 @@ class VCGen:
             if s.strict:
                 self.oblige("key", ctx, L.select(d.has, k), s.loc, f"key being deleted from '{s.name}' is present")  # type: ignore[arg-type]
             st.env[s.name] = DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
+            self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.IndexAssign) and isinstance(st.env.get(s.name), DictVal):
             d = st.env[s.name]
@@ -926,6 +938,7 @@ class VCGen:
             k = self.ev(s.idx, ctx)
             v = coerce(self.ev(s.value, ctx), d.ty.val)
             st.env[s.name] = DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
+            self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.IndexAssign):
             lst = st.env[s.name]
@@ -934,12 +947,15 @@ class VCGen:
             i = self.index_of(lst, self.ev(s.idx, ctx), s.wrap, ctx, s.loc, s.name)
             v = self.ev(s.value, ctx)
             st.env[s.name] = ListVal(L.store(lst.arr, L.add(lst.off, i), v), lst.off, lst.len, lst.ty)
+            self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.Append):
             lst = st.env[s.name]
             assert isinstance(lst, ListVal)
-            v = self.ev(s.value, self.ctx(st))
+            ctx = self.ctx(st)
+            v = self.ev(s.value, ctx)
             st.env[s.name] = ListVal(L.store(lst.arr, L.add(lst.off, lst.len), v), lst.off, L.add(lst.len, L.ONE), lst.ty)
+            self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.If):
             c = self.ev(s.cond, self.ctx(st))
@@ -1102,6 +1118,9 @@ class VCGen:
                             if isinstance(a, ir.Var) and isinstance(a.ty, (ir.TList, ir.TDict)):
                                 names.add(a.name)
                                 appends.add(a.name)
+                        if self.program.extern_writes_unchecked(sub, self.fn, self.views):
+                            names.update(self.shared)
+                            appends.update(self.shared)
                         if self.program.extern_touches_heap(sub):
                             names.add("@alloc")
                             names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
@@ -1119,6 +1138,15 @@ class VCGen:
                                 names.add(a.name)
                                 if p.name in self.program.appends.get(tgt.key, ()):
                                     appends.add(a.name)
+                                if a.name in self.views:
+                                    names.update(self.shared)
+                                    appends.update(self.shared)
+                        if tgt.key in self.program.unchecked_writers:
+                            names.update(self.shared)
+                            appends.update(self.shared)
+            if (isinstance(s, (ir.IndexAssign, ir.Append, ir.DictDel)) and s.name in self.views) or (isinstance(s, ir.Assign) and self.writes_in_place(s)):
+                names.update(self.shared)
+                appends.update(self.shared)
         return names, appends
 
     def _init_key(self, cls: str) -> str | None:
@@ -2030,6 +2058,10 @@ class VCGen:
                     if isinstance(nv, ListVal):
                         ctx.assume(L.le(L.ZERO, nv.len))
                     env[a_e.name] = nv
+            if self.program.extern_writes_unchecked(e, self.fn, self.views, set(ctx.state.env)):
+                self.havoc_unchecked(ctx)
+            elif unchecked_constructor(e) and any(reaches_unchecked(a.ty) for a in e.args):
+                self.note(e.loc, f"'{e.name}' leaves the values it is handed unchanged")
             if self.program.extern_touches_heap(e) or (self.program.classes and self.fn.escaped):
                 self.havoc_heap(ctx)
                 if any(c.invariants for c in self.program.classes.values()):
@@ -2203,6 +2235,12 @@ class VCGen:
                     ctx.assume(L.le(L.ZERO, nv.len))
                 env[a_expr.name] = nv
                 post[p.name] = nv
+        views = [a.name for p, a in zip(fn.params, arg_exprs) if p.name in muts and isinstance(a, ir.Var) and a.name in self.views]
+        if callee.key in self.program.unchecked_writers or views:
+            self.havoc_unchecked(ctx, keep=frozenset(views))
+            for p, a_expr in zip(fn.params, arg_exprs):
+                if reaches_unchecked(p.ty) and p.name not in post:
+                    post[p.name] = env[a_expr.name] if isinstance(a_expr, ir.Var) and a_expr.name in self.shared else self.fresh(p.name, p.ty)
         self.havoc_call(callee, args, new_self, ctx)
         post.update(self.heap_env(env))
         for i, p in enumerate(fn.params):
@@ -2312,12 +2350,16 @@ class VCGen:
         if isinstance(v, DictVal) and isinstance(ty, ir.TDict) and isinstance(ty.val, ir.TOpaque):
             kind = "dict"
             k = L.Const(f"k!{n}", sort_of(ty.key))
-            for op, held in (("opaque.cmp.in.Bool", True), ("opaque.in.Bool", True), ("opaque.cmp.notin.Bool", False)):
+            has = L.select(v.has, k)
+            # Python's 'in' is key membership; JavaScript's also sees inherited
+            # properties, and a Map's entries are not properties at all
+            mems = [("opaque.cmp.in.Bool", has), ("opaque.cmp.notin.Bool", L.not_(has))] if not ty.js else [("opaque.in.Bool", None)] if ty.js == "object" else []
+            for op, held in mems:
                 mem = L.Fn(op, (k, b), L.BOOL)
-                has = L.select(v.has, k)
-                facts.append(L.Quant("forall", (k,), L.eq(mem, has if held else L.not_(has)), patterns=((mem,),) if _triggerable((mem,)) else ()))
-            get = L.Fn("opaque.getitem.Opaque", (b, k), L.OPAQUE)
-            facts.append(L.Quant("forall", (k,), L.implies(L.select(v.has, k), L.eq(get, L.select(v.vals, k))), patterns=((get,),) if _triggerable((get,)) else ()))
+                facts.append(L.Quant("forall", (k,), L.eq(mem, held) if held is not None else L.implies(has, mem), patterns=((mem,),) if _triggerable((mem,)) else ()))
+            if ty.js != "map":
+                get = L.Fn("opaque.getitem.Opaque", (b, k), L.OPAQUE)
+                facts.append(L.Quant("forall", (k,), L.implies(has, L.eq(get, L.select(v.vals, k))), patterns=((get,),) if _triggerable((get,)) else ()))
         elif isinstance(v, ListVal) and isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TOpaque):
             kind = "list"
             i = L.Const(f"i!{n}", L.INT)
@@ -2340,6 +2382,47 @@ class VCGen:
             fact = L.implies(is_kind, L.and_(*facts)) if facts else L.TRUE
         if fact != L.TRUE:
             self.lemma(fact, ctx, (b,))
+
+    @property
+    def views(self) -> set[str]:
+        return self.program.views.get(self.ref.key, set())
+
+    @property
+    def shared(self) -> set[str]:
+        """Variables that may hold an object unchecked values can reach."""
+        if self._shared is None:
+            tys = {**{p.name: p.ty for p in self.fn.params}, **self.fn.locals}
+            self._shared = {n for n, t in tys.items() if reaches_unchecked(t)} | self.views
+        return self._shared
+
+    def writes_in_place(self, s: ir.Assign) -> bool:
+        return in_place(s) and (s.name in self.views or isinstance(self.fn.locals.get(s.name), ir.TOpaque))
+
+    def wrote_view(self, name: str, ctx: Ctx) -> None:
+        if name in self.views:
+            self.havoc_unchecked(ctx, keep=frozenset({name}))
+
+    def havoc_unchecked(self, ctx: Ctx, keep: frozenset[str] = frozenset()) -> None:
+        """An object unchecked values can reach may have changed: forget
+        what is known about every variable that may share one. Two variables
+        holding the same unchecked value still hold the same one."""
+        assert ctx.state is not None
+        env = ctx.state.env
+        tys = {**{p.name: p.ty for p in self.fn.params}, **self.fn.locals}
+        renamed: dict[L.Term, Val] = {}
+        for n in sorted(self.shared - keep):
+            if n not in env or n not in tys:
+                continue
+            old = env[n]
+            if isinstance(old, L.Term) and old.sort == L.OPAQUE:
+                if old not in renamed:
+                    renamed[old] = self.fresh(n, tys[n])
+                env[n] = renamed[old]
+                continue
+            nv = self.fresh(n, tys[n])
+            if isinstance(nv, ListVal):
+                ctx.assume(L.le(L.ZERO, nv.len))
+            env[n] = nv
 
     def havoc_call(self, callee: FuncRef, args: list[Val], new_self: bool, ctx: Ctx) -> None:
         """The heap after a call: only the fields the callee may write change,

@@ -63,6 +63,14 @@ class Z3Encoder:
         self.funcs: dict[str, z3.FuncDeclRef] = {}
         self.datatypes: dict[str, Any] = {}
         self.key_candidates: dict[str, list[Any]] = {}
+        # keys an unchecked value rebuilt as JSON may have: those the obligation names
+        self.json_keys: list[str] | None = None
+        self.json_attrs: set[L.Term] = set()  # t.k reads the obligation makes
+        self.json_ops: set[str] = set()
+        self.json_kinds: set[str] = set()
+        self.json_containers: set[L.Term] = set()  # values the obligation looks inside
+        self.json_lits: list[str] = []
+        self.json_model: z3.ModelRef | None = None
         self.defs = {d.name: d for d in theory_defs}
         for d in theory_defs:
             self.declare(d)
@@ -287,8 +295,6 @@ def array_entries(v: z3.ExprRef) -> tuple[list[tuple[Any, Any]], Any]:
             v = v.arg(0)
         elif z3.is_K(v):
             return entries, to_python(v.arg(0))
-        elif z3.is_lambda(v) or z3.is_quantifier(v):
-            return entries, None
         else:
             return entries, None
 
@@ -320,6 +326,8 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
             return []
         return [decode(enc, model, L.select(val.arr, L.add(val.off, L.IntV(i)))) for i in range(max(0, min(n, 256)))]
     if isinstance(val, L.Term) and val.sort == L.OPAQUE:
+        if enc.json_keys is not None:
+            return {"__json__": unchecked_json(enc, enc.json_model or model, val, 0)}
         return {"__opaque__": True}
     if isinstance(val, OptVal):
         if enc.value(model, val.some) is not True:
@@ -358,6 +366,102 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
             out[fname] = decode(enc, model, L.field(val, fname))
         return out
     return enc.value(model, val)
+
+
+def _has_opaque(v: Val) -> bool:
+    from .program import reaches_unchecked
+
+    if isinstance(v, L.Term):
+        return v.sort == L.OPAQUE
+    ty = getattr(v, "ty", None)
+    return ty is not None and reaches_unchecked(ty)
+
+
+KINDS = ("dict", "list", "str", "int", "float")
+MEMBERSHIP = ("opaque.cmp.in.Bool", "opaque.cmp.notin.Bool", "opaque.in.Bool")
+
+
+def _json_hints(enc: Z3Encoder, s: z3.Solver, m: z3.ModelRef, terms: list[L.Term]) -> None:
+    """What the obligation says about its unchecked values' shapes: the
+    keys, types and string literals it names, for ``unchecked_json``."""
+    fns = [x for t in terms for x in L.iter_terms(t) if isinstance(x, L.Fn)]
+    enc.json_model = _json_model(enc, s, terms) or m
+    enc.json_ops = {x.name for x in fns}
+    enc.json_attrs = {x for x in fns if x.name.startswith("opaque.attr.")}
+    keys = {x.args[0] for x in fns if x.name in MEMBERSHIP} | {x.args[1] for x in fns if x.name == "opaque.getitem.Opaque"}
+    enc.json_keys = sorted({k.value for k in keys if isinstance(k, L.StrV)} | {a.name[len("opaque.attr.") : -len(".Opaque")] for a in enc.json_attrs})
+    enc.json_containers = {x.args[1] for x in fns if x.name in MEMBERSHIP} | {x.args[0] for x in fns if x.name == "opaque.getitem.Opaque" or x.name.startswith("opaque.attr.")}
+    enc.json_kinds = {x.args[1].value for x in fns if x.name == "opaque.isinstance.Bool" and isinstance(x.args[1], L.StrV)}
+    enc.json_lits = sorted({x.args[0].value for x in fns if x.name == "box.str" and isinstance(x.args[0], L.StrV)})
+
+
+def _json_model(enc: Z3Encoder, s: z3.Solver, terms: list[L.Term]) -> z3.ModelRef | None:
+    """The same counterexample with each unchecked value of one Python type
+    at most (the obligation alone need not say so), if there is one."""
+    seen = [x for t in terms for x in L.iter_terms(t)]
+    if not any(isinstance(x, L.Fn) and x.name == "opaque.isinstance.Bool" for x in seen):
+        return None
+    values = {x for x in seen if not isinstance(x, L.Quant) and x.sort == L.OPAQUE and not any("!" in c.name for c in L.consts(x))}
+    none = any(isinstance(x, L.Fn) and x.name == "opaque.is_none.Bool" for x in seen)
+    s.push()
+    try:
+        for u in values:
+            isk = [enc.term(L.Fn("opaque.isinstance.Bool", (u, L.StrV(k)), L.BOOL)) for k in KINDS]
+            s.add(z3.AtMost(*isk, *([enc.term(L.Fn("opaque.is_none.Bool", (u,), L.BOOL))] if none else []), 1))
+        return s.model() if s.check() == z3.sat else None
+    finally:
+        s.pop()
+
+
+JSON_DEPTH = 6
+JSON_LEN = 16
+
+
+def unchecked_json(enc: Z3Encoder, model: z3.ModelRef, t: L.Term, depth: int) -> Any:
+    """An unchecked value as the JSON the model says it is, through the
+    operations specs use on it (Python and TypeScript spell them apart).
+    What the model leaves open becomes null; replay decides whether the
+    value is a real counterexample."""
+
+    def ask(name: str, *args: L.Term, sort: L.Sort = L.BOOL) -> Any:
+        # an operation the obligation never applies says nothing about the value
+        return enc.value(model, L.Fn(name, (t, *args), sort)) if name in enc.json_ops else None
+
+    def kind(k: str) -> bool:
+        return k in enc.json_kinds and ask("opaque.isinstance.Bool", L.StrV(k)) is True
+
+    def same(x: L.Term) -> bool:
+        return enc.value(model, L.eq(t, x)) is True
+
+    if depth > JSON_DEPTH or ask("opaque.is_none.Bool") is True or ask("opaque.is_null.Bool") is True:
+        return None
+    typeof = ask("opaque.typeof.Str", sort=L.STR)
+    if kind("bool") or typeof == "boolean":
+        return ask("opaque.truthy.Bool") is True
+    if kind("int") or typeof == "number":
+        n = ask("unbox.int.", sort=L.INT) if kind("int") else 0
+        return n if isinstance(n, int) else 0
+    if kind("str") or typeof == "string":
+        for k in enc.json_lits:
+            if same(L.Fn("box.str", (L.StrV(k),), L.OPAQUE)):
+                return k
+        v = ask("unbox.str.", sort=L.STR) if kind("str") else ""
+        return v if isinstance(v, str) else ""
+    if kind("list"):
+        n = ask("opaque.len.Int", sort=L.INT)
+        n = n if isinstance(n, int) else 0
+        return [unchecked_json(enc, model, L.Fn("opaque.getitem.Opaque", (t, L.IntV(i)), L.OPAQUE), depth + 1) for i in range(max(0, min(n, JSON_LEN)))]
+    out: dict[str, Any] = {}
+    for k in enc.json_keys or ():
+        held = any(enc.value(model, L.Fn(op, (L.StrV(k), t), L.BOOL)) is True for op in ("opaque.cmp.in.Bool", "opaque.in.Bool") if op in enc.json_ops)
+        attr = L.Fn(f"opaque.attr.{k}.Opaque", (t,), L.OPAQUE)
+        if attr in enc.json_attrs:
+            held = held or not any(enc.value(model, L.Fn(op, (attr,), L.BOOL)) is True for op in ("opaque.is_undefined.Bool", "opaque.is_nullish.Bool") if op in enc.json_ops)
+        if held:
+            out[k] = unchecked_json(enc, model, attr if attr in enc.json_attrs else L.Fn("opaque.getitem.Opaque", (t, L.StrV(k)), L.OPAQUE), depth + 1)
+    if out or kind("dict") or typeof == "object" or t in enc.json_containers:
+        return out
+    return None
 
 
 def solve(ob: Obligation, theory: Theory, timeout_ms: int = 8000) -> SmtResult:
@@ -444,6 +548,8 @@ def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Te
             enc.key_candidates.setdefault(v.sort.name, []).append(x)
     for sname, default in (("Str", ""), ("Int", 0)):
         enc.key_candidates.setdefault(sname, []).append(default)
+    if any(_has_opaque(v) for _, v in ob.inputs):
+        _json_hints(enc, s, m, terms)
     model = {name: decode(enc, m, v) for name, v in ob.inputs}
     too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
     state: dict[str, Any] = {}

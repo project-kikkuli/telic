@@ -592,16 +592,12 @@ class Vacuity:
             if gen.probes_contract:
                 out[rep.ref.key] = f"its @requires and @ensures can never hold together, so every proof that uses '{fn.name}' is vacuous; fix its contract"
                 continue
+            if gen.lemmas and _unsat(_unsat_probe(gen, gen.lemmas), theory, opts, cache):
+                preds = sorted(gen.program.funcs[k].fn.name for k in gen.deps if k in gen.program.predicates)
+                out[rep.ref.key] = f"the @ensures of trusted {', '.join(preds)} cannot hold at every value '{fn.name}' applies {'it' if len(preds) == 1 else 'them'} to, so every claim about '{fn.name}' is vacuous; fix the contract"
+                continue
             if gen.invariant_facts and fn.requires:
-                ob = _unsat_probe(gen, gen.invariant_facts)
-                key = "sat:" + obligation_key(ob, theory)
-                hit = cache.get(key)
-                if hit is None:
-                    res = solve(ob, theory, opts.timeout_ms)
-                    hit = {"method": {"proved": "unsat", "refuted": "sat"}.get(res.status, "unknown")}
-                    if hit["method"] != "unknown":
-                        cache.put(key, hit)
-                inv_unsat = hit.get("method") == "unsat"
+                inv_unsat = _unsat(_unsat_probe(gen, gen.invariant_facts), theory, opts, cache)
             elif gen.invariant_facts:
                 inv_unsat = True
             if inv_unsat:
@@ -614,6 +610,27 @@ class Vacuity:
         return out
 
 
+def _unsat(ob: Obligation, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> bool:
+    key = "sat:" + obligation_key(ob, theory)
+    hit = cache.get(key)
+    if hit is None:
+        res = solve(ob, theory, opts.timeout_ms)
+        hit = {"method": {"proved": "unsat", "refuted": "sat"}.get(res.status, "unknown")}
+        if hit["method"] != "unknown":
+            cache.put(key, hit)
+    return hit.get("method") == "unsat"
+
+
+def _body_lemmas(gen: VCGen) -> list[L.Term]:
+    """The trusted-predicate unfoldings the body's obligations assume on top
+    of the entry's: together they hold for any consistent contracts, however
+    deep the unfoldings reach."""
+    if gen.probes_contract:
+        return []
+    seen = set(gen.entry_facts)
+    return [t for t in gen.lemmas if t not in seen]
+
+
 def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
     """``facts ⊢ false``: proved exactly when ``facts`` are unsatisfiable."""
     excl = {k for k in gen.program.funcs if gen.program.same_scc(gen.ref.key, k)}
@@ -623,9 +640,10 @@ def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
 def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache") -> Vacuity:
     v = Vacuity()
     for rep, gen in entries:
-        if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract):
+        lemmas = _body_lemmas(gen)
+        if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract or lemmas):
             continue
-        ob = _unsat_probe(gen, gen.entry_facts)
+        ob = _unsat_probe(gen, gen.entry_facts + lemmas)
         key = "sat:" + obligation_key(ob, theory)
         hit = cache.get(key)
         if hit is None:
@@ -715,7 +733,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if use_engine:
         # Cached inferences are rebuilt locally; the rest run in the engine,
         # and whatever it cannot decide falls back to Python.
-        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference" and k not in program.predicate_users]
+        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k)) or {}).get("method") != "inference" and not program.python_only(k)]
         by_engine = _engine.infer(program, theory, [r for _, r in fresh], min(opts.timeout_ms, 1000), opts.jobs)
         inf_results = [(k, inference_key(program, k), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
         done = {k for k, _, _ in inf_results}
@@ -869,7 +887,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             rep.from_receipt = True
             reports.append(rep)
             continue
-        if use_engine and program.ambiguity(ref) is None and key not in program.predicate_users:
+        if use_engine and program.ambiguity(ref) is None and not program.python_only(key):
             engine_tasks.append((rep, ref, inf, fkey, ft))
             reports.append(rep)
             continue

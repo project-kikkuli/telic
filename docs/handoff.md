@@ -22,7 +22,9 @@ done looks like. Soundness items come first: they can make telic say
   context of a call; an entry check Z3 cannot decide leaves the verdict
   alone. A trusted function's own contract is checked for satisfiability
   (`VCGen.contract_probe`), unfolding predicates once round their
-  recursion group; a contradiction deeper unfoldings reveal is missed.
+  recursion group; deeper contradictions are caught in each function
+  whose proof unfolds that deep (its unfoldings are checked together,
+  `_body_lemmas` in `telic/checker.py`), never in the predicate itself.
 - **Calls inside impure comprehensions are not checked.** When a
   comprehension's body calls a function that is not definitional
   (`[pos(x) for x in xs]` where `pos` prints), `VCGen.comprehension`
@@ -38,10 +40,9 @@ done looks like. Soundness items come first: they can make telic say
    type and immutable frozen-dataclass fields (`ModelCheck.replay`,
    `Prop.__str__`). `typescript._type`/`_expr` are proved with trusted
    predicates (`wf_type`, `wf_expr`, `json_depth`).
-2. Counterexamples over unchecked values print as `…` and are not
-   replayed (`smt.decode` gives opaque values no structure). Rebuilding a
-   JSON value from the model's `isinstance`/`getitem`/`unbox` functions
-   would turn those open verdicts into replayed refutations.
+2. Counterexamples over unchecked values are rebuilt as JSON
+   (`smt.unchecked_json`) for Python and Node only; Rust and Swift still
+   show `…` and do not replay them.
 3. 70 open: facts about objects and dicts held in fields, callee contracts,
    and termination measures over ASTs (opaque). Few are loop invariants.
 4. Put contracts and aims on the pure helpers (`telic/phrase.py`,

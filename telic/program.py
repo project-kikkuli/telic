@@ -45,6 +45,11 @@ class Program:
     predicate_users: set[str] = field(default_factory=set)
     mutated: dict[str, set[str]] = field(default_factory=dict)
     appends: dict[str, set[str]] = field(default_factory=dict)
+    # per function: variables holding the same object as an unchecked value
+    # (a checked view of one, or a checked value handed to unchecked code)
+    views: dict[str, set[str]] = field(default_factory=dict)
+    # functions that may change an object unchecked values can reach
+    unchecked_writers: set[str] = field(default_factory=set)
     logic_names: dict[str, str] = field(default_factory=dict)
     classes: dict[str, ir.ClassDecl] = field(default_factory=dict)
     class_module: dict[str, ir.Module] = field(default_factory=dict)
@@ -97,6 +102,7 @@ class Program:
         p._escaping_constructors()
         p._sccs()
         p._mutation()
+        p._unchecked_writes()
         p._heap()
         p._predicates()
         p._definitional()
@@ -511,6 +517,69 @@ class Program:
                                         self.appends[key].add(a.name)
                                         changed = True
 
+    def _unchecked_writes(self) -> None:
+        """Unchecked values are objects telic models as unchanging terms, so
+        anything that may change one must forget what is known about every
+        value that may share it: find the views and the writers."""
+        direct: set[str] = set()
+        for key, ref in self.funcs.items():
+            views: set[str] = set()
+            for s in ir.walk_stmts(ref.fn.body):
+                if isinstance(s, ir.Assign) and _is_view(s.value):
+                    views.add(s.name)
+                for e in ir.stmt_exprs(s):
+                    for sub in ir.walk_expr(e):
+                        if isinstance(sub, ir.Builtin) and sub.name == "to_opaque" and isinstance(sub.args[0], ir.Var) and _mutable(sub.args[0].ty):
+                            views.add(sub.args[0].name)
+            self.views[key] = views
+            tys = {**{p.name: p.ty for p in ref.fn.params}, **ref.fn.locals}
+            for s in ir.walk_stmts(ref.fn.body):
+                if isinstance(s, (ir.IndexAssign, ir.Append, ir.DictDel)) and s.name in views:
+                    direct.add(key)
+                if isinstance(s, ir.Assign) and in_place(s) and (s.name in views or isinstance(tys.get(s.name), ir.TOpaque)):
+                    direct.add(key)
+                for e in ir.stmt_exprs(s):
+                    for sub in ir.walk_expr(e):
+                        if isinstance(sub, ir.Extern) and self.extern_writes_unchecked(sub, ref.fn, views):
+                            direct.add(key)
+        # calls the code makes (a spec's calls change nothing)
+        calls: dict[str, list[tuple[FuncRef, ir.Call]]] = {}
+        for key, ref in self.funcs.items():
+            calls[key] = []
+            for s in ir.walk_stmts(ref.fn.body):
+                for e in ir.stmt_exprs(s):
+                    for sub in ir.walk_expr(e):
+                        tgt = self.resolve(ref.module, sub.func) if isinstance(sub, ir.Call) else None
+                        if tgt is not None:
+                            calls[key].append((tgt, sub))  # type: ignore[arg-type]
+                            if any(p.name in self.mutated.get(tgt.key, ()) and isinstance(a, ir.Var) and a.name in self.views[key] for p, a in zip(tgt.fn.params, sub.args)):  # type: ignore[union-attr]
+                                direct.add(key)
+        self.unchecked_writers = set(direct)
+        changed = True
+        while changed:
+            changed = False
+            for key, cs in calls.items():
+                if key not in self.unchecked_writers and any(t.key in self.unchecked_writers for t, _ in cs):
+                    self.unchecked_writers.add(key)
+                    changed = True
+
+    def python_only(self, key: str) -> bool:
+        """Only the Python core unfolds trusted predicates and forgets what
+        a change to an unchecked value may have broken."""
+        return key in self.predicate_users or key in self.unchecked_writers
+
+    def extern_writes_unchecked(self, e: ir.Extern, fn: ir.Function, views: set[str], bound: set[str] | None = None) -> bool:
+        """May this unchecked call change an object an unchecked value can
+        reach? Only through what it is handed (a closure may reach whatever
+        the function holds: its variables, or those ``bound`` now), and not
+        if it only reads."""
+        if any(isinstance(a.ty, ir.TOpaque) and a.ty.why == "closure" for a in e.args):
+            tys = {**{p.name: p.ty for p in fn.params}, **fn.locals}
+            return any(reaches_unchecked(t) for n, t in tys.items() if bound is None or n in bound)
+        if e.name.split(".")[-1] in PURE_EXTERNS or unchecked_constructor(e):
+            return False
+        return any(_hands_unchecked(a, views) for a in e.args)
+
     def _heap(self) -> None:
         """Which fields each function may write (and of which objects), which
         it reads, and whether it allocates; transitively through calls."""
@@ -905,3 +974,76 @@ def _rewrite_stmts(stmts: list[ir.Stmt], f) -> list[ir.Stmt]:
                 changes[fl.name] = nv
         out.append(dataclasses.replace(s, **changes) if changes else s)
     return out
+
+
+# Unchecked calls that only read what they are handed (the last part of the name).
+PURE_EXTERNS = frozenset(
+    "get keys values items entries copy count index find rfind startswith endswith startsWith endsWith lower upper "
+    "toLowerCase toUpperCase strip lstrip rstrip trim split rsplit splitlines join format replace encode decode "
+    "isdigit isalpha isalnum isspace print log warn error str repr String Number Boolean len int float bool "
+    "isinstance type id hash sorted list dict tuple set frozenset dumps stringify abs min max sum any all round "
+    "isArray isInteger isNaN parseInt parseFloat slice concat indexOf lastIndexOf includes at toString "
+    "hasOwnProperty charAt charCodeAt substring padStart padEnd repeat getattr hasattr".split()
+)
+
+
+# Operations on unchecked values whose result is a new object.
+FRESH_OPS = frozenset("add mult comprehension dict tuple set array object rest slice_step".split())
+
+
+def in_place(s: ir.Assign) -> bool:
+    """``xs += ys`` and the like: Python changes a list, set or dict in place."""
+    v = s.value
+    if isinstance(v, ir.Builtin) and v.name == "list_concat":
+        first = v.args[0]
+    elif isinstance(v, ir.Builtin) and v.name == "opaque_op" and isinstance(v.args[0], ir.Lit) and v.args[0].value in ("add", "mult", "sub", "bitor", "bitand", "bitxor") and len(v.args) > 1:
+        first = v.args[1]
+    else:
+        return False
+    return isinstance(first, ir.Var) and first.name == s.name
+
+
+def unchecked_constructor(e: ir.Extern) -> bool:
+    """``Name(...)`` or ``new Name(...)``: assumed to leave what it is handed unchanged."""
+    last = e.name.removeprefix("new ").split(".")[-1]
+    return last[:1].isupper()
+
+
+def reaches_unchecked(t: ir.Type) -> bool:
+    """Can a value of type ``t`` hold (or be) an unchecked object?"""
+    if isinstance(t, ir.TOpaque):
+        return True
+    if isinstance(t, ir.TList):
+        return reaches_unchecked(t.elem)
+    if isinstance(t, ir.TDict):
+        return reaches_unchecked(t.val)
+    if isinstance(t, ir.TOption):
+        return reaches_unchecked(t.inner)
+    if isinstance(t, ir.TRecord):
+        return any(reaches_unchecked(ft) for _, ft in t.fields)
+    return False
+
+
+def _hands_unchecked(a: ir.Expr, views: set[str]) -> bool:
+    """Does passing ``a`` hand over an unchecked object? A checked value seen
+    untyped holds none."""
+    if isinstance(a, ir.Builtin) and a.name == "to_opaque":
+        return _hands_unchecked(a.args[0], views)
+    return reaches_unchecked(a.ty) or (isinstance(a, ir.Var) and a.name in views)
+
+
+def _mutable(t: ir.Type) -> bool:
+    return isinstance(t.inner if isinstance(t, ir.TOption) else t, (ir.TList, ir.TDict))
+
+
+def _is_view(e: ir.Expr) -> bool:
+    """Does ``e`` denote an unchecked object seen at a checked container type?"""
+    if isinstance(e, ir.Builtin) and e.name == "from_opaque":
+        x = e.args[0]
+        new = isinstance(x, ir.Builtin) and x.name == "opaque_op" and isinstance(x.args[0], ir.Lit) and x.args[0].value in FRESH_OPS
+        return _mutable(e.ty) and not new
+    if isinstance(e, ir.Builtin) and e.name in ("some", "await"):
+        return _is_view(e.args[0])
+    if isinstance(e, ir.Ite):
+        return _is_view(e.then) or _is_view(e.orelse)
+    return False

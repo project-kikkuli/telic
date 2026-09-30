@@ -9,6 +9,7 @@ import pytest
 from telic.aim import _aim_json
 from telic.checker import CheckOptions, check
 from telic.html import render_html
+from telic.replay import call_text
 
 from conftest import HAS_NODE
 
@@ -30,6 +31,14 @@ EXPECTED = [
     ("config.py", "grandchildren", "open"),
     ("tree.ts", "leaves", "proved"),
     ("tree.ts", "overclaims", "open"),
+    ("rebuilt.py", "present_is_not_null", "refuted"),
+    ("rebuilt.py", "contains", "refuted"),
+    ("rebuilt.py", "adds", "refuted"),
+    ("rebuilt.py", "reads", "proved"),
+    ("rebuilt.ts", "missingIsNull", "refuted"),
+    ("rebuilt.ts", "setsField", "refuted"),
+    ("xf", "one_level", "proved"),
+    ("xf", "two_levels", "open"),
 ]
 
 
@@ -39,7 +48,8 @@ def reports():
     for name in sorted({n for n, _, _ in EXPECTED}):
         if name.endswith(".ts") and not HAS_NODE:
             continue
-        out[name] = check([str(CASES / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(CASES))
+        root = CASES / name if (CASES / name).is_dir() else CASES
+        out[name] = check([str(CASES / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(root))
     return out
 
 
@@ -78,3 +88,12 @@ def test_check_json_carries_the_assumption(tmp_path, capsys):
     main(["aims", str(CASES / "payload.py"), "--root", str(CASES), "--json", "--no-cache"])
     (aim,) = json.loads(capsys.readouterr().out)
     assert aim["trusted"] == ["valid_item", "valid_order"]
+
+
+@pytest.mark.parametrize("name,fn,call", [("rebuilt.py", "present_is_not_null", "present_is_not_null({'k': None})"), ("rebuilt.ts", "missingIsNull", "missingIsNull({})")])
+def test_a_refutation_shows_the_json_it_ran(reports, name, fn, call):
+    if name not in reports:
+        pytest.skip("frontend not available")
+    (f,) = [f for f in reports[name].functions if f.fn.name == fn]
+    (v,) = [v for v in f.verdicts if v.status == "refuted"]
+    assert v.replay.confirmed and call_text(f.fn, v.model, f.ref.module.language) == call

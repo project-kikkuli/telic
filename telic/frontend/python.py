@@ -2534,7 +2534,7 @@ class ExprLowerer:
             return out
         if name in fe.signatures and name not in self.fl.env:
             return self.user_call(n, loc, name)
-        if name in self.fl.closures and not self.spec:
+        if not self.spec and name in self.fl.closures:
             captured = [ir.Var(self.fl.env[c], loc, c) for c in self.fl.closures[name] if isinstance(self.fl.env.get(c), (ir.TList, ir.TDict, ir.TClass, ir.TOpaque))]
             return self.extern(f"local {name}", captured, n, loc, expect)
         if not self.spec:

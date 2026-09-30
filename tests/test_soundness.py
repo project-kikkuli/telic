@@ -86,6 +86,8 @@ TRUE_HELPERS = {
     "lc1.ts": {"Meter.__init__", "Meter.tick", "Lock.__init__", "Lock.seal", "Stepper.__init__", "Stepper.next"},
     "lc2.py": {"Tab.__init__", "Tab.pay", "Gauge.__init__", "Latch.__init__", "Latch.close", "Meter.__init__", "Meter.tick"},
     "lc2.rs": {"Tally.bump"},
+    "json_mutate.py": {"put"},
+    "json_mutate.rs": {"clear"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.
@@ -135,6 +137,8 @@ VACUOUS = [
     ("json_liar.py", "use_liar"),
     ("json_liar.py", "p"),
     ("json_liar.py", "q"),
+    ("json_deep_liar.py", "sums"),
+    ("json_deep_liar.py", "sums_from"),
 ]
 
 

@@ -142,12 +142,26 @@ def leaves(t: dict[str, Any]) -> int:
   function's `@requires` and `@ensures` can hold together, unfolding a
   predicate once round its recursion group. `result == (not p(t))` is
   reported `vacuous`, and so is every function that requires it. A
-  contradiction only deeper unfoldings reveal is not detected.
-- **Counterexamples** that hold unchecked values are shown with `…` and not
-  replayed, so a failed obligation there stays open rather than refuted.
+  contradiction only deeper unfoldings reveal makes vacuous every function
+  whose proof unfolds that deep.
+- **Unchecked values are objects.** Setting a key or calling a method on an
+  `Any` value, changing a checked view of one (`d: dict[str, Any] = t`,
+  then `d["k"] = v`), `xs += ys` on one, or calling a function that does
+  any of these, forgets what was known about every unchecked value and
+  view in scope. Unchecked calls that only read (`str(t)`, `t.get(k)`,
+  `JSON.stringify(t)`) and constructors (`Node(t)`, assumed and listed
+  under *trusted base*) keep it.
+- **Counterexamples** that hold unchecked values are rebuilt as JSON from
+  the model and run: `present_is_not_null({'k': None})`. A rebuilt value
+  that breaks the `@requires`, or a run telic cannot make, leaves the
+  obligation open, never refuted.
 
 The same works in TypeScript (`t: any`, `"k" in t`, `t.k`, `typeof t.v ===
-"number"`) and Rust (a trusted `fn` over any value types).
+"number"`) and Rust (a trusted `fn` over any value types). In TypeScript,
+`t === null` and `t === undefined` are different facts (`t == null` is
+either), `==` against a string says nothing about the value's type, and a
+checked `Record` seen untyped has at least its own keys `in` it (inherited
+properties too; a `Map`'s entries are not properties).
 
 ## Lifecycles
 

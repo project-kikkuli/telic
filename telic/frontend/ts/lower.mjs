@@ -2541,11 +2541,19 @@ class FunctionLowerer {
         let c;
         if (other.ty.k === "none") c = { e: "Lit", ty: BOOL, loc, value: true };
         else if (other.ty.k === "option") c = { e: "Builtin", ty: BOOL, loc, name: "is_none", args: [other] };
-        else if (other.ty.k === "opaque") c = this.opaqueOp("is_nullish", [other], BOOL, loc);
+        else if (other.ty.k === "opaque") {
+          // an untyped value can be null, undefined or neither: only == null means either
+          const lit = a.ty.k === "none" ? n.left : n.right;
+          const strict = k === K.EqualsEqualsEqualsToken || k === K.ExclamationEqualsEqualsToken;
+          c = this.opaqueOp(!strict ? "is_nullish" : lit.kind === K.NullKeyword ? "is_null" : "is_undefined", [other], BOOL, loc);
+        }
         else c = { e: "Lit", ty: BOOL, loc, value: false }; // a non-optional value is never null/undefined
         return cmp[k] === "eq" ? c : { e: "Unary", ty: BOOL, loc, op: "not", arg: c };
       }
-      if (a.ty.k === "opaque" || b.ty.k === "opaque") return this.opaqueOp(`cmp.${cmp[k]}`, [a, b], BOOL, loc);
+      if (a.ty.k === "opaque" || b.ty.k === "opaque") {
+        const loose = k === K.EqualsEqualsToken || k === K.ExclamationEqualsToken; // "1" == 1, ["a"] == "a"
+        return this.opaqueOp(`cmp.${loose ? "loose" : ""}${cmp[k]}`, [a, b], BOOL, loc);
+      }
       if (eqop && (a.ty.k === "enum" || b.ty.k === "enum") && (a.e === "Lit" && a.ty.k === "str" || b.e === "Lit" && b.ty.k === "str")) {
         // tag === "circle": a string enum compared with one of its values (or with a string it never equals)
         const [en, lit] = a.ty.k === "enum" ? [a, b] : [b, a];

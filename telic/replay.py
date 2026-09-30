@@ -30,7 +30,7 @@ PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 
 def _encode_any(v: Any) -> Any:
     """Encode a decoded model value whose static type is not at hand."""
-    if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v):
+    if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v or "__json__" in v):
         return v
     if isinstance(v, dict) and "__record__" in v:
         return {"__record__": v["__record__"], "fields": {k: _encode_any(x) for k, x in v["fields"].items()}}
@@ -55,6 +55,8 @@ def _anything(ty: ir.Type) -> bool:
 
 
 def encode_value(v: Any, ty: ir.Type) -> Any:
+    if isinstance(v, dict) and "__json__" in v:
+        return v  # an unchecked value rebuilt from the model, passed as it is
     if isinstance(v, dict) and "__opaque__" in v:
         return {"__opaque__": True, "any": _anything(ty)}
     if isinstance(v, dict) and "__enum__" in v:
@@ -121,6 +123,8 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         return f"{v['__enum__']}.{v['member']}"
     if isinstance(v, dict) and "__opaque__" in v:
         return "…"
+    if isinstance(v, dict) and "__json__" in v:
+        return repr(v["__json__"]) if lang == "python" else json.dumps(v["__json__"])
     if isinstance(v, dict) and "__dict__" in v:
         inner = ", ".join(f"{format_value(k, None, lang)}: {format_value(x, None, lang)}" for k, x in v["__dict__"])
         return "{" + inner + "}"
@@ -399,7 +403,7 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
         return False, f"could not run: {out['harness_error'].splitlines()[-1] if out['harness_error'] else 'unknown error'}", None
     if out.get("violation") == "requires" and out.get("func") == ir.source_name(fn.name) and ob.kind != "call":
         if any(_opaque_inside(p.ty) for p in fn.params):
-            return False, f"{runtime}: not replayed: the counterexample holds unchecked values telic cannot rebuild (shown as …)", None
+            return False, f"{runtime}: the unchecked values rebuilt from the model violate '@requires {out.get('text', '')}' (telic models them only in part)", None
         return False, f"{runtime}: the model violates '@requires {out.get('text', '')}' (telic model mismatch; please report)", None
     summary = describe(out, runtime)
     if out.get("stand_in"):
@@ -419,6 +423,20 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
     if ob.kind in ("inv.step", "variant") or loop_state:
         return False, f"{summary} without violating anything -- the state behind this counterexample is unreachable; a loop invariant is too weak to rule it out", None
     return False, f"{summary} without violating anything", None
+
+
+def _no_json(model: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilt JSON is for Python and Node; other harnesses take no stand-in."""
+    return {k: {"__opaque__": True} if isinstance(x, dict) and "__json__" in x else x for k, x in model.items()}
+
+
+def _partial(program: Program, ob) -> bool:
+    """Does the obligation rest on something its model does not pin down: an
+    unchecked value, or a trusted predicate unfolded only so deep?"""
+    from . import logic as L
+
+    preds = {program.logic_names[k] for k in program.predicates}
+    return any((isinstance(x, L.Term) and x.sort == L.OPAQUE) or (isinstance(x, L.Fn) and x.name in preds) for t in [*ob.hyps, ob.goal] for x in L.iter_terms(t))
 
 
 def _consts(t):
@@ -449,7 +467,7 @@ def replay_verdicts(program: Program, rep) -> None:
         if lang == "rust":
             from .frontend.rust_replay import run_rust
 
-            out = run_rust(full, fn, v.model)
+            out = run_rust(full, fn, _no_json(v.model))
             if out is None:
                 continue  # not executable here (no toolchain, or a type the harness cannot build)
             confirmed, summary, violation = classify(v.ob, out, fn, lang)
@@ -458,7 +476,7 @@ def replay_verdicts(program: Program, rep) -> None:
         if lang == "swift":
             from .frontend.swift_replay import run_swift
 
-            out = run_swift(full, fn, v.model)
+            out = run_swift(full, fn, _no_json(v.model))
             if out is None:
                 continue  # not executable here (no toolchain, or a value the harness cannot build)
             confirmed, summary, violation = classify(v.ob, out, fn, lang)
@@ -508,7 +526,11 @@ def replay_verdicts(program: Program, rep) -> None:
             for v in pending:
                 v.replay.fuzz_summary = f"{out.get('tried', 0)} random inputs found no failure"  # type: ignore[attr-defined]
     # A model the real program cannot reproduce is not a refutation; nor is
-    # one for termination, which no finite run can witness.
+    # one for termination, which no finite run can witness, nor one telic
+    # models only in part (unchecked values, trusted predicates) unless a
+    # run confirms it.
     for v in rep.verdicts:
         if v.status == "refuted" and (v.ob.kind == "variant" or v.replay is not None and v.replay.ran and not v.replay.confirmed):
+            v.status = "unconfirmed"
+        elif v.status == "refuted" and not (v.replay is not None and v.replay.confirmed) and _partial(program, v.ob):
             v.status = "unconfirmed"

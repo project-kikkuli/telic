@@ -5,6 +5,7 @@ Reads ``{"path", "func", "args"}`` as JSON on stdin, prints one JSON line.
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import traceback
@@ -30,6 +31,8 @@ def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
         for k, x in (v.get("fields") or {}).items():
             object.__setattr__(obj, k, decode(x, module, memo))
         return obj
+    if isinstance(v, dict) and "__json__" in v:
+        return copy.deepcopy(v["__json__"])
     if isinstance(v, dict) and "__dict__" in v:
         return {decode(k, module, memo): decode(x, module, memo) for k, x in v["__dict__"]}
     if isinstance(v, dict) and "__enum__" in v:
