@@ -30,6 +30,17 @@ jobs:
           pip install -e '.[test]'
           (cd telic/frontend/ts && npm ci)
           sudo apt-get install -y z3
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Install Chromium for the UI tests
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = true ]; then python -m playwright install-deps chromium; else python -m playwright install --with-deps chromium; fi
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.2"
@@ -41,5 +52,7 @@ jobs:
         run: swiftc --version || echo "no swiftc on this runner"
       - name: Test
         run: pytest -q -rs
+        env:
+          TELIC_UI_SLOTS: "2"
       - name: Demo
         run: telic demo --no-pause --color never
