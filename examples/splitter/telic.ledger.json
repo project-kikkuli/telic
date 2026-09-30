@@ -1,0 +1,257 @@
+{
+  "aims": {
+    "BACK-HOME": {
+      "clauses": [
+        "ui back-home: always reachable home"
+      ],
+      "declared": "aims/BACK-HOME.md",
+      "functions": [],
+      "status": "backed",
+      "text": "WHILE any screen or dialog is shown, the web app shall let the user get back to the group list."
+    },
+    "BALANCE-ZERO": {
+      "clauses": [
+        "apply_expense: ensures len(result) == len(balances)",
+        "apply_expense: ensures sum(result) == sum(balances)",
+        "balances: ensures len(result) == members",
+        "balances: ensures sum(result) == 0"
+      ],
+      "declared": "aims/BALANCE-ZERO.md",
+      "functions": [
+        "server/ledger.py::apply_expense",
+        "server/ledger.py::balances"
+      ],
+      "status": "backed",
+      "text": "WHEN a group's balances are computed, the splitter shall produce balances that sum to zero."
+    },
+    "CURRENCY-PERSISTS": {
+      "clauses": [
+        "ui currency-persists: persists combobox \"Currency\""
+      ],
+      "declared": "aims/CURRENCY-PERSISTS.md",
+      "functions": [],
+      "status": "backed",
+      "text": "WHEN the user changes the currency setting, the web app shall keep it the next time it is opened."
+    },
+    "EXPENSE-LIFECYCLE": {
+      "clauses": [],
+      "declared": "aims/EXPENSE-LIFECYCLE.md",
+      "functions": [],
+      "status": "backed",
+      "text": "The splitter shall move an expense only forward from draft to posted to settled, and never back to an earlier state."
+    },
+    "SETTLE-CLEARS": {
+      "clauses": [
+        "settle_up: ensures all(0 <= t.debtor < len(balances) and 0 <= t.creditor < len(balances) for t in result)",
+        "settle_up: ensures all(balances[m] == sum(t.amount for t in result if t.creditor == m) - sum(t.amount for t in result if t.debtor == m) for m in range(len(balances)))",
+        "settle_up: ensures all(balances[t.debtor] < 0 < balances[t.creditor] for t in result)",
+        "settle_up: ensures all(t.amount > 0 for t in result)"
+      ],
+      "declared": "server/ledger.py",
+      "functions": [
+        "server/ledger.py::settle_up"
+      ],
+      "status": "partial",
+      "text": "WHEN a group settles up, the splitter shall propose positive payments from members who owe to members who are owed that clear every balance."
+    },
+    "SETTLE-VISIBLE": {
+      "clauses": [
+        "ui settle-visible: unobscured button \"Settle up\" while not overlay"
+      ],
+      "declared": "aims/SETTLE-VISIBLE.md",
+      "functions": [],
+      "status": "backed",
+      "text": "WHILE a group is shown, the web app shall keep the settle-up button uncovered."
+    },
+    "SPLIT-AGREE": {
+      "clauses": [],
+      "declared": "aims/SPLIT-AGREE.md",
+      "functions": [
+        "web/src/split.ts::shareOf",
+        "web/src/split.ts::splitEqual"
+      ],
+      "status": "backed",
+      "text": "WHEN a user previews an expense split, the web app shall show exactly the shares the server records."
+    },
+    "SPLIT-EXACT": {
+      "clauses": [
+        "split_equal: ensures all(result[i] == share_of(amount, parts, i) for i in range(parts))",
+        "split_equal: ensures all(s >= 0 for s in result)",
+        "split_equal: ensures len(result) == parts",
+        "split_equal: ensures sum(result) == amount",
+        "split_exact: ensures all(s >= 0 for s in result)",
+        "split_exact: ensures result == shares",
+        "split_exact: ensures sum(result) == amount",
+        "split_exact: raises sum(shares) != amount or any(s < 0 for s in shares)"
+      ],
+      "declared": "aims/SPLIT-EXACT.md",
+      "functions": [
+        "server/split.py::split_equal",
+        "server/split.py::split_exact"
+      ],
+      "status": "backed",
+      "text": "WHEN an expense is split among members, the splitter shall assign every cent of the amount to exactly one member and give no member a negative share."
+    }
+  },
+  "functions": {
+    "server/app.py::balances_body": {
+      "obligations": 10,
+      "status": "open"
+    },
+    "server/app.py::settle_body": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "server/app.py::split_body": {
+      "obligations": 2,
+      "status": "proved"
+    },
+    "server/expense.py::Expense@server_expense.edit": {
+      "obligations": 12,
+      "status": "proved"
+    },
+    "server/expense.py::Expense@server_expense.post": {
+      "obligations": 13,
+      "status": "proved"
+    },
+    "server/expense.py::Expense@server_expense.settle": {
+      "obligations": 13,
+      "status": "proved"
+    },
+    "server/expense.py::new_expense": {
+      "obligations": 5,
+      "status": "proved"
+    },
+    "server/ledger.py::apply_expense": {
+      "obligations": 11,
+      "status": "proved"
+    },
+    "server/ledger.py::balances": {
+      "obligations": 9,
+      "status": "proved"
+    },
+    "server/ledger.py::settle_up": {
+      "obligations": 75,
+      "status": "open"
+    },
+    "server/split.py::share_of": {
+      "obligations": 5,
+      "status": "proved"
+    },
+    "server/split.py::split_equal": {
+      "lean": 1,
+      "obligations": 26,
+      "status": "proved"
+    },
+    "server/split.py::split_exact": {
+      "obligations": 6,
+      "status": "proved"
+    },
+    "web/src/api.ts::post": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/expense.ts::Expense@src_expense.__init__": {
+      "obligations": 4,
+      "status": "proved"
+    },
+    "web/src/expense.ts::Expense@src_expense.post": {
+      "obligations": 13,
+      "status": "proved"
+    },
+    "web/src/expense.ts::Expense@src_expense.settle": {
+      "obligations": 13,
+      "status": "proved"
+    },
+    "web/src/main.ts::el": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::expenseDialog": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::go": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::header": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::link": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::load": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::render": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::renderGroup": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::renderGroups": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::renderSettings": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::save": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::seed": {
+      "obligations": 8,
+      "status": "proved"
+    },
+    "web/src/main.ts::settleDialog": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/main.ts::toast": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/settings.ts::formatMoney": {
+      "obligations": 1,
+      "status": "proved"
+    },
+    "web/src/settings.ts::loadCurrency": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/settings.ts::saveCurrency": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "web/src/split.ts::parseCents": {
+      "obligations": 4,
+      "status": "open"
+    },
+    "web/src/split.ts::shareOf": {
+      "obligations": 3,
+      "status": "proved"
+    },
+    "web/src/split.ts::splitEqual": {
+      "obligations": 23,
+      "status": "proved"
+    }
+  },
+  "mirrors": {
+    "server/split.py::share_of ~ web/src/split.ts::shareOf": "proved",
+    "server/split.py::split_equal ~ web/src/split.ts::splitEqual": "proved"
+  },
+  "telic": "0.1.0",
+  "ui": {
+    "web/src/main.ts::back-home": "proved",
+    "web/src/main.ts::currency-persists": "proved",
+    "web/src/main.ts::settle-visible": "proved"
+  }
+}

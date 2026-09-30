@@ -1,0 +1,4 @@
+[ui]
+command = "sh dev.sh {port}"
+viewports = ["390x844", "1280x800"]
+workers = 1

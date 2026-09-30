@@ -73,6 +73,11 @@ lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
   open: a route out of two stacked dialogs, reached one of several ways, does
   not replay.
 
+`examples/splitter` is an app built with telic from the first line: a
+Python API and a TypeScript front end with aims for money, a lifecycle, a
+cross-language mirror and three ui lemmas (the way home, an uncovered Settle
+up button, a persisted currency). Its README shows the workflow.
+
 A first run takes a few minutes per app (one browser per viewport; `workers`
 adds more); later runs reuse the verdicts until a source file changes. Every
 browser takes one of `TELIC_UI_SLOTS` (default 2) slots shared by all telic
