@@ -157,3 +157,12 @@ def test_a_binary_built_from_other_sources_is_refused(monkeypatch):
     monkeypatch.setattr(engine, "source_hash", lambda: "not-these-sources")
     with pytest.raises(RuntimeError, match="stale.*make -C"):
         engine.binary()
+
+
+def test_engine_and_python_core_run_the_same_z3():
+    import subprocess
+
+    import z3
+
+    out = subprocess.run([engine.z3_binary(), "--version"], capture_output=True, text=True).stdout
+    assert f"Z3 version {z3.get_version_string()}" in out

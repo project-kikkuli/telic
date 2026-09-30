@@ -29,7 +29,6 @@ jobs:
         run: |
           pip install -e '.[test]'
           (cd telic/frontend/ts && npm ci)
-          sudo apt-get install -y z3
       - name: Playwright version
         id: pw
         run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,28 @@ def binary() -> str | None:
 
 
 _FRESH: set[str] = set()
+_Z3: str | None = None
+
+
+def z3_binary() -> str:
+    """The z3 executable the engine drives: the one shipped in the ``z3-solver``
+    wheel telic imports, so both sides run one Z3 (rlimit units, and so
+    verdicts, differ across Z3 versions). Refused if its version differs."""
+    global _Z3
+    if _Z3 is None:
+        import z3
+
+        want = z3.get_version_string()
+        wheel = Path(sys.executable).parent / "z3"
+        exe = str(wheel) if wheel.exists() else os.environ.get("TELIC_Z3") or shutil.which("z3")
+        if exe is None:
+            raise RuntimeError("no z3 executable: install the z3-solver wheel into the environment telic runs in")
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+        m = re.search(r"Z3 version (\d+\.\d+\.\d+)", out)
+        if m is None or m.group(1) != want:
+            raise RuntimeError(f"{exe} is Z3 {m.group(1) if m else out.strip()!r} but telic's Python core is Z3 {want}; verdicts would differ. Use the z3 from the z3-solver wheel")
+        _Z3 = exe
+    return _Z3
 
 
 def source_hash() -> str | None:
@@ -180,7 +203,7 @@ def _call(req: dict[str, Any]) -> dict[str, Any]:
     assert exe is not None
     with take_jobs(req["jobs"] or None) as workers:
         req["jobs"] = workers
-        p = subprocess.run([exe], input=json.dumps(req), capture_output=True, text=True)
+        p = subprocess.run([exe], input=json.dumps(req), capture_output=True, text=True, env={**os.environ, "TELIC_Z3": z3_binary()})
     if p.returncode != 0:
         raise RuntimeError(f"telic-core failed: {p.stderr.strip()[-800:]}")
     if p.stderr and os.environ.get("TELIC_CORE_DEBUG"):

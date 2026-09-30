@@ -236,7 +236,7 @@ requires-dist = [
     { name = "tree-sitter-rust", marker = "extra == 'test'", specifier = ">=0.23" },
     { name = "tree-sitter-swift", marker = "extra == 'swift'", specifier = ">=0.7" },
     { name = "tree-sitter-swift", marker = "extra == 'test'", specifier = ">=0.7" },
-    { name = "z3-solver", specifier = ">=4.12" },
+    { name = "z3-solver", specifier = "==5.1.0.0" },
 ]
 provides-extras = ["rust", "swift", "ui", "test"]
 
