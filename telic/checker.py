@@ -13,6 +13,8 @@ from typing import Any, Callable
 from . import ir, irjson
 from . import logic as L
 from .infer import Inferred, infer
+from .jobs import exit_with_parent
+from .jobs import take as take_jobs
 from .program import FuncRef, Program
 from .smt import SmtResult, Theory, solve
 from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
@@ -451,7 +453,7 @@ class CheckOptions:
     only: set[str] | None = None  # function names to check
     progress: Callable[[str], None] | None = None
     receipts: bool = True  # reuse whole-function verdicts for unchanged functions
-    jobs: int | None = None  # solver threads (default: every core)
+    jobs: int | None = None  # solver workers (default: TELIC_JOBS, else min(4, cores // 2))
     # "ox": the native engine (core/), where it applies
     engine: str = field(default_factory=lambda: os.environ.get("TELIC_ENGINE", "python"))
     ui: bool = True  # run ui lemmas against the app (cached verdicts are shown either way)
@@ -465,25 +467,26 @@ def _pool_call(item: Any) -> Any:
 
 
 def run_parallel(fn: Callable[[Any], Any], items: list[Any], jobs: int | None) -> list[Any]:
-    """Map ``fn`` over ``items`` on every core (fork: the function and what it
-    closes over are inherited, only items and results are pickled)."""
-    workers = max(1, min(jobs or (os.cpu_count() or 1), len(items)))
-    if workers == 1 or len(items) < 2:
-        return [fn(x) for x in items]
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    """Map ``fn`` over ``items`` on the run's worker slots (fork: the function
+    and what it closes over are inherited, only items and results are
+    pickled)."""
+    with take_jobs(jobs, len(items)) as workers:
+        if workers == 1 or len(items) < 2:
+            return [fn(x) for x in items]
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-    if "fork" in mp.get_all_start_methods():
-        _POOL["fn"] = fn
-        try:
-            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as pool:
-                return list(pool.map(_pool_call, items, chunksize=max(1, len(items) // (workers * 4))))
-        except Exception:  # pragma: no cover
-            pass
-        finally:
-            _POOL.pop("fn", None)
-    with ThreadPoolExecutor(max_workers=workers) as tp:
-        return list(tp.map(fn, items))
+        if "fork" in mp.get_all_start_methods():
+            _POOL["fn"] = fn
+            try:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork"), initializer=exit_with_parent) as pool:
+                    return list(pool.map(_pool_call, items, chunksize=max(1, len(items) // (workers * 4))))
+            except Exception:  # pragma: no cover
+                pass
+            finally:
+                _POOL.pop("fn", None)
+        with ThreadPoolExecutor(max_workers=workers) as tp:
+            return list(tp.map(fn, items))
 
 
 def _pool_solve(ob: Obligation) -> SmtResult:
@@ -491,26 +494,26 @@ def _pool_solve(ob: Obligation) -> SmtResult:
 
 
 def solve_all(obs: list[Obligation], theory: Theory, timeout_ms: int, jobs: int | None) -> list[SmtResult]:
-    """Solve independent obligations on every core. Worker processes (fork)
-    sidestep the GIL, which the Python half of each solve holds; threads are
-    the fallback where fork is unavailable."""
-    workers = max(1, min(jobs or (os.cpu_count() or 1), len(obs)))
-    if workers == 1 or len(obs) < 4:
-        return [solve(ob, theory, timeout_ms) for ob in obs]
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    """Solve independent obligations on the run's worker slots. Worker
+    processes (fork) sidestep the GIL, which the Python half of each solve
+    holds; threads are the fallback where fork is unavailable."""
+    with take_jobs(jobs, len(obs)) as workers:
+        if workers == 1 or len(obs) < 4:
+            return [solve(ob, theory, timeout_ms) for ob in obs]
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-    if "fork" in mp.get_all_start_methods():
-        _POOL["theory"], _POOL["timeout"] = theory, timeout_ms
-        try:
-            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork")) as pool:
-                return list(pool.map(_pool_solve, obs, chunksize=max(1, len(obs) // (workers * 4))))
-        except Exception:  # pragma: no cover - e.g. a sandbox without fork
-            pass
-        finally:
-            _POOL.clear()
-    with ThreadPoolExecutor(max_workers=workers) as tp:
-        return list(tp.map(lambda ob: solve(ob, theory, timeout_ms), obs))
+        if "fork" in mp.get_all_start_methods():
+            _POOL["theory"], _POOL["timeout"] = theory, timeout_ms
+            try:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("fork"), initializer=exit_with_parent) as pool:
+                    return list(pool.map(_pool_solve, obs, chunksize=max(1, len(obs) // (workers * 4))))
+            except Exception:  # pragma: no cover - e.g. a sandbox without fork
+                pass
+            finally:
+                _POOL.clear()
+        with ThreadPoolExecutor(max_workers=workers) as tp:
+            return list(tp.map(lambda ob: solve(ob, theory, timeout_ms), obs))
 
 
 class Vacuity:
@@ -841,7 +844,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
         to_replay = [rep for rep, _, _ in staged if any(v.status == "refuted" for v in rep.verdicts)]
         if to_replay:
-            with ThreadPoolExecutor(max_workers=min(len(to_replay), opts.jobs or os.cpu_count() or 4)) as ex:
+            with take_jobs(opts.jobs, len(to_replay)) as workers, ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(lambda r: replay_verdicts(program, r), to_replay))
     vacuous = vacuity.explain(theory, opts, cache)
     for rep, fkey, ft in staged:

@@ -23,6 +23,7 @@ from typing import Any
 from . import ir
 from . import irjson
 from . import logic as L
+from .jobs import take as take_jobs
 from .program import FuncRef, Program
 from .smt import solve
 from .vcgen import ListVal, Obligation, Options, VCGen
@@ -155,7 +156,9 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
 def _call(req: dict[str, Any]) -> dict[str, Any]:
     exe = binary()
     assert exe is not None
-    p = subprocess.run([exe], input=json.dumps(req), capture_output=True, text=True)
+    with take_jobs(req["jobs"] or None) as workers:
+        req["jobs"] = workers
+        p = subprocess.run([exe], input=json.dumps(req), capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"telic-core failed: {p.stderr.strip()[-800:]}")
     if p.stderr and os.environ.get("TELIC_CORE_DEBUG"):

@@ -499,7 +499,9 @@ def check_attempts(lean: str, defs_text: str, attempts: list[Attempt]) -> tuple[
     never see, or interfere with, another."""
     from concurrent.futures import ThreadPoolExecutor
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(attempts)))) as pool:
+    from .jobs import take
+
+    with take(None, len(attempts)) as workers, ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(lambda at: _check_one(lean, defs_text, at), attempts))
     return results, None
 

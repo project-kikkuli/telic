@@ -35,6 +35,8 @@ jobs:
           ocaml-compiler: "5.2"
       - name: Build the native engine
         run: opam exec -- make -C core
+      - name: Use every core
+        run: echo "TELIC_JOBS=$(nproc)" >> "$GITHUB_ENV" && echo "TELIC_MAX_JOBS=$(nproc)" >> "$GITHUB_ENV"
       - name: Test
         run: pytest -q -rs
       - name: Demo

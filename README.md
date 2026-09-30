@@ -157,6 +157,10 @@ telic oracle [--probe]     which classifier or model answers the judgment steps
 telic run script.py        run with every contract checked at runtime
 ```
 
+A run uses `-j` / `TELIC_JOBS` solver workers (default min(4, cores / 2)).
+All telic runs on the machine share `TELIC_MAX_JOBS` worker slots (default
+cores / 2) and `TELIC_UI_SLOTS` browsers (default 2), and queue for them.
+
 ## What you are trusting
 
 - **Language semantics.** Python ints are exact; Rust integers are their fixed

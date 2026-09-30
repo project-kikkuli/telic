@@ -48,7 +48,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--no-cache", action="store_true", help="ignore and do not write .telic/cache.json")
     ap.add_argument("--only", action="append", metavar="FUNC", help="check only these functions")
     ap.add_argument("--root", default=None, help="project root for relative paths and the cache (default: cwd)")
-    ap.add_argument("-j", "--jobs", type=int, default=None, help="solver threads (default: every core)")
+    ap.add_argument("-j", "--jobs", type=int, default=None, help="solver workers (default: TELIC_JOBS, else min(4, cores // 2)); all telic runs share TELIC_MAX_JOBS (default cores // 2)")
     ap.add_argument("--engine", choices=["python", "ox"], default=None, help="'ox': the native OxCaml engine (core/), where it applies")
     ap.add_argument("--no-ui", action="store_true", help="do not run ui lemmas against the app (cached verdicts still show)")
 
