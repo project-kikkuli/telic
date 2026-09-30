@@ -524,7 +524,7 @@ class Function:
     raises: list[Clause] = field(default_factory=list)  # "@raises cond"
     body: list[Stmt] = field(default_factory=list)
     aims: list[str] = field(default_factory=list)
-    mirrors: list[tuple[str, Loc]] = field(default_factory=list)
+    mirrors: list[tuple[str, Loc, tuple[str, ...]]] = field(default_factory=list)  # (target, where, aims its tag names)
     unsupported: list[tuple[str, Loc]] = field(default_factory=list)
     trusted: bool = False  # "@trusted": contract assumed, body not verified
     exported: bool = True

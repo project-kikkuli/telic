@@ -194,8 +194,8 @@ def build(rep: Any) -> list[AimReport]:
             for s in _loop_invariants(f.fn):
                 if iid in s.aims:
                     clauses.append(s)
-            if not clauses:
-                r.pointers.append(f"{f.fn.name} cites {iid} but none of its @ensures carries it")
+            if not clauses and not any(f.ref.key in (mr.a.key, mr.b.key) for mr in mirrors.get(iid, [])):
+                r.pointers.append(f"{f.fn.name} cites {iid} but none of its @ensures or @mirrors carries it")
             for c in clauses:
                 r.lemmas.append(Lemma(f.ref.key, f.fn.name, f.ref.module.path, c.loc.line, c.kind, c.text, _clause_status(f, c)))
         for mr in mirrors.get(iid, []):

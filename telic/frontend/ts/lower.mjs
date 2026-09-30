@@ -1164,7 +1164,8 @@ class FunctionLowerer {
       return;
     }
     if (kw === "mirrors") {
-      this.fn.mirrors.push([cl.payload.trim(), cl.line]);
+      this.fn.mirrors.push([cl.payload.trim(), cl.line, cl.tags]);
+      for (const t of cl.tags) if (!this.aims.includes(t)) this.aims.push(t);
       return;
     }
     if (kw === "trusted") {

@@ -205,3 +205,21 @@ def test_anything_else_in_aims_is_an_error_naming_it(tmp_path, capsys, stray, na
     assert got["PAY"].status == ("unbacked" if check == "aims" else "backed")
     assert (len(problems), all(named in p for p in problems)) == ((1, True) if named else (0, True))
     assert run(tmp_path, capsys=capsys)[0] == (1 if named else 0)
+
+
+MIRROR_PY = "def f(x: int) -> int:\n    #@ [AGREE] mirrors ../srv.py::g\n    #@ aim OTHER\n    #@ requires x >= 0\n    #@ ensures result >= 0\n    return x\n"
+MIRROR_TS = "export function f(x: number): number {\n  //@ [AGREE] mirrors ../srv.py::g\n  //@ aim OTHER\n  //@ requires x >= 0\n  //@ ensures result >= 0\n  return x\n}\n"
+
+
+@pytest.mark.parametrize("name,source", [("web/f.py", MIRROR_PY), ("web/f.ts", MIRROR_TS)])
+def test_a_tagged_mirror_backs_only_its_tag(tmp_path, name, source):
+    files = {
+        "srv.py": "def g(x: int) -> int:\n    return x\n",
+        name: source,
+        **aims("", ("AGREE", SAME, f"{name}::f"), ("OTHER", SAME, f"{name}::f")),
+    }
+    rep, got = report(tree(tmp_path, files))
+    assert [m.aims for m in rep.mirrors] == [["AGREE"]]
+    assert got["AGREE"].status == "backed" and not got["AGREE"].pointers
+    assert got["OTHER"].status == "backed" and not got["OTHER"].pointers
+    assert not any(x.kind == "mirror" for x in got["OTHER"].lemmas)

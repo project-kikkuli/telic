@@ -274,8 +274,10 @@ def explain_difference(a: ir.Function, b: ir.Function, notes: list[str]) -> str:
     return notes[0] if notes else ""
 
 
-def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300) -> MirrorReport:
-    rep = MirrorReport(a, b, loc, sorted(set(a.fn.aims) | set(b.fn.aims)), "open", verdicts=["mirror"])
+def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300, aims: list[str] | None = None) -> MirrorReport:
+    """``aims``: the tags on the ``@mirrors`` line; untagged, the mirror
+    serves every aim either function cites."""
+    rep = MirrorReport(a, b, loc, aims or sorted(set(a.fn.aims) | set(b.fn.aims)), "open", verdicts=["mirror"])
     try:
         ina, inb, shown, notes = _shared_inputs(a.fn, b.fn)
     except Incomparable as e:
@@ -388,7 +390,7 @@ def mirror_targets(modules: list[ir.Module]) -> list[str]:
     out = []
     for m in modules:
         for f in m.functions.values():
-            for spec, _ in f.mirrors:
+            for spec, _, _ in f.mirrors:
                 if "::" in spec:
                     rel = spec.rsplit("::", 1)[0]
                     out.append(os.path.normpath(os.path.join(os.path.dirname(m.path), rel)))
@@ -402,13 +404,13 @@ def check_mirrors(program: Program, theory: Theory, opts, root: str | None = Non
         for f in m.functions.values():
             if opts.only and f.name not in opts.only:
                 continue
-            for spec, loc in f.mirrors:
+            for spec, loc, tags in f.mirrors:
                 owner = FuncRef(m, f)
                 target = resolve_mirror(program, owner, spec)
                 if target is None:
-                    rep = MirrorReport(owner, owner, loc, list(f.aims), "open", verdicts=["mirror"])
+                    rep = MirrorReport(owner, owner, loc, list(tags or f.aims), "open", verdicts=["mirror"])
                     rep.reason = f"cannot find '{spec}' (path is relative to {m.path}; the file must be checkable)"
                     out.append(rep)
                     continue
-                out.append(check_pair(program, theory, target, owner, root, loc, opts.timeout_ms))
+                out.append(check_pair(program, theory, target, owner, root, loc, opts.timeout_ms, aims=list(tags)))
     return out

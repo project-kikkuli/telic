@@ -438,6 +438,9 @@ automatically. The two functions must take the same number of parameters (matche
 by position) and must agree on every input both preconditions accept. An `int`
 parameter against a `number` parameter is compared on integers.
 
+A mirror is a lemma. Tagged (`//@ [PRICE-AGREE] mirrors ...`), it backs
+that aim only; untagged, it backs every aim either function cites.
+
 ## UI lemmas
 
 A UI lemma is a property of the running app, checked through its

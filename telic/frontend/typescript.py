@@ -311,7 +311,7 @@ def _function(d: dict[str, Any]) -> ir.Function:
         raises=[_clause(c) for c in d["raises"]],  # type: ignore[misc]
         body=list(_stmts(d["body"])),
         aims=list(d.get("aims") or []),
-        mirrors=[(m, ir.Loc(int(line))) for m, line in d.get("mirrors") or []],
+        mirrors=[(m[0], ir.Loc(int(m[1])), tuple(m[2] if len(m) > 2 else ())) for m in d.get("mirrors") or []],
         unsupported=[(m, ir.Loc(int(line))) for m, line in d.get("unsupported") or []],
         trusted=bool(d.get("trusted")),
         exported=bool(d.get("exported", True)),

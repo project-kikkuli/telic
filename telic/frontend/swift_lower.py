@@ -141,7 +141,10 @@ class FunctionLowerer:
             self.fn.aims = list(self.aims)
             return
         if kw == "mirrors":
-            self.fn.mirrors.append((cl.payload.strip(), ir.Loc(cl.line, cl.col)))
+            self.fn.mirrors.append((cl.payload.strip(), ir.Loc(cl.line, cl.col), tuple(cl.tags)))
+            for t in cl.tags:
+                if t not in self.fn.aims:
+                    self.fn.aims.append(t)
             return
         if kw == "trusted":
             self.fn.trusted = True
