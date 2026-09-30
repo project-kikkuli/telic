@@ -107,8 +107,8 @@ class Model:
             for t in ts:
                 yield sig, t
 
-    def path(self, frm: int, goals: set[int], deterministic: bool = False, avoid: set[tuple[int, str]] = frozenset()) -> list[str] | None:
-        """Shortest action sequence from ``frm`` to any of ``goals``."""
+    def path(self, frm: int, goals: set[int], deterministic: bool = False, avoid: set[tuple[int, str]] = frozenset(), allow: Callable[[str], bool] = lambda _sig: True) -> list[str] | None:
+        """Shortest action sequence from ``frm`` to any of ``goals`` (of actions ``allow`` accepts)."""
         if frm in goals:
             return []
         prev: dict[int, tuple[int, str]] = {frm: (-1, "")}
@@ -116,7 +116,7 @@ class Model:
         while q:
             s = q.popleft()
             for sig, ts in sorted(self.trans.get(s, {}).items()):
-                if (deterministic and len(ts) > 1) or (s, sig) in avoid:
+                if (deterministic and len(ts) > 1) or (s, sig) in avoid or not allow(sig):
                     continue
                 for t in sorted(ts):
                     if t in prev:
@@ -131,11 +131,13 @@ class Model:
                     q.append(t)
         return None
 
-    def reaching(self, goals: set[int]) -> set[int]:
-        """States from which some path reaches ``goals``."""
+    def reaching(self, goals: set[int], allow: Callable[[str], bool] = lambda _sig: True) -> set[int]:
+        """States from which some path (of actions ``allow`` accepts) reaches ``goals``."""
         back: dict[int, set[int]] = {}
         for s, m in self.trans.items():
-            for ts in m.values():
+            for sig, ts in m.items():
+                if not allow(sig):
+                    continue
                 for t in ts:
                     back.setdefault(t, set()).add(s)
         out = set(goals)
@@ -148,7 +150,7 @@ class Model:
                     q.append(s)
         return out
 
-    def forcing(self, goals: set[int]) -> set[int]:
+    def forcing(self, goals: set[int], allow: Callable[[str], bool] = lambda _sig: True) -> set[int]:
         """States from which some sequence of actions reaches ``goals``
         whichever of its observed outcomes each action has (hidden state
         decides a nondeterministic one, not the user)."""
@@ -157,21 +159,21 @@ class Model:
         while grew:
             grew = False
             for s, m in self.trans.items():
-                if s not in out and any(ts and ts <= out for ts in m.values()):
+                if s not in out and any(ts and ts <= out for sig, ts in m.items() if allow(sig)):
                     out.add(s)
                     grew = True
         return out
 
-    def closed_from(self, sid: int) -> bool:
-        """Every state reachable from ``sid`` has had every action fired."""
+    def closed_from(self, sid: int, allow: Callable[[str], bool] = lambda _sig: True) -> bool:
+        """Every state reachable from ``sid`` (by actions ``allow`` accepts) has had every such action fired."""
         seen = {sid}
         q = deque([sid])
         while q:
             s = self.states[q.popleft()]
-            if any(a not in s.fired for a in s.actions):
+            if any(a not in s.fired and allow(a) for a in s.actions):
                 return False
-            for _, t in self.edges(s.id):
-                if t not in seen:
+            for sig, t in self.edges(s.id):
+                if allow(sig) and t not in seen:
                     seen.add(t)
                     q.append(t)
         return True

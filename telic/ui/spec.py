@@ -10,7 +10,9 @@ tagged with the aims it backs:
 
 Properties (``P`` and ``Q`` are predicates over one screen):
 
-    always reachable P [from Q]   from every reachable state (where Q holds), P can be reached
+    always reachable P [from Q] [by A]
+                                  from every reachable state (where Q holds), P can be
+                                  reached (using only actions A)
     reachable P                   some reachable state satisfies P
     always P [while Q]            every reachable state (where Q holds) satisfies P
     never P [while Q]             no reachable state (where Q holds) satisfies P
@@ -27,6 +29,10 @@ a target ``ROLE "name"`` (present), ``T is enabled|disabled|checked|
 unchecked|expanded|collapsed|selected|pressed``, ``T == "value"``, combined
 with ``not``, ``and``, ``or`` and parentheses. A name is a string (exact) or
 ``/regex/``; a role alone matches any name.
+
+Actions (``A``), joined with ``or``: ``tap`` (anything but a key press: what a
+touch screen offers), ``key`` or ``key "Escape"`` (a key press), or a control
+``ROLE "name"`` (clicking, filling or choosing in it).
 """
 
 from __future__ import annotations
@@ -141,12 +147,49 @@ def _name_ok(t: Target, name: str) -> bool:
 
 TRUE = Pred("true")
 
+_VERB = re.compile(r"^(?:fill|select|increase) ")
+
+
+@dataclass(frozen=True)
+class Using:
+    """Actions a route may take: ``tap``, ``key ["name"]`` or a control."""
+
+    kind: str  # tap | key | control
+    target: Target | None = None
+
+    def allows(self, sig: str) -> bool:
+        if self.kind == "tap":
+            return not sig.startswith("key ")
+        if self.kind == "key":
+            return sig.startswith("key ") and (self.target is None or _name_ok(self.target, sig[4:]))
+        assert self.target is not None
+        m = re.match(r'(\w+)(?: ("(?:[^"\\]|\\.)*"))?', _VERB.sub("", sig.split(" › ")[-1]))
+        if m is None or m.group(1) != self.target.role:
+            return False
+        if self.target.name is None and self.target.pattern is None:
+            return True
+        # names in actions have their numbers blanked, as in 'All tasks #'
+        name = json.loads(m.group(2)) if m.group(2) else ""
+        want = self.target if self.target.pattern is not None else Target(self.target.role, re.sub(r"\d+", "#", self.target.name or ""))
+        return _name_ok(want, name)
+
+    def __str__(self) -> str:
+        if self.kind == "tap":
+            return "tap"
+        if self.kind == "key":
+            return "key" + (" " + str(self.target).split(" ", 1)[1] if self.target is not None else "")
+        return str(self.target)
+
 
 @dataclass(frozen=True)
 class Prop:
     kind: str  # always_reachable | reachable | always | never | unobscured | persists
     goal: Pred | Target
     cond: Pred = TRUE
+    by: tuple[Using, ...] = ()  # always_reachable: the only actions its routes may take
+
+    def allows(self, sig: str) -> bool:
+        return not self.by or any(u.allows(sig) for u in self.by)
 
     def atoms(self) -> list[Pred]:
         """Predicates the state abstraction must keep apart for this property."""
@@ -162,6 +205,8 @@ class Prop:
         tail = ""
         if self.cond is not TRUE:
             tail = (" from " if self.kind == "always_reachable" else " while ") + str(self.cond)
+        if self.by:
+            tail += " by " + " or ".join(str(u) for u in self.by)
         return f"{head} {self.goal}{tail}"
 
 
@@ -218,7 +263,7 @@ class _Parser:
             if self.word("reachable"):
                 goal = self.pred()
                 cond = self.pred() if self.word("from") else TRUE
-                p = Prop("always_reachable", goal, cond)
+                p = Prop("always_reachable", goal, cond, self.using() if self.word("by") else ())
             else:
                 goal = self.pred()
                 p = Prop("always", goal, self.pred() if self.word("while") else TRUE)
@@ -235,6 +280,8 @@ class _Parser:
         else:
             t = self.peek()
             raise SpecError(f"expected 'always reachable', 'reachable', 'always', 'never', 'unobscured' or 'persists', got {t[1] if t else 'nothing'!r}")
+        if self.word("by"):
+            raise SpecError("'by' limits the route of 'always reachable P [from Q]', and comes after it")
         via = None
         if self.word("via"):
             k, v = self.need("a function name after 'via'")
@@ -244,6 +291,23 @@ class _Parser:
         if self.peek() is not None:
             raise SpecError(f"unexpected {self.peek()[1]!r}")
         return p, via
+
+    def using(self) -> tuple[Using, ...]:
+        out = [self.one_using()]
+        while self.word("or"):
+            out.append(self.one_using())
+        return tuple(out)
+
+    def one_using(self) -> Using:
+        if self.word("tap"):
+            return Using("tap")
+        if self.word("key"):
+            t = self.peek()
+            return Using("key", self._named("key") if t and t[0] in ("str", "re") else None)
+        t = self.peek()
+        if t is None or t[0] != "word" or not _ROLE.match(t[1]) or t[1] in ("and", "or", "not", "is", "while", "from", "via", "by"):
+            raise SpecError(f"expected 'tap', 'key' or a control after 'by', got {t[1] if t else 'nothing'!r}")
+        return Using("control", self.target())
 
     def pred(self) -> Pred:
         left = self.conj()
@@ -296,7 +360,7 @@ class _Parser:
 
     def target(self) -> Target:
         k, v = self.need("a role, e.g. button \"Close\"")
-        if k != "word" or not _ROLE.match(v) or v in ("and", "or", "not", "is", "while", "from", "via"):
+        if k != "word" or not _ROLE.match(v) or v in ("and", "or", "not", "is", "while", "from", "via", "by"):
             raise SpecError(f"expected a role (button, link, dialog, ...), got {v!r}")
         return self._named(v)
 

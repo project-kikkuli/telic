@@ -470,11 +470,17 @@ files work too), and it cites its aims with a tag:
 
 | property | holds when |
 |---|---|
-| `always reachable P [from Q]` | from every reachable state (where `Q` holds), some sequence of actions reaches `P` |
+| `always reachable P [from Q] [by A]` | from every reachable state (where `Q` holds), some sequence of actions (only actions `A`) reaches `P` |
 | `reachable P` | some reachable state satisfies `P` |
 | `always P [while Q]` / `never P [while Q]` | every reachable state (where `Q` holds) satisfies `P` / not `P` |
 | `unobscured T [while Q]` | wherever `T` renders, its center and four corners hit `T` (or its label) and nothing is painted over them, at every viewport |
 | `persists T` | changing control `T` and reopening the app (stored data kept) shows the new value |
+
+`by A` limits the route to some actions, joined with `or`: `tap` (anything
+but a key press, what a touch screen offers), `key` or `key "Escape"`, or a
+control `ROLE "name"` (clicking, typing or choosing in it). `always reachable
+not overlay from overlay by key "Escape"` says Escape closes every dialog,
+and `... by tap` says a phone user can always get out.
 
 Any property can end with `via FUNC`: the function that handles the change.
 Its own verdict then counts toward the lemma (a refuted handler refutes it).

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .driver import DriverError
 from .learn import Explorer, Model, UiState, Worker
@@ -134,7 +134,7 @@ class ModelCheck:
                 return None, done, f"step {len(done)} failed: {at.blocked.get(sig, 'blocked')}"
         return w.snap, done, ""
 
-    def reach(self, path: list[str], goals: set[int], goal: Pred, w: Worker, budget: int = 0) -> tuple[bool, str]:
+    def reach(self, path: list[str], goals: set[int], goal: Pred, w: Worker, budget: int = 0, allow: Callable[[str], bool] = lambda _sig: True) -> tuple[bool, str]:
         """Follow ``path`` in the app, then get to a goal state, re-planning on
         the model from wherever the app actually is after each step (so state
         the abstraction does not see cannot fake a route)."""
@@ -153,7 +153,7 @@ class ModelCheck:
                 return False, "the app left the model"
             here = used.setdefault(_concrete(w), set())
             avoid = {(at.id, sig) for sig in here | (set(at.actions) - set(w.acts))}
-            route = self.m.path(at.id, goals, avoid=avoid)
+            route = self.m.path(at.id, goals, avoid=avoid, allow=allow)
             if not route:
                 return False, f"no route left from {at.describe()}"
             sig = route[0]
@@ -215,12 +215,12 @@ class ModelCheck:
         rel = self._states(p.cond)
         if not rel:
             return self._nothing("learned model", f"no reachable state has {_phrase(p.cond)}")
-        can = self.m.reaching(goals)
+        can = self.m.reaching(goals, p.allows)
         bad = sorted((s for s in rel if s.id not in can), key=lambda s: (s.depth, s.id))
         if bad:
             s = bad[0]
-            n = len(s.actions)
-            if not self.m.closed_from(s.id):
+            n = sum(1 for a in s.actions if p.allows(a))
+            if not self.m.closed_from(s.id, p.allows):
                 return Outcome("open", "learned model", f"no route to {_phrase(p.goal)} found from {s.describe()}, but exploration from there is unfinished", relevant=len(rel))
             snap, done, why = self.replay(s.access)
             if snap is None or self.w.cur is None or self.w.cur.id != s.id:
@@ -230,12 +230,12 @@ class ModelCheck:
             return Outcome(
                 "refuted",
                 "learned model",
-                f"stuck at {s.describe()}: none of its {n} actions leads to {_phrase(p.goal)}{tail}",
+                f"stuck at {s.describe()}: none of its {n} actions{' by ' + ' or '.join(map(str, p.by)) if p.by else ''} leads to {_phrase(p.goal)}{tail}",
                 trace=done,
                 replay={"confirmed": True, "summary": f"reached {s.describe()}"},
                 relevant=len(rel),
             )
-        forced = self.m.forcing(goals)
+        forced = self.m.forcing(goals, p.allows)
         chancy = sorted((s for s in rel if s.id not in forced), key=lambda s: (s.depth, s.id))
         if chancy:
             s = chancy[0]
@@ -270,7 +270,7 @@ class ModelCheck:
                     if not queue or failed:
                         return
                     s, path = queue.pop()
-                ok, why = self.reach(path, goals, p.goal, w)
+                ok, why = self.reach(path, goals, p.goal, w, allow=p.allows)
                 if not ok:
                     with self.ex.lock:
                         failed.append((s, path, why))

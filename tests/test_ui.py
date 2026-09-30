@@ -33,6 +33,8 @@ APP = Path(__file__).parent / "cases" / "ui" / "app"
         ('unobscured button "Menu" while screen "/notes/*"', 'unobscured button "Menu" while screen "/notes/*"'),
         ("persists switch /sync/i", "persists switch /(?i)sync/"),
         ('always reachable (screen "/" or screen "/home") from overlay "Settings"', 'always reachable screen "/" or screen "/home" from overlay "Settings"'),
+        ('always reachable home from overlay by key "Escape"', 'always reachable home from overlay by key "Escape"'),
+        ('always reachable home by tap or button /close/i or key', 'always reachable home by tap or button /(?i)close/ or key'),
     ],
 )
 def test_properties_parse(text, shown):
@@ -53,6 +55,8 @@ def test_via_names_the_handler():
         ("unobscured and", "expected a role"),
         ('reachable screen /x/', "quoted path"),
         ('reachable (home', "expected ')'"),
+        ("always reachable home by", "expected 'tap', 'key' or a control"),
+        ('reachable home by tap', "'by' limits the route of 'always reachable P"),
     ],
 )
 def test_bad_properties_say_why(text, says):
@@ -151,7 +155,7 @@ class FakeApp(Driver):
 
     def observe(self):
         overlay, buttons = self.screens[self.at]
-        kids = [Node("button", b, ref=b) for b in buttons] + [Node("button", "Menu", ref="Menu")]
+        kids = [Node("button", b, ref=b) for b in buttons if not b.startswith("key ")] + [Node("button", "Menu", ref="Menu")]
         root = Node("root", children=kids)
         if overlay:
             root.children.append(Node("dialog", overlay))
@@ -159,6 +163,7 @@ class FakeApp(Driver):
 
     def do(self, a):
         if a.kind == "key":
+            self.at = self.screens[self.at][1].get(a.sig, self.at)
             return
         if a.sig.split('"')[1] in self.covered:
             raise DriverError("covered by div.backdrop")
@@ -189,7 +194,7 @@ def learn(app, lemmas, **kw):
             if lem.prop.kind == "unobscured" and lem.prop.cond.eval(snap, ex.model.home):
                 occl[lem.name].record(state.id, *hit_test(d, lem.prop.goal, snap), paths)
 
-    ex = Explorer([app], atoms.preds, Settings(keys=(), workers=1, **kw), "fake", probe)
+    ex = Explorer([app], atoms.preds, Settings(**{"keys": (), "workers": 1, **kw}), "fake", probe)
     model = ex.learn()
     mc = ModelCheck(ex, atoms, occl)
     return model, {lem.name: mc.check(lem) for lem in s.lemmas}
@@ -313,6 +318,26 @@ def test_the_model_does_not_depend_on_which_browser_is_quicker(budget):
     first = run(1)
     assert len(first["states"]) == 16 if budget > 16 else "state budget" in first["stop"]
     assert all(run(j) == first for j in (2, 3))
+
+
+@pytest.mark.parametrize(
+    "ways_out, by, status",
+    [
+        ({"Close": "home", "key Escape": "home"}, 'key "Escape"', "proved"),
+        ({"Close": "home"}, 'key "Escape"', "refuted"),  # Escape does nothing: only the button closes it
+        ({"Close": "home"}, "tap", "proved"),
+        ({"key Escape": "home"}, "tap", "refuted"),  # only a keyboard gets out: a phone cannot
+        ({"key Escape": "home"}, 'key "Escape"', "proved"),
+        ({"Close": "home"}, 'button "Close" or key "Escape"', "proved"),
+        ({"Close": "home"}, 'button "Cancel"', "refuted"),
+    ],
+)
+def test_an_escape_route_can_be_limited_to_some_actions(ways_out, by, status):
+    screens = {"home": (None, {"Open": "home:d"}), "home:d": ("Details", ways_out)}
+    _, got = learn(FakeApp(screens), [("esc", f"always reachable home from overlay by {by}")], keys=("Escape",))
+    assert got["esc"].status == status
+    if status == "refuted":
+        assert got["esc"].trace == ['click button "Open"'] and 'dialog "Details"' in got["esc"].detail
 
 
 def test_actions_a_walk_reveals_are_explored_before_the_model_is_complete():
