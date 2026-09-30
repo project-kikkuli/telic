@@ -260,6 +260,10 @@ def build(rep: Any) -> list[AimReport]:
             r.status = "backed"
         else:
             r.status = "partial"
+            if all(x.status in ("proved", "trusted") for x in r.lemmas):
+                why = [f"{f.fn.name} ({f.status})" for f in fns if f.status not in ("proved", "trusted")] + [f"{m.a.fn.name} ≡ {m.b.fn.name} ({m.status})" for m in mirrors.get(iid, []) if m.status != "proved"]
+                if why:
+                    r.advice.append(f"every lemma is proved, but not everything the backing functions do: {', '.join(why)}")
         r.trusted = sorted({f.fn.name for f in fns if f.status == "trusted"} | {d.split("::")[-1] for f in fns for d in f.trusted_deps})
         r.digest = digest(r)
         rv = reviews.get(iid)
