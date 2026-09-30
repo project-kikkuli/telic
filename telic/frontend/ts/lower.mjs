@@ -225,7 +225,7 @@ class ModuleLowerer {
       }
     }
     for (const st of this.sf.statements) {
-      if (ts.isInterfaceDeclaration(st)) this.record(st.name.text, st.members, st);
+      if (ts.isInterfaceDeclaration(st)) this.record(st.name.text, this.interfaceMembers(st), st);
       else if (ts.isTypeAliasDeclaration(st)) {
         if (ts.isTypeLiteralNode(st.type) && !st.type.members.some((m) => ts.isIndexSignatureDeclaration(m))) this.record(st.name.text, st.type.members, st);
         else this.aliases[st.name.text] = st.type;
@@ -484,7 +484,7 @@ class ModuleLowerer {
     this.memberLists[name] = members;
     const fields = [];
     for (const m of members) {
-      if (!ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return;
+      if (!m || !ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name)) return;
       let t;
       try {
         t = this.typeOf(m.type);
@@ -578,6 +578,21 @@ class ModuleLowerer {
     return opaque(tn.getText(this.sf));
   }
 
+  // An interface's members, those of the interfaces it extends (in this file) first.
+  interfaceMembers(st, seen = new Set()) {
+    if (seen.has(st)) return [];
+    seen.add(st);
+    const out = [];
+    for (const h of st.heritageClauses || []) {
+      for (const t of h.types) {
+        const base = ts.isIdentifier(t.expression) && !t.typeArguments ? this.sf.statements.find((x) => ts.isInterfaceDeclaration(x) && x.name.text === t.expression.text) : null;
+        if (!base) return [...st.members, null]; // an unknown base: not a record
+        out.push(...this.interfaceMembers(base, seen).filter((m) => m && !st.members.some((o) => o.name && m.name && o.name.getText() === m.name.getText())));
+      }
+    }
+    return [...out, ...st.members];
+  }
+
   // A discriminated union of object types ({ kind: "a", ... } | { kind: "b", ... }):
   // a record whose tag is an enum of the literals and whose other fields are
   // those of every variant; a field another variant lacks is read only where
@@ -596,7 +611,7 @@ class ModuleLowerer {
       let ms = null;
       if (ts.isTypeLiteralNode(t)) ms = t.members;
       else if (ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && !t.typeArguments) ms = this.memberLists[t.typeName.text] || (this.aliases[t.typeName.text] && ts.isTypeLiteralNode(this.aliases[t.typeName.text]) ? this.aliases[t.typeName.text].members : null);
-      if (!ms || !ms.every((m) => ts.isPropertySignature(m) && m.type && ts.isIdentifier(m.name))) return null;
+      if (!ms || !ms.every((m) => m && ts.isPropertySignature(m) && m.type && ts.isIdentifier(m.name))) return null;
       variants.push(ms);
     }
     if (variants.length < 2) return null;
@@ -1782,6 +1797,8 @@ class FunctionLowerer {
     if (ts.isExpressionStatement(s)) return this.exprStatement(s.expression, s);
     if (ts.isIfStatement(s)) {
       const c = this.cond(s.expression);
+      const dead = (x) => x.e === "Lit" ? !x.value : x.e === "Unary" && x.op === "not" && x.arg.e === "Lit" && x.arg.value === true;
+      if (dead(c)) return s.elseStatement ? this.inner(s.elseStatement) : []; // never taken
       const facts = this.tagFacts(s.expression);
       const then = this.withTags(facts.pos, () => this.inner(s.thenStatement));
       const orelse = s.elseStatement ? this.withTags(facts.neg, () => this.inner(s.elseStatement)) : [];
@@ -1799,6 +1816,7 @@ class FunctionLowerer {
     if (ts.isForOfStatement(s)) return this.scoped(() => this.forOf(s, loc));
     if (ts.isReturnStatement(s)) {
       if (!s.expression) return [{ s: "Return", loc, value: null }];
+      if (this.f.ctor) throw this.err("a constructor that returns a value replaces the object 'new' built; not modelled", s);
       if (this.sig.ret.k === "none") throw this.err("function returns a value but is declared void", s);
       const v = this.coerce(this.expr(s.expression, this.sig.ret), this.sig.ret);
       if (!tyEq(v.ty, this.sig.ret)) throw this.err(`returns ${tyStr(v.ty)} but is declared to return ${tyStr(this.sig.ret)}`, s);
@@ -2439,6 +2457,9 @@ class FunctionLowerer {
       if (d.ty.k === "dict") return { e: "Builtin", ty: BOOL, loc, name: "dict_has", args: [d, this.coerce(this.expr(n.left), d.ty.key)] };
       return this.opaqueOp("in", [this.expr(n.left), this.coerce(d, opaque(""))], BOOL, loc);
     }
+    if (k === K.InstanceOfKeyword && n.left.kind === K.ThisKeyword && this.selfTy() && ts.isIdentifier(n.right) && this.ml.chain(this.f.cls).some((c) => c.name === n.right.text)) {
+      return { e: "Lit", ty: BOOL, loc, value: true }; // a class's code runs on its instances (a class constructor needs 'new')
+    }
     if (k === K.InstanceOfKeyword) return this.opaqueOp("instanceof", [this.coerce(this.expr(n.left), opaque("")), { e: "Lit", ty: STR, loc, value: n.right.getText(this.spec ? this.specSf : this.ml.sf) }], BOOL, loc);
     const cmp = { [K.LessThanToken]: "lt", [K.LessThanEqualsToken]: "le", [K.GreaterThanToken]: "gt", [K.GreaterThanEqualsToken]: "ge", [K.EqualsEqualsEqualsToken]: "eq", [K.ExclamationEqualsEqualsToken]: "ne", [K.EqualsEqualsToken]: "eq", [K.ExclamationEqualsToken]: "ne" };
     if (cmp[k]) {
@@ -2803,7 +2824,7 @@ class FunctionLowerer {
     }
     if (this.spec) throw this.err(`array method .${m}() is not supported in specifications`, this.nline(n));
     const res = { find: optionOf(t.elem), pop: optionOf(t.elem), shift: optionOf(t.elem), indexOf: INT, findIndex: INT, lastIndexOf: INT, join: STR, concat: t, map: listOf(opaque("")), filter: t, flatMap: listOf(opaque("")), push: REAL, unshift: REAL, toString: STR }[m];
-    if (["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && xs.e !== "Var") throw this.err(`'.${m}()' on an array that is not a variable is not tracked`, this.nline(n));
+    if (["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && xs.e !== "Var" && !this.freshList(xs)) throw this.err(`'.${m}()' on an array that is not a variable is not tracked`, this.nline(n));
     // a non-mutating method leaves the array alone unless a callback mentions it
     const mentions = (a) => xs.e === "Var" && (() => { let hit = false; const v = (x) => { if (ts.isIdentifier(x) && this.resolve(x.text) === xs.name) hit = true; ts.forEachChild(x, v); }; v(a); return hit; })();
     const pure = !["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"].includes(m) && !args.some(mentions);
@@ -3028,7 +3049,10 @@ function link(mls, byFile, stage) {
           ml.module.class_origin[d.name] = other.rel;
         }
         else if (d.name in other.constants) ml.constants[d.local] = other.constants[d.name];
-        else if (other.aliases[d.name]) ml.aliases[d.local] = other.aliases[d.name];
+        else if (other.aliases[d.name]) {
+          ml.aliases[d.local] = other.aliases[d.name];
+          if (other.globalsBound.has(d.name)) ml.imported[d.local] = { mod: other, name: d.name }; // `const X` and `type X` together
+        }
         else ml.imported[d.local] = { mod: other, name: d.name };
         ml.globalsBound.delete(d.local);
         if (ml.imported[d.local] === undefined) delete ml.imported[d.local];

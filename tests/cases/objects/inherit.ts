@@ -123,3 +123,16 @@ export function totalArea(s: Shape, t: Shape): number {
   //@ ensures result >= 0
   return s.area() + t.area();
 }
+
+// the guard for a call without 'new', which a class constructor never gets
+export class Guarded {
+  v: number;
+
+  constructor(v: number) {
+    //@ ensures this.v === v
+    if (!(this instanceof Guarded)) {
+      return new Guarded(v);
+    }
+    this.v = v;
+  }
+}

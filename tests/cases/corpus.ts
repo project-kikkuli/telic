@@ -318,3 +318,36 @@ export async function doubledLater(x: number): Promise<number> {
   await Promise.resolve();
   return 2 * x;
 }
+
+interface Named {
+  name: string;
+}
+
+interface Aged extends Named {
+  age: number;
+}
+
+type Pet = Cat | Dog;
+
+interface Cat extends Named {
+  species: "cat";
+  lives: number;
+}
+
+interface Dog extends Named {
+  species: "dog";
+  good: boolean;
+}
+
+// expect: proved
+export function describeAged(a: Aged): number {
+  //@ ensures result === a.name.length + a.age
+  return a.name.length + a.age;
+}
+
+// expect: proved
+export function livesLeft(p: Pet): number {
+  //@ ensures result >= 0
+  if (p.species === "dog") return p.good ? 1 : 0;
+  return Math.max(p.lives, 0) + p.name.length * 0;
+}

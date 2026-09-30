@@ -423,6 +423,22 @@ function writes. A call changes only the fields the callee may write, and only
 on objects it can reach. Dataclasses, pydantic models, TypeScript parameter
 properties, getters and setters work as in the language.
 
+**Inheritance.** A subclass of a checked class keeps its fields and invariants.
+Calls go by the static type, so a call through a base may run any override: an
+override without a contract inherits the one it overrides and is checked
+against it, and a different contract is reported. An abstract method is its
+contract; every override is checked against it. `super(...)`, `super.m()`
+and a TypeScript subclass without a constructor run the base's code. Two
+rules keep dispatch sound. An override assumes on entry only the subclass
+invariants that code typed as the base cannot break (none over inherited
+fields). A constructor may not hand `self` to other code while a subclass has
+fields to set.
+
+**Unions.** A TypeScript discriminated union (`{ kind: "a", ... } | { kind:
+"b", ... }`) is a value whose tag is one of its literals. A field only some
+variants have may be read only where the tag has been checked (`if`, `switch`,
+`?:`, `&&`, `implies`, or an early `return`).
+
 **Optionals.** `T | None`, `Optional[T]`, `T | undefined`, `x?: T`. Using an
 optional where a value is needed (`x + 1`, `x.f`, `x!`) is an obligation that it
 is present. Proving it uses whatever checks came before, so no narrowing syntax
@@ -439,7 +455,9 @@ uninterpreted.
 
 **Async.** At every `await`, other tasks may change any object that existed
 before the call. They leave class invariants intact, but anything else is
-re-checked. That is how a check-then-act race shows up.
+re-checked. That is how a check-then-act race shows up. An async function
+called without `await` has not finished when the call returns, so the call is
+unchecked code: the caller learns nothing from its contract.
 
 **Unchecked code.** A value telic knows nothing about (unannotated, `Any`,
 `unknown`, a library type) is opaque. So is the result of a call into code it

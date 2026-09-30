@@ -45,9 +45,10 @@ done looks like. Soundness items come first: they can make telic say
   opaque. There is no fuzzing for Rust, and a runtime check of an `ensures`
   skips clauses that use `old(...)` or `implies(...)`
   (`frontend/rust_replay.py`).
-- **TypeScript.** `class B extends A` is recorded as a note, not modelled:
-  inherited fields and methods are opaque (Python inheritance is fully
-  modelled).
+- **TypeScript.** A subclass of a library class (`extends Component`) and a
+  value of an interface type with methods are opaque. Generic type parameters
+  are opaque. `instanceof` narrows nothing except `this instanceof` its own
+  class.
 - **Runtime contracts (`telic run`, the pytest plugin).** Inherited contracts
   are applied only when the base class is in the same module
   (`_with_inherited_contracts` in `telic/runtime.py`).

@@ -102,6 +102,40 @@ frontends), and 39 from `for a, b in pairs` loops. Open rose because functions t
 callers of the new preconditions, have obligations Z3 cannot close without
 loop invariants.
 
+## TypeScript classes and idioms
+
+TypeScript was brought to parity with Python's classes (`extends`, overrides
+and dispatch, `super`, abstract classes, inherited invariants) and learned
+discriminated unions, interfaces that extend interfaces, and unawaited async
+calls. Two TypeScript sources were then checked, `--no-lean --no-cache`,
+before (`f8e8802`) and after:
+
+| source | before | after |
+|---|---|---|
+| examples/ui/notes-react `src/` (React, 20 files) | 1 proved, 24 with nothing to check, 1 unsupported | 1 proved, 25 with nothing to check |
+| vultix/ts-results `src/` (`910789d`) | 50 with nothing to check, 4 unsupported | 54 with nothing to check |
+
+The blockers were idioms:
+
+- `[...notes].sort(...)`: sorting a fresh array was rejected like sorting a
+  shared one;
+- `import { None } from "./option"`, where `None` is both a `const` and a
+  `type`: the import kept only the type;
+- `if (!(this instanceof ErrImpl)) return new ErrImpl(v)` in a constructor, a
+  guard for calls without `new`, which a class constructor never gets.
+
+Neither source makes claims, so nothing new is proved. The soundness review
+behind the class work found four holes, now closed, each with an exploit in
+`tests/cases/soundness/`:
+
+- a subclass invariant over an inherited field, broken by code typed as the
+  base and then assumed by an override (Python too, `inh1.py`);
+- a base constructor calling a method the subclass overrides before the
+  subclass set its fields (`inh2.py`, `inh2.ts`);
+- a call to an async function without `await`, whose postcondition was
+  assumed as if it had finished (Python too, `async1.py`);
+- `void f()`, which dropped the call.
+
 ## What it means
 
 Most functions in glue code have **nothing to check**. They have no contract

@@ -88,7 +88,7 @@ def test_inheritance():
 @needs_node
 def test_inheritance_ts():
     got = run("inherit.ts")
-    for name in ("Account.deposit", "Account.withdraw", "Savings.__init__", "Savings.addInterest", "Capped.__init__", "Capped.withdraw", "Logged.deposit", "savingsDeposit", "openCapped", "Square.area", "Shape.twice"):
+    for name in ("Account.deposit", "Account.withdraw", "Savings.__init__", "Savings.addInterest", "Capped.__init__", "Capped.withdraw", "Logged.deposit", "savingsDeposit", "openCapped", "Square.area", "Shape.twice", "Guarded.__init__"):
         assert got[name].status == "proved", (name, got[name].status, got[name].problems, [(v.ob.id, v.status) for v in got[name].verdicts])
     for name in ("Leaky.withdraw", "Hole.area", "badSavings"):
         assert refuted_confirmed(got[name]), (name, got[name].status)
