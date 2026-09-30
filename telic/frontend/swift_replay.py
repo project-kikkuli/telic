@@ -23,6 +23,12 @@ TIMEOUT_S = 10.0
 COMPILE_TIMEOUT_S = 600.0
 
 PRELUDE = r'''
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+let telicUnbuffered: Void = { setvbuf(stdout, nil, _IONBF, 0); return () }()
 indirect enum TelicJ { case list([TelicJ]); case atom(String) }
 func telicParse(_ text: String) -> TelicJ {
     let c = Array(text.utf8)
@@ -434,6 +440,7 @@ func telicCase(_ j: TelicJ) {{
 }}
 let telicCases = telicList(telicParse(CommandLine.arguments[1]))
 let telicFrom = Int(CommandLine.arguments[2])!
+_ = telicUnbuffered
 for i in telicFrom..<telicCases.count {{ print("TELIC_CASE \\(i)"); telicCase(telicCases[i]) }}
 """
         src = self.source.encode("utf8")

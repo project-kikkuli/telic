@@ -1164,6 +1164,11 @@ class FunctionLowerer:
                     body: list[ir.Stmt] = list(pre)
                     if body_n is not None:
                         items = [c for c in body_n.children if c.is_named and c.type not in EXPR_STMT_SKIP]
+                        if items and items[-1].type == "control_transfer_statement" and text(items[-1]).strip() == "break":
+                            items = items[:-1]  # 'break' ends the case; nothing to do
+                            if not items:
+                                arms.append((cond, body))
+                                continue
                         if target is not None and len(items) == 1 and self._is_expression(items[0]):
                             if items[0].type in ("if_statement", "switch_statement"):
                                 self.valued_statement(items[0], target, ty, kind, body)
@@ -1173,7 +1178,15 @@ class FunctionLowerer:
                                 body.extend(vel.pre)
                                 body.append(ir.Assign(loc, target, self.coerce(v, ty)))  # type: ignore[arg-type]
                         else:
-                            self.block(body_n, body)
+                            self.push_scope()
+                            try:
+                                prev = _line(body_n) - 1
+                                for it in items:
+                                    self._stmt_contracts(prev, _line(it) - 1, body)
+                                    self.stmt(it, body)
+                                    prev = it.end_point[0] + 1
+                            finally:
+                                self.pop_scope()
                     arms.append((cond, body))
                 finally:
                     self.pop_scope()

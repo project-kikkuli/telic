@@ -65,7 +65,7 @@ TRUE_HELPERS = {
     "t33.ts": {"Acct.__init__", "sees"},
 }
 
-FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))
+FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs", ".swift"))
 
 
 @pytest.mark.parametrize("name", FILES)
@@ -77,6 +77,8 @@ def test_no_exploit_is_proved(name):
             pytest.skip("Node.js not available")
     if name.endswith(".rs"):
         pytest.importorskip("tree_sitter_rust")
+    if name.endswith(".swift"):
+        pytest.importorskip("tree_sitter_swift")
     rep = check([str(DIR / name)], CheckOptions(cache_path=None, lean=False, timeout_ms=4000), root=str(DIR))
     proved = {f.fn.name for f in rep.functions if f.status == "proved" and not f.open_deps}
     unexpected = proved - TRUE_HELPERS.get(name, set())

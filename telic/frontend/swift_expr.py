@@ -1010,7 +1010,9 @@ class ExprLowerer:
             name = callee.id
             r = self.fl.resolve(name)
             if r is not None or name in self.bound:
-                raise self.err(f"calling the closure '{name}' is not modelled", x) if self.spec else self._closure_call(name, args, x, expect)
+                if self.spec:
+                    raise self.err(f"calling the closure '{name}' is not modelled", x)
+                return self._closure_call(name, args, x, expect)
             tr = self._type_ref(callee)
             if tr is not None:
                 return self.construct(tr, args, x, expect)
@@ -1366,7 +1368,20 @@ class ExprLowerer:
         else:
             out = self.hoist(self.ranged(e, fi.ret_kind) if fi.ret_kind and fi.ret == ir.INT else self.kinded(e, fi.ret_kind))
         self._write_back(written, loc)
+        self.closures_ran(loc)
         return out
+
+    def closures_ran(self, loc: ir.Loc) -> None:
+        """A closure that escaped may have been called: what it captured may
+        have changed. (Unchecked calls do this in the verifier; a checked
+        callee can call a closure it is handed too.)"""
+        for n in sorted(self.fl.escaped):
+            ty = self.fl.env.get(n)
+            if ty is None or n in self.fl.lets:
+                continue
+            k = self.fl.kinds.get(n)
+            v: ir.Expr = ir.Extern(ty, loc, "a closure that captured it", ())
+            self.pre.append(ir.Assign(loc, n, self.fl.in_range(v, k) if k and ty == ir.INT else v))
 
     def _through_object(self, ax: X | None) -> bool:
         """Does this argument path read through a class object (which the

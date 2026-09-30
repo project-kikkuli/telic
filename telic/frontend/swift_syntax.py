@@ -160,13 +160,17 @@ def flatten(n: Any) -> list[Any]:
             seq = flatten(target)  # '-a * b' is (-a) * b: the prefix binds to the first operand
             seq[0] = _prefix(text(op), seq[0], n)
             return seq
+    if t in ("-", "+", "~", "bang") and not n.named_children:
+        # '-(a)' after an operator comes back as the operator, then a call
+        return [X("prefixop", n, op="!" if t == "bang" else t)]
     if t == "try_expression":
         e = n.child_by_field_name("expr")
         if e is not None and _leads_sequence(e):
             seq = flatten(e)
             seq[0] = X("try", n, op=_try_kind(n), e=seq[0], lead=True)
             return seq
-    return [norm(n)]
+    r = norm(n, as_seq=True)
+    return r if isinstance(r, list) else [r]
 
 
 def _leads_sequence(n: Any) -> bool:
@@ -240,13 +244,17 @@ def _span(e: X, whole: Any) -> X:
     return e
 
 
-def norm(n: Any) -> X:
-    """Normalize a tree-sitter expression node."""
+def norm(n: Any, as_seq: bool = False) -> Any:
+    """Normalize a tree-sitter expression node. With ``as_seq``, a postfix
+    operation tree-sitter attached to an operator sequence comes back as
+    that sequence (for the enclosing fold)."""
     t = n.type
     if t in BINARY or t == "prefix_expression" and _leads_sequence(n) or t == "try_expression" and _leads_sequence(n):
         return _span(fold(flatten(n)), n)
     if t == "simple_identifier":
         return X("name", n, id=text(n))
+    if not n.is_named and t in ("+", "-", "*", "/", "<", ">", "<=", ">=", "==", "&&", "||"):
+        return X("name", n, id=t)  # an operator passed as a function: reduce(0, +)
     if t == "integer_literal" or t in ("hex_literal", "oct_literal", "bin_literal"):
         return X("int", n, text=text(n))
     if t == "real_literal":
@@ -307,7 +315,7 @@ def norm(n: Any) -> X:
             raise Unsupported(f"unsupported member access '{text(n)}'", n)
         if target is None:  # '.member' after a type (Int.max) is still a target; this is not
             raise Unsupported(f"unsupported member access '{text(n)}'", n)
-        return _suffixed(target, lambda b: X("member", n, base=b, name=text(name_n), opt=opt), n)
+        return _suffixed(target, lambda b: X("member", n, base=b, name=text(name_n), opt=opt), n, as_seq)
     if t == "call_expression" and n.children and n.children[0].type in ("-", "+", "~", "bang"):
         # '-(a * b)' and '!(a && b)' come back as calls of the operator
         va = next((c for s in n.children if s.type == "call_suffix" for c in s.children if c.type == "value_arguments"), None)
@@ -328,8 +336,8 @@ def norm(n: Any) -> X:
         subscript = va is not None and any(c.type == "[" for c in va.children)
         args = _arguments(va) if va is not None else []
         if subscript:
-            return _suffixed(callee_n, lambda b: X("subscript", n, base=b, args=args, opt=opt), n)
-        return _suffixed(callee_n, lambda b: X("call", n, callee=b, args=args, trailing=trailing, opt=opt), n)
+            return _suffixed(callee_n, lambda b: X("subscript", n, base=b, args=args, opt=opt), n, as_seq)
+        return _suffixed(callee_n, lambda b: X("call", n, callee=b, args=args, trailing=trailing, opt=opt), n, as_seq)
     if t == "postfix_expression":
         op = n.child_by_field_name("operation")
         target = n.child_by_field_name("target")
@@ -337,7 +345,7 @@ def norm(n: Any) -> X:
         if target is None:
             target = named(n)[0]
         if o == "!":
-            return _suffixed(target, lambda b: X("force", n, e=b), n)
+            return _suffixed(target, lambda b: X("force", n, e=b), n, as_seq)
         if o in ("++", "--"):
             raise Unsupported(f"'{o}' does not exist in Swift", n)
         raise Unsupported(f"unsupported postfix operator '{o}'", n)
@@ -363,17 +371,23 @@ def norm(n: Any) -> X:
     raise Unsupported(f"unsupported expression: {t.replace('_', ' ')}", n)
 
 
-def _suffixed(target: Any, make: Any, whole: Any) -> X:
+def _suffixed(target: Any, make: Any, whole: Any, as_seq: bool = False) -> Any:
     """A postfix operation (call, member, subscript, '!') on ``target``. When
     tree-sitter hands it an operator sequence (``a && xs.allSatisfy { ... }``
     comes back as a call of ``a && xs.allSatisfy``), it belongs to the
     sequence's last operand."""
-    if target.type in BINARY:
+    if target.type in BINARY or _leads_sequence(target):
         seq = flatten(target)
         if not isinstance(seq[-1], X):
             raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
-        seq[-1] = _postfix(seq[-1], make)
-        return _span(fold(seq), whole)
+        if seq[-1].kind == "prefixop":
+            probe = make(X("name", whole, id="_"))
+            if probe.kind != "call" or len(probe.args) != 1 or probe.args[0][0] is not None or probe.trailing:
+                raise Unsupported(f"unsupported expression '{text(whole)}'", whole)
+            seq[-1] = X("prefix", whole, op=seq[-1].op, e=X("paren", whole, e=probe.args[0][1]))
+        else:
+            seq[-1] = _postfix(seq[-1], make)
+        return seq if as_seq else _span(fold(seq), whole)
     return _postfix(norm(target), make)
 
 
