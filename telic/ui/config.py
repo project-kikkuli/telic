@@ -112,7 +112,7 @@ def load(path: str, root: str) -> UiConfig:
     if not isinstance(ui, dict):
         raise ConfigError(f"{os.path.relpath(path, root)} has no [ui] section")
     known = {
-        "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
+        "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_actions", "max_seconds", "walks",
         "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "witnesses", "settle_ms", "wait",
         "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
         "walk_seed", "routes",
@@ -131,7 +131,7 @@ def load(path: str, root: str) -> UiConfig:
     elif not (ui.get("url") or ui.get("command") or ui.get("static")):
         raise ConfigError(f"{os.path.relpath(path, root)}: [ui] needs 'command' (starts the app), 'static' (a directory telic serves) or 'url' (an app already running)")
     s = Settings()
-    for k in ("max_states", "max_depth", "walks", "walk_length", "workers"):
+    for k in ("max_states", "max_depth", "max_actions", "walks", "walk_length", "workers"):
         if k in ui:
             setattr(s, k, int(ui[k]))
     if "walk_seed" in ui:

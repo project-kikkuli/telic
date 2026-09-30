@@ -35,6 +35,7 @@ class Outcome:
     trace: list[str] | None = None
     replay: dict[str, Any] | None = None
     relevant: int = 0
+    timeout: bool | None = None  # the wall-clock net stopped learning: open whatever was seen
 
     def to_json(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -444,7 +445,12 @@ def _change(n: Node) -> tuple[str, str | None, str] | None:
 def combine(outs: list[Outcome]) -> Outcome:
     #@ requires len(outs) > 0
     """One verdict over every viewport: refuted anywhere is refuted; proved
-    needs no open viewport and at least one that was not vacuous."""
+    needs no open viewport and at least one that was not vacuous; a timeout
+    anywhere leaves it open."""
+    late = [o for o in outs if o.timeout]
+    if late:
+        o = late[0]
+        return Outcome("open", "", f"at {o.viewport}: {o.detail}" if len(outs) > 1 else o.detail, o.viewport, timeout=True)
     for st in ("refuted", "open"):
         hit = [o for o in outs if o.status == st]
         if hit:

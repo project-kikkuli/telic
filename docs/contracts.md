@@ -550,9 +550,10 @@ command = "npm run dev -- --port {port}"   # started on a free port; or:
 # static = "dist"                          # a directory telic serves (with build = "npm run build")
 # url = "https://staging.example.com/"     # an app already running
 viewports = ["390x844", "1280x800"]         # each explored separately
-max_states = 300                            # budgets; hitting one leaves verdicts open
-max_depth = 30
-max_seconds = 600
+max_states = 300                            # budgets, counted so verdicts do not depend on the machine;
+max_depth = 30                              # hitting one leaves verdicts open
+max_actions = 5000                          # actions fired per learning pass
+max_seconds = 1800                          # a wall-clock safety net: every verdict "open (timeout)", never cached
 workers = 1                                 # browsers per viewport (each takes one of TELIC_UI_SLOTS, default 2, machine-wide)
 abstraction = "auto"                        # "controls", "screens", or auto: controls unless that exceeds 100 states
 keys = ["Escape"]                           # keys a user may press anywhere (plus those found in the source)

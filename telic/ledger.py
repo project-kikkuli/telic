@@ -54,6 +54,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
     by_key = {f.ref.key: f for f in rep.functions}
     timed_out = {f.ref.key for f in rep.functions if f.timed_out}
     undecided = timed_out | {f.ref.key for f in rep.functions if f.open_deps & timed_out}
+    ui_late = {(r.lemma.path, r.lemma.name) for r in rep.ui.results if r.timeout} if rep.ui is not None else set()
     for i in rep.aims:
         clauses = [f"ui {x.name}: {x.text}" for x in i.lemmas if x.kind == "ui"]
         for key in i.functions:
@@ -68,7 +69,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
             "clauses": sorted(set(clauses)),
             **({"links": sorted(i.pointers)} if i.pointers else {}),
             **({"declared": i.loc[0]} if i.loc else {}),
-            **({"timeout": True} if undecided & set(i.functions + i.assumes) else {}),
+            **({"timeout": True} if undecided & set(i.functions + i.assumes) or any(x.kind == "ui" and (x.path, x.name) in ui_late for x in i.lemmas) else {}),
         }
     functions = {}
     for f in rep.functions:
@@ -76,9 +77,10 @@ def snapshot(rep: Report) -> dict[str, Any]:
         functions[f.ref.key] = {"status": f.status, "obligations": len(f.verdicts), **({"lean": lean} if lean else {}), **({"timeout": True} if f.ref.key in undecided else {})}
     mirrors = {f"{m.a.key} ~ {m.b.key}": m.status for m in rep.mirrors}
     ui = {f"{r.lemma.path}::{r.lemma.name}": r.status for r in rep.ui.results} if rep.ui is not None else {}
+    late = sorted(f"{p}::{n}" for p, n in ui_late)
     from . import __version__
 
-    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors, **({"ui": ui} if ui else {})}
+    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors, **({"ui": ui} if ui else {}), **({"ui_timeout": late} if late else {})}
 
 
 def write_ledger(path: str, data: dict[str, Any]) -> None:
@@ -99,6 +101,10 @@ def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> d
         for part in ("aims", "functions"):
             had = old.get(part, {})
             new[part] = {k: had[k] if v.get("timeout") and k in had else v for k, v in new[part].items()}
+        late = set(new.pop("ui_timeout", []))
+        if late:
+            had = old.get("ui", {})
+            new["ui"] = {k: had[k] if k in late and k in had else v for k, v in new.get("ui", {}).items()}
     if files is None or old is None:
         return new
     out = {"telic": new["telic"], "aims": {}, "functions": {}, "mirrors": {}, "ui": {}}
@@ -196,6 +202,8 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
             continue
         n = new.get("ui", {}).get(key)
         path = key.split("::")[0]
+        if key in new.get("ui_timeout", []):
+            continue
         if n is None:
             out.append(Change(key, "regression", f"ui lemma {key} was removed (it was {o})", path))
         elif RANK.get(n, 0) < RANK.get(o, 0):
@@ -203,7 +211,7 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
         elif RANK.get(n, 0) > RANK.get(o, 0):
             out.append(Change(key, "improvement", f"ui {key}: {o} → {n}", path))
     for key, n in new.get("ui", {}).items():
-        if key not in old.get("ui", {}):
+        if key not in old.get("ui", {}) and key not in new.get("ui_timeout", []):
             out.append(Change(key, "regression" if n == "refuted" else "new", f"ui {key} is new ({n})", key.split("::")[0]))
     return out
 

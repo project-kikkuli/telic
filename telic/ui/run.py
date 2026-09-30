@@ -37,6 +37,7 @@ class UiResult:
     replay: dict[str, Any] | None = None
     viewports: list[dict[str, Any]] = field(default_factory=list)
     cached: bool = False
+    timeout: bool = False  # open because the wall-clock net fired: never cached, never a change in the ledger
 
     def to_json(self) -> dict[str, Any]:
         lem = self.lemma
@@ -54,6 +55,7 @@ class UiResult:
             "replay": self.replay,
             "viewports": self.viewports,
             "cached": self.cached,
+            **({"timeout": True} if self.timeout else {}),
         }
 
 
@@ -169,7 +171,7 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
         for lem in todo:
             r = got[lem.name]
             rep.results.append(r)
-            if app.error is None:
+            if app.error is None and not r.timeout:
                 entries[keys[lem.name]] = {"result": r.to_json(), "models": app.models, "url": app.url}
                 used.add(keys[lem.name])
     keep = {k: v for k, v in entries.items() if k in used}
@@ -222,7 +224,7 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     out: dict[str, UiResult] = {}
     for lem in lems:
         o = combine(outs[lem.name])
-        out[lem.name] = UiResult(lem, cfg.path, o.status, o.method, o.detail, o.trace, o.replay, [x.to_json() for x in outs[lem.name]])
+        out[lem.name] = UiResult(lem, cfg.path, o.status, o.method, o.detail, o.trace, o.replay, [x.to_json() for x in outs[lem.name]], timeout=bool(o.timeout))
     return out
 
 
@@ -282,11 +284,7 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, si
             model.notes.append(f"{dialogs} browser dialogs (alert, confirm) were accepted")
         _source_notes(model, facts, watched, set().union(*(d.read for d in drivers)))
         _dump(cfg, model)
-        mc = ModelCheck(ex, atoms, occl, cfg.witnesses)
-        got: dict[str, Outcome] = {}
-        for lem in lems:
-            got[lem.name] = mc.persists(lem) if lem.prop.kind == "persists" else mc.check(lem)
-        return model.summary(), got
+        return model.summary(), judge(ex, atoms, occl, lems, cfg.witnesses)
     finally:
         for d in drivers:
             d.stop()
@@ -308,6 +306,16 @@ def _source_notes(model, facts, watched, read: set[str]) -> None:
         model.notes.append("changed by timers, not waited for: " + ", ".join(f"{h.describe()}, timer at line {', '.join(map(str, h.clock))}" for h in clocked))
     for e in facts.errors[:3]:
         model.notes.append(e)
+
+
+def judge(ex, atoms: Atoms, occl: dict[str, Occlusion], lems: list[UiLemma], witnesses: int = 20) -> dict[str, Outcome]:
+    """Each lemma's verdict on the learned model; none when the wall-clock net stopped learning."""
+    model = ex.model
+    if model.timed_out:
+        why = f"timeout: {model.stop}, so the verdict would depend on how busy the machine is (raise max_seconds, or lower the budgets)"
+        return {lem.name: Outcome("open", "", why, model.viewport, timeout=True) for lem in lems}
+    mc = ModelCheck(ex, atoms, occl, witnesses)
+    return {lem.name: mc.persists(lem) if lem.prop.kind == "persists" else mc.check(lem) for lem in lems}
 
 
 def learn_auto(learn: Callable[[Settings], tuple], s: Settings) -> tuple:

@@ -35,7 +35,8 @@ RESET_COST = 3  # a fresh start costs about as much as this many actions
 class Settings:
     max_states: int = 300
     max_depth: int = 30
-    max_seconds: float = 600.0
+    max_actions: int = 5000  # fired per learning pass: budgets are counts, so verdicts do not depend on the machine
+    max_seconds: float = 1800.0  # a wall-clock safety net; hitting it leaves every verdict open (timeout)
     walks: int = 10
     walk_length: int = 0  # 0: two more than the deepest state
     workers: int = 1  # browsers per viewport: more only when asked for
@@ -81,6 +82,7 @@ class Model:
     trans: dict[int, dict[str, set[int]]] = field(default_factory=dict)
     complete: bool = False
     stop: str = ""
+    timed_out: bool = False  # stopped by the wall-clock net: nothing learned may decide a verdict
     fired: int = 0
     resets: int = 0
     seconds: float = 0.0
@@ -207,6 +209,7 @@ class Model:
             "transitions": self.transitions,
             "complete": self.complete,
             "stop": self.stop,
+            **({"timeout": True} if self.timed_out else {}),
             "fired": self.fired,
             "resets": self.resets,
             "seconds": round(self.seconds, 1),
@@ -421,10 +424,13 @@ class Explorer:
     # -- learning --------------------------------------------------------------
 
     def _over(self) -> str:
-        if time.monotonic() - self.t0 > self.s.max_seconds:
-            return f"stopped at the time budget ({self.s.max_seconds:.0f}s)"
         if len(self.model.states) >= self.s.max_states:
             return f"stopped at the state budget ({self.s.max_states})"
+        if self.model.fired >= self.s.max_actions:
+            return f"stopped at the action budget ({self.s.max_actions})"
+        if time.monotonic() - self.t0 > self.s.max_seconds:
+            self.model.timed_out = True
+            return f"stopped at the wall-clock limit ({self.s.max_seconds:.0f}s)"
         return ""
 
     def _claim(self, w: Worker) -> tuple[UiState, str] | None:

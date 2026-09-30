@@ -340,6 +340,37 @@ def test_an_escape_route_can_be_limited_to_some_actions(ways_out, by, status):
         assert got["esc"].trace == ['click button "Open"'] and 'dialog "Details"' in got["esc"].detail
 
 
+@pytest.mark.parametrize(
+    "budget, status, stop",
+    [
+        ({}, "refuted", ""),
+        ({"max_actions": 2}, "open", "action budget (2)"),
+        ({"max_seconds": 0.0}, "open", "timeout: stopped at the wall-clock limit"),
+    ],
+)
+def test_budgets_are_counts_and_the_clock_only_leaves_verdicts_open(budget, status, stop):
+    from telic.ui.run import judge
+
+    screens = dict(SCREENS, **{"about:help": ("Help", {})})
+    s = Scan()
+    scan_source('//@ [X] ui esc: always reachable home from overlay', "app.js", s)
+    atoms = Atoms(s.lemmas)
+    ex = Explorer([FakeApp(screens)], atoms.preds, Settings(keys=(), workers=1, **budget), "fake")
+    ex.learn()
+    o = judge(ex, atoms, {}, s.lemmas)["esc"]
+    assert o.status == status and stop in o.detail
+    assert bool(o.timeout) == ("max_seconds" in budget)
+
+
+def test_a_timed_out_ui_lemma_is_never_a_change_in_the_ledger():
+    from telic.ledger import compare, merge
+
+    old = {"aims": {}, "functions": {}, "mirrors": {}, "ui": {"app.js::esc": "proved", "app.js::menu": "proved"}}
+    new = {"aims": {}, "functions": {}, "mirrors": {}, "ui": {"app.js::esc": "open", "app.js::menu": "open"}, "ui_timeout": ["app.js::esc"]}
+    assert [c.what for c in compare(old, new, None)] == ["ui app.js::menu: proved → open"]
+    assert merge(old, new, None)["ui"] == {"app.js::esc": "proved", "app.js::menu": "open"}
+
+
 def test_actions_a_walk_reveals_are_explored_before_the_model_is_complete():
     # one screen whose "Clear" button only shows after two adds: only a walk gets there
     screens = {"home:0": (None, {"Add": "home:1"}), "home:1": (None, {"Add": "home:2"}), "home:2": (None, {"Add": "home:2", "Clear": "home:0"})}
