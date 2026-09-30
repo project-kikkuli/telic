@@ -25,11 +25,12 @@ done looks like. Soundness items come first: they can make telic say
 
 `docs/field-notes.md` has the numbers and the triage. Remaining:
 
-1. The four refuted functions whose preconditions telic cannot state
-   (`vcgen.pack`, `typescript._type`/`_expr`, `html._line_status`): they need
-   specs over `components()`, a JSON schema, and quantifiers over dict keys.
-2. 92 open, mostly loops without invariants and termination of recursion
-   over ASTs (opaque, so no measure).
+1. Refuted, needing modelling telic lacks: a recursive JSON schema over
+   `Any` (`typescript._type`/`_expr`), a property's annotated return type
+   and immutable frozen-dataclass fields (`ModelCheck.replay`,
+   `Prop.__str__`).
+2. 70 open: facts about objects and dicts held in fields, callee contracts,
+   and termination measures over ASTs (opaque). Few are loop invariants.
 3. Put contracts and aims on the pure helpers (`telic/phrase.py`,
    `ears_problems`, `ears_conditions`, `split_by`, `oracle._one`), then add a
    CI job that ratchets `telic.ledger.json` for telic itself.
@@ -58,12 +59,15 @@ done looks like. Soundness items come first: they can make telic say
 
 ## Engine (OxCaml, `core/`)
 
-- **No unboxed types.** The sources use no unboxed layouts, so the Makefile
-  no longer passes `-unboxed-types`; any OCaml >= 5.1 builds the engine
-  (`OCAMLFLAGS` passes local flags). What makes it fast is native code,
-  hash-consing and one Z3 per domain. *Done:* hot records such as terms and
-  obligations use unboxed layouts, and `TELIC_CORE_DEBUG` timings show the
-  difference.
+- **No unboxed types, on evidence.** Built with OxCaml `5.2.0+ox` and
+  profiled on `telic/` (581 functions; `TELIC_CORE_DEBUG` prints phase
+  times). VC generation was 16.5s of a 25s run, and its time went to
+  quadratic list membership and repeated heap-key computation, now fixed
+  (5.9s). Of what remains, sampling puts about 60% in polymorphic
+  comparison and hashing (hash-consing compares sorts structurally) and
+  about 14% in the GC; solving is 8.4s. Unboxed layouts can only reduce the
+  GC share, so they are not worth their cost yet. The next win is interning
+  sorts so hash-cons lookups compare by identity.
 - The engine reads the obligation cache through its own keys (`ox:` in the
   cache, a structural digest in `job_key` in `core/main.ml`). Engine-proved
   obligations are also stored under the Python key, but Python-proved ones

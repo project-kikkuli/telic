@@ -48,6 +48,8 @@ A few were soundness bugs, now fixed:
 |---|---|---|---|---|---|---|
 | `9bf7e76` | 17 | 51 | 106 | 230 | 314 | 5 |
 | `16f1cf5` | 6 | 92 | 144 | 254 | 239 | 4 |
+| `e4c60a2` (48 files: `telic/ui/` added) | 11 | 102 | 162 | 306 | 278 | 6 |
+| `45d034a` | 7 | 70 | 182 | 323 | 279 | 6 |
 
 The 17 refuted functions were triaged:
 
@@ -71,6 +73,27 @@ Six remain refuted: the demo's planted bug (`refund_amount` and its
 `vcgen.pack` (arity depends on the type), `typescript._type` and `_expr`
 (well-formed JSON from `lower.mjs`), and `html._line_status` (needs a loop
 invariant quantifying over a dict's keys).
+
+Second pass (`e4c60a2` to `45d034a`):
+
+- `vcgen.pack` and `html._line_status` now state and prove their
+  preconditions, with two contract-language additions: quantifiers over a
+  dict's keys (`all(p(k) for k in d)`) and `isinstance(x, (A, B))` as one
+  predicate per class.
+- A real bug: `viewports = []` in `telic.toml` crashed `run_app`.
+- Open fell by 32, almost all from requiring termination only where a
+  recursion group makes a claim or is a logical definition (as for loops).
+  Loop invariants are not what the rest need: of the 50 open functions (not
+  counting errors) at that point, 5 have a loop state a stronger invariant
+  would rule out, and Houdini inference already closes 1 of them. The rest
+  need facts about objects and dicts held in fields (27), callee
+  contracts (8) and termination measures over ASTs (3).
+- Still refuted: the demo's planted bug, `typescript._type`/`_expr` (their
+  precondition is "well-formed JSON from `lower.mjs`", a recursive schema
+  over `Any` values telic cannot state), `ModelCheck.replay` and
+  `Prop.__str__` (need a property's annotated return type, and frozen
+  dataclass fields that calls cannot change), and `run_app` (every viewport
+  must report on every lemma).
 
 Unsupported fell by 75: 37 functions from telling telic's same-named
 classes apart (`FunctionLowerer`, `ExprLowerer` in the Python and Rust
