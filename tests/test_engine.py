@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 
 from telic import engine
-from telic.checker import CheckOptions, build_theory, check, load_modules
+from telic.checker import CheckOptions, build_theory, check, load_modules, solve_all
 from telic.program import Program
 from telic.infer import infer_rlimit
-from telic.smt import RLIMIT, solve
+from telic.smt import RLIMIT
 from telic.vcgen import Options, VCError, VCGen
 
 from conftest import HAS_NODE
@@ -28,17 +28,18 @@ def _differential(path: Path):
     tasks = [(r, Options()) for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
     res = engine.run(p, th, tasks, 60000, RLIMIT, None)
     assert res is not None
-    diffs, compared = [], 0
+    diffs, compared, generated = [], 0, []
     for ref, _ in tasks:
         r = res[ref.key]
         if r["status"] != "ok":
             continue
         try:
-            obs = VCGen(p, ref).run()
+            generated.append((ref, r, VCGen(p, ref).run()))
         except VCError:
             diffs.append(f"{ref.key}: engine generated VCs the Python core rejects")
-            continue
-        py = {o.id: solve(o, th).status for o in obs}
+    solved = iter(solve_all([o for _, _, obs in generated for o in obs], th, 60000, RLIMIT, None))
+    for ref, r, obs in generated:
+        py = {o.id: next(solved).status for o in obs}
         ox = {o["ob"].id: o["status"] for o in r["obligations"]}
         if set(py) != set(ox):
             diffs.append(f"{ref.key}: obligations differ {sorted(set(py) ^ set(ox))}")
