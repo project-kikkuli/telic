@@ -15,6 +15,20 @@ from .replay import call_text
 # Paint
 
 
+
+# Symbols telic makes for lists it builds; not state a reader wrote.
+INTERNAL_STATE = ("alloc@", "comp@", "lit@", "range@", "rep@", "cat@")
+
+
+def _has_loop(fn: ir.Function) -> bool:
+    return any(isinstance(st, (ir.While, ir.ForRange, ir.ForEach)) for st in ir.walk_stmts(fn.body))
+
+
+def state_name(key: str) -> str:
+    """``out@3.len`` -> ``len(out)``, ``i@2`` -> ``i``."""
+    base, _, rest = key.partition("@")
+    return f"len({base})" if rest.endswith(".len") else base
+
 class Paint:
     def __init__(self, enabled: bool | None = None):
         if enabled is None:
@@ -391,10 +405,10 @@ class Renderer:
         else:
             if solver_cex and v.status in ("refuted", "unconfirmed"):
                 out.append(f"   {p.bold(pad('counterexample', 16))}{solver_cex}")
-                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith("()") and "@new" not in k and not k.startswith(("alloc@",))}
+                interesting = {k: val for k, val in v.state.items() if "@" in k and not k.endswith(("()", ".arr")) and "@new" not in k and not k.startswith(INTERNAL_STATE)}
                 if interesting and v.status == "unconfirmed" and not race:
-                    st = ", ".join(f"{k.split('@')[0]}={fmt_state_value(val)}" for k, val in list(interesting.items())[:6])
-                    out.append(f"   {p.dim(pad('loop state', 16))}{p.dim(st)}")
+                    st = ", ".join(f"{state_name(k)}={fmt_state_value(val)}" for k, val in list(interesting.items())[:6])
+                    out.append(f"   {p.dim(pad('loop state' if _has_loop(f.fn) else 'unknowns', 16))}{p.dim(st)}")
             if rp is not None:
                 if rp.confirmed and v.status == "refuted":
                     out.append(f"   {p.bold(pad('replayed', 16))}{p.green('✓')} {rp.summary}")
@@ -429,6 +443,8 @@ class Renderer:
                 return "add or fix '@decreases' on this loop"
             if v.replay is not None and "too weak to rule this out" in v.replay.summary:
                 return "add the missing fact to the callee's '@ensures'"
+            if not _has_loop(f.fn):
+                return "telic assumes nothing about what unchecked calls return: check the value in the code, or call a checked wrapper whose '@ensures' says it"
             return "strengthen the loop invariant(s) so the solver cannot pick an unreachable state"
         if v.status == "unknown":
             return "prove it in Lean: telic lean " + ob.id

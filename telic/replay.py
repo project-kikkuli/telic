@@ -423,8 +423,10 @@ def classify(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> tuple[bool,
         callees = ", ".join(sorted(d.split("::")[-1] for d in ob.deps))
         return False, f"{summary} without violating anything -- the contracts of {callees} are too weak to rule this out (telic checks each function against the others' contracts, not their code)", None
     loop_state = any("@" in c.name for h in ob.hyps for c in _consts(h))
-    if ob.kind in ("inv.step", "variant") or loop_state:
+    if ob.kind in ("inv.step", "variant") or (loop_state and has_loop):
         return False, f"{summary} without violating anything -- the state behind this counterexample is unreachable; a loop invariant is too weak to rule it out", None
+    if loop_state:
+        return False, f"{summary} without violating anything -- the solver assumed values for unchecked calls that they do not return here", None
     return False, f"{summary} without violating anything", None
 
 
