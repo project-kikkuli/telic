@@ -84,6 +84,10 @@ TRUE_HELPERS = {
     "t36.ts": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift"},
     "lc1.py": {"Counter.__init__", "Counter.bump", "Job.__init__", "Job.start", "Job.finish", "Base.__init__", "Door.__init__", "Door.lock", "Valve.__init__"},
     "lc1.ts": {"Meter.__init__", "Meter.tick", "Lock.__init__", "Lock.seal", "Stepper.__init__", "Stepper.next"},
+    "lc2.py": {"Tab.__init__", "Tab.pay", "Gauge.__init__", "Latch.__init__", "Latch.close", "Meter.__init__", "Meter.tick"},
+    "lc2.rs": {"Tally.bump"},
+    "json_mutate.py": {"put"},
+    "json_mutate.rs": {"clear"},
     "t31.rs": {"f", "f@two", "Ctr.reset", "E2.from", "Five.w", "Loose.eq", "Tr.w@default", "fails", "wrap"},
     "t32.rs": {"set"},
 }

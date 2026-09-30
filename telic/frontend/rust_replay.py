@@ -280,15 +280,16 @@ class _Target:
 
     def lifecycles(self) -> tuple[list[str], list[str], list[Any]]:
         """(snapshots taken before the call, checks after it, the lifecycles):
-        the receiver changes only as its lifecycles allow."""
-        if self.info is None or not any(p.name == "self" for p in self.fn.params):
+        objects passed in change only as their lifecycles allow."""
+        if self.info is None:
             return [], [], []
         from ..runtime import _lifecycles
 
-        lcs = [lc for _, lc in _lifecycles(self.fe.classes, self.info.owner or "")]
+        pairs = [(p, lc) for p in self.fn.params if isinstance(p.ty, ir.TClass) for _, lc in _lifecycles(self.fe.classes, p.ty.name)]
+        lcs = [lc for _, lc in pairs]
         snaps, checks = [], []
-        for i, lc in enumerate(lcs):
-            cond, olds = _extract_old(re.sub(r"\bself\b", "__self", lc.code))
+        for i, (p, lc) in enumerate(pairs):
+            cond, olds = _extract_old(re.sub(r"\bself\b", "__self" if p.name == "self" else p.name, lc.code))
             for k, o in enumerate(olds):
                 snaps.append(f"let __o{i}_{k} = ({o}).clone();")
                 cond = cond.replace(f"__OLD{k}__", f"__o{i}_{k}")

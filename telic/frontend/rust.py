@@ -2145,9 +2145,17 @@ class ExprLowerer:
             raise self.err("assignment through an index needs a Vec variable or field", left)
         if left.type == "unary_expression" and _text(left.children[0]) == "*":
             inner = left.named_children[0]
+            obj = self.expr(inner) if inner.type in ("identifier", "self") else None
+            if obj is not None and isinstance(obj.ty, ir.TClass):
+                # the struct behind the reference is overwritten in place, field by field
+                tmp = self.fl.fresh("whole", obj.ty)
+                self.pre.append(ir.Assign(loc, tmp, self.fl.coerce(value, obj.ty)))
+                src = ir.Var(obj.ty, loc, tmp)
+                for f, t in self.fe.classes[obj.ty.name].fields:
+                    self.pre.append(ir.FieldAssign(loc, obj, obj.ty.name, f, ir.Field(t, loc, src, f)))
+                return
             if inner.type == "self":
-                if "self" not in self.fl.env or isinstance(self.fl.env["self"], ir.TClass):
-                    raise self.err("assigning a whole object through *self is not modelled", left)
+                self.fl.writable("self", left)
                 self.pre.append(ir.Assign(loc, "self", self.fl.coerce(value, self.fl.env["self"])))
                 return
             return self._store(inner, value, n)
