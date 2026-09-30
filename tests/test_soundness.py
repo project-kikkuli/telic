@@ -58,6 +58,7 @@ TRUE_HELPERS = {
     "inh4.ts": {"A.__init__", "A.m", "A.viaSuper", "B.__init__", "B.m"},
     "inh5.ts": {"A.__init__", "A.f"},
     "alias1.ts": {"flip", "grow", "Holder.__init__"},
+    "alias2.ts": {"setKind", "nested", "orElse", "pick", "same", "push", "via"},
     "t32.py": {"Acct.__init__", "refill", "clamp", "refill_nested"},
     "t32.ts": {"Acct.__init__", "refill"},
     "t33.py": {"Acct.__init__", "sees"},

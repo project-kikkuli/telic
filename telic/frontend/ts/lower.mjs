@@ -733,7 +733,9 @@ class ModuleLowerer {
       if (node.body) visit(node.body);
       if (valued) ret = opaque("unannotated return");
     }
-    return { params, ret, node, contracts: cls, intsFromContract: ints, defaults, rest, cls: f.cls, isStatic: !!f.isStatic, destructs };
+    const sig = { params, ret, node, contracts: cls, intsFromContract: ints, defaults, rest, cls: f.cls, isStatic: !!f.isStatic, destructs };
+    SIG_MODULE.set(sig, this);
+    return sig;
   }
 
   // Greatest fixpoint: a number-typed function result is an int if every
@@ -1378,6 +1380,7 @@ class FunctionLowerer {
   // An existing array, map or record as an untyped value: the same JavaScript
   // object, so a write through it changes one telic models as a value.
   boxedValue(v) {
+    if (v.e === "Builtin" && v.name === "some") return this.boxedValue(v.args[0]);
     if (v.e !== "Builtin" || v.name !== "to_opaque") return null;
     const x = v.args[0];
     const t = x.ty.k === "option" ? x.ty.inner : x.ty;
@@ -2759,7 +2762,7 @@ class FunctionLowerer {
         else throw this.err(`'${key}' is missing argument '${p.name}'`, this.nline(n));
       } else v = this.coerce(this.expr(a, p.ty), p.ty);
       const boxed = this.boxedValue(v);
-      if (boxed) throw this.err(`argument '${p.name}' of '${key}' has a type telic does not model, so it could change the ${tyStr(boxed.ty)} passed to it unseen; give the parameter that type`, this.nline(n));
+      if (boxed && !readOnlyParam(sig, p.name)) throw this.err(`argument '${p.name}' of '${key}' has a type telic does not model, so it could change the ${tyStr(boxed.ty)} passed to it unseen; give the parameter that type`, this.nline(n));
       if (!tyEq(v.ty, p.ty) && !(p.ty.k === "list" && v.ty.k === "list" && v.ty.elem.k === "none") && !(p.ty.k === "dict" && v.ty.k === "dict" && v.ty.key.k === "none")) {
         if (p.ty.k === "int" && v.ty.k === "real") throw this.err(`argument '${p.name}' of '${key}' must be an integer; telic cannot show this number is one`, this.nline(n));
         throw this.err(`argument '${p.name}' of '${key}' expects ${tyStr(p.ty)}, got ${tyStr(v.ty)}`, this.nline(n));
@@ -2901,6 +2904,72 @@ function resolveBases(mls) {
       delete ml.module.class_origin[k];
     }
   }
+}
+
+// Does the function only read its parameter `name`: every use is a read of
+// a primitive through it (p.a.b compared, tested, printed), so nothing it is
+// given can be changed through it or escape to code that could?
+const SIG_MODULE = new WeakMap();
+
+function readOnlyParam(sig, name) {
+  sig.readOnly ??= {};
+  if (!(name in sig.readOnly)) {
+    sig.readOnly[name] = false; // while it is being decided: a recursive pass-on is not a read
+    sig.readOnly[name] = !!sig.node && !!sig.node.body && onlyRead(sig.node.body, name, SIG_MODULE.get(sig));
+  }
+  return sig.readOnly[name];
+}
+
+const READ_OPS = new Set([
+  "EqualsEqualsEqualsToken", "ExclamationEqualsEqualsToken", "EqualsEqualsToken", "ExclamationEqualsToken", "LessThanToken", "GreaterThanToken",
+  "LessThanEqualsToken", "GreaterThanEqualsToken", "InstanceOfKeyword", "InKeyword", "MinusToken", "AsteriskToken", "SlashToken", "PercentToken",
+].map((k) => ts.SyntaxKind[k]));
+const READ_CALLS = /^(console\.\w+|JSON\.stringify|String|Number|Boolean|Array\.isArray|Number\.is\w+)$/;
+
+function onlyRead(body, name, ml) {
+  let ok = true;
+  const visit = (n) => {
+    if (!ok) return;
+    if (ts.isIdentifier(n) && (n.text === "arguments" || (n.text === name && !declName(n) && !readUse(n, ml)))) ok = false;
+    ts.forEachChild(n, visit);
+  };
+  visit(body);
+  return ok;
+}
+
+function declName(id) {
+  const p = id.parent;
+  return (p.name === id && !ts.isShorthandPropertyAssignment(p) && !ts.isPropertyAccessExpression(p)) || (ts.isPropertyAccessExpression(p) && p.name === id);
+}
+
+// The value read from a use of the parameter (through p.a[i]...) is consumed
+// as a primitive: compared, tested, negated, printed, used as a key.
+const PASS_OPS = new Set([ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken]);
+
+function readUse(id, ml) {
+  let n = id;
+  for (;;) {
+    const p = n.parent;
+    if ((ts.isBinaryExpression(p) && PASS_OPS.has(p.operatorToken.kind)) || (ts.isConditionalExpression(p) && p.condition !== n)) n = p; // the value itself may be the result
+    else if (ts.isParenthesizedExpression(p) || ts.isNonNullExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertionExpression(p) || ts.isSatisfiesExpression(p)) n = p;
+    else if ((ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === n) n = p;
+    else break;
+  }
+  const p = n.parent;
+  if (ts.isBinaryExpression(p)) return READ_OPS.has(p.operatorToken.kind) || (p.operatorToken.kind === ts.SyntaxKind.PlusToken);
+  if (ts.isPrefixUnaryExpression(p)) return p.operator !== ts.SyntaxKind.PlusPlusToken && p.operator !== ts.SyntaxKind.MinusMinusToken;
+  if (ts.isTypeOfExpression(p) || ts.isTemplateSpan(p) || ts.isSwitchStatement(p) || ts.isCaseClause(p)) return true;
+  if (ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) return p.expression === n;
+  if (ts.isConditionalExpression(p)) return p.condition === n;
+  if (ts.isForStatement(p)) return p.condition === n;
+  if (ts.isElementAccessExpression(p)) return p.argumentExpression === n;
+  if (ts.isCallExpression(p) && p.expression !== n) {
+    if (READ_CALLS.test(p.expression.getText())) return true;
+    const sig = ml && ts.isIdentifier(p.expression) && ml.sigs[p.expression.text];
+    const param = sig && !sig.cls && sig.rest === null && sig.params[p.arguments.indexOf(n)];
+    return !!param && readOnlyParam(sig, param.name);
+  }
+  return false;
 }
 
 // A checked class used as a value (a class expression's base, a mixin's
