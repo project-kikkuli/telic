@@ -90,3 +90,24 @@ def test_html_report(tmp_path):
     assert out.returncode == 0, out.stderr
     page = (tmp_path / "r.html").read_text()
     assert page.startswith("<!doctype html>") and "POS" in page and "✓ proved" in page
+
+
+def test_trusted_base_separates_glue_from_what_proofs_rest_on(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "import os\n\n\ndef glue() -> None:\n    os.getcwd()\n    os.getpid()\n\n\n"
+        "def claim(x: int) -> int:\n    #@ ensures result == x\n    os.getcwd()\n    return x\n"
+    )
+    out = telic("check", "m.py", "--no-cache", "--color", "never", cwd=tmp_path).stdout
+    base = out.split("trusted base", 1)[1]
+    assert "unchecked calls do not raise: os.getcwd  m.py:11" in base
+    assert "2 more in 1 function with nothing to check" in base and "os.getpid" not in base
+    detail = telic("check", "m.py", "--no-cache", "--color", "never", "--trusted", cwd=tmp_path).stdout.split("trusted base", 1)[1]
+    assert "glue  m.py:5,6  os.getcwd, os.getpid  (nothing checked here)" in detail
+    assert "claim  m.py:11  os.getcwd" in detail
+
+
+def test_explain_takes_the_file_first_too(tmp_path):
+    (tmp_path / "m.py").write_text("def f(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
+    a = telic("explain", "f", "m.py", "--no-cache", cwd=tmp_path)
+    b = telic("explain", "m.py", "f", "--no-cache", cwd=tmp_path)
+    assert a.returncode == b.returncode == 0 and a.stdout == b.stdout and "f/ensures" in a.stdout

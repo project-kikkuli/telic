@@ -125,7 +125,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(json.dumps(report_json(rep), indent=2))
     else:
         paint = Paint(True if args.color == "always" else False if args.color == "never" else None)
-        print(Renderer(rep, paint, verbose=args.verbose).render())
+        print(Renderer(rep, paint, verbose=args.verbose, trusted=args.trusted).render())
     if args.strict:
         return 0 if rep.ok and all(f.status in ("proved", "trusted") for f in rep.functions) and all(m.status == "proved" for m in rep.mirrors) and all(lc.status == "proved" for lc in rep.lifecycles) else 1
     return 0 if rep.ok else 1
@@ -135,6 +135,9 @@ def cmd_explain(args: argparse.Namespace) -> int:
     from .render import Paint, explain
 
     root = os.path.abspath(args.root or os.getcwd())
+    # 'explain FILE NAME', the order the other commands take, means the same
+    if os.path.exists(args.name) and len(args.paths) == 1 and not os.path.exists(args.paths[0]):
+        args.name, args.paths = args.paths[0], [args.name]
     name = args.name.split("/")[0]
     args.only = [name]
     opts = _options(args, root)
@@ -174,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     _common(c)
     c.add_argument("--json", action="store_true", help="machine-readable output (for agents and CI)")
     c.add_argument("-v", "--verbose", action="store_true")
+    c.add_argument("--trusted", action="store_true", help="list every assumption the report rests on, by kind and function")
     c.add_argument("--strict", action="store_true", help="also fail when anything is open or unsupported")
     c.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     c.set_defaults(func=cmd_check)

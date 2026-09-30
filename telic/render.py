@@ -210,10 +210,11 @@ def fmt_state_value(v: Any) -> str:
 
 
 class Renderer:
-    def __init__(self, report: Report, paint: Paint | None = None, verbose: bool = False, width: int | None = None):
+    def __init__(self, report: Report, paint: Paint | None = None, verbose: bool = False, width: int | None = None, trusted: bool = False):
         self.r = report
         self.p = paint or Paint()
         self.verbose = verbose
+        self.trusted = trusted
         self.width = width or min(100, max(72, _term_width()))
         self.aim_text = {i.id: i.text for i in report.aims}
 
@@ -444,7 +445,9 @@ class Renderer:
             if v.replay is not None and "too weak to rule this out" in v.replay.summary:
                 return "add the missing fact to the callee's '@ensures'"
             if not _has_loop(f.fn):
-                return "telic assumes nothing about what unchecked calls return: check the value in the code, or call a checked wrapper whose '@ensures' says it"
+                calls = sorted({c.name.split("()")[0] for t in [*ob.hyps, ob.goal] for c in L.consts(t) if "()" in c.name})
+                named = f" ({', '.join(calls[:4])}{', …' if len(calls) > 4 else ''})" if calls else ""
+                return f"telic assumes nothing about what unchecked calls{named} return: check the value in the code, or call a checked wrapper whose '@ensures' says it"
             return "strengthen the loop invariant(s) so the solver cannot pick an unreachable state"
         if v.status == "unknown":
             return "prove it in Lean: telic lean " + ob.id
@@ -713,18 +716,27 @@ class Renderer:
         return out
 
     def trust_section(self) -> list[str]:
+        """What proofs rest on, by kind. An assumption made where nothing is
+        checked (glue with no contract and no operation that can fail)
+        supports no verdict: those are counted on one line, and '--trusted'
+        lists every assumption where it is made."""
         p = self.p
         trusted = [f for f in self.r.functions if f.status == "trusted"]
         assumes = [(f, loc, t) for f in self.r.functions for loc, t in f.assumptions]
         langs = sorted({m.language for m in self.r.modules})
-        if not (trusted or assumes or self.verbose):
+        if not (trusted or assumes or self.verbose or self.trusted):
             return []
+        if self.trusted:
+            return self.trust_detail(trusted, assumes)
         out = [self.rule("trusted base", ""), ""]
         for f in trusted:
             out.append(f"  {p.blue('◇')} {f.fn.name} {p.dim(fn_loc(f))} {p.dim('@trusted')}")
+        glue = [(f, loc, t) for f, loc, t in assumes if not f.verdicts and t.startswith("assumed: ")]
         groups: dict[str, list[tuple[str, int]]] = {}
         calls: dict[str, list[tuple[str, int]]] = {}
         for f, loc, text in assumes:
+            if not f.verdicts and text.startswith("assumed: "):
+                continue
             if text.startswith("assumed: call:"):
                 calls.setdefault(text[len("assumed: call:"):], []).append((f.ref.module.path, loc.line))
             elif text.startswith("assumed: "):
@@ -753,8 +765,17 @@ class Renderer:
             out.append(f"  {p.blue('◇')} unchecked calls do not raise: {shown}{more}  {p.dim(where([x for v in calls.values() for x in v]))}")
         for text, locs in groups.items():
             out.append(f"  {p.blue('◇')} {text}  {p.dim(where(locs))}")
+        if glue:
+            kinds: dict[str, int] = {}
+            for _, _, text in glue:
+                k = _trust_kind(text)
+                kinds[k] = kinds.get(k, 0) + 1
+            fns = {f.ref.key for f, _, _ in glue}
+            ranked = sorted(kinds, key=lambda k: (-kinds[k], k))
+            what = ", ".join(f"{k} ×{kinds[k]}" for k in ranked[:3]) + (f", … {len(ranked) - 3} more kinds" if len(ranked) > 3 else "")
+            out.append(f"  {p.blue('◇')} {p.dim(f'{len(glue)} more in {len(fns)} function{chr(115) * (len(fns) != 1)} with nothing to check, backing no verdict: {what} (--trusted lists them)')}")
         if brief and (calls or groups) and sum(len(v) for v in calls.values()) + sum(len(v) for v in groups.values()) > 12:
-            out.append(p.dim("  (--verbose lists every assumption and where it is made)"))
+            out.append(p.dim("  (--verbose lists every place; --trusted every assumption by function)"))
         if self.verbose:
             for lang in langs:
                 mod = next(m for m in self.r.modules if m.language == lang)
@@ -762,6 +783,39 @@ class Renderer:
                     out.append(f"  {p.dim('·')} {p.dim(lang + ': ' + a)}")
         out.append("")
         return out
+
+    def trust_detail(self, trusted: list[FunctionReport], assumes: list[tuple[FunctionReport, ir.Loc, str]]) -> list[str]:
+        """Every assumption, by kind, then by function, with each place."""
+        p = self.p
+        out = [self.rule("trusted base", "every assumption"), ""]
+        for f in trusted:
+            out.append(f"  {p.blue('◇')} {f.fn.name} {p.dim(fn_loc(f))} {p.dim('@trusted: contract assumed, body not checked')}")
+        by_kind: dict[str, dict[str, list[tuple[FunctionReport, int, str]]]] = {}
+        for f, loc, text in assumes:
+            kind = _trust_kind(text)
+            detail = text[len("assumed: call:"):] if text.startswith("assumed: call:") else text if not text.startswith("assumed: ") else ""
+            by_kind.setdefault(kind, {}).setdefault(f.ref.key, []).append((f, loc.line, detail))
+        for kind in sorted(by_kind, key=lambda k: (-sum(len(v) for v in by_kind[k].values()), k)):
+            fns = by_kind[kind]
+            n = sum(len(v) for v in fns.values())
+            out.append(f"  {p.blue('◇')} {kind}  {p.dim(f'{n} place{chr(115) * (n != 1)}')}")
+            for key in sorted(fns, key=lambda k: (fns[k][0][0].ref.module.path, fns[k][0][1])):
+                rows = fns[key]
+                f = rows[0][0]
+                lines = ",".join(str(x) for x in sorted({r[1] for r in rows}))
+                names = sorted({r[2] for r in rows if r[2]})
+                note = "" if f.verdicts else p.dim("  (nothing checked here)")
+                out.append(f"      {f.fn.name}  {p.dim(f'{f.ref.module.path}:{lines}')}{('  ' + ', '.join(names)) if names else ''}{note}")
+        out.append("")
+        return out
+
+
+def _trust_kind(text: str) -> str:
+    if text.startswith("assumed: call:"):
+        return "unchecked calls do not raise"
+    if text.startswith("assumed: "):
+        return text[len("assumed: "):]
+    return "@assume"
 
 
 def ui_label(status: str, method: str) -> str:
