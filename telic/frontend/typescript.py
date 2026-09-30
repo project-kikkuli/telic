@@ -111,7 +111,7 @@ def _type(t: dict[str, Any]) -> ir.Type:
     if k == "opaque":
         return ir.TOpaque(t.get("why", ""))
     if k == "enum":
-        return ir.TEnum(t["name"], tuple(t["members"]), tuple(t.get("values") or ()))
+        return ir.TEnum(t["name"], tuple(t["members"]), tuple(utf16(v) if isinstance(v, str) else v for v in t.get("values") or ()))
     raise ValueError(f"unknown type {t}")
 
 
@@ -181,6 +181,12 @@ def wf_expr(d: Any) -> bool:
     return all(wf_expr(k) for k in kids)
 
 
+def utf16(s: str) -> str:
+    """A JavaScript string is a sequence of UTF-16 code units: one char each."""
+    b = s.encode("utf-16-le", "surrogatepass")
+    return "".join(chr(int.from_bytes(b[i : i + 2], "little")) for i in range(0, len(b), 2))
+
+
 #@ requires wf_expr(d)
 #@ decreases json_depth(d)
 def _expr(d: dict[str, Any]) -> ir.Expr:
@@ -196,6 +202,8 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
             return ir.Lit(ty, loc, Fraction(v))
         if isinstance(ty, ir.TInt) and isinstance(v, float):
             v = int(v)
+        if isinstance(v, str):
+            v = utf16(v)
         return ir.Lit(ty, loc, v)
     if kind == "Var":
         return ir.Var(ty, loc, d["name"])
