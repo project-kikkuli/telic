@@ -26,6 +26,8 @@ const ts = require("typescript");
 
 const INT = { k: "int" }, REAL = { k: "real" }, BOOL = { k: "bool" }, STR = { k: "str" }, NONE = { k: "none" };
 const listOf = (elem) => ({ k: "list", elem });
+// can a value of this type lead to an object's fields?
+const reachesObject = (t) => t.k === "class" || (t.k === "list" && reachesObject(t.elem)) || (t.k === "dict" && (reachesObject(t.key) || reachesObject(t.val))) || (t.k === "option" && reachesObject(t.inner)) || (t.k === "record" && t.fields.some(([, ft]) => reachesObject(ft)));
 const optionOf = (inner) => (inner.k === "option" || inner.k === "opaque" ? inner : inner.k === "list" || inner.k === "dict" ? opaque("optional container") : { k: "option", inner });
 const opaque = (why = "") => ({ k: "opaque", why });
 const classOf = (name) => ({ k: "class", name });
@@ -466,7 +468,8 @@ class ModuleLowerer {
         const walk = (x) => {
           if (!x || typeof x !== "object") return;
           if (x.e === "Field" && x.obj.ty.k === "class" && !(x.obj.e === "Var" && x.obj.name === "self")) throw new LowerError("a class invariant may only read fields of 'this', not of other objects", cl.line);
-          if (x.e === "Call" && x.args.some((a) => a.ty.k === "class")) throw new LowerError("a class invariant may not call methods; write the condition on this's fields", cl.line);
+          if (x.e === "Quant" && (x.idx === "self" || x.elem === "self")) throw new LowerError("a class invariant may not rebind 'self'", cl.line);
+          if (x.e === "Call" && x.args.some((a) => reachesObject(a.ty))) throw new LowerError("a class invariant may not call functions on objects (they could read other objects); write the condition on this's fields", cl.line);
           for (const v of Object.values(x)) if (Array.isArray(v)) v.forEach(walk);
           else if (v && typeof v === "object") walk(v);
         };

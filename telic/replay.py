@@ -246,13 +246,26 @@ def ts_contracts(module: ir.Module | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if module is None:
         return out
+
+    def invs(cls: str, seen: tuple[str, ...] = ()) -> list[str]:
+        decl = module.classes.get(cls)
+        if decl is None or cls in seen:
+            return []
+        return [c.text for c in decl.invariants] + [t for b in decl.bases for t in invs(b, seen + (cls,))]
+
+    classes = {ir.source_name(c): invs(c) for c in module.classes}
+    classes = {c: ts for c, ts in classes.items() if ts}
     for f in module.functions.values():
         out[ir.source_name(f.name)] = {
             "params": [p.name for p in f.params],
             "lists": [i for i, p in enumerate(f.params) if isinstance(p.ty, ir.TList)],
             "requires": [c.text for c in f.requires],
             "ensures": [c.text for c in f.ensures],
+            # class invariants: of the objects passed in, and of every object it changes
+            "invs": [[p.name, invs(p.ty.name)] for p in f.params if isinstance(p.ty, ir.TClass) and invs(p.ty.name)],
+            "classes": classes if classes and any(isinstance(s, ir.FieldAssign) for s in ir.walk_stmts(f.body)) else {},
         }
+    out["__classes__"] = classes
     return out
 
 
@@ -334,7 +347,8 @@ def describe(out: dict[str, Any], runtime: str) -> str:
         if kind == "requires":
             return f"{runtime}: called {where}() violating '@requires {text}'"
         if kind == "class.inv":
-            return f"{runtime}: class invariant '{text}' is false when {where.split('.')[-1]}() returns"
+            how = "raises" if str(out.get("detail", "")) == "raised" else "returns"
+            return f"{runtime}: class invariant '{text}' is false when {where.split('.')[-1]}() {how}"
         if kind == "invariant":
             return f"{runtime}: invariant '{text}' is false at runtime -- the invariant itself is wrong"
         return f"{runtime}: '@{kind} {text}' failed" + (f" at line {out.get('line')}" if out.get("line") else "")

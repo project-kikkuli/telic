@@ -315,6 +315,18 @@ func tryWithdraw(_ start: Int, _ amount: Int) -> Bool {
     }
 }
 
+// expect: proved
+func tryWithdrawFrom(_ a: Account, _ amount: Int) -> Bool {
+    //@ requires amount >= 0
+    //@ ensures result == (amount <= old(a.balance))
+    do {
+        try a.withdrawChecked(amount)
+        return true
+    } catch {
+        return false
+    }
+}
+
 // MARK: enums and switch
 
 enum Light {

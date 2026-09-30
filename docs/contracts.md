@@ -420,10 +420,12 @@ them up. In TypeScript a `number` is an integer when telic can show it
 
 **Objects.** Classes are references: two parameters may be the same object, and
 counterexamples show it (`f(a=<Box v=0>, b=a)`). A class invariant (`#@ invariant`
-in the class body, over `self`/`this` only) is assumed for objects passed in,
-proved when they are handed back or passed on, and proved for any object a
-function writes. Inside a loop, the objects written so far must satisfy it
-after every iteration. A call changes only the fields the callee may write, and only
+in the class body) reads only the object's own fields: not another object's,
+and not through a function it passes an object, list or dict of objects to. It
+is assumed for objects passed in, proved when they are passed on, and proved
+for them and for any object a function writes whenever control leaves it: on return, on raise, and
+at each `await` or `yield`. Inside a loop, the objects written so far must
+satisfy it after every iteration. A call changes only the fields the callee may write, and only
 on objects it can reach. Dataclasses, pydantic models, TypeScript parameter
 properties, getters and setters work as in the language.
 
@@ -523,8 +525,9 @@ methods of classes preserve it). An enum without payloads is an enum (with
 `if case` and `==`. Optionals, `if let`, `guard let`, `while let`, `?.`, `??`
 and `!` are modelled. `do`/`catch` runs a catch clause from the state where
 the error was thrown; which clause matches is left open. A contract describes
-normal returns only, so after a call throws, whatever the callee could reach
-(its object, its arguments' objects and arrays) is unknown.
+normal returns only, so after a call throws, the fields it may write and the
+arrays it may change are unknown, but its objects satisfy their invariants
+(a checked callee restores them before it throws, as before it returns).
 
 A protocol is a base class of its conformers: a call through it is checked
 against the requirement's contract, and every conformer's implementation

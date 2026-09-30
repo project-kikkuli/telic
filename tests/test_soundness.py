@@ -64,7 +64,11 @@ TRUE_HELPERS = {
     "t33.py": {"Acct.__init__", "sees"},
     "t33.ts": {"Acct.__init__", "sees"},
     "swift1.swift": {"Box.init", "mayThrow", "runIt", "Ten.size", "Three.size", "Five.value", "Six.value"},
-    "swift2.swift": {"One.value", "Base.init", "Base.v", "ViaAlias.v", "throughAlias", "check", "Span.init", "Span.risky"},  # throughAlias: proved only assuming Negative.value, which is refuted
+    "swift2.swift": {"One.value", "Base.init", "Base.v", "ViaAlias.v", "throughAlias", "check", "Span.init"},  # throughAlias: proved only assuming Negative.value, which is refuted
+    "t34.py": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__"},
+    "t34.ts": {"nonneg", "dip", "Acct.__init__", "Link.__init__", "Pool.__init__"},
+    "t35.py": {"Acct.__init__", "Checked.__init__"},
+    "t35.ts": {"Acct.__init__", "Checked.__init__"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs", ".swift"))

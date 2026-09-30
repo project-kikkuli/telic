@@ -1562,8 +1562,10 @@ def _own_fields_only(e: ir.Expr, cls: str, line: int) -> None:
     for sub in ir.walk_expr(e):
         if isinstance(sub, ir.Field) and isinstance(sub.obj.ty, ir.TClass) and not (isinstance(sub.obj, ir.Var) and sub.obj.name == "self"):
             raise LowerError(f"a class invariant may only read fields of 'self', not of other objects", line=line)
-        if isinstance(sub, ir.Call) and any(isinstance(a.ty, ir.TClass) for a in sub.args):
-            raise LowerError("a class invariant may not call methods (they could read other objects); write the condition on self's fields", line=line)
+        if (isinstance(sub, ir.Quant) and "self" in (sub.idx, sub.elem)) or (isinstance(sub, ir.Builtin) and sub.name == "comp" and isinstance(sub.args[1], ir.Lit) and sub.args[1].value == "self"):
+            raise LowerError("a class invariant may not rebind 'self'", line=line)
+        if isinstance(sub, ir.Call) and any(ir.reaches_object(a.ty) for a in sub.args):
+            raise LowerError("a class invariant may not call functions on objects (they could read other objects); write the condition on self's fields", line=line)
 
 
 PY_GLOBALS = set(dir(__import__("builtins"))) | {"__name__", "__file__", "__spec__", "__package__", "__doc__"} | {"datetime", "time", "uuid", "os", "json", "re", "random", "logging", "Decimal", "sorted", "reversed", "zip", "map", "filter", "open", "input", "id", "hash", "repr", "type", "set", "tuple", "list", "frozenset", "getattr", "setattr", "hasattr", "iter", "next", "divmod", "pow", "chr", "ord", "hex", "bin", "format", "vars", "dir", "callable", "super"}

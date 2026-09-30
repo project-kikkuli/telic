@@ -1120,7 +1120,8 @@ class ExprLowerer:
 
     def maybe_throw_extern(self, name: str, args: list[ir.Expr], expect: Any, loc: ir.Loc, x: Any) -> ir.Expr:
         if self.try_kind is not None:
-            self.throw_point(None, [a for a in args if not isinstance(a, ir.Lit)], loc, x, name)
+            reach = [a for a in args if not isinstance(a, ir.Lit)]
+            self.throw_point(None, reach, loc, x, name)
         return self.extern(name, args, expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of {name}"), loc, x)
 
     def _never(self, expect: Any, loc: ir.Loc) -> ir.Expr:
@@ -1325,16 +1326,20 @@ class ExprLowerer:
         if isinstance(rc, ir.Lit) and rc.value is False:
             return None
         if self.try_kind == "try":
-            self.pre.append(ir.If(loc, rc, (self.before_throw(name, args, loc), ir.Raise(loc, f"an error from {name}", caught=self.fl.do_depth > 0)), ()))
+            self.pre.append(ir.If(loc, rc, (self.before_throw(fi, name, args, loc), ir.Raise(loc, f"an error from {name}", caught=self.fl.do_depth > 0)), ()))
             return None
         if self.try_kind == "try!":
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Unary(ir.BOOL, loc, "not", rc), loc, f"try! {name} does not throw"), native=True))
             return None
         return rc
 
-    def before_throw(self, name: str, args: list[ir.Expr], loc: ir.Loc) -> ir.Stmt:
+    def before_throw(self, fi: FnInfo | None, name: str, args: list[ir.Expr], loc: ir.Loc) -> ir.Stmt:
         """What a call may have changed before it threw: its contract says
-        nothing about that state, so whatever it can reach is unknown."""
+        nothing about that state. A checked callee may have changed only what
+        it may write, and leaves its objects' invariants intact; what
+        unchecked code can reach is unknown."""
+        if fi is not None:
+            return ir.ExprStmt(loc, ir.Builtin(ir.NONE, loc, "threw", (ir.Call(fi.ret, loc, fi.key, tuple(args)),)))
         return ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, f"{name} up to its throw", tuple(a for a in args if not isinstance(a, ir.Lit))))
 
     def args_for(self, fi: FnInfo, args: list[tuple[str | None, X]], x: X) -> list[tuple[ir.Param, X | None, Any]]:
@@ -1393,7 +1398,7 @@ class ExprLowerer:
                 ok_body.append(ir.Assign(loc, t, call_v))
             else:
                 ok_body.append(ir.ExprStmt(loc, e))
-            thrown = (self.before_throw(fi.key, vals, loc),) + ((ir.Assign(loc, t, ir.Lit(rty, loc, None)),) if t is not None else ())
+            thrown = (self.before_throw(fi, fi.key, vals, loc),) + ((ir.Assign(loc, t, ir.Lit(rty, loc, None)),) if t is not None else ())
             self.pre.append(ir.If(loc, rc, thrown, tuple(ok_body)))
             self._write_back(written, loc)
             if t is None:

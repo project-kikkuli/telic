@@ -389,3 +389,24 @@ export function nestedWrong(r: Nested): number {
   //@ ensures result === r.inner.m
   return r.n;
 }
+
+// expect: refuted
+export function emptyWallets(ws: Wallet[]): void {
+  for (const w of ws) {
+    w.cents = -1;
+  }
+}
+
+export class Span {
+  //@ invariant this.lo <= this.hi
+  lo = 0;
+  hi = 0;
+}
+
+// expect: refuted
+export function stretch(s: Span, x: number): void {
+  //@ raises x < 0
+  s.lo = s.hi + 1;
+  if (x < 0) throw new Error("negative");
+  s.hi = s.lo;
+}

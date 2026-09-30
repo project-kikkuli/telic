@@ -622,6 +622,7 @@ and builtin g ctx (e : Ir.expr) name args =
   let assume_ t = assume ctx t in
   match name with
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
+  | "threw" -> threw g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
     D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
   | "dict_lit" ->
@@ -640,7 +641,7 @@ and builtin g ctx (e : Ir.expr) name args =
     pairs args;
     D { vals = !vals; has = !has; dty = e.ty }
   | _ -> (
-    (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_suspended g ctx st loc "await" | _ -> ());
+    (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the await" | _ -> ());
     let vals = List.map (ev g ctx) args in
     let lst = function L l -> l | _ -> raise (Vc_error ("builtin on a non-list: " ^ name, loc)) in
     let dct = function D d -> d | _ -> raise (Vc_error ("builtin on a non-dict: " ^ name, loc)) in
@@ -920,7 +921,7 @@ and extern g ctx (e : Ir.expr) name args =
   let _vals = List.map (ev g ctx) args in
   if ctx.spec then raise (Vc_error (Printf.sprintf "specifications cannot call unchecked code ('%s')" name, loc));
   if not (starts_with "caught exception" name || starts_with "default of" name) then note_assumed g loc ("call:" ^ name);
-  (match ctx.state with Some st when name = "yield" -> check_suspended g ctx st loc "yield" | _ -> ());
+  (match ctx.state with Some st when name = "yield" -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the yield" | _ -> ());
   let fn = g.info.fn in
   (match ctx.state with
    | Some st ->
@@ -1050,40 +1051,62 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
     end
   in
   let post = ref pmap in
-  (match ctx.state with
-   | Some st when not ctx.spec ->
-     List.iter
-       (fun ((p, pty), a_e) ->
-         match a_e with
-         | Some { Ir.e = Var n; _ } when List.mem p muts -> (
-           match SM.find_opt n st.env with
-           | Some (D _) ->
-             let nd = fresh g n pty () in
-             st.env <- SM.add n nd st.env;
-             post := SM.add p nd !post
-           | Some (L old) ->
-             let keep = if List.mem p callee.appends then None else Some old.len in
-             let nv = match fresh g n pty ?len:keep () with L l -> l | _ -> assert false in
-             let nv = match keep with Some k -> { nv with off = old.off; len = k } | None -> assume ctx (le zero nv.len); nv in
-             st.env <- SM.add n (L nv) st.env;
-             post := SM.add p (L nv) !post
-           | _ -> raise (Vc_error ("mutated argument is not a list", loc)))
-         | _ -> ())
-       (zip fn.params arg_exprs);
-     havoc_call g callee args ctx;
-     post := SM.union (fun _ _ b -> Some b) !post (heap_env st.env)
-   | _ -> ());
+  (match ctx.state with Some st when not ctx.spec -> post := SM.union (fun _ _ b -> Some b) !post (call_effects g callee args arg_exprs ctx st loc) | _ -> ());
   if (not ctx.spec) && fn.ensures <> [] && not g.definitional_mode then begin
     let ectx = { cctx with env = !post; old_env = Some (with_pmap heap_pre); result = (match r with NoneV -> None | r -> Some r) } in
     List.iter (fun (en : Ir.clause) -> assume ctx (term_of loc (ev g ectx en.cexpr))) fn.ensures
   end;
-  (match ctx.state with
-   | Some st when not ctx.spec ->
-     List.iter
-       (fun ((_, pty), a) -> match (pty, a) with Ir.TClass c, T r -> List.iter (fun (_, t) -> assume ctx t) (class_invariants g c r st.env ctx.base) | _ -> ())
-       (zip fn.params args)
-   | _ -> ());
   r
+
+(* what a call leaves in the caller's state whether it returns or raises:
+   mutated list arguments get fresh contents, the fields it may write change,
+   and the objects it was passed satisfy their invariants (an object under
+   construction only if it returns); the changed arguments and the heap *)
+and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args arg_exprs ctx (st : state) loc =
+  let fn = callee.fn in
+  let muts = callee.mutated in
+  let post = ref SM.empty in
+  List.iter
+    (fun ((p, pty), a_e) ->
+      match a_e with
+      | Some { Ir.e = Var n; _ } when List.mem p muts -> (
+        match SM.find_opt n st.env with
+        | Some (D _) ->
+          let nd = fresh g n pty () in
+          st.env <- SM.add n nd st.env;
+          post := SM.add p nd !post
+        | Some (L old) ->
+          let keep = if List.mem p callee.appends then None else Some old.len in
+          let nv = match fresh g n pty ?len:keep () with L l -> l | _ -> assert false in
+          let nv = match keep with Some k -> { nv with off = old.off; len = k } | None -> assume ctx (le zero nv.len); nv in
+          st.env <- SM.add n (L nv) st.env;
+          post := SM.add p (L nv) !post
+        | _ -> raise (Vc_error ("mutated argument is not a list", loc)))
+      | _ -> ())
+    (zip fn.params arg_exprs);
+  havoc_call g callee args ctx;
+  List.iteri
+    (fun i ((_, pty), a) ->
+      match (pty, a) with
+      | Ir.TClass c, T r when returned || not (new_self && i = 0) -> List.iter (fun (_, t) -> assume ctx t) (class_invariants g c r st.env ctx.base)
+      | _ -> ())
+    (zip fn.params args);
+  SM.union (fun _ _ b -> Some b) !post (heap_env st.env)
+
+(* the state a call leaves when it raises: its contract describes normal
+   returns only, so only what it may change, and the invariants of the
+   objects it was passed, are known *)
+and threw g ctx (e : Ir.expr) =
+  match (e.e, ctx.state) with
+  | Call (f, args), Some st when not ctx.spec ->
+    let callee = match resolve g ctx.modpath f with Some c -> c | None -> raise (Vc_error (Printf.sprintf "unknown function '%s'" f, e.loc)) in
+    let vals = List.map (fun (a, (_, pty)) -> coerce (ev g ctx a) (Some pty)) (zip args callee.fn.params) in
+    if not (List.mem callee.key g.deps) then g.deps <- g.deps @ [ callee.key ];
+    let ends s suffix = String.length s >= String.length suffix && String.sub s (String.length s - String.length suffix) (String.length suffix) = suffix in
+    ignore (call_effects g ~new_self:(ends callee.fn.name ".__init__") ~returned:false callee vals (List.map Option.some args) ctx st e.loc);
+    NoneV
+  | Call _, _ -> NoneV
+  | _ -> raise (Vc_error ("'threw' takes a call", e.loc))
 
 (* the heap after a call: only the fields the callee may write change, and
    only on the objects it may write them on *)
@@ -1160,31 +1183,34 @@ and written_claims g cls env base =
   let pats = match w.node with Const _ -> [ [| select w r |] ] | _ -> [] in
   List.map (fun (inv, t) -> (inv, quant "forall" [ r ] (implies held t) pats)) (class_invariants g cls r env base)
 
-(* other tasks, or a generator's consumer, run while this code is suspended:
-   the objects it wrote and was passed must satisfy their invariants there *)
-and check_suspended g ctx (st : state) (site : Ir.loc) what =
-  let sctx = spec_ctx g ~quiet:false ~guard:ctx.guard ~base:st.facts ~env:st.env () in
-  List.iter
-    (fun c ->
-      let cls = c.cname in
-      match SM.find_opt (written_key cls) st.env with
-      | Some (T w) when w != no_writes ->
-        List.iter
-          (fun ((inv : Ir.clause), t) ->
-            oblige g ~site ~clause:inv "class.inv" sctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds at the %s for every object written so far" cls inv.text what))
-          (written_claims g cls st.env st.facts)
-      | _ -> ())
-    g.prog.classes;
+(* the objects this function was passed, and every other object it wrote a
+   field of, satisfy their invariants when control leaves it: on return, on
+   raise, and while it is suspended (other tasks, or a generator's consumer,
+   run then) *)
+and check_objects g ?(guard = []) facts env (site : Ir.loc) when_ =
+  let ctx = spec_ctx g ~quiet:false ~guard ~base:facts ~env () in
   List.iter
     (fun (p, (ty : Ir.ty)) ->
       match (ty, SM.find_opt p g.entry) with
       | TClass c, Some (T r) ->
         List.iter
-          (fun ((inv : Ir.clause), t) ->
-            oblige g ~site ~clause:inv "class.inv" sctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds for '%s' at the %s" c inv.text p what))
-          (class_invariants g c r st.env st.facts)
+          (fun ((inv : Ir.clause), t) -> oblige g ~site ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds for '%s' %s" c inv.text p when_))
+          (class_invariants g c r env facts)
       | _ -> ())
-    g.info.fn.params
+    g.info.fn.params;
+  List.iter
+    (fun c ->
+      let cls = c.cname in
+      match SM.find_opt (written_key cls) env with
+      | Some (T w) when w != no_writes ->
+        (* (not written on the paths that reach here otherwise) *)
+        let lines = List.sort_uniq compare (List.filter_map (fun (c', l) -> if c' = cls then Some l else None) g.written) in
+        let what = if lines = [] then "every object written so far" else "every object written at line " ^ String.concat ", " (List.map string_of_int lines) in
+        List.iter
+          (fun ((inv : Ir.clause), t) -> oblige g ~site ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds %s for %s" cls inv.text when_ what))
+          (written_claims g cls env facts)
+      | _ -> ())
+    g.prog.classes
 
 let state_ctx g ?(spec = false) (st : state) =
   { base = st.facts; modpath = g.info.modpath; env = st.env; live = Some st; guard = []; bound = SM.empty; old_env = None; result = None; spec; quiet = false; state = Some st }
@@ -1312,6 +1338,8 @@ and stmt g (s : Ir.stmt) (st : state) : state =
        else if g.info.fn.requires <> [] || g.info.fn.ensures <> [] then
          oblige g "raise" ctx ff loc (Printf.sprintf "raise %s is reachable (add '@raises <condition>' if intended)" what)
        (* without a contract, an explicit raise is what the function does, not a failure *));
+      (* (an object whose initializer raises never reaches the caller) *)
+      if not (is_init g) then check_objects g st.facts st.env loc "when it raises";
       st.alive <- false;
       st
     end
@@ -1680,33 +1708,7 @@ let check_exits g =
             oblige g ~site:ex.eloc ~clause:en "ensures" ctx gl en.cloc (Printf.sprintf "postcondition '%s'" en.text))
           fn.ensures;
         (* objects the function could have changed satisfy their invariants again *)
-        List.iter
-          (fun (p, (ty : Ir.ty)) ->
-            match (ty, SM.find_opt p g.entry) with
-            | TClass c, Some (T r) ->
-              let ctx = spec_ctx g ~quiet:false ~base:facts ~env:ex.eenv () in
-              List.iter
-                (fun ((inv : Ir.clause), t) ->
-                  oblige g ~site:ex.eloc ~clause:inv "class.inv" ctx t inv.cloc (Printf.sprintf "invariant of %s ('%s') holds for '%s' on return" c inv.text p))
-                (class_invariants g c r ex.eenv facts)
-            | _ -> ())
-          fn.params;
-        List.iter
-          (fun c ->
-            let cls = c.cname in
-            let lines = List.sort_uniq compare (List.filter_map (fun (c', l) -> if c' = cls then Some l else None) g.written) in
-            let unwritten = match SM.find_opt (written_key cls) ex.eenv with Some (T w) -> w == no_writes | _ -> true in
-            (* (written only on paths that do not reach this exit) *)
-            if lines <> [] && not unwritten then begin
-              let at = String.concat ", " (List.map string_of_int lines) in
-              let ctx = spec_ctx g ~quiet:false ~base:facts ~env:ex.eenv () in
-              List.iter
-                (fun ((inv : Ir.clause), t) ->
-                  oblige g ~site:ex.eloc ~clause:inv "class.inv" ctx t inv.cloc
-                    (Printf.sprintf "invariant of %s ('%s') holds on return for every object written at line %s" cls inv.text at))
-                (written_claims g cls ex.eenv facts)
-            end)
-          g.prog.classes;
+        check_objects g facts ex.eenv ex.eloc "on return";
         if fn.raises <> [] then begin
           let ctx = spec_ctx g ~base:facts ~env:g.entry () in
           let cond = or_ (List.map (fun (r : Ir.clause) -> term_of r.cloc (ev g ctx r.cexpr)) fn.raises) in

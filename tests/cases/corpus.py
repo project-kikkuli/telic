@@ -464,3 +464,20 @@ def new_wallets(ws: list[Wallet], n: int) -> None:
         w = Wallet()
         w.cents = 5
         ws.append(w)
+
+
+class Span:
+    #@ invariant self.lo <= self.hi
+
+    def __init__(self):
+        self.lo = 0
+        self.hi = 0
+
+
+# expect: refuted
+def stretch(s: Span, x: int) -> None:
+    #@ raises x < 0
+    s.lo = s.hi + 1
+    if x < 0:
+        raise ValueError("negative")
+    s.hi = s.lo

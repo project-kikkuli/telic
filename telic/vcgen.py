@@ -481,22 +481,23 @@ class VCGen:
             w, r = st.env[WRITTEN + cls], L.Const(f"r!{next(self.counter)}", L.INT)
             st.facts.append(L.Quant("forall", (r,), L.implies(L.select(w, r), L.select(st.env["@alloc"], r)), patterns=((L.select(w, r),),)))  # type: ignore[arg-type]
 
-    def check_suspended(self, ctx: Ctx, site: ir.Loc, what: str) -> None:
-        """Other tasks, or a generator's consumer, run while this code is
-        suspended: the objects it wrote and was passed must satisfy their
-        invariants there."""
-        st = ctx.state
-        assert st is not None
-        sctx = Ctx(base=st.facts, env=st.env, module=self.module, guard=ctx.guard, spec=True)
-        for cls in self.program.classes:
-            if st.env.get(WRITTEN + cls, NO_WRITES) is NO_WRITES:
-                continue
-            for inv, t in self.written_claims(cls, st.env, st.facts):
-                self.oblige("class.inv", sctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds at the {what} for every object written so far", site=site, clause=inv)
+    def check_objects(self, st: State, site: ir.Loc, when: str, guard: tuple[L.Term, ...] = ()) -> None:
+        """The objects this function was passed, and every other object it
+        wrote a field of, satisfy their invariants ``when`` control leaves it:
+        on return, on raise, and while it is suspended (other tasks, or a
+        generator's consumer, run then)."""
+        ctx = Ctx(base=st.facts, env=st.env, module=self.module, guard=guard, spec=True)
         for p in self.fn.params:
             if isinstance(p.ty, ir.TClass):
                 for inv, t in self.class_invariants(p.ty.name, self.entry[p.name], st.env, st.facts):  # type: ignore[arg-type]
-                    self.oblige("class.inv", sctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' at the {what}", site=site, clause=inv)
+                    self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' {when}", site=site, clause=inv)
+        for cls in self.program.classes:
+            if st.env.get(WRITTEN + cls, NO_WRITES) is NO_WRITES:
+                continue  # (not written on the paths that reach here)
+            at = ", ".join(str(n) for n in sorted(set(self.written.get(cls, []))))
+            what = f"every object written at line {at}" if at else "every object written so far"
+            for inv, t in self.written_claims(cls, st.env, st.facts):
+                self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds {when} for {what}", site=site, clause=inv)
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
         keys = self.heap_keys(cls, fname, strict=True)
@@ -698,23 +699,7 @@ class VCGen:
                 )
             # Objects this function could have changed must satisfy their
             # class invariants again when it returns.
-            for p in fn.params:
-                if isinstance(p.ty, ir.TClass):
-                    ref = self.entry[p.name]
-                    ctx = Ctx(base=st.facts, env=ex.env, module=self.module, spec=True)
-                    for inv, t in self.class_invariants(p.ty.name, ref, ex.env, st.facts):  # type: ignore[arg-type]
-                        self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {p.ty.name} ('{inv.text}') holds for '{p.name}' on return", site=ex.loc, clause=inv)
-            # ... and so must every other object it wrote a field of.
-            for cls in self.program.classes:
-                lines = self.written.get(cls)
-                if not lines:
-                    continue
-                if ex.env[WRITTEN + cls] is NO_WRITES:
-                    continue  # (written only on paths that do not reach this exit)
-                at = ", ".join(str(n) for n in sorted(set(lines)))
-                ctx = Ctx(base=st.facts, env=ex.env, module=self.module, spec=True)
-                for inv, t in self.written_claims(cls, ex.env, st.facts):
-                    self.oblige("class.inv", ctx, t, inv.loc, f"invariant of {cls} ('{inv.text}') holds on return for every object written at line {at}", site=ex.loc, clause=inv)
+            self.check_objects(State(ex.env, st.facts), ex.loc, "on return")
             if fn.raises:
                 ctx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
                 cond = L.or_(*[self.ev(r.expr, ctx) for r in fn.raises])
@@ -859,6 +844,8 @@ class VCGen:
             elif self.fn.requires or self.fn.ensures:
                 self.oblige("raise", ctx, L.FALSE, s.loc, f"raise {s.what} is reachable (add '@raises <condition>' if intended)")
             # (without a contract, an explicit raise is what the function does, not a failure)
+            if not self.is_init:  # (an object whose initializer raises never reaches the caller)
+                self.check_objects(st, s.loc, "when it raises")
             st.alive = False
             return st
         if isinstance(s, ir.ExprStmt):
@@ -1409,8 +1396,10 @@ class VCGen:
         name = e.name
         if name == "comp":
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
+        if name == "threw":
+            return self.ev_threw(e, ctx)
         if name == "await" and ctx.state is not None and not ctx.spec:
-            self.check_suspended(ctx, e.loc, "await")
+            self.check_objects(ctx.state, e.loc, "at the await", ctx.guard)
         if name == "dict_lit" and e.ty.key == ir.NONE:  # type: ignore[union-attr]
             return DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), e.ty)  # type: ignore[arg-type]
         if name == "dict_lit":
@@ -1777,7 +1766,7 @@ class VCGen:
         if not e.name.startswith(("caught exception", "default of")):
             self.note(e.loc, f"call:{e.name}")
         if e.name == "yield" and ctx.state is not None:
-            self.check_suspended(ctx, e.loc, "yield")
+            self.check_objects(ctx.state, e.loc, "at the yield", ctx.guard)
         if ctx.state is not None:
             env = ctx.state.env
             # It may change any list/dict variable passed to it, and, if it
@@ -1915,40 +1904,66 @@ class VCGen:
                     ctx.assume(fact)
         post = dict(pmap)
         if ctx.state is not None and not ctx.spec:
-            env = ctx.state.env
-            # Mutated list arguments get fresh contents.
-            for p, a_expr in zip(fn.params, arg_exprs):
-                if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
-                    nd = self.fresh(a_expr.name, p.ty)
-                    env[a_expr.name] = nd
-                    post[p.name] = nd
-                    continue
-                if p.name in muts and isinstance(a_expr, ir.Var):
-                    old = env[a_expr.name]
-                    assert isinstance(old, ListVal)
-                    keep = None if p.name in self.program.appends.get(callee.key, ()) else old.len
-                    nv = self.fresh(a_expr.name, p.ty, len_=keep)
-                    assert isinstance(nv, ListVal)
-                    if keep is not None:
-                        nv = ListVal(nv.arr, old.off, keep, nv.ty)
-                    else:
-                        ctx.assume(L.le(L.ZERO, nv.len))
-                    env[a_expr.name] = nv
-                    post[p.name] = nv
-            self.havoc_call(callee, args, new_self, ctx)
-            post.update(self.heap_env(env))
+            post.update(self.call_effects(callee, args, arg_exprs, ctx, new_self))
         # Assume the postcondition (code context; spec calls use lemma axioms).
         if not ctx.spec and fn.ensures and not self.definitional_mode:
             ectx = Ctx(base=ctx.base, env=post, module=callee.module, guard=ctx.guard, old_env={**heap_pre, **pmap}, result=r if r is not NONE_V else None, spec=True, quiet=True)
             for en in fn.ensures:
                 ctx.assume(self.ev(en.expr, ectx))
-        # ... and objects come back satisfying their invariants.
-        if ctx.state is not None and not ctx.spec:
-            for i, p in enumerate(fn.params):
-                if isinstance(p.ty, ir.TClass):
-                    for _, t in self.class_invariants(p.ty.name, args[i], ctx.state.env, ctx.base):  # type: ignore[arg-type]
-                        ctx.assume(t)
         return r
+
+    def call_effects(self, callee: FuncRef, args: list[Val], arg_exprs: list[ir.Expr | None], ctx: Ctx, new_self: bool = False, returned: bool = True) -> dict[str, Val]:
+        """What a call leaves in the caller's state whether it returns or
+        raises: mutated list arguments get fresh contents, the fields it may
+        write change, and the objects it was passed satisfy their invariants
+        (an object under construction only if it returns). Returns the
+        changed arguments and the heap."""
+        assert ctx.state is not None
+        fn = callee.fn
+        muts = self.program.mutated.get(callee.key, set())
+        post: dict[str, Val] = {}
+        env = ctx.state.env
+        for p, a_expr in zip(fn.params, arg_exprs):
+            if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
+                nd = self.fresh(a_expr.name, p.ty)
+                env[a_expr.name] = nd
+                post[p.name] = nd
+                continue
+            if p.name in muts and isinstance(a_expr, ir.Var):
+                old = env[a_expr.name]
+                assert isinstance(old, ListVal)
+                keep = None if p.name in self.program.appends.get(callee.key, ()) else old.len
+                nv = self.fresh(a_expr.name, p.ty, len_=keep)
+                assert isinstance(nv, ListVal)
+                if keep is not None:
+                    nv = ListVal(nv.arr, old.off, keep, nv.ty)
+                else:
+                    ctx.assume(L.le(L.ZERO, nv.len))
+                env[a_expr.name] = nv
+                post[p.name] = nv
+        self.havoc_call(callee, args, new_self, ctx)
+        post.update(self.heap_env(env))
+        for i, p in enumerate(fn.params):
+            if isinstance(p.ty, ir.TClass) and (returned or not (new_self and i == 0)):
+                for _, t in self.class_invariants(p.ty.name, args[i], env, ctx.base):  # type: ignore[arg-type]
+                    ctx.assume(t)
+        return post
+
+    def ev_threw(self, e: ir.Builtin, ctx: Ctx) -> Val:
+        """The state a call leaves when it raises: its contract describes
+        normal returns only, so only what it may change, and the invariants
+        of the objects it was passed, are known."""
+        c = e.args[0]
+        assert isinstance(c, ir.Call)
+        callee = self.program.resolve(ctx.module, c.func)
+        if callee is None:
+            raise VCError(f"unknown function '{c.func}'", e.loc)
+        if ctx.state is not None and not ctx.spec:
+            args = [coerce(self.ev(a, ctx), p.ty) for a, p in zip(c.args, callee.fn.params)]
+            self.deps.add(callee.key)
+            exprs: list[ir.Expr | None] = list(c.args)
+            self.call_effects(callee, args, exprs, ctx, new_self=callee.fn.name.endswith(".__init__"), returned=False)
+        return NONE_V
 
     def havoc_call(self, callee: FuncRef, args: list[Val], new_self: bool, ctx: Ctx) -> None:
         """The heap after a call: only the fields the callee may write change,

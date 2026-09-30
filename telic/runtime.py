@@ -242,7 +242,34 @@ class FunctionInstrumenter:
         tail: list[ast.stmt] = []
         if fn.ret == ir.NONE and post_checks:
             tail = [ast.Assign(targets=[ast.Name(id="__telic_r", ctx=ast.Store())], value=ast.Constant(None))] + post_checks
-        self.node.body = doc + pre + body + tail
+        body = body + tail
+        if inv_post and not fn.name.endswith(".__init__"):
+            # an exception carries the objects to whoever catches it: their
+            # invariants must hold then too (an initializer's object is lost)
+            violation = ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="ContractViolation", ctx=ast.Load())
+            body = [
+                ast.Try(
+                    body=body,
+                    handlers=[
+                        ast.ExceptHandler(type=violation, name=None, body=[ast.Raise()]),
+                        ast.ExceptHandler(type=ast.Name(id="Exception", ctx=ast.Load()), name=None, body=[
+                            ast.Try(
+                                body=[copy.deepcopy(c) for c in inv_post],
+                                handlers=[ast.ExceptHandler(type=copy.deepcopy(violation), name="__telic_v", body=[
+                                    ast.Assign(targets=[ast.Attribute(value=ast.Name(id="__telic_v", ctx=ast.Load()), attr="detail", ctx=ast.Store())], value=ast.Constant("raised")),
+                                    ast.Raise(exc=ast.Name(id="__telic_v", ctx=ast.Load())),
+                                ])],
+                                orelse=[],
+                                finalbody=[],
+                            ),
+                            ast.Raise(),
+                        ]),
+                    ],
+                    orelse=[],
+                    finalbody=[],
+                )
+            ]
+        self.node.body = doc + pre + body
 
     def _instrument_block(self, parent: ast.AST, field: str) -> None:
         stmts: list[ast.stmt] = getattr(parent, field)

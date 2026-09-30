@@ -179,10 +179,50 @@ function compileSpec(params, text) {
   return new Function(...params, "result", "__old", ...Object.keys(helpers), `return (${js});`);
 }
 
-// Enforce a function's (or method's) @requires/@ensures. For a method the
-// contract's `this` is the receiver.
+// Class invariants hold of the objects a function is passed, on entry and
+// whenever it returns or throws, and of every object it changes.
+const invCache = new Map();
+const invFns = (texts) => texts.map((t) => {
+  if (!invCache.has(t)) invCache.set(t, compileSpec([], t));
+  return [t, invCache.get(t)];
+});
+const holds = (f, o, H) => {
+  try {
+    return !!f.call(o, undefined, [], ...H);
+  } catch {
+    return true; // (an invariant that cannot be evaluated here demonstrates nothing)
+  }
+};
+
+function reachable(roots) {
+  const out = new Set();
+  const stack = [...roots];
+  while (stack.length && out.size < 10000) {
+    const v = stack.pop();
+    if (!v || typeof v !== "object" || out.has(v)) continue;
+    out.add(v);
+    if (Array.isArray(v)) for (let i = 0; i < v.length; i++) stack.push(Reflect.get(v, i));
+    else if (v instanceof Map) for (const [k, x] of v) stack.push(k, x);
+    else if (v instanceof Set) for (const x of v) stack.push(x);
+    else for (const x of Object.values(v)) stack.push(x);
+  }
+  return out;
+}
+
+const fieldsOf = (o) => (Array.isArray(o) || o instanceof Map || o instanceof Set ? [] : Object.entries(o));
+const changed = (o, before) => {
+  const now = fieldsOf(o);
+  return now.length !== before.length || now.some(([k, v], i) => before[i][0] !== k || !Object.is(before[i][1], v));
+};
+
+// Enforce a function's (or method's) @requires/@ensures and class invariants.
+// For a method the contract's `this` is the receiver.
 function wrap(name, fn, c) {
-  if (!c || (!c.requires.length && !c.ensures.length)) return fn;
+  if (!c) return fn;
+  const pinv = (c.invs || []).map(([p, texts]) => [p, invFns(texts)]);
+  const cinv = Object.fromEntries(Object.entries(c.classes || {}).map(([k, texts]) => [k, invFns(texts)]));
+  const tracks = Object.keys(cinv).length > 0;
+  if (!c.requires.length && !c.ensures.length && !pinv.length && !tracks) return fn;
   const params = c.params[0] === "self" ? c.params.slice(1) : c.params;
   const reqs = c.requires.map((t) => [t, compileSpec(params, t)]);
   const ens = c.ensures.map((t) => {
@@ -191,33 +231,63 @@ function wrap(name, fn, c) {
   });
   const H = Object.values(helpers);
   return function (...args) {
-    for (const [t, f] of reqs) if (!f.call(this, ...args, undefined, [], ...H)) throw new Violation("requires", t, name);
-    const olds = ens.map(([, , os]) => os.map((o) => structuredCloneSafe(o.call(this, ...args, undefined, [], ...H))));
     const self = this;
-    const r = fn.apply(this, args);
+    const objOf = (p) => (p === "self" ? self : args[params.indexOf(p)]);
+    const passedIn = (kind, how = "") => {
+      for (const [p, fs] of pinv) {
+        const o = objOf(p);
+        if (o && typeof o === "object") for (const [t, f] of fs) if (!holds(f, o, H)) throw new Violation(kind, t, name, how);
+      }
+    };
+    for (const [t, f] of reqs) if (!f.call(this, ...args, undefined, [], ...H)) throw new Violation("requires", t, name);
+    passedIn("requires");
+    const before = tracks ? new Map([...reachable([this, ...args])].map((o) => [o, fieldsOf(o)])) : null;
+    const invariants = (v, how = "") => {
+      passedIn("class.inv", how);
+      if (!tracks) return;
+      for (const o of reachable([self, ...args, v])) {
+        const fs = cinv[o.constructor && o.constructor.name];
+        if (!fs || (before.has(o) && !changed(o, before.get(o)))) continue;
+        for (const [t, f] of fs) if (!holds(f, o, H)) throw new Violation("class.inv", t, name, how);
+      }
+    };
+    const olds = ens.map(([, , os]) => os.map((o) => structuredCloneSafe(o.call(this, ...args, undefined, [], ...H))));
+    const thrown = (e) => {
+      if (!(e instanceof Violation)) invariants(undefined, "raised");
+      throw e;
+    };
+    let r;
+    try {
+      r = fn.apply(this, args);
+    } catch (e) {
+      thrown(e);
+    }
     const done = (v) => {
       ens.forEach(([t, f], k) => {
         if (!f.call(self, ...args, v, olds[k], ...H)) throw new Violation("ensures", t, name, `returned ${show(v)}`);
       });
+      invariants(v);
       return v;
     };
-    return r && typeof r.then === "function" ? r.then(done) : done(r);
+    return r && typeof r.then === "function" ? r.then(done, thrown) : done(r);
   };
 }
 
 // A constructor's contract: @requires on its arguments before it runs,
-// @ensures of the object it built.
-function wrapClass(name, C, c) {
-  if (!c || (!c.requires.length && !c.ensures.length) || typeof C !== "function") return C;
-  const params = c.params.slice(1);
-  const reqs = c.requires.map((t) => [t, compileSpec(params, t)]);
-  const ens = c.ensures.map((t) => [t, compileSpec(params, extractOld(t)[0])]);
+// @ensures and the class invariants of the object it built.
+function wrapClass(name, C, c, invs) {
+  if (typeof C !== "function" || ((!c || (!c.requires.length && !c.ensures.length)) && !invs.length)) return C;
+  const params = c ? c.params.slice(1) : [];
+  const reqs = c ? c.requires.map((t) => [t, compileSpec(params, t)]) : [];
+  const ens = c ? c.ensures.map((t) => [t, compileSpec(params, extractOld(t)[0])]) : [];
+  const inv = invFns(invs);
   const H = Object.values(helpers);
   return new Proxy(C, {
     construct(target, args, newTarget) {
       for (const [t, f] of reqs) if (!f.call(undefined, ...args, undefined, [], ...H)) throw new Violation("requires", t, name);
       const o = Reflect.construct(target, args, newTarget === C ? target : newTarget);
       for (const [t, f] of ens) if (!f.call(o, ...args, undefined, [], ...H)) throw new Violation("ensures", t, name, `built ${show(o)}`);
+      if (newTarget === C) for (const [t, f] of inv) if (!holds(f, o, H)) throw new Violation("class.inv", t, name);
       return o;
     },
   });
@@ -271,13 +341,14 @@ function load(path, contracts) {
   }
   let suffix = "\n;";
   for (const n of decls) if (contracts[n]) suffix += `${n} = (globalThis as any).__telic_wrap(${JSON.stringify(n)}, ${n});\n`;
-  for (const n of classes) if (contracts[`${n}.__init__`]) suffix += `${n} = (globalThis as any).__telic_wrap_class(${JSON.stringify(`${n}.__init__`)}, ${n});\n`;
+  const invsOf = (n) => (contracts.__classes__ || {})[n] || [];
+  for (const n of classes) if (contracts[`${n}.__init__`] || invsOf(n).length) suffix += `${n} = (globalThis as any).__telic_wrap_class(${JSON.stringify(`${n}.__init__`)}, ${n});\n`;
   suffix += `(globalThis as any).__telic_fns = { ${decls.concat(consts, classes).join(", ")} };\n`;
   const js = ts.transpileModule(src + suffix, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const sandbox = { console: { log() {}, error() {}, warn() {}, info() {}, debug() {} }, structuredClone, Map, Set, Date, JSON, Math, Promise, Error, TypeError, RangeError, Number, String, Object, Array, Symbol, parseInt, parseFloat, isNaN, isFinite, setTimeout, clearTimeout };
   sandbox.globalThis = sandbox;
   sandbox.__telic_wrap = (n, f) => wrap(n, f, contracts[n]);
-  sandbox.__telic_wrap_class = (n, C) => wrapClass(n, C, contracts[n]);
+  sandbox.__telic_wrap_class = (n, C) => wrapClass(n, C, contracts[n], (contracts.__classes__ || {})[n.split(".")[0]] || []);
   vm.createContext(sandbox);
   const cache = new Map();
   const mod = { exports: {} };

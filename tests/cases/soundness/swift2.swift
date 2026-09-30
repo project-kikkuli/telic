@@ -142,8 +142,8 @@ func lazyRead(_ l: Lazy) -> Int {
     return l.cached
 }
 
-// A method that throws may have changed its object first: its invariant is
-// not known after the throw.
+// A method that throws may have changed its object first: it must restore
+// the invariant before it throws, as before it returns.
 enum Oops: Error {
     case bad
 }

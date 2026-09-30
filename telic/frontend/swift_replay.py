@@ -381,6 +381,7 @@ class Harness:
         plist = ", ".join(f"_ {pn}: {self.ty_text(tn)}" for pn, tn, _ in ps)
         pargs = ", ".join(pn for pn, _, _ in ps)
         checks_code: list[str] = []
+        throw_checks: list[str] = []
         pre_code: list[str] = []
         if checks:
             reqs = [c.text for c in fn.requires if "old(" not in c.text]
@@ -421,6 +422,8 @@ class Harness:
                 for i, inv in enumerate(invs):
                     self.decls.append(f"extension {host} {{ func __telicInv{i}() -> Bool {{ {inv} }} }}")
                     checks_code.append(f"if !{target}.__telicInv{i}() {{ print(\"TELIC_VIOLATION class.inv {i}\") }}")
+                    if recv:  # (the error carries the receiver to whoever catches it)
+                        throw_checks.append(f"if !__self.__telicInv{i}() {{ print(\"TELIC_VIOLATION class.inv {i}\") }}")
         if info.kind == "init" and info.failable:
             checks_code = [f"if let __v = __v {{ {' '.join(checks_code)} }}"] if checks_code else []
         enc = self.encoder(ret_n) if not is_void and info.kind != "init" else ("telicVoid" if is_void else "telicInitE")
@@ -431,7 +434,7 @@ class Harness:
         body = "\n    ".join(lines + pre_code)
         inner = "\n        ".join([call_line] + checks_code + [f'print("TELIC_RETURNED " + {enc}(__v))'])
         if info.throws:
-            run = f"do {{\n        {inner}\n    }} catch {{ print(\"TELIC_THROW \\(error)\") }}"
+            run = f"do {{\n        {inner}\n    }} catch {{ {''.join(c + '; ' for c in throw_checks)}print(\"TELIC_THROW \\(error)\") }}"
         else:
             run = inner
         main = f"""
@@ -662,6 +665,8 @@ def _parse_case(lines: list[str]) -> dict[str, Any] | None:
             _, kind, i = line.split()
             out.update({"violation": kind, "index": int(i)})
         elif line.startswith("TELIC_THROW "):
+            if "violation" in out:
+                return {**out, "detail": "raised"}
             return {"crash": "throw", "msg": line[len("TELIC_THROW "):]}
         elif line.startswith("TELIC_RETURNED "):
             text = line[len("TELIC_RETURNED "):]
@@ -723,7 +728,8 @@ def describe(out: dict[str, Any], fn: ir.Function, h: Harness) -> dict[str, Any]
         c = fn.ensures[out["index"]]
         return {"violation": "ensures", "func": ir.source_name(fn.name), "text": c.text, "detail": f"returned {out.get('returned_repr', '')}".strip(), "returned_repr": out.get("returned_repr")}
     if out.get("violation") == "class.inv":
-        return {"violation": "class.inv", "func": ir.source_name(fn.name), "text": h.invariants()[out["index"]], "returned_repr": out.get("returned_repr")}
+        seen = {k: out[k] for k in ("returned_repr", "detail") if k in out}
+        return {"violation": "class.inv", "func": ir.source_name(fn.name), "text": h.invariants()[out["index"]], **seen}
     return out
 
 

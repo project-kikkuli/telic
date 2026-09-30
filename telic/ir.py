@@ -146,6 +146,21 @@ class TEnum:
 
 Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass, TOpaque, TEnum]
 
+
+def reaches_object(t: Type) -> bool:
+    """Can a value of type ``t`` lead to an object's fields?"""
+    if isinstance(t, TClass):
+        return True
+    if isinstance(t, TList):
+        return reaches_object(t.elem)
+    if isinstance(t, TDict):
+        return reaches_object(t.key) or reaches_object(t.val)
+    if isinstance(t, TOption):
+        return reaches_object(t.inner)
+    if isinstance(t, TRecord):
+        return any(reaches_object(ft) for _, ft in t.fields)
+    return False
+
 INT, REAL, BOOL, STR, NONE = TInt(), TReal(), TBool(), TStr(), TNone()
 
 
