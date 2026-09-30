@@ -116,10 +116,12 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         key = (v["__object__"], v["ref"])
         if key in names:
             return names[key]
+        # objects are numbered as they are shown: the solver's own references are arbitrary
+        num = names.setdefault(("#", key), sum(1 for k in names if isinstance(k, tuple) and k and k[0] == "#"))
         if v["fields"] is None:
-            return f"<{v['__object__']} #{v['ref']}>"
-        names[key] = label or f"#{v['ref']}"
-        tag = v["__object__"] if label else f"{v['__object__']} #{v['ref']}"
+            return f"<{v['__object__']} #{num}>"
+        names[key] = label or f"#{num}"
+        tag = v["__object__"] if label else f"{v['__object__']} #{num}"
         inner = " ".join(f"{k}={format_value(x, None, lang, names)}" for k, x in v["fields"].items())
         return f"<{tag} {inner}>" if inner else f"<{tag}>"
     if isinstance(v, dict) and "__enum__" in v:

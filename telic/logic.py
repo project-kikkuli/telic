@@ -514,7 +514,9 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
     if isinstance(t, Quant):
         inner = {k: v for k, v in m.items() if k not in t.vars}
         body = substitute(t.body, inner)
-        return t if body is t.body else Quant(t.kind, t.vars, body)
+        if body is t.body:
+            return t
+        return Quant(t.kind, t.vars, body, patterns=tuple(tuple(substitute(p, inner) for p in ps) for ps in t.patterns))
     return t
 
 
@@ -632,9 +634,12 @@ def theory_lemmas(elem: Sort) -> list[Axiom]:
         )
     )
     out.append(Axiom(f"{ss}_split", q((a, lo, mid, hi), implies(and_(le(lo, mid), le(mid, hi)), eq(S(a, lo, hi), add(S(a, lo, mid), S(a, mid, hi)))), ((S(a, lo, mid), S(a, mid, hi)),)), "", "sum splits at any midpoint", ss))
+    at_k = and_(le(lo, k), lt(k, hi))
+    out.append(Axiom(f"{ss}_elem_le", q((a, lo, hi, k), implies(and_(inner, at_k), le(select(a, k), S(a, lo, hi))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-negatives is at most their sum", ss))
+    out.append(Axiom(f"{ss}_elem_ge", q((a, lo, hi, k), implies(and_(inner_np, at_k), le(S(a, lo, hi), select(a, k))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-positives is at least their sum", ss))
     out.append(Axiom(f"{sc}_bounds", q((a, lo, hi, v), and_(le(ZERO, C(a, lo, hi, v)), le(C(a, lo, hi, v), max_(sub(hi, lo), ZERO))), ((C(a, lo, hi, v),),)), "", "a count lies between 0 and the length", sc))
     out.append(Axiom(f"{sc}_front", q((a, lo, hi, v), implies(lt(lo, hi), eq(C(a, lo, hi, v), add(ite(eq(select(a, lo), v), ONE, ZERO), C(a, add(lo, ONE), hi, v)))), ((C(a, lo, hi, v), select(a, lo)),)), "", "count peels off its first element", sc))
-    del b, mid
+    del mid
     return out
 
 

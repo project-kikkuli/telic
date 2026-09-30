@@ -28,11 +28,12 @@ obligations grows with the size of the function, not with its path count.
 from __future__ import annotations
 
 import itertools
+import json
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Union
 
-from . import ir
+from . import ir, irjson
 from . import logic as L
 from .program import FuncRef, Program, in_place, reaches_unchecked, unchecked_constructor
 
@@ -360,7 +361,13 @@ class Ctx:
         """Assume ``t`` for every value of the enclosing quantifier
         variables. Sound only when every fresh symbol in ``t`` is a
         function of them."""
-        self.base.append(L.forall(self.binders, L.implies(L.and_(*self.guard), t)))
+        guard = L.and_(*self.guard)
+        if isinstance(t, L.Quant) and t.kind == "forall" and t.patterns and all(any(b == x for p in t.patterns for u in p for x in L.iter_terms(u)) for b in self.binders):
+            # one quantifier, triggered where the inner one is: a nested
+            # quantifier over the binders alone has nothing to trigger on
+            self.base.append(L.Quant("forall", self.binders + t.vars, L.implies(guard, t.body), patterns=t.patterns))
+            return
+        self.base.append(L.forall(self.binders, L.implies(guard, t)))
 
 
 @dataclass
@@ -422,6 +429,14 @@ class VCGen:
         self.lc_written: list[str] = []  # classes of the non-parameter objects it writes a field of
         self.lc_sites: list[tuple[list[L.Term], L.Term, L.Term, str, dict[str, Val], bool]] = []
         self._shared: set[str] | None = None
+        # pure comprehension arrays -> (their body, enclosing quantifier variables);
+        # sums over them by body: (array, length, sum, quantifier variables)
+        self.comp_bodies: dict[L.Term, tuple[str, tuple[L.Const, ...]]] = {}
+        self.comp_memo: dict[tuple, L.Term] = {}
+        self.comp_sums: dict[str, list[tuple[L.Term, L.Term, L.Term, tuple[L.Const, ...]]]] = {}
+        # facts relating two of those sums, and the terms (or, quantified, the
+        # function names) an obligation must mention for them to matter
+        self.pair_facts: list[tuple[L.Term, frozenset]] = []
 
     # -- naming -----------------------------------------------------------
 
@@ -809,6 +824,9 @@ class VCGen:
             return [L.select(alloc, v)]  # type: ignore[arg-type]
         if isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TClass) and isinstance(v, OptVal):
             return [L.implies(v.some, L.select(alloc, v.val))]  # type: ignore[arg-type]
+        if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TClass) and isinstance(v, ListVal):
+            i = L.Const(f"i!{next(self.counter)}", L.INT)
+            return [L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), L.select(alloc, v.at(i))), patterns=((v.at(i),),))]  # type: ignore[arg-type]
         return []
 
     def post_env(self, exit_env: dict[str, Val]) -> dict[str, Val]:
@@ -1204,6 +1222,8 @@ class VCGen:
                 h.env[name] = nv
             else:
                 h.env[name] = self.fresh(name, ty)
+            if "@alloc" in h.env:
+                h.facts.extend(self.alloc_facts(h.env[name], ty, h.env))
         return h
 
     def cut(self, names: set[str], st: State, site: ir.Loc, at_head: bool = False) -> None:
@@ -1428,6 +1448,8 @@ class VCGen:
         if wrap:
             ok = L.and_(L.le(L.neg(n), i), L.lt(i, n))
             self.oblige("index", ctx, ok, loc, f"index into '{what}' is within -len..len-1")
+            if _nonneg_under(i, ctx.guard):
+                return i
             return L.ite(L.lt(i, L.ZERO), L.add(i, n), i)
         ok = L.and_(L.le(L.ZERO, i), L.lt(i, n))
         self.oblige("index", ctx, ok, loc, f"index into '{what}' is within 0..len-1")
@@ -1891,7 +1913,9 @@ class VCGen:
             assert isinstance(xs, ListVal)
             fd = "seqsum" if xs.ty.elem == ir.INT else "seqsum_r"
             self.theory_fns.add(fd)
-            return L.Fn(fd, (xs.arr, xs.off, L.add(xs.off, xs.len)), sort_of(xs.ty.elem))
+            total = L.Fn(fd, (xs.arr, xs.off, L.add(xs.off, xs.len)), sort_of(xs.ty.elem))
+            self.comp_sum(xs, total)
+            return total
         if name == "count":
             xs, v = args
             assert isinstance(xs, ListVal)
@@ -1914,6 +1938,8 @@ class VCGen:
                 assert not isinstance(b, ListVal)
                 return L.ite(L.lt(b, L.ZERO), L.max_(L.add(b, n), L.ZERO), L.min_(b, n))
 
+            if lo is NONE_V and hi is NONE_V:
+                return xs
             lo2 = norm(lo, L.ZERO)
             hi2 = norm(hi, n)
             return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty)
@@ -2007,7 +2033,10 @@ class VCGen:
             self.note(e.loc, "operations on values from unchecked code do not raise")
         if cond is None:
             b = self.ev(body, sub)
+            arr = self.same_comp(arr, b, seq, i, ctx)
             assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
+            key = json.dumps([elem, irjson.without_locs(irjson.expr(body))], sort_keys=True, default=str)
+            self.comp_bodies[arr] = (key, ctx.binders if isinstance(arr, L.Fn) else ())
         else:
             c = self.ev(cond, sub)
             self.ev(body, sub.sub(c))  # type: ignore[arg-type]
@@ -2020,6 +2049,58 @@ class VCGen:
             # every element comes from some accepted source element
             assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
         return ListVal(arr, L.ZERO, ln, e.ty)
+
+    def same_comp(self, arr: L.Term, b: L.Term, seq: ListVal, i: L.Const, ctx: Ctx) -> L.Term:
+        """The array of an earlier comprehension computing the same elements
+        from the same list (``b`` is element ``i``), else ``arr``: then sums
+        over both are one term. Both definitions agree wherever both apply."""
+        x = L.Const("@elem", seq.at(i).sort)
+        m: dict[L.Term, L.Term] = {seq.at(i): x}
+        m.update({v: L.Const(f"@{k}", v.sort) for k, v in enumerate(ctx.binders)})
+        shape = L.substitute(b, m)
+        if i in L.consts(shape):
+            return arr
+        key = (L.canonical(shape), L.canonical(seq.arr), L.canonical(seq.off), L.canonical(seq.len), tuple(str(v.sort) for v in ctx.binders), isinstance(arr, L.Fn))
+        old = self.comp_memo.setdefault(key, arr)
+        if old is arr:
+            return arr
+        return L.Fn(old.name, ctx.binders, arr.sort) if isinstance(old, L.Fn) else old  # type: ignore[attr-defined]
+
+    def comp_sum(self, xs: ListVal, total: L.Term) -> None:
+        """Relate a sum over a comprehension to the earlier sums over ones with
+        the same body: equal on their common prefix wherever the elements are
+        (seqsum_ext), and each the sum of that prefix and the rest (seqsum_split)."""
+        info = self.comp_bodies.get(xs.arr)
+        if info is None or xs.off != L.ZERO or not isinstance(total, L.Fn):
+            return
+        key, binders = info
+        sums = self.comp_sums.setdefault(key, [])
+        for arr2, len2, total2, binders2 in sums:
+            if [b.sort for b in binders2] != [b.sort for b in binders] or L.ZERO in (xs.len, len2):
+                continue
+            vs = tuple(L.Const(f"{b.name.split('!')[0]}!{next(self.counter)}", b.sort) for b in binders)
+            m1: dict[L.Term, L.Term] = dict(zip(binders, vs))
+            m2: dict[L.Term, L.Term] = dict(zip(binders2, vs))
+            a1, n1, t1 = (L.substitute(x, m1) for x in (xs.arr, xs.len, total))
+            a2, n2, t2 = (L.substitute(x, m2) for x in (arr2, len2, total2))
+
+            def S(a: L.Term, lo: L.Term, hi: L.Term) -> L.Term:
+                return L.Fn(total.name, (a, lo, hi), total.sort)  # type: ignore[attr-defined]
+
+            k = _shorter(n1, n2)
+            # skolemized: where the prefixes differ, if anywhere (a fresh symbol)
+            d = L.Fn(f"diff!{next(self.counter)}", vs, L.INT)
+            parts = [L.or_(L.and_(L.le(L.ZERO, d), L.lt(d, k), L.ne(L.select(a1, d), L.select(a2, d))), L.eq(S(a1, L.ZERO, k), S(a2, L.ZERO, k)))]
+            parts += [L.eq(t, L.add(S(a, L.ZERO, k), _tail(S, a, k, n))) for a, n, t in ((a1, n1, t1), (a2, n2, t2)) if n != k]
+            fact = L.implies(L.and_(L.le(L.ZERO, n1), L.le(L.ZERO, n2)), L.and_(*parts))
+            if vs:
+                pats = next((p for p in ((t1, t2), (a1, a2)) if _triggerable(p) and all(any(v == x for t in p for x in L.iter_terms(t)) for v in vs)), None)
+                fact = L.Quant("forall", vs, fact, patterns=(pats,) if pats else ())
+                need = frozenset(x.name for a in (a1, a2) for x in L.iter_terms(a) if isinstance(x, L.Fn))
+            else:
+                need = frozenset((t1, t2))
+            self.pair_facts.append((fact, need))
+        sums.append((xs.arr, xs.len, total, binders))
 
     def defined_symbol(self, ctx: Ctx, name: str, srt: L.Sort, pure: bool = True):
         """A new symbol and how to assume its definition. Under a quantifier
@@ -2447,7 +2528,7 @@ class VCGen:
         """The lemmas about terms the obligation mentions, and what those
         lemmas mention in turn, except applications of predicates in the
         unfolded one's own recursion group (the fuel bound, per obligation)."""
-        if not self.lemma_info:
+        if not self.lemma_info and not self.pair_facts:
             return []
         present: set[L.Term] = set()
         heads: set[str] = set()
@@ -2476,7 +2557,8 @@ class VCGen:
                     chosen.add(i)
                     mention(fact, pred)
                     changed = True
-        return [self.lemma_info[i][0] for i in sorted(chosen)]
+        pairs = [fact for fact, need in self.pair_facts if need <= heads or need <= present]
+        return [self.lemma_info[i][0] for i in sorted(chosen)] + pairs
 
     def box_facts(self, b: L.Term, v: Val, ty: ir.Type, ctx: Ctx, known: bool) -> None:
         """How a checked value ``v`` of type ``ty`` looks through the
@@ -2648,6 +2730,47 @@ def lex_lt(a: list[L.Term], b: list[L.Term]) -> L.Term:
 
 
 PREDICATE_FUEL = 1
+
+
+def _tail(S, a: L.Term, k: L.Term, n: L.Term) -> L.Term:
+    """``S(a, k, n)``, the sum of ``a[k:n]``, spelled out where ``n`` is ``k``
+    plus a small constant (a list appended to), branch by branch."""
+    if isinstance(n, L.App) and n.op == "ite":
+        return L.ite(n.args[0], _tail(S, a, k, n.args[1]), _tail(S, a, k, n.args[2]))
+    if n == k:
+        return L.lit(0, a.sort.elem)  # type: ignore[arg-type]
+    if isinstance(n, L.App) and n.op == "add" and n.args[0] == k and isinstance(n.args[1], L.IntV) and 0 < n.args[1].value <= 4:
+        out = L.select(a, k)
+        for j in range(1, n.args[1].value):
+            out = L.add(out, L.select(a, L.add(k, L.IntV(j))))
+        return out
+    return S(a, k, n)
+
+
+def _nonneg_under(i: L.Term, guard: tuple[L.Term, ...]) -> bool:
+    """Does a conjunct of ``guard`` say ``c <= i`` for a constant ``c >= 0``
+    (a quantifier over ``range(c, ...)``)?"""
+    todo = list(guard)
+    while todo:
+        g = todo.pop()
+        if isinstance(g, L.App) and g.op == "and":
+            todo.extend(g.args)
+        elif isinstance(g, L.App) and g.op == "le" and g.args[1] == i and isinstance(g.args[0], L.IntV) and g.args[0].value >= 0:
+            return True
+    return False
+
+
+def _shorter(a: L.Term, b: L.Term) -> L.Term:
+    """min(a, b) of two lengths, without a case split when one is the other
+    plus a non-negative constant (a list and the same list appended to)."""
+    for x, y in ((a, b), (b, a)):
+        if x == L.ZERO:
+            return x
+        if x == y or (isinstance(y, L.App) and y.op == "add" and y.args[0] == x and isinstance(y.args[1], L.IntV) and y.args[1].value >= 0):
+            return x
+        if isinstance(x, L.App) and x.op == "ite":
+            return L.ite(x.args[0], _shorter(x.args[1], y), _shorter(x.args[2], y))
+    return L.min_(a, b)
 
 
 def _triggerable(ts: tuple[L.Term, ...]) -> bool:

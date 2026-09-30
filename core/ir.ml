@@ -306,3 +306,27 @@ let assigned_names (ss : stmt list) : string list =
       | _ -> ())
     ss;
   !out
+
+(* an expression without its positions: equal for the same code written twice *)
+let rec strip (x : expr) : expr =
+  let s = strip in
+  let e =
+    match x.e with
+    | Old a -> Old (s a)
+    | Unary (o, a) -> Unary (o, s a)
+    | Binary (o, a, b) -> Binary (o, s a, s b)
+    | Ite (a, b, c) -> Ite (s a, s b, s c)
+    | Call (f, xs) -> Call (f, List.map s xs)
+    | Builtin (f, xs) -> Builtin (f, List.map s xs)
+    | Index (a, b, w) -> Index (s a, s b, w)
+    | Field (a, f) -> Field (s a, f)
+    | Quant q -> Quant { q with lo = s q.lo; hi = s q.hi; body = s q.body; seq = Option.map s q.seq }
+    | ListLit xs -> ListLit (List.map s xs)
+    | RecordLit fs -> RecordLit (List.map (fun (n, a) -> (n, s a)) fs)
+    | New (c, xs) -> New (c, List.map s xs)
+    | Extern (f, xs) -> Extern (f, List.map s xs)
+    | e -> e
+  in
+  { x with e; loc = noloc }
+
+let shape (x : expr) = Marshal.to_string (strip x) []

@@ -102,19 +102,22 @@ let rec wterm w (t : term) =
 
 let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.Int l.end_col ]
 
-type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; phases : (Smt.fundef list * Smt.axiom list * int) list; probes : (string * Vc.value) list; state_consts : term list }
+type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; phases : (Smt.fundef list * Smt.axiom list * int * bool) list; probes : (string * Vc.value) list; state_consts : term list }
 
 let solve_job z (jb : job) : Smt.result =
   let t0 = Unix.gettimeofday () in
   let rec go = function
     | [] -> { Smt.status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "no phases" }
-    | (defs, axioms, rlimit) :: rest -> (
+    | (defs, axioms, rlimit, prove_only) :: rest -> (
       let text = Smt.script defs axioms jb.ob.hyps jb.neg_goal in
       (match Sys.getenv_opt "TELIC_CORE_DUMP" with
        | Some dir -> Out_channel.with_open_text (Filename.concat dir (String.map (fun c -> if c = '/' || c = '>' || c = '#' then '_' else c) jb.ob.oid ^ Printf.sprintf ".%d.smt2" rlimit)) (fun oc -> output_string oc text)
        | None -> ());
       let ans, err = try Smt.check z ~timeout_ms:jb.wall_ms ~rlimit text with Smt.Timeout -> ("unknown", "timeout") in
       match ans with
+      | "unknown" when err = "timeout" -> { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = err }
+      | ("sat" | "unknown") when prove_only && rest <> [] -> go rest
+      | "sat" when prove_only -> { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "unknown" }
       | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
       | "sat" ->
         (* inputs: scalars first, then list lengths, then list elements *)
@@ -160,8 +163,20 @@ let make_job th (wall_ms, rlimit) (ob : Vc.obligation) =
   let terms_ = ob.hyps @ [ ob.goal ] in
   let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
   let phases =
-    if List.length (snd with_l) = List.length (snd without) then [ (fst with_l, snd with_l, rlimit) ]
-    else [ (fst without, snd without, rlimit / 10); (fst with_l, snd with_l, rlimit) ]
+    (* an undecided stage is retried with recursive definitions (seqsum)
+       opaque: z3 keeps unfolding them where a proof never needs it; a model
+       may then be spurious, so only a proof counts *)
+    let stage (defs, axioms) rl =
+      let recursive (d : Smt.fundef) =
+        let seen = Hashtbl.create 8 in
+        let rec reaches (t : term) = List.exists (fun n -> n = d.fname || (not (Hashtbl.mem seen n) && (Hashtbl.add seen n (); match List.find_opt (fun (e : Smt.fundef) -> e.fname = n) defs with Some { body = Some b; _ } -> reaches b | _ -> false))) (fns t) in
+        match d.body with Some b -> reaches b | None -> false
+      in
+      let plain = List.filter (fun d -> not (recursive d)) defs in
+      (defs, axioms, rl, false) :: (if List.length plain < List.length defs then [ (plain, axioms, rl, true) ] else [])
+    in
+    if List.length (snd with_l) = List.length (snd without) then stage with_l rlimit
+    else stage without (rlimit / 10) @ stage with_l rlimit
   in
   let input_consts = List.concat_map (fun (_, v) -> Vc.flatten v) ob.inputs in
   let state_consts =
@@ -202,7 +217,8 @@ let job_key salt (jb : job) : string =
   let b = Buffer.create 1024 in
   Buffer.add_string b salt;
   List.iter
-    (fun ((defs : Smt.fundef list), (axioms : Smt.axiom list), _) ->
+    (fun ((defs : Smt.fundef list), (axioms : Smt.axiom list), _, prove_only) ->
+      if prove_only then Buffer.add_string b "\nopaque";
       List.iter (fun (d : Smt.fundef) -> Buffer.add_string b ("\ndef " ^ d.fname ^ "(" ^ String.concat "," (List.map h d.params) ^ ")" ^ Smt.sort_smt d.fsort ^ "=" ^ match d.body with Some x -> h x | None -> "?")) defs;
       List.iter (fun (a : Smt.axiom) -> Buffer.add_string b ("\nax " ^ h a.formula)) axioms)
     jb.phases;

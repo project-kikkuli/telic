@@ -3370,7 +3370,7 @@ class ExprLowerer:
             elem = cur_seq.ty.elem  # type: ignore[union-attr]
             if elem not in (ir.INT, ir.REAL):
                 return None
-            total = ir.Builtin(elem, loc, "sum", (cur_seq,))
+            total = ir.sum_of(cur_seq, loc)
             return self.checked(total, ek) if elem == ir.INT else total
         if m == "collect":
             return self.elems_kinded(cur_seq, ek)

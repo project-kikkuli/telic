@@ -47,6 +47,14 @@ def ty(t: ir.Type) -> dict[str, Any]:
     raise TypeError(t)
 
 
+def without_locs(x: Any) -> Any:
+    if isinstance(x, dict):
+        return {k: without_locs(v) for k, v in x.items() if k not in ("loc", "end_line")}
+    if isinstance(x, list):
+        return [without_locs(v) for v in x]
+    return x
+
+
 def loc(l: ir.Loc) -> list[int]:
     return [l.line, l.col, l.end_col]
 

@@ -390,3 +390,29 @@ let fns (t : term) : string list =
   in
   go t;
   List.rev !out
+
+(* [t] with each key of [m] (by id) replaced by its value; bound variables are not replaced *)
+let subst (m : (term * term) list) (t : term) : term =
+  let memo = Hashtbl.create 64 in
+  let m0 = m in
+  let rec go m t =
+    match List.find_opt (fun (k, _) -> k == t) m with
+    | Some (_, v) -> v
+    | None -> (
+      match Hashtbl.find_opt memo t.id with
+      | Some r when m == m0 -> r
+      | _ ->
+        let r =
+          match t.node with
+          | App (op, xs) -> let ys = Array.map (go m) xs in if Array.for_all2 ( == ) xs ys then t else mk (App (op, ys)) t.sort
+          | Fn (f, xs) -> let ys = Array.map (go m) xs in if Array.for_all2 ( == ) xs ys then t else mk (Fn (f, ys)) t.sort
+          | Quant (k, vs, b, ps) ->
+            let inner = List.filter (fun (k, _) -> not (Array.exists (fun v -> v == k) vs)) m in
+            let b' = go inner b in
+            if b' == b then t else mk (Quant (k, vs, b', List.map (Array.map (go inner)) ps)) t.sort
+          | _ -> t
+        in
+        if m == m0 then Hashtbl.replace memo t.id r;
+        r)
+  in
+  go m t

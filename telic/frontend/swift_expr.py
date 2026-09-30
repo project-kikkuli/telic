@@ -1597,7 +1597,7 @@ class ExprLowerer:
             init = self.expr(args[0][1], t.elem, ek)
             if t.elem not in (ir.INT, ir.REAL) or init.ty != t.elem:
                 raise self.err("reduce(_, +) on numbers only", x)
-            total = ir.Builtin(t.elem, loc, "sum", (b,))
+            total = ir.sum_of(b, loc)
             if init.ty == ir.INT:
                 total = ir.Binary(ir.INT, loc, "add", init, total)
                 if not self.spec:

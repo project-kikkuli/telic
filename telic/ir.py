@@ -658,6 +658,18 @@ def source_name(name: str) -> str:
     return re.sub(r"@\w+", "", name) if "@" in name else name
 
 
+def sum_of(xs: Expr, loc: Loc) -> Builtin:
+    """``sum(xs)``. A filtered comprehension is summed as a mapped one,
+    ``sum(f(x) if c(x) else 0 for x in s)``: the same total, and each element
+    is determined by its source element."""
+    if isinstance(xs, Builtin) and xs.name == "comp" and len(xs.args) == 4 and isinstance(xs.ty, TList):
+        seq, elem, body, cond = xs.args
+        zero = Lit(body.ty, loc, Fraction(0) if isinstance(body.ty, TReal) else 0)
+        xs = Builtin(xs.ty, xs.loc, "comp", (seq, elem, Ite(body.ty, body.loc, cond, body, zero)))
+    assert isinstance(xs.ty, TList)
+    return Builtin(xs.ty.elem, loc, "sum", (xs,))
+
+
 def walk_stmts(stmts: Any):
     """Yield every statement in ``stmts`` recursively (pre-order)."""
     for s in stmts:

@@ -247,7 +247,15 @@ let hyps ctx = Dynarray.to_list ctx.base @ ctx.guard
 let assume ctx t = Dynarray.add_last ctx.base (if ctx.guard = [] then t else implies (and_ ctx.guard) t)
 (* assume t for every value of the enclosing quantifier variables: sound only
    when every fresh symbol in t is a function of them *)
-let assume_for_all_binders ctx t = Dynarray.add_last ctx.base (forall ctx.binders (implies (and_ ctx.guard) t))
+(* [t] for every value of the enclosing quantifier variables. One quantifier,
+   triggered where the inner one is: a quantifier over the variables alone
+   has nothing to trigger on. *)
+let assume_for_all_binders ctx t =
+  let guard = and_ ctx.guard in
+  let covers pats = List.for_all (fun b -> List.exists (Array.exists (fun u -> occurs b u)) pats) ctx.binders in
+  match t.node with
+  | Quant ("forall", vs, body, (_ :: _ as pats)) when covers pats -> Dynarray.add_last ctx.base (quant "forall" (ctx.binders @ Array.to_list vs) (implies guard body) pats)
+  | _ -> Dynarray.add_last ctx.base (forall ctx.binders (implies guard t))
 (* a new symbol and how to assume its definition: under a quantifier, a
    function of its variables, defined for all of them at once *)
 let defined_symbol ?(pure = true) ctx name srt =
@@ -280,6 +288,9 @@ type gen = {
   mutable written : (string * int) list;  (** (class, line) of each field write to a class with an invariant, reversed *)
   mutable created : term list;  (** objects this call allocated *)
   mutable lc_written : string list;  (** classes of the non-parameter objects it writes a field of *)
+  comp_memo : (string, term) Hashtbl.t;  (** what a pure comprehension computes -> its array *)
+  comp_bodies : (int, string * term list) Hashtbl.t;  (** comprehension array -> its body, quantifier variables *)
+  comp_sums : (string, term * term * term * term list) Hashtbl.t;  (** body -> sums over such arrays (array, length, sum, variables) *)
 }
 
 let next g =
@@ -402,10 +413,42 @@ let lookup ctx name (loc : Ir.loc) =
 
 let expr_name (e : Ir.expr) = match e.e with Var n -> n | Field (_, f) -> f | Call (f, _) -> f ^ "(...)" | _ -> "value"
 
+(* min of two lengths, without a case split when one is the other plus a
+   non-negative constant (a list and the same list appended to) *)
+let rec shorter a b =
+  let longer x y = match y.node with App ("add", [| u; c |]) -> u == x && (match num c with Some q -> Q.compare q (Q.of_int 0) >= 0 | None -> false) | _ -> false in
+  if a == zero || b == zero then zero
+  else if a == b || longer a b then a
+  else if longer b a then b
+  else match (a.node, b.node) with
+    | App ("ite", [| c; x; y |]), _ -> ite c (shorter x b) (shorter y b)
+    | _, App ("ite", [| c; x; y |]) -> ite c (shorter a x) (shorter a y)
+    | _ -> min_ a b
+
+(* [sum a k n], the sum of a[k:n], spelled out where [n] is [k] plus a small
+   constant (a list appended to), branch by branch *)
+let rec tail sum a k n =
+  match n.node with
+  | App ("ite", [| c; x; y |]) -> ite c (tail sum a k x) (tail sum a k y)
+  | _ when n == k -> lit_of_int 0 (elem_sort a.sort)
+  | App ("add", [| u; c |]) when u == k && (match num c with Some q -> q.d = 1 && q.n > 0 && q.n <= 4 | None -> false) ->
+    let c = match num c with Some q -> q.n | None -> 0 in
+    List.fold_left (fun acc j -> add acc (select a (add k (int_ j)))) (select a k) (List.init (c - 1) (fun j -> j + 1))
+  | _ -> sum a k n
+
+(* a conjunct of the guard says c <= i for a constant c >= 0 (a quantifier over range(c, ...)) *)
+let nonneg_under i guard =
+  let rec go g = match g.node with
+    | App ("and", xs) -> Array.exists go xs
+    | App ("le", [| c; j |]) -> j == i && (match num c with Some q -> Q.compare q (Q.of_int 0) >= 0 | None -> false)
+    | _ -> false
+  in
+  List.exists go guard
+
 let index_of g (arr, off, len) i wrap ctx loc what =
   if wrap then begin
     oblige g "index" ctx (and_ [ le (neg len) i; lt i len ]) loc (Printf.sprintf "index into '%s' is within -len..len-1" what);
-    ite (lt i zero) (add i len) i
+    if nonneg_under i ctx.guard then i else ite (lt i zero) (add i len) i
   end else begin
     oblige g "index" ctx (and_ [ le zero i; lt i len ]) loc (Printf.sprintf "index into '%s' is within 0..len-1" what);
     i
@@ -445,6 +488,9 @@ let rec alloc_facts g v (ty : Ir.ty) env =
     let self_ = match SM.find_opt "self" g.entry with Some (T s) -> s == t | _ -> false in
     if is_init g && self_ then [] else [ select (alloc_of env) t ]
   | TOption (TClass _), O o -> [ implies o.some (select (alloc_of env) o.v) ]
+  | TList (TClass _), L l ->
+    let i = const (Printf.sprintf "i!%d" (next g)) Int in
+    [ quant "forall" [ i ] (implies (and_ [ le zero i; lt i l.len ]) (select (alloc_of env) (at (l.arr, l.off) i))) [ [| at (l.arr, l.off) i |] ] ]
   | _ -> []
 
 let rec reaches_objects (t : Ir.ty) = match t with TClass _ | TOpaque -> true | TList e -> reaches_objects e | TDict (_, v) -> reaches_objects v | TOption i -> reaches_objects i | _ -> false
@@ -921,7 +967,9 @@ and builtin g ctx (e : Ir.expr) name args =
       let l = lst xs in
       let elem = match l.lty with TList t -> t | _ -> TInt in
       let fd = if elem = TInt then "seqsum" else "seqsum_r" in
-      T (fn fd [| l.arr; l.off; add l.off l.len |] (sort_of elem))
+      let total = fn fd [| l.arr; l.off; add l.off l.len |] (sort_of elem) in
+      comp_sum g ctx l total;
+      T total
     | "count", [ xs; v ] ->
       let l = lst xs in
       let elem = match l.lty with TList t -> t | _ -> TInt in
@@ -936,7 +984,7 @@ and builtin g ctx (e : Ir.expr) name args =
       let n = l.len in
       let norm b default = match b with NoneV -> default | b -> let b = tm b in ite (lt b zero) (max_ (add b n) zero) (min_ b n) in
       let lo2 = norm lo zero and hi2 = norm hi n in
-      L { l with off = add l.off lo2; len = max_ (sub hi2 lo2) zero }
+      if (match (lo, hi) with NoneV, NoneV -> true | _ -> false) then L l else L { l with off = add l.off lo2; len = max_ (sub hi2 lo2) zero }
     | "list_append", [ xs; v ] -> let l = lst xs in L { l with arr = store l.arr (add l.off l.len) (tm v); len = add l.len one }
     | "list_set", [ xs; i; v ] ->
       let l = lst xs in
@@ -1127,7 +1175,8 @@ and havoc g (st : state) names appends : state =
             let nv = match fresh g name ty ?len:keep () with L l -> l | _ -> assert false in
             let nv = match keep with None -> Dynarray.add_last h.facts (le zero nv.len); nv | Some k -> { nv with off = o.off; len = k } in
             h.env <- SM.add name (L nv) h.env
-          | _ -> h.env <- SM.add name (fresh g name ty ()) h.env)))
+          | _ -> h.env <- SM.add name (fresh g name ty ()) h.env);
+          if SM.mem "@alloc" h.env then List.iter (Dynarray.add_last h.facts) (alloc_facts g (SM.find name h.env) ty h.env)))
     (List.sort compare names);
   h
 
@@ -1177,6 +1226,7 @@ and comprehension g ctx (e : Ir.expr) seq =
   let sub = sub_ctx ~cond:rng { ctx with spec = true } in
   let sub = { sub with bound = SM.add elem (T (at (seq.arr, seq.off) i)) sub.bound } in
   let result = L { arr; off = zero; len = ln; lty = e.ty } in
+  let comp_arr = ref arr in
   if not is_pure then begin
     (* values unknown; obligations and effects as for any element *)
     each_element g ctx e seq;
@@ -1186,7 +1236,10 @@ and comprehension g ctx (e : Ir.expr) seq =
     (match cond with
      | None ->
        let b = term_of loc (ev g sub body) in
-       assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) b)) [ [| select arr i |] ])
+       let arr = same_comp g arr b seq i ctx in
+       assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) b)) [ [| select arr i |] ]);
+       Hashtbl.replace g.comp_bodies arr.id (elem ^ Ir.shape body, if under then ctx.binders else []);
+       comp_arr := arr
      | Some c ->
        let cv = term_of loc (ev g sub c) in
        ignore (ev g (sub_ctx ~cond:cv sub) body);
@@ -1197,7 +1250,51 @@ and comprehension g ctx (e : Ir.expr) seq =
          (quant "forall" [ k ]
             (implies (and_ [ le zero k; lt k ln ]) (exists [ j ] (and_ [ le zero j; lt j seq.len; cj; eq (select arr k) bj ])))
             [ [| select arr k |] ]));
-    result
+    L { arr = !comp_arr; off = zero; len = ln; lty = e.ty }
+  end
+
+(* relate a sum over a comprehension to the earlier sums over ones with the
+   same body: equal on their common prefix wherever the elements are
+   (seqsum_ext, skolemized), and each the sum of that prefix and the rest
+   (seqsum_split) *)
+and comp_sum g ctx (l : lv) total =
+  match (Hashtbl.find_opt g.comp_bodies l.arr.id, total.node) with
+  | Some (key, binders), Fn (fd, _) when l.off == zero ->
+    let earlier = Hashtbl.find_all g.comp_sums key in
+    List.iter
+      (fun (arr2, len2, total2, binders2) ->
+        if List.map (fun (b : term) -> b.sort) binders2 = List.map (fun (b : term) -> b.sort) binders && l.len != zero && len2 != zero then begin
+          let vs = List.map (fun (b : term) -> const (Printf.sprintf "%s!%d" (match String.index_opt (match b.node with Const n -> n | _ -> "v") '!' with Some k -> String.sub (match b.node with Const n -> n | _ -> "v") 0 k | None -> "v") (next g)) b.sort) binders in
+          let s1 = subst (List.combine binders vs) and s2 = subst (List.combine binders2 vs) in
+          let a1 = s1 l.arr and n1 = s1 l.len and t1 = s1 total and a2 = s2 arr2 and n2 = s2 len2 and t2 = s2 total2 in
+          let sum a lo hi = fn fd [| a; lo; hi |] total.sort in
+          let k = shorter n1 n2 in
+          let d = fn (Printf.sprintf "diff!%d" (next g)) (Array.of_list vs) Int in
+          let parts =
+            or_ [ and_ [ le zero d; lt d k; ne (select a1 d) (select a2 d) ]; eq (sum a1 zero k) (sum a2 zero k) ]
+            :: List.filter_map (fun (a, n, t) -> if n == k then None else Some (eq t (add (sum a zero k) (tail sum a k n)))) [ (a1, n1, t1); (a2, n2, t2) ]
+          in
+          let fact = implies (and_ [ le zero n1; le zero n2 ]) (and_ parts) in
+          let fact = if vs = [] then fact else quant "forall" vs fact [ [| t1; t2 |] ] in
+          Dynarray.add_last ctx.base fact
+        end)
+      earlier;
+    Hashtbl.add g.comp_sums key (l.arr, l.len, total, binders)
+  | _ -> ()
+
+(* the array of an earlier comprehension computing the same elements from the
+   same list ([b] is element [i]), else [arr]: then sums over both are one
+   term. Both definitions agree wherever both apply. *)
+and same_comp g arr b (seq : lv) i ctx =
+  let x = const "@elem" (at (seq.arr, seq.off) i).sort in
+  let m = (at (seq.arr, seq.off) i, x) :: List.mapi (fun k v -> (v, const (Printf.sprintf "@%d" k) v.sort)) ctx.binders in
+  let shape = subst m b in
+  if List.memq i (consts shape) then arr
+  else begin
+    let key = Printf.sprintf "%d/%d/%d/%d/%d/%b" shape.id seq.arr.id seq.off.id seq.len.id (List.length ctx.binders) (match arr.node with Fn _ -> true | _ -> false) in
+    match Hashtbl.find_opt g.comp_memo key with
+    | None -> Hashtbl.replace g.comp_memo key arr; arr
+    | Some old -> ( match old.node with Fn (name, _) -> fn name (Array.of_list ctx.binders) arr.sort | _ -> old)
   end
 
 and await_havoc g ctx (loc : Ir.loc) =
@@ -2066,7 +2163,7 @@ let check_exits g =
 let make prog info opts =
   {
     prog; info; opts; obligations = []; exits = []; loops = []; counter = 0; ids = Hashtbl.create 32; deps = []; entry = SM.empty;
-    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; written = []; created = []; lc_written = [];
+    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; written = []; created = []; lc_written = []; comp_memo = Hashtbl.create 8; comp_bodies = Hashtbl.create 8; comp_sums = Hashtbl.create 8;
   }
 
 let run g =

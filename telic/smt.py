@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from dataclasses import dataclass, field
@@ -488,22 +489,30 @@ SEED = 0
 
 
 def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int = RLIMIT) -> SmtResult:
-    """Two phases. Theory lemmas are consequences of the definitions, so a
-    model found without them is a genuine model; but their quantifiers can
-    stop Z3 from finding models at all. So: first without them (fast, good
-    counterexamples), then with them only if the first phase is undecided."""
+    """Theory lemmas are consequences of the definitions, so a model found
+    without them is a genuine model; but their quantifiers can stop Z3 from
+    finding models at all. So: first without them (fast, good
+    counterexamples), then with them only if the first stage is undecided.
+
+    An undecided stage is retried with recursive definitions (seqsum)
+    opaque: Z3 keeps unfolding them where a proof never needs it. Opaque, a
+    model may be spurious, so only a proof counts."""
     t0 = time.perf_counter()
     terms = list(ob.hyps) + [ob.goal]
     with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
-    if len(with_lemmas[1]) == len(without[1]):
-        return _solve(ob, with_lemmas, timeout_ms, rlimit, t0)
-    # Phase one only needs enough to find a model or a quick proof;
-    # quantified lemmas are what unlock the rest.
-    first = _solve(ob, without, timeout_ms, rlimit // 10, t0)
-    if first.status != "unknown" or first.reason.startswith("timeout"):
-        return first
-    return _solve(ob, with_lemmas, timeout_ms, rlimit, t0)
+    stages = [(with_lemmas, rlimit)] if len(with_lemmas[1]) == len(without[1]) else [(without, rlimit // 10), (with_lemmas, rlimit)]
+    res = SmtResult("unknown", 0.0)
+    for (defs, axioms), budget in stages:
+        res = _solve(ob, (defs, axioms), timeout_ms, budget, t0)
+        if res.status != "unknown" or res.reason.startswith("timeout"):
+            return res
+        if any(d.recursive for d in defs):
+            opaque = [dataclasses.replace(d, body=None) if d.recursive else d for d in defs]
+            again = _solve(ob, (opaque, axioms), timeout_ms, budget, t0)
+            if again.status == "proved":
+                return again
+    return res
 
 
 class _Deadline:

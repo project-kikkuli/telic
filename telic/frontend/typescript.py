@@ -220,6 +220,8 @@ def _expr(d: dict[str, Any]) -> ir.Expr:
     if kind == "Call":
         return ir.Call(ty, loc, d["func"], tuple(_expr(a) for a in d["args"]))
     if kind == "Builtin":
+        if d["name"] == "sum":
+            return ir.sum_of(_expr(d["args"][0]), loc)
         return ir.Builtin(ty, loc, d["name"], tuple(_expr(a) for a in d["args"]))
     if kind == "Index":
         return ir.Index(ty, loc, _expr(d["seq"]), _expr(d["idx"]), bool(d["wrap"]))

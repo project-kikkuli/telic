@@ -408,20 +408,12 @@ def toolchain_id() -> str:
     return _TOOLCHAIN
 
 
-def _without_locs(x: Any) -> Any:
-    if isinstance(x, dict):
-        return {k: _without_locs(v) for k, v in x.items() if k not in ("loc", "end_line")}
-    if isinstance(x, list):
-        return [_without_locs(v) for v in x]
-    return x
-
-
 def _lowered(program: Program, key: str) -> str:
     """A function as telic reads it, module constants inlined, without
     positions: an edit outside the function that changes its meaning changes this."""
     memo = program.__dict__.setdefault("_lowered", {})
     if key not in memo:
-        memo[key] = json.dumps(_without_locs(irjson.function(program.ref(key).fn)), sort_keys=True, default=str)
+        memo[key] = json.dumps(irjson.without_locs(irjson.function(program.ref(key).fn)), sort_keys=True, default=str)
     return memo[key]
 
 

@@ -148,6 +148,40 @@ theorem seqsum_split (a : Int → Int) (lo mid hi : Int) (h1 : lo ≤ mid) (h2 :
   have e : mid + ((hi - mid).toNat : Int) = hi := by omega
   rwa [e] at this
 
+theorem seqsum_ext_aux (a b : Int → Int) (lo : Int) (n : Nat)
+    (h : ∀ i, lo ≤ i → i < lo + n → a i = b i) : seqsum a lo (lo + n) = seqsum b lo (lo + n) := by
+  induction n with
+  | zero => rw [seqsum_empty a lo _ (by omega), seqsum_empty b lo _ (by omega)]
+  | succ n ih =>
+    rw [seqsum_last a lo _ (by omega), seqsum_last b lo _ (by omega)]
+    have e : lo + ((n + 1 : Nat) : Int) - 1 = lo + n := by omega
+    rw [e, ih (fun i h1 h2 => h i h1 (by omega)), h (lo + n) (by omega) (by omega)]
+
+/-- `seqsum_ext`: sums of lists that agree on the range are equal. -/
+theorem seqsum_ext (a b : Int → Int) (lo hi : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i = b i) : seqsum a lo hi = seqsum b lo hi := by
+  by_cases hl : hi ≤ lo
+  · rw [seqsum_empty a lo hi hl, seqsum_empty b lo hi hl]
+  · have := seqsum_ext_aux a b lo (hi - lo).toNat (fun i h1 h2 => h i ⟨h1, by omega⟩)
+    have e : lo + ((hi - lo).toNat : Int) = hi := by omega
+    rwa [e] at this
+
+/-- `seqsum_elem_le`: each of non-negatives is at most their sum. -/
+theorem seqsum_elem_le (a : Int → Int) (lo hi k : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → 0 ≤ a i) (hk : lo ≤ k ∧ k < hi) : a k ≤ seqsum a lo hi := by
+  rw [seqsum_split a lo k hi (by omega) (by omega), seqsum_front a k hi (by omega)]
+  have h1 := seqsum_nonneg a lo k (fun i hi' => h i ⟨hi'.1, by omega⟩)
+  have h2 := seqsum_nonneg a (k + 1) hi (fun i hi' => h i ⟨by omega, hi'.2⟩)
+  omega
+
+/-- `seqsum_elem_ge`: each of non-positives is at least their sum. -/
+theorem seqsum_elem_ge (a : Int → Int) (lo hi k : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i ≤ 0) (hk : lo ≤ k ∧ k < hi) : seqsum a lo hi ≤ a k := by
+  rw [seqsum_split a lo k hi (by omega) (by omega), seqsum_front a k hi (by omega)]
+  have h1 := seqsum_nonpos a lo k (fun i hi' => h i ⟨hi'.1, by omega⟩)
+  have h2 := seqsum_nonpos a (k + 1) hi (fun i hi' => h i ⟨by omega, hi'.2⟩)
+  omega
+
 -- ---------------------------------------------------------------------------
 -- Counts
 
@@ -320,5 +354,36 @@ theorem seqsumR_split (a : Int → Rat) (lo mid hi : Int) (h1 : lo ≤ mid) (h2 
   have := seqsumR_split_aux a lo mid h1 (hi - mid).toNat
   have e : mid + ((hi - mid).toNat : Int) = hi := by omega
   rwa [e] at this
+
+theorem seqsumR_ext_aux (a b : Int → Rat) (lo : Int) (n : Nat)
+    (h : ∀ i, lo ≤ i → i < lo + n → a i = b i) : seqsumR a lo (lo + n) = seqsumR b lo (lo + n) := by
+  induction n with
+  | zero => rw [seqsumR_empty a lo _ (by omega), seqsumR_empty b lo _ (by omega)]
+  | succ n ih =>
+    rw [seqsumR_last a lo _ (by omega), seqsumR_last b lo _ (by omega)]
+    have e : lo + ((n + 1 : Nat) : Int) - 1 = lo + n := by omega
+    rw [e, ih (fun i h1 h2 => h i h1 (by omega)), h (lo + n) (by omega) (by omega)]
+
+theorem seqsumR_ext (a b : Int → Rat) (lo hi : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i = b i) : seqsumR a lo hi = seqsumR b lo hi := by
+  by_cases hl : hi ≤ lo
+  · rw [seqsumR_empty a lo hi hl, seqsumR_empty b lo hi hl]
+  · have := seqsumR_ext_aux a b lo (hi - lo).toNat (fun i h1 h2 => h i ⟨h1, by omega⟩)
+    have e : lo + ((hi - lo).toNat : Int) = hi := by omega
+    rwa [e] at this
+
+theorem seqsumR_elem_le (a : Int → Rat) (lo hi k : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → 0 ≤ a i) (hk : lo ≤ k ∧ k < hi) : a k ≤ seqsumR a lo hi := by
+  rw [seqsumR_split a lo k hi (by omega) (by omega), seqsumR_front a k hi (by omega)]
+  have h1 := seqsumR_nonneg a lo k (fun i hi' => h i ⟨hi'.1, by omega⟩)
+  have h2 := seqsumR_nonneg a (k + 1) hi (fun i hi' => h i ⟨by omega, hi'.2⟩)
+  grind
+
+theorem seqsumR_elem_ge (a : Int → Rat) (lo hi k : Int)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i ≤ 0) (hk : lo ≤ k ∧ k < hi) : seqsumR a lo hi ≤ a k := by
+  rw [seqsumR_split a lo k hi (by omega) (by omega), seqsumR_front a k hi (by omega)]
+  have h1 := seqsumR_nonpos a lo k (fun i hi' => h i ⟨hi'.1, by omega⟩)
+  have h2 := seqsumR_nonpos a (k + 1) hi (fun i hi' => h i ⟨by omega, hi'.2⟩)
+  grind
 
 end TelicTheory

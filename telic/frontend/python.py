@@ -2485,7 +2485,7 @@ class ExprLowerer:
             (x,) = self._args(n, 1)
             if not (isinstance(x.ty, ir.TList) and ir.is_numeric(x.ty.elem)):
                 raise self.err("sum() needs a list of numbers", n)
-            return ir.Builtin(x.ty.elem, loc, "sum", (x,))
+            return ir.sum_of(x, loc)
         if name == "float":
             (x,) = self._args(n, 1)
             if not ir.is_numeric(x.ty):

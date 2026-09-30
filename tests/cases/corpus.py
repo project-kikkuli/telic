@@ -816,3 +816,44 @@ def set_guarded_call(xs: list[int]) -> int:
     #@ ensures result == 0
     _ = {pos_int(x) for x in xs if x >= 1}
     return 0
+
+
+# expect: proved
+def pay_member(xs: list[Item], m: int, p: int) -> list[Item]:
+    # a filtered sum over a list that grows by append
+    #@ ensures sum(t.price for t in result if t.qty == m) == sum(t.price for t in xs if t.qty == m) + p
+    out = xs[:]
+    out.append(Item(p, m))
+    return out
+
+
+# expect: refuted
+def pay_member_lost(xs: list[Item], m: int, p: int) -> list[Item]:
+    #@ ensures sum(t.price for t in result if t.qty == m) == sum(t.price for t in xs if t.qty == m)
+    out = xs[:]
+    out.append(Item(p, m))
+    return out
+
+
+# expect: proved
+def paid_each(n: int, k: int) -> list[Item]:
+    # per-member filtered sums kept by a loop that appends
+    #@ requires n >= 1 and k >= 0
+    #@ ensures all(sum(t.price for t in result if t.qty == m) == (k if m == 0 else 0) for m in range(n))
+    out: list[Item] = []
+    c = 0
+    while c < k:
+        #@ invariant 0 <= c <= k
+        #@ invariant all(sum(t.price for t in out if t.qty == m) == (c if m == 0 else 0) for m in range(n))
+        out.append(Item(1, 0))
+        c += 1
+    return out
+
+
+# expect: proved
+def cleared(rest: list[int], i: int) -> bool:
+    # non-negatives summing to zero are all zero
+    #@ requires sum(rest) == 0 and i == len(rest)
+    #@ requires all(rest[k] >= 0 for k in range(i))
+    #@ ensures all(rest[m] == 0 for m in range(len(rest)))
+    return True
