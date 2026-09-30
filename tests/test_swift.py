@@ -245,3 +245,19 @@ def test_calls_across_files_use_the_callee_contract(tmp_path):
         replay=False,
     )
     assert {f.fn.name: f.status for f in rep.functions} == {"small": "proved", "twice": "proved"}
+
+
+def test_swift_aims_and_citations(tmp_path):
+    shop = (
+        "//@ aim REFUND-CAP: WHEN a refund is requested, the shop shall refund at most\n"
+        "//@   what the customer paid, net of earlier refunds.\n"
+        "//@   by: refundAmount\n\n"
+        "func refundAmount(_ paid: Int, _ refunded: Int, _ requested: Int) -> Int {\n"
+        "    //@ requires 0 <= refunded && refunded <= paid && requested >= 0\n"
+        "    //@ [REFUND-CAP] ensures 0 <= result && result <= paid - refunded\n"
+        "    return min(requested, paid - refunded)\n"
+        "}\n"
+    )
+    rep = run_check(tmp_path, {"shop.swift": shop}, lean=False, replay=False)
+    (aim,) = rep.aims
+    assert aim.id == "REFUND-CAP" and aim.status == "backed"
