@@ -2337,7 +2337,12 @@ class ExprLowerer:
             return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "str"), self.fl.coerce(x, ir.TOpaque("")) if isinstance(x.ty, (ir.TList, ir.TDict, ir.TOption)) else x))
         if name == "isinstance" and name not in fe.bound:
             x = self.expr(n.args[0])
-            return self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(n.args[1]))], ir.BOOL, loc)
+            # isinstance(x, (A, B)) is isinstance(x, A) or isinstance(x, B): one predicate per class
+            classes = n.args[1].elts if isinstance(n.args[1], ast.Tuple) and n.args[1].elts else [n.args[1]]
+            out = self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(classes[0]))], ir.BOOL, loc)
+            for c in classes[1:]:
+                out = ir.Binary(ir.BOOL, loc, "or", out, self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(c))], ir.BOOL, loc))
+            return out
         if name in fe.signatures and name not in self.fl.env:
             return self.user_call(n, loc, name)
         if name in self.fl.closures and not self.spec:
@@ -2643,8 +2648,16 @@ class ExprLowerer:
                     elem = gen.target.id
                     idx = f"{elem}$idx"
                     seq = self.expr(it)
+                if isinstance(seq.ty, ir.TDict) and elem is not None and idx == f"{elem}$idx":
+                    # all(p(k) for k in d): over the keys d holds
+                    self.bound[elem] = seq.ty.key
+                    body = self.cond(g.elt)
+                    for cond in gen.ifs:
+                        body = ir.Binary(ir.BOOL, loc, "implies" if kind == "forall" else "and", self.cond(cond), body)
+                    zero = ir.Lit(ir.INT, loc, 0)
+                    return ir.Quant(ir.BOOL, loc, kind, idx, zero, zero, body, elem, seq)
                 if not isinstance(seq.ty, ir.TList):
-                    raise self.err("generator must range over range(...) or a list", n)
+                    raise self.err("generator must range over range(...), a list or a dict", n)
                 lo = ir.Lit(ir.INT, loc, 0)
                 hi = ir.Builtin(ir.INT, loc, "len", (seq,))
                 self.bound[idx] = ir.INT

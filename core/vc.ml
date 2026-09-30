@@ -511,6 +511,19 @@ let rec ev g ctx (e : Ir.expr) : value =
     let arr = ref base.arr in
     List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) elems;
     L { arr = !arr; off = zero; len = int_ (List.length elems); lty = e.ty }
+  | Quant q when (match q.seq with Some { ty = TDict _; _ } -> true | _ -> false) -> (
+    (* over a dict's keys: every k it holds *)
+    match (q.seq, q.elem) with
+    | Some s, Some el -> (
+      match (ev g ctx s, s.ty) with
+      | D d, TDict (kty, _) ->
+        let k = const (Printf.sprintf "%s!%d" el (next g)) (sort_of kty) in
+        let held = select d.has k in
+        let sub = sub_ctx ~cond:held ctx in
+        let body = tm (ev g { sub with bound = SM.add el (T k) sub.bound } q.body) in
+        if q.kind = "forall" then T (forall [ k ] (implies held body)) else T (exists [ k ] (and_ [ held; body ]))
+      | _ -> raise (Vc_error ("quantifier over a non-dict", loc)))
+    | _ -> raise (Vc_error ("quantifier over a dict needs a name", loc)))
   | Quant q ->
     let lo = tm (ev g ctx q.lo) and hi = tm (ev g ctx q.hi) in
     let base = match String.index_opt q.idx '$' with Some k -> String.sub q.idx 0 k | None -> q.idx in

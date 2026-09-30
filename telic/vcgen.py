@@ -108,7 +108,17 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     return [("", sort_of(ty))]
 
 
+def arity(ty: ir.Type) -> int:
+    """How many logical components a value of ``ty`` has."""
+    if isinstance(ty, ir.TList):
+        return 3
+    if isinstance(ty, (ir.TOption, ir.TDict)):
+        return 2
+    return 1
+
+
 def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
+    #@ requires len(comps) == arity(ty)
     if isinstance(ty, ir.TList):
         return ListVal(comps[0], comps[1], comps[2], ty)
     if isinstance(ty, ir.TOption):
@@ -1275,6 +1285,19 @@ class VCGen:
         return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
+        if e.seq is not None and isinstance(e.seq.ty, ir.TDict):
+            # over a dict's keys: every k it holds
+            d = self.ev(e.seq, ctx)
+            assert isinstance(d, DictVal) and e.elem is not None
+            k = L.Const(f"{e.elem}!{next(self.counter)}", sort_of(e.seq.ty.key))
+            held = L.select(d.has, k)
+            sub = ctx.sub(held)
+            sub.bound[e.elem] = k
+            body = self.ev(e.body, sub)
+            assert not isinstance(body, ListVal)
+            if e.kind == "forall":
+                return L.forall([k], L.implies(held, body))
+            return L.exists([k], L.and_(held, body))
         lo = self.ev(e.lo, ctx)
         hi = self.ev(e.hi, ctx)
         assert not isinstance(lo, ListVal) and not isinstance(hi, ListVal)

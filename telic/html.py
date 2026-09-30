@@ -184,8 +184,10 @@ def _span(fn: ir.Function, source_lines: list[str]) -> tuple[int, int]:
 def _line_status(f: FunctionReport) -> dict[int, str]:
     worst: dict[int, str] = {}
     for v in f.verdicts:
+        #@ invariant all(worst[k] == "refuted" or worst[k] == "open" or worst[k] == "proved" for k in worst)
         st = "refuted" if v.status == "refuted" else "open" if v.status in ("unknown", "unconfirmed") else "proved"
         for ln in {v.ob.loc.line, (v.ob.site or v.ob.loc).line}:
+            #@ invariant all(worst[k] == "refuted" or worst[k] == "open" or worst[k] == "proved" for k in worst)
             cur = worst.get(ln)
             rank = {"refuted": 0, "open": 1, "proved": 2}
             if cur is None or rank[st] < rank[cur]:

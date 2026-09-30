@@ -390,3 +390,26 @@ def first_of_last_pair(pairs: list[tuple[int, int]]) -> int:
     for a, b in pairs:
         t = a
     return t
+
+
+# expect: proved
+def dict_put_pos(d: dict[str, int], k: str) -> None:
+    #@ requires all(d[x] > 0 for x in d)
+    #@ ensures all(d[x] > 0 for x in d)
+    d[k] = 5
+
+
+# expect: refuted
+def dict_put_zero(d: dict[str, int], k: str) -> None:
+    #@ requires all(d[x] > 0 for x in d)
+    #@ ensures all(d[x] > 0 for x in d)
+    d[k] = 0
+
+
+# expect: proved
+def dict_lookup_pos(d: dict[str, int], k: str) -> int:
+    #@ requires all(d[x] > 0 for x in d)
+    #@ ensures result >= 0
+    if k in d:
+        return d[k]
+    return 0
