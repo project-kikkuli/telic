@@ -126,12 +126,15 @@ def test_github_annotations(repo):
     assert "::error file=lib/cap.py,line=" in out.stdout
 
 
-def test_receipts_are_bound_to_the_toolchain(repo, monkeypatch):
+def test_receipts_are_bound_to_the_toolchain(monkeypatch):
     import telic.checker as C
 
-    first = C.toolchain_id()
+    # Both ids are computed now, from the same files: the one cached earlier in
+    # this process may predate an edit made while the suite runs.
     monkeypatch.setattr(C, "_TOOLCHAIN", None)
-    assert C.toolchain_id() == first  # stable across processes for the same sources
+    here = C.toolchain_id()
+    there = sh(ROOT, sys.executable, "-c", "from telic.checker import toolchain_id; print(toolchain_id())").stdout.strip()
+    assert here == there  # stable across processes for the same sources
 
 
 BASE = "class Shape:\n    def area(self) -> int:\n        #@ ensures result >= 0\n        return 0\n"
