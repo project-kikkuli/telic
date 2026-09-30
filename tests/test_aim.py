@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from telic.checker import CheckOptions, check
 from telic.aim import accept, ears_problems, judge, split_by
 
@@ -80,3 +82,45 @@ def test_judge_is_cached_and_labelled(tmp_path):
     assert got["CAP"].coverage["kind"] == "judged"
     judge(str(tmp_path), [got["CAP"]], oracle=spec)
     assert counter.read_text() == "x"  # asked once
+
+
+RESTS = """#@ aim POS: The result shall be non-negative.
+
+
+def helper(x: int) -> int:
+    #@ ensures result >= 0
+    return x
+
+
+def user(x: int) -> int:
+    #@ aim POS
+    #@ ensures result >= 0
+    return helper(x)
+
+
+class A:
+    def f(self) -> int:
+        #@ ensures result >= 0
+        return 1
+
+
+class B(A):
+    def f(self) -> int:
+        #@ ensures result >= 0
+        return -1
+
+
+def through(a: A) -> int:
+    #@ aim POS
+    #@ ensures result >= 0
+    return a.f()
+"""
+
+
+@pytest.mark.parametrize("lemma,assumption", [("user", "user assumes helper (refuted)"), ("through", "through assumes B.f (refuted)")])
+def test_an_aim_resting_on_unproved_code_is_partial_and_says_why(tmp_path, lemma, assumption):
+    (tmp_path / "m.py").write_text(RESTS)
+    rep = check([str(tmp_path / "m.py")], CheckOptions(cache_path=None, lean=False), root=str(tmp_path))
+    (pos,) = rep.aims
+    assert {f.fn.name: f.status for f in rep.functions}[lemma] == "proved"
+    assert pos.status == "partial" and assumption in pos.assumes

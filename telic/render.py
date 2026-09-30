@@ -575,6 +575,8 @@ class Renderer:
                     out.append(f"      {pad('', nw)}{p.dim(d)}")
             if cov is not None and cov.get("kind") == "judged" and cov.get("verdict") != "sufficient" and cov.get("missing"):
                 out.append(f"    {p.yellow('judge')}  {p.dim('missing: ' + cov['missing'])}")
+            for msg in i.assumes:
+                out.append(f"    {p.yellow('rests')}  {msg}")
             for msg in i.pointers:
                 out.append(f"    {p.yellow('link')}   {msg}")
             for msg in i.ears:

@@ -361,7 +361,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         )
         if i.loc:
             ev.append(f"declared in {i.loc[0]}:{i.loc[1]}")
-        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
+        issues = "".join(f"<li>⚠ {e(m)}</li>" for m in i.assumes) + "".join(f"<li>⚠ {e(m)}</li>" for m in i.pointers) + "".join(f"<li>EARS: the sentence {e(m)}</li>" for m in i.ears) + "".join(f"<li>{e(m)}</li>" for m in i.advice)
         aims.append(
             f'<div class="aim"><span class="id">{e(i.id)}</span><span class="text">{e(i.text or "cited but never declared")}</span>'
             f"{pill(i.status)}<span class=\"evidence\">{e(' · '.join(ev))}<ul>{lemmas}{issues}</ul></span></div>"

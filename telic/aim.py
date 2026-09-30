@@ -107,6 +107,7 @@ class AimReport:
     digest: str = ""  # hash of the text and the lemma set
     scope: str | None = None  # declared in <scope>/aims/<ID>.md ('' = the root); None = a comment
     advice: list[str] = field(default_factory=list)  # findings that do not fail
+    assumes: list[str] = field(default_factory=list)  # unproved code a lemma's proof rests on
 
     # counts kept for the ledger and older callers
     @property
@@ -214,6 +215,10 @@ def build(rep: Any) -> list[AimReport]:
             _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context, root=getattr(rep, "root", None) or ".")
         if text is not None:
             r.ears = ears_problems(text)
+        status_of = {f.ref.key: f.status for f in rep.functions}
+        for f in fns:
+            for d in sorted(f.open_deps):
+                r.assumes.append(f"{f.fn.name} assumes {d.split('::')[-1]} ({status_of.get(d, 'not checked')})")
         # Status: what the lemmas establish (never "proved").
         fstat = [f.status for f in fns] + [m.status for m in mirrors.get(iid, [])]
         if text is None:

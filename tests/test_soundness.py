@@ -44,6 +44,7 @@ TRUE_HELPERS = {
     "t25.ts": {"fine"},
     "t26.rs": {"fine"},
     "t27.py": {"Box.__init__", "Box.get"},
+    "t30.ts": {"Shape.area", "Shape.__init__"},
 }
 
 FILES = sorted(p.name for p in DIR.iterdir() if p.suffix in (".py", ".ts", ".rs"))
@@ -125,3 +126,30 @@ def test_mirror_with_disjoint_preconditions_is_vacuous():
     rep = check([str(DIR / "mirvac")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mirvac"))
     assert [m.status for m in rep.mirrors] == ["vacuous"]
     assert [i.status for i in rep.aims if i.id == "SAME"] == ["vacuous"]
+
+
+DIVERGES = """
+def down(n: int) -> int:
+    #@ decreases n
+    if n <= 0:
+        return 0
+    return down(n + 1) + 1
+
+
+def uses_down(x: int) -> int:
+    #@ ensures result == 42 or down(3) == 0
+    return x
+"""
+
+
+@pytest.mark.parametrize("engine", ["python", "ox"])
+def test_the_timeout_bounds_unfolding_a_diverging_definition(tmp_path, engine):
+    from telic.engine import binary
+
+    if engine == "ox" and binary() is None:
+        pytest.skip("telic-core not built")
+    (tmp_path / "m.py").write_text(DIVERGES)
+    opts = CheckOptions(cache_path=None, lean=False, replay=False, timeout_ms=1000, engine=engine, only={"uses_down"})
+    rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+    (f,) = rep.functions
+    assert f.status == "open" and [v.reason for v in f.verdicts] == ["timeout"]
