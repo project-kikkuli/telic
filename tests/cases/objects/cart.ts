@@ -6,20 +6,22 @@ export enum Status {
   Shipped = "shipped",
 }
 
+type int = number;
+
 export interface Item {
   sku: string;
-  priceCents: number;
-  qty: number;
+  priceCents: int;
+  qty: int;
   note?: string;
 }
 
 const MAX_ITEMS = 50;
 
 export class Cart {
-  //@ invariant this.totalCents >= 0
+  //@ invariant this.totalCents >= 0 && Number.isSafeInteger(this.totalCents)
   items: Item[] = [];
   status: Status = Status.Draft;
-  totalCents = 0;
+  totalCents: int = 0;
   readonly id: string;
 
   constructor(public owner: string) {
@@ -47,10 +49,10 @@ export class Cart {
   }
 }
 
-export function withTax(cents: number): number {
-  //@ requires cents >= 0
+export function withTax(cents: int): int {
+  //@ requires cents >= 0 && Number.isSafeInteger(cents)
   //@ ensures result >= cents
-  return cents + (cents * 8) / 100;
+  return cents + Math.floor((cents * 8) / 100);
 }
 
 export function discount(total: number, code: string | undefined, codes: Map<string, number>): number {

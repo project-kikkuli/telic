@@ -71,9 +71,8 @@ def test_vibecoded_cart_ts():
         assert got[name].status == "proved", (name, got[name].status, got[name].problems)
     for name in ("discount", "badNote", "parseQty", "Cart.add"):
         assert refuted_confirmed(got[name]), (name, got[name].status)
-    # the status can change during the await; with the cart's cents in floats
-    # (its invariant quantifies over them) the solver may not find the race
-    assert got["checkout"].status in ("refuted", "open")
+    race = [v for v in got["checkout"].verdicts if v.replay is not None and v.replay.violation == "race"]
+    assert race
 
 
 def test_inheritance():
