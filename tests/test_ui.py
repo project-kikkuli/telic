@@ -622,6 +622,8 @@ MENU = '<button id=menu onclick="">Menu</button>'
         ('unobscured button "Menu"', MENU + "<div class=veil></div>", "", ".veil{position:fixed;inset:0;pointer-events:none}", "proved", ""),
         ('unobscured button "Menu"', MENU + '<div role=dialog aria-label="Cookies" class=ban>We use cookies</div>', "", ".ban{position:fixed;top:0;left:0;right:0;height:60px;background:#fd0}", "refuted", "Cookies"),
         ('unobscured button "Menu" while not overlay', MENU + '<div class=bd><div role=dialog aria-modal=true aria-label="Hi">Hi</div></div>', "", ".bd{position:fixed;inset:0;background:#0006}", "vacuous", ""),
+        # a dialog titled by its heading is named as a screen reader names it (two such dialogs are not one state)
+        ('reachable overlay "Delete item?"', '<button onclick="document.querySelector(\'main\').insertAdjacentHTML(\'beforeend\', \'<div role=dialog aria-labelledby=t><h2 id=t>Delete item?</h2></div>\')">Delete</button>', "", "", "proved", "reached in 1 step"),
         ('never overlay "Expired"', "<p>Hi</p>", "setTimeout(() => document.querySelector('main').insertAdjacentHTML('beforeend', '<div role=dialog aria-label=Expired>Expired</div>'), 1500);", "", "refuted", "Expired"),
     ],
 )

@@ -11,7 +11,7 @@ import time
 from urllib.parse import urljoin, urlsplit
 
 from .driver import Driver, DriverError
-from .tree import TEXT_ENTRY, Action, Node, Snapshot, route
+from .tree import OVERLAYS, TEXT_ENTRY, Action, Node, Snapshot, route
 
 _LINE = re.compile(r"^(?P<indent>\s*)- (?P<body>.*)$")
 _ATTR = re.compile(r"\s*\[(?P<a>[^\]]*)\]")
@@ -256,6 +256,16 @@ _FIBERS_JS = """
   return out;
 }
 """.replace("ABSTRACT", _ABSTRACT_JS.strip())
+
+
+# An element's name from aria-label or aria-labelledby, which the snapshot
+# leaves out for some roles (a dialog titled by its heading).
+_NAME_JS = """
+(el) => {
+  const by = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).map((id) => document.getElementById(id)).filter(Boolean);
+  return (el.getAttribute('aria-label') || by.map((x) => x.innerText || x.textContent || '').join(' ')).trim().replace(/\\s+/g, ' ');
+}
+"""
 
 
 def _scalar(o: dict):
@@ -612,6 +622,11 @@ class WebDriver(Driver):
     def observe(self) -> Snapshot:
         root = parse_aria(self.text)
         for n in root.walk():
+            if n.role in OVERLAYS and not n.name and n.ref is not None:
+                try:
+                    n.name = self._loc(n.ref).evaluate(_NAME_JS, timeout=self.timeout_ms)
+                except Exception:  # noqa: BLE001 - detached since the snapshot: unnamed
+                    pass
             if n.role in TEXT_ENTRY and n.ref is not None:
                 try:
                     n.form = self._loc(n.ref).evaluate(_FORM_JS, timeout=self.timeout_ms)

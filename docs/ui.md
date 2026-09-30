@@ -78,9 +78,13 @@ lemmas added at the top of `App.tsx` and `App.svelte`. Run them with
   gives more than 100 states (filters, forms, the banner multiply), so the
   model is over screens: about 25 and 20 states, complete. telic finds a
   real defect: at 390x844 the cookie banner covers the sidebar's Settings
-  link, and the trace is one click (`Open sidebar`), replayed. Escape stays
-  open: a route out of two stacked dialogs, reached one of several ways, does
-  not replay.
+  link, and the trace is one click (`Open sidebar`), replayed. Its dialogs
+  are titled by their headings (`aria-labelledby`), which the browser's
+  snapshot leaves unnamed; telic names them, so "Delete task?" over the task
+  drawer is no longer the same state as "Discard changes?", and every route
+  out of the stacked dialogs replays. Reading the state the tree does not
+  show (filters, settings, the open task, the focus queue) multiplies the
+  states past the default budget, so escape is open at `max_states = 300`.
 
 `examples/splitter` is an app built with telic from the first line: a
 Python API and a TypeScript front end with aims for money, a lifecycle, a
