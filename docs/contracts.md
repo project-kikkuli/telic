@@ -554,7 +554,6 @@ ignore = ['button "Sign out"']              # actions never fired (regexes)
 text = "telic"                              # what is typed into text fields
 fill = { "Coupon" = "SAVE10" }              # by field name (regex); emails, passwords, dates... are guessed
 wait = 5                                    # seconds: a timer the app sets for up to this long is waited for; 0: never
-seed = false                                # true: an oracle proposes paths from the source first
 walk_seed = 0                               # of the random walks that test the model; the same seed, the same model
 ```
 

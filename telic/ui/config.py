@@ -52,7 +52,6 @@ class UiConfig:
     settings: Settings = field(default_factory=Settings)
     driver: str = "web"
     inputs: list[str] | None = None
-    seed: bool = False
     witnesses: int = 20
     settle_ms: int = 50
     platform: str = "web"
@@ -112,7 +111,7 @@ def load(path: str, root: str) -> UiConfig:
         raise ConfigError(f"{os.path.relpath(path, root)} has no [ui] section")
     known = {
         "url", "command", "static", "build", "ready_timeout", "viewports", "max_states", "max_depth", "max_seconds", "walks",
-        "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "seed", "witnesses", "settle_ms", "wait",
+        "walk_length", "workers", "abstraction", "text", "fill", "keys", "ignore", "driver", "inputs", "witnesses", "settle_ms", "wait",
         "platform", "app", "project", "workspace", "scheme", "devices", "launch_args",
         "walk_seed",
     }
@@ -163,7 +162,6 @@ def load(path: str, root: str) -> UiConfig:
         settings=s,
         driver=str(ui.get("driver", "web")),
         inputs=list(ui["inputs"]) if "inputs" in ui else None,
-        seed=bool(ui.get("seed", False)),
         witnesses=int(ui.get("witnesses", 20)),
         settle_ms=int(ui.get("settle_ms", 50)),
         platform=platform,

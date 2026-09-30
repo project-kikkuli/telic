@@ -7,7 +7,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -19,7 +18,7 @@ from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
 from .driver import DriverError
-from .spec import SKIP_DIRS, SOURCE_EXT, Scan, UiDecl, UiLemma
+from .spec import Scan, UiDecl, UiLemma
 
 CACHE = os.path.join(".telic", "ui.json")
 AUTO_STATES = 100
@@ -197,11 +196,10 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
             facts = source.scan(cfg.dir, cfg.platform)
             if facts.keys:
                 cfg = replace(cfg, settings=replace(cfg.settings, keys=tuple(dict.fromkeys([*cfg.settings.keys, *(k.key for k in facts.keys)]))))
-            seeds = propose(cfg, lems) if cfg.seed else None
             # one simulator at a time: each device is learned after the last
             jobs = list(enumerate(cfg.viewports if cfg.platform == "web" else cfg.devices or [""]))
             with ThreadPoolExecutor(max_workers=len(jobs) if cfg.platform == "web" else 1) as pool:
-                done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, seeds, facts, job[0], job[1], log), jobs))
+                done = list(pool.map(lambda job: _viewport(cfg, url, lems, atoms, facts, job[0], job[1], log), jobs))
     except (AppError, DriverError) as e:
         app.error = str(e)
         return {lem.name: UiResult(lem, cfg.path, "open", "", f"the app did not run: {e}") for lem in lems}
@@ -217,14 +215,14 @@ def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str],
     return out
 
 
-def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, facts, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _viewport(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, i: int, size: tuple[int, int] | str, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     # one browser (or simulator) slot each, machine-wide: runs in other processes queue for them
     vp = f"{size[0]}x{size[1]}" if isinstance(size, tuple) else size or "iOS"
     with slots.hold(max(1, cfg.settings.workers) if cfg.platform == "web" else 1, log=lambda m: log(f"{vp}: {m}")) as n:
-        return _learn(cfg, url, lems, atoms, seeds, facts, size, n, log)
+        return _learn(cfg, url, lems, atoms, facts, size, n, log)
 
 
-def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, facts, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
+def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, facts, size: tuple[int, int] | str, browsers: int, log) -> tuple[dict[str, Any], dict[str, Outcome]]:
     from .learn import Explorer
 
     drivers: list = []
@@ -265,7 +263,7 @@ def _learn(cfg: UiConfig, url: str, lems: list[UiLemma], atoms: Atoms, seeds, fa
 
             ex = Explorer(drivers, atoms.preds, settings, vp, probe, lambda m: log(f"{vp}: {m}"))
             holder.append(ex)
-            return ex, ex.learn(seeds), occl
+            return ex, ex.learn(), occl
 
         s = cfg.settings
         if s.abstraction == "auto":
@@ -317,50 +315,3 @@ def _dump(cfg: UiConfig, model) -> None:
         Path(d, f"ui-model-{model.viewport}.json").write_text(json.dumps(model.dump(), indent=1, ensure_ascii=False))
     except OSError:
         pass
-
-
-# ---------------------------------------------------------------------------
-# An oracle's model of the app, from its source: a seed, tested like any guess
-
-
-def propose(cfg: UiConfig, lems: list[UiLemma], budget: int = 40000) -> list[list[str]] | None:
-    from .. import oracle
-
-    files: dict[str, str] = {}
-    size = 0
-    for dirpath, dirnames, filenames in os.walk(cfg.dir):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
-        for f in sorted(filenames):
-            if not f.endswith(SOURCE_EXT) or f.endswith((".config.js", ".config.ts")):
-                continue
-            try:
-                text = Path(dirpath, f).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            if size + len(text) > budget:
-                continue
-            files[os.path.relpath(os.path.join(dirpath, f), cfg.dir)] = text
-            size += len(text)
-    state = {"sources": files, "lemmas": [f"{lem.name}: {lem.text}" for lem in lems]}
-    questions = {
-        "paths": {
-            "type": "text",
-            "instructions": (
-                "Read the app's source and predict how a user moves through it. Answer with only a JSON array of action sequences, "
-                "each an array of steps written as an accessible role and name, e.g. [[\"button \\\"Settings\\\"\", \"checkbox \\\"Dark mode\\\"\"], "
-                "[\"link \\\"About\\\"\", \"key Escape\"]]. Cover every screen, dialog and menu, and the states the lemmas mention."
-            ),
-        }
-    }
-    got = oracle.consult("ui-model", state, questions, root=cfg.dir)
-    text = (got.answers.get("paths") or {}).get("text")
-    if not text:
-        return None
-    m = re.search(r"\[.*\]", text, re.S)
-    try:
-        data = json.loads(m.group(0)) if m else None
-    except ValueError:
-        return None
-    if not isinstance(data, list):
-        return None
-    return [[str(x) for x in p] for p in data if isinstance(p, list)][:40]

@@ -785,9 +785,6 @@ def model_line(m: dict[str, Any], p: Paint) -> str:
         bits.append(conf)
     if m.get("nondeterministic"):
         bits.append(p.yellow(f"{m['nondeterministic']} nondeterministic"))
-    if m.get("seeded"):
-        sd = m["seeded"]
-        bits.append(f"oracle seed: {sd.get('steps_agreed', 0)} steps right, {sd.get('steps_wrong', 0)} wrong")
     return f"{p.bold(m['viewport'])}  " + p.dim(" · ").join(bits)
 
 

@@ -11,8 +11,6 @@ access sequence from a fresh start, as in active automata learning.
 The model is then conformance-tested: random walks through it are replayed
 in the app step by step, and every step whose outcome the model did not
 predict is added to it (the app is the judge), after which learning resumes.
-A model proposed by an oracle from reading the source can seed the search;
-its predictions are tested the same way and never trusted.
 """
 
 from __future__ import annotations
@@ -90,7 +88,6 @@ class Model:
     walk_length: int = 0
     agreed: int = 0
     disagreed: list[str] = field(default_factory=list)
-    seeded: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     unreproducible: set[int] = field(default_factory=set)  # seen once, never reached again by any known path
     keys: list[str] = field(default_factory=list)  # found in the source, pressed like any action ('Escape (app.js:3)')
@@ -216,7 +213,6 @@ class Model:
             "agreed": self.agreed,
             "disagreed": self.disagreed[:10],
             "nondeterministic": self.nondeterministic,
-            "seeded": self.seeded,
             "unreproducible": len(self.unreproducible),
             "keys": self.keys,
             "hidden": self.hidden,
@@ -581,32 +577,8 @@ class Explorer:
         self.model.walk_length = max(self.model.walk_length, length)
         return surprised[0]
 
-    def seed(self, paths: list[list[str]]) -> None:
-        """Replay action sequences an oracle predicted; each step it got
-        right or wrong is counted, and what the app did is kept."""
-        agreed = wrong = 0
-        w = self.main
-        for p in paths:
-            if self._over():
-                break
-            s = self.reset(w)
-            for want in p:
-                sig = next((k for k, a in w.acts.items() if want in (k, a.label) or a.label.endswith(" " + want)), None)
-                if sig is None:
-                    wrong += 1
-                    break
-                t = self.fire(w, s, sig)
-                if t is None:
-                    wrong += 1
-                    break
-                agreed += 1
-                s = t
-        self.model.seeded = {"paths": len(paths), "steps_agreed": agreed, "steps_wrong": wrong}
-
-    def learn(self, seeds: list[list[str]] | None = None, rounds: int = 3) -> Model:
+    def learn(self, rounds: int = 3) -> Model:
         self.reset(self.main)
-        if seeds:
-            self.seed(seeds)
         def untried() -> list[UiState]:
             return [s for s in self.model.states if s.id not in self.model.unreproducible and any(a not in s.fired for a in s.actions)]
 
