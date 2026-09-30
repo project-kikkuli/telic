@@ -55,7 +55,10 @@ telic tries measures derived from its condition (`hi - lo + 1`, `len(xs) - i`,
 other, none with `@decreases`) it tries, in order, one shape in every function
 (an int parameter, that parameter less a bound it is compared with, `len` of a
 list or string, `hi - lo`, the depth of a frozen dataclass or NamedTuple
-value, whose fields are always shallower, and a trusted `int` predicate of
+value, whose fields are always shallower unless some checked module can
+rewrite objects (`object.__setattr__`, `setattr`, `vars`, `__dict__`, assigning
+`__class__`, three-argument `type`) or subclasses it outside a module's top
+level, and a trusted `int` predicate of
 one argument, like `depth(t)` below), that shape paired with each
 function's rank in the calls that keep it, then lexicographic pairs. It proves
 the first that works and shows it (`telic check -v`, and `inferred.measure` in

@@ -109,6 +109,7 @@ class PythonFrontend:
         # every checked class in the project (name -> owner), for types that
         # reach a module through fields without being imported there
         self.project: dict[str, "PythonFrontend"] = {}
+        self.peers: list["PythonFrontend"] = [self]  # every module checked with this one
 
     def import_class_info(self, other: "PythonFrontend", cname: str) -> None:
         """Make a class from another checked module usable here: its
@@ -252,7 +253,13 @@ class PythonFrontend:
                     subs[n] |= more
                     changed = True
         structs: dict[str, frozenset[str]] = {}
+        reopened = self._reopened(set(by_name))
+        if reopened is None:
+            self._structs = (structs, aliases)
+            return self._structs
         for n in by_name:
+            if subs[n] & reopened:
+                continue
             got = [attrs_of(d) for d in sorted(subs[n])]
             if all(g is not None for g in got):
                 fields = frozenset().union(*(g[0] for g in got if g))
@@ -260,6 +267,24 @@ class PythonFrontend:
                 structs[n] = fields - others
         self._structs = (structs, aliases)
         return self._structs
+
+    def _reopened(self, names: set[str]) -> set[str] | None:
+        """Classes of ``names`` subclassed outside this module's top level
+        (inside a function, or in another module), or None when some module
+        can rewrite any object: ``object.__setattr__``, ``setattr``,
+        ``vars``, ``__dict__``, assigning ``__class__``, or ``type(name,
+        bases, ns)``."""
+        out: set[str] = set()
+        top = set(map(id, getattr(self, "tree", ast.Module([], [])).body))
+        for fe in self.peers:
+            for n in ast.walk(getattr(fe, "tree", ast.Module([], []))):
+                if isinstance(n, ast.Attribute) and (n.attr in ("__setattr__", "__dict__") or n.attr == "__class__" and isinstance(n.ctx, ast.Store)):
+                    return None
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and (n.func.id in ("setattr", "vars") or n.func.id == "type" and len(n.args) == 3):
+                    return None
+                if isinstance(n, ast.ClassDef) and not (fe is self and id(n) in top):
+                    out.update(b for b in map(_decorator_name, n.bases) if b in names)
+        return out
 
     def import_function(self, other: "PythonFrontend", name: str) -> None:
         self.signatures[name] = other.signatures[name]
@@ -3007,6 +3032,7 @@ def lower_python_project(files: list[tuple[str, str]]) -> list[ir.Module]:
     registry = {n: o for n, o in owners.items() if o is not None}
     for fe in fes:
         fe.project = registry
+        fe.peers = fes
     # A class can be dropped as unmodelable after other types mention it
     # (a field of type Settings, where Settings subclasses a library base):
     # those mentions become opaque, like any other library type.

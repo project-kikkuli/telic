@@ -49,6 +49,10 @@ TRUE_HELPERS = {
     "t30.ts": {"Shape.area", "Shape.__init__", "Square.__init__"},
     "t31.py": {"claim", "claim2"},  # proved only assuming the recursion, which stays open
     "t37.py": {"Loop.__post_init__"},
+    "t38.py": {"knot"},
+    "t39.py": {"knot"},
+    "t40.py": {"knot"},
+    "t41.py": {"knot", "Loop.nxt"},
     "inh1.py": {"Base.__init__", "Base.setx", "Base.helper", "Sub.__init__"},
     "inh2.py": {"Base.size", "Sub.size"},
     "async1.py": {"Counter.__init__", "bump"},
