@@ -147,10 +147,36 @@ def contract_result(program: Program, ref: FuncRef, inputs: dict[str, Val], side
     return r, list(ctx.base) + facts  # type: ignore[return-value]
 
 
-def agree_by_contracts(program: Program, theory: Theory, a: FuncRef, b: FuncRef, ina: dict[str, Val], inb: dict[str, Val], loc: ir.Loc, timeout_ms: int) -> bool:
+def mirror_lemma(program: Program, a: FuncRef, b: FuncRef) -> L.Term | None:
+    """A proved mirror between two logical definitions, as a fact: on every
+    input both accept, they are equal."""
+    if a.key not in program.logic_names or b.key not in program.logic_names:
+        return None
+    try:
+        ina, inb, shown, _ = _shared_inputs(a.fn, b.fn)
+    except Incomparable:
+        return None
+    if any(isinstance(v, ListVal) for _, v in shown):
+        return None
+    reqs: list[L.Term] = []
+    apps: list[L.Term] = []
+    for ref, ins in ((a, ina), (b, inb)):
+        g = VCGen(program, ref, inputs=ins)
+        g.definitional_mode = True
+        ctx = Ctx(base=[], env=dict(ins), module=ref.module, spec=True, quiet=True)
+        reqs += [g.ev(r.expr, ctx) for r in ref.fn.requires]
+        if ctx.base:
+            return None
+        apps.append(g.apply_def(ref, [ins[p.name] for p in ref.fn.params]))
+    x, y = _coerce_pair(apps[0], apps[1])
+    fresh = {v: L.Const(f"eq!{a.fn.name}.{n}", v.sort) for n, v in shown}  # type: ignore[misc]
+    return L.substitute(L.Quant("forall", tuple(fresh.values()), L.implies(L.and_(*reqs), L.eq(x, y)), patterns=((L.substitute(apps[0], fresh),),)), fresh)
+
+
+def agree_by_contracts(program: Program, theory: Theory, a: FuncRef, b: FuncRef, ina: dict[str, Val], inb: dict[str, Val], loc: ir.Loc, timeout_ms: int, lemmas: list[L.Term] = ()) -> bool:  # type: ignore[assignment]
     """Do the two proved contracts pin the same result on every input both
     accept? Only for scalar parameters (nothing to mutate) and functions
-    that never raise."""
+    that never raise. ``lemmas``: proved mirrors of the helpers they use."""
     if a.fn.raises or b.fn.raises or not all(isinstance(p.ty, SCALARS) for p in a.fn.params + b.fn.params):
         return False
     ra, ha = contract_result(program, a, ina, "a")
@@ -158,13 +184,16 @@ def agree_by_contracts(program: Program, theory: Theory, a: FuncRef, b: FuncRef,
     if isinstance(ra, ListVal) != isinstance(rb, ListVal):
         return False
     if isinstance(ra, ListVal) and isinstance(rb, ListVal):
-        i = L.Const("mirror.i", L.INT)
+        i = L.Const("mirror.i", L.INT)  # any index: free, so the goal needs no quantifier
         x, y = _coerce_pair(ra.at(i), rb.at(i))
-        goal = L.and_(L.eq(ra.len, rb.len), L.forall([i], L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ra.len)), L.eq(x, y))))
+        goal = L.and_(L.eq(ra.len, rb.len), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ra.len)), L.eq(x, y)))
+        # element-wise @ensures, instantiated at that index
+        ha = ha + [L.substitute(h.body, {h.vars[0]: i}) for h in ha if isinstance(h, L.Quant) and h.kind == "forall" and len(h.vars) == 1]
+        hb = hb + [L.substitute(h.body, {h.vars[0]: i}) for h in hb if isinstance(h, L.Quant) and h.kind == "forall" and len(h.vars) == 1]
     else:
         x, y = _coerce_pair(ra, rb)  # type: ignore[arg-type]
         goal = L.eq(x, y)
-    ob = Obligation(id=f"{a.fn.name}~{b.fn.name}/contracts", func=a.key, kind="mirror", loc=loc, site=None, message=f"the contracts of {a.fn.name} and {b.fn.name} pin the same result", hyps=ha + hb, goal=goal, inputs=[])
+    ob = Obligation(id=f"{a.fn.name}~{b.fn.name}/contracts", func=a.key, kind="mirror", loc=loc, site=None, message=f"the contracts of {a.fn.name} and {b.fn.name} pin the same result", hyps=ha + hb + list(lemmas), goal=goal, inputs=[])
     return solve(ob, theory, timeout_ms).status == "proved"
 
 
@@ -323,7 +352,7 @@ def explain_difference(a: ir.Function, b: ir.Function, notes: list[str]) -> str:
     return notes[0] if notes else ""
 
 
-def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300, aims: list[str] | None = None, proved: set[str] | None = None) -> MirrorReport:
+def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: str, loc: ir.Loc, timeout_ms: int = 8000, n_tests: int = 300, aims: list[str] | None = None, proved: set[str] | None = None, lemmas: list[L.Term] = ()) -> MirrorReport:  # type: ignore[assignment]
     """``aims``: the tags on the ``@mirrors`` line; untagged, the mirror
     serves every aim either function cites. ``proved``: functions whose
     every obligation is proved, whose contracts may stand in for them."""
@@ -374,7 +403,7 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
             rep.reason = str(e)
     if proved is not None and a.key in proved and b.key in proved:
         try:
-            if agree_by_contracts(program, theory, a, b, ina, inb, loc, timeout_ms):
+            if agree_by_contracts(program, theory, a, b, ina, inb, loc, timeout_ms, lemmas):
                 rep.status, rep.method, rep.reason = "proved", "contracts", ""
                 return rep
         except (Incomparable, VCError):
@@ -457,6 +486,7 @@ def mirror_targets(modules: list[ir.Module]) -> list[str]:
 def check_mirrors(program: Program, theory: Theory, opts, root: str | None = None, proved: set[str] | None = None) -> list[MirrorReport]:
     root = root or getattr(program, "root", os.getcwd())
     out: list[MirrorReport] = []
+    pairs = []
     for m in program.modules:
         for f in m.functions.values():
             if opts.only and f.name not in opts.only:
@@ -469,5 +499,16 @@ def check_mirrors(program: Program, theory: Theory, opts, root: str | None = Non
                     rep.reason = f"cannot find '{spec}' (path is relative to {m.path}; the file must be checkable)"
                     out.append(rep)
                     continue
-                out.append(check_pair(program, theory, target, owner, root, loc, opts.timeout_ms, aims=list(tags), proved=proved))
+                pairs.append((target, owner, loc, tags))
+    # Loop-free pairs first: once proved, a pair of helpers is a lemma for
+    # the mirrors of functions that use them.
+    pairs.sort(key=lambda p: _has_loops(p[0].fn) or _has_loops(p[1].fn))
+    lemmas: list[L.Term] = []
+    for target, owner, loc, tags in pairs:
+        rep = check_pair(program, theory, target, owner, root, loc, opts.timeout_ms, aims=list(tags), proved=proved, lemmas=lemmas)
+        out.append(rep)
+        if rep.status == "proved":
+            lemma = mirror_lemma(program, target, owner)
+            if lemma is not None:
+                lemmas.append(lemma)
     return out

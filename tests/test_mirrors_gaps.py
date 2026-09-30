@@ -124,6 +124,14 @@ def test_mirror_of_loops_is_proved_from_their_contracts(tmp_path, web, status, m
     assert (m.status, m.method) == (status, method), m.reason
 
 
+@needs_node
+def test_a_proved_helper_mirror_is_a_lemma_for_the_loops_using_it(tmp_path):
+    py = SPLIT_PY.replace("if i < amount % parts:\n        return amount // parts + 1\n    return amount // parts", "base = amount // parts\n    if i < amount % parts:\n        return base + 1\n    return base")
+    web = SPLIT_TS.replace("function shareOf(amount: int, parts: int, i: int): int {\n", "export function shareOf(amount: int, parts: int, i: int): int {\n  //@ mirrors ../server/split.py::share\n")
+    rep = run_check(tmp_path, {"server/split.py": py, "web/split.ts": web})
+    assert sorted((m.a.fn.name, m.status, m.method) for m in rep.mirrors) == [("share", "proved", "smt"), ("split", "proved", "contracts")]
+
+
 REFUND = """
 def refund(paid: int, refunded: int, requested: int) -> int:
     #@ requires 0 <= refunded <= paid and requested >= 0
