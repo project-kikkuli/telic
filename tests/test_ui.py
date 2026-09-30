@@ -416,18 +416,21 @@ def test_concurrent_browsers_never_exceed_the_machine_budget(tmp_path, monkeypat
     assert peak[0] == budget and live[0] == 0
 
 
-@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT", "SIGKILL"])
 @needs_browser
-def test_a_signal_takes_down_the_dev_server_and_browsers(tmp_path, sig):
+def test_nothing_telic_started_outlives_it(tmp_path, sig):
+    import os
     import signal
     import subprocess
     import sys
     import time
 
     d = fixture_app(tmp_path)
+    running: set[int] = set()
     toml = (d / "telic.toml").read_text().replace('static = "."', f'command = "{sys.executable} -m http.server {{port}} --bind 127.0.0.1"')
     (d / "telic.toml").write_text(toml + "max_seconds = 300\n")
-    proc = subprocess.Popen([sys.executable, "-m", "telic.cli", "check", str(d), "--no-cache"], cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    proc = subprocess.Popen([sys.executable, "-m", "telic.cli", "check", str(d), "--no-cache"], cwd=d, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def tree() -> set[int]:
         rows = [ln.split() for ln in subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout.splitlines()]
@@ -463,3 +466,8 @@ def test_a_signal_takes_down_the_dev_server_and_browsers(tmp_path, sig):
         assert commands(running) == []
     finally:
         proc.kill()
+        for pid in running:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass

@@ -9,6 +9,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +28,28 @@ class AppError(Exception):
 
 
 _LIVE: set[App] = set()  # apps whose server is up, for a signal to take down
+
+# Runs the dev server command in its own process group and takes the whole
+# group down when telic's end of its stdin closes: whenever telic exits, even
+# killed outright, nothing it started outlives it.
+_GUARD = """
+import os, signal, subprocess, sys, threading
+p = subprocess.Popen(sys.argv[1], shell=True, stdin=subprocess.DEVNULL)
+def down(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        os.killpg(0, signal.SIGTERM)
+        p.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    os.killpg(0, signal.SIGKILL)
+signal.signal(signal.SIGTERM, down)
+threading.Thread(target=lambda: (sys.stdin.buffer.read(), os.kill(os.getpid(), signal.SIGTERM)), daemon=True).start()
+code = p.wait()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+os.killpg(0, signal.SIGTERM)
+os._exit(code if code >= 0 else 128 - code)
+"""
 
 
 @contextmanager
@@ -144,7 +167,9 @@ class App:
             cmd = cfg.command.replace("{port}", str(port))
             self.log(f"starting: {cmd}")
             env = dict(os.environ, PORT=str(port), BROWSER="none")
-            self.proc = subprocess.Popen(cmd, shell=True, cwd=cfg.dir, env=env, stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True)
+            self.proc = subprocess.Popen(
+                [sys.executable, "-c", _GUARD, cmd], cwd=cfg.dir, env=env, stdin=subprocess.PIPE, stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True
+            )
             _LIVE.add(self)
             deadline = time.monotonic() + cfg.ready_timeout
             while time.monotonic() < deadline:
@@ -168,6 +193,8 @@ class App:
     def kill(self) -> None:
         """Stop the dev server and everything it started."""
         _LIVE.discard(self)
+        if self.proc is not None and self.proc.stdin is not None:
+            self.proc.stdin.close()
         if self.proc is not None and self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
