@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from telic.checker import CheckOptions, check
 from telic.replay import call_text
 
@@ -88,3 +90,10 @@ def test_same_class_name_in_two_files_is_checked_against_its_own(tmp_path):
     by = {(f.ref.module.path, f.fn.name): f for f in rep.functions}
     assert all(by[k].status == "proved" for k in [("a.py", "get"), ("b.py", "name"), ("b.py", "plain")])
     assert {f.fn.params[0].ty.name for k, f in by.items() if k[1] in ("get", "name")} == {"Box@a", "Box@b"}
+
+
+@pytest.mark.parametrize("init", ["-1", "-1.5", "+2"])
+def test_a_field_initialised_to_a_signed_literal_is_typed(tmp_path, init):
+    (tmp_path / "m.py").write_text(f"class A:\n    #@ invariant self.w != 0\n\n    def __init__(self):\n        self.w = {init}\n")
+    rep = check([str(tmp_path / "m.py")], CheckOptions(cache_path=None, lean=False), root=str(tmp_path))
+    assert [f.status for f in rep.functions] == ["proved"]

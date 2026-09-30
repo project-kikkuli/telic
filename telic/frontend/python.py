@@ -425,6 +425,8 @@ class PythonFrontend:
                     ty = self.type_of_annotation(ann[val.id])
                 elif isinstance(val, ast.Constant) and type(val.value) in (int, float, str, bool):
                     ty = {int: ir.INT, float: ir.REAL, str: ir.STR, bool: ir.BOOL}[type(val.value)]
+                elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.USub, ast.UAdd)) and isinstance(val.operand, ast.Constant) and type(val.operand.value) in (int, float):
+                    ty = ir.INT if type(val.operand.value) is int else ir.REAL
                 elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id in self.enum_types:
                     ty = self.enum_types[val.value.id]
                 else:
