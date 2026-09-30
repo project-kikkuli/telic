@@ -186,3 +186,43 @@ def test_proved_functions_hold_when_run(report):
                 bad.append(f"{fn.name}{m}: {o}")
     assert ran >= 25, ran
     assert not bad, "\n".join(bad)
+
+
+STAND_IN = """
+use std::cell::Cell;
+
+pub struct Rec {
+    pub n: u32,
+    pub c: Cell<u32>,
+}
+
+pub fn peek(c: &Cell<u32>) -> u32 {
+    //@ ensures result == 7
+    c.get()
+}
+
+pub fn through(r: &Rec) -> u32 {
+    //@ ensures result == 7
+    r.c.get()
+}
+
+pub fn bug(k: u32) -> u32 {
+    //@ requires k < 100
+    //@ ensures result == k
+    k + 1
+}
+"""
+
+
+@pytest.mark.skipif(not HAS_RUSTC, reason="rustc not available")
+def test_replay_never_runs_on_stand_ins(tmp_path):
+    """The Rust harness builds only real values: a counterexample needing a
+    value of a type telic does not model (here Cell) is not run, so it
+    confirms nothing; one over modelled types is confirmed."""
+    f = tmp_path / "u.rs"
+    f.write_text(STAND_IN)
+    rep = check([str(f)], CheckOptions(cache_path=None, lean=False), root=str(tmp_path))
+    got = {r.fn.name: r for r in rep.functions}
+    for name in ("peek", "through"):
+        assert not any(v.replay is not None and v.replay.confirmed for v in got[name].verdicts), name
+    assert any(v.replay is not None and v.replay.confirmed for v in got["bug"].verdicts)

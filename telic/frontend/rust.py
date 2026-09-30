@@ -911,6 +911,14 @@ class RustFrontend:
         return ir.Builtin(t, loc, "opaque_op", (ir.Lit(ir.STR, loc, "default"),))
 
 
+def _int_literal(n: Any) -> int | None:
+    """The value of an integer literal node (0x, 0o, 0b, _ and a type suffix allowed)."""
+    if n.type != "integer_literal":
+        return None
+    m = re.match(r"^(0x[0-9a-fA-F]+|0o[0-7]+|0b[01]+|\d+)(?:[iu](?:8|16|32|64|128|size))?$", _text(n).replace("_", ""))
+    return int(m.group(1), 0) if m else None
+
+
 def _array_len(tn: Any) -> int | None:
     """N in [T; N] (behind references)."""
     while tn is not None and tn.type == "reference_type":
@@ -918,12 +926,7 @@ def _array_len(tn: Any) -> int | None:
     if tn is None or tn.type != "array_type":
         return None
     n = tn.child_by_field_name("length")
-    if n is None or n.type != "integer_literal":
-        return None
-    try:
-        return int(re.sub(r"[_a-z]+\d*$", "", _text(n).replace("_", "")), 0)
-    except ValueError:
-        return None
+    return _int_literal(n) if n is not None else None
 
 
 def _is_result(t: ir.Type) -> bool:
@@ -1822,6 +1825,8 @@ class ExprLowerer:
             v = self._path_value(hit, name, n, expect, loc)
             if v is not None:
                 return v
+        if hit is None and name[:1].isupper() and not self.spec:
+            return self.hoist(ir.Extern(ir.TOpaque(name), loc, name, ()))  # a unit struct or constant from outside the crate
         raise self.err(f"unknown name '{name}'", n)
 
     def x_self(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
@@ -2923,7 +2928,7 @@ class ExprLowerer:
             raise self.err(f".{m}() is not supported in specifications here", n)
         if isinstance(t, ir.TOpaque) and m in ("len", "count", "capacity") and not argn:
             v = self._opaque_as(self.hoist(ir.Extern(ir.TOpaque(""), loc, f"{t}.{m}", (recv,))), ir.INT, None)
-            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (v, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, (1 << 63) - 1))), "usize")  # (no collection holds more than isize::MAX)
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (v, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, (1 << 64) - 1))), "usize")
         if isinstance(t, ir.TOpaque) and m in ("unwrap", "expect"):
             return self.opaque("unwrap", [recv], ir.TOpaque(""), loc)  # a Result from unchecked code
         args, writes = self.extern_args(argn)
@@ -2944,7 +2949,7 @@ class ExprLowerer:
             t, k = self.fe.type_of_text(arg[:-1])
             if isinstance(t, (ir.TOpaque, ir.TNone)):
                 return None
-            v = self.hoist(ir.Builtin(t, loc, "from_opaque", (self.opaque(m, [recv], ir.TOpaque(""), loc),)))
+            v = self.hoist(ir.Builtin(t, loc, "from_opaque", (self.hoist(ir.Extern(ir.TOpaque(""), loc, f"{want}::{m}", (recv,))),)))  # (each call may return something else)
             if isinstance(t, (ir.TList, ir.TDict)):
                 return self.elems_kinded(v, k)
             return self.ranged(v, k) if t == ir.INT else v
@@ -2957,8 +2962,9 @@ class ExprLowerer:
             return self.checked(ir.Builtin(ir.INT, loc, "abs", (recv,)), k)
         if m in ("min", "max"):
             return self.kinded(ir.Builtin(ir.INT, loc, m, (recv, args[0])), k)
-        if m == "pow" and argn and argn[0].type == "integer_literal" and int(re.match(r"\d+", _text(argn[0]).replace("_", "")).group(0)) <= 128:  # type: ignore[union-attr]
-            p = int(re.match(r"\d+", _text(argn[0]).replace("_", "")).group(0))  # type: ignore[union-attr]
+        exp = _int_literal(argn[0]) if argn else None
+        if m == "pow" and exp is not None and 0 <= exp <= 128:
+            p = exp
             out: ir.Expr = ir.Lit(ir.INT, loc, 1)
             for _ in range(p):
                 out = ir.Binary(ir.INT, loc, "mul", out, recv)
@@ -3098,8 +3104,9 @@ class ExprLowerer:
         if m == "len":
             if self.spec:
                 return self.kinded(length, "usize")
-            # a Vec never holds more than isize::MAX elements
-            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (length, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, (1 << 63) - 1))), "usize")
+            # a Vec of non-zero-sized elements never holds more than isize::MAX of them
+            zst = isinstance(t.elem, (ir.TRecord, ir.TClass)) and not (t.elem.fields if isinstance(t.elem, ir.TRecord) else self.fe.classes.get(t.elem.name, ir.ClassDecl("", [], [])).fields)
+            return self.kinded(ir.Builtin(ir.INT, loc, "in_range", (length, ir.Lit(ir.INT, loc, 0), ir.Lit(ir.INT, loc, (1 << 64) - 1 if zst else (1 << 63) - 1))), "usize")
         if m == "is_empty":
             return ir.Binary(ir.BOOL, loc, "eq", length, ir.Lit(ir.INT, loc, 0))
         if m == "contains":
@@ -3159,30 +3166,35 @@ class ExprLowerer:
             k = self.expr(argn[0], ir.INT, "usize")
             self.pre.append(ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice", (recv, ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "min", (k, length))))))
             return ir.Lit(ir.NONE, loc, None)
-        mutating = m in ("sort", "sort_unstable", "reverse", "dedup", "retain", "insert", "remove", "sort_by", "sort_by_key", "drain", "iter_mut", "resize")
-        if m in ("remove", "swap_remove", "insert") and len(argn) == (2 if m == "insert" else 1):
-            i = self.hoist(self.expr(argn[0], ir.INT, "usize"))
+        args, writes = self.extern_args(argn)
+        if m in ("remove", "swap_remove", "insert") and len(args) == (2 if m == "insert" else 1):
+            i = args[0]
             bound = ir.Binary(ir.BOOL, loc, "le" if m == "insert" else "lt", i, length)
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), i), bound), loc, f"the {m} index is within bounds"), native=True))
-        if not isinstance(recv, ir.Var) and m in VEC_MUTATORS:
-            args, writes = self.extern_args(argn)
-            out = self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(""), loc, f"Vec.{m}", (self.fl.coerce(recv, ir.TOpaque("")), *args)))
+        ret = expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of .{m}()")
+        if m in VEC_MUTATORS and not isinstance(recv, ir.Var):
+            out = self.hoist(ir.Extern(ret, loc, f"Vec.{m}", (self.fl.coerce(recv, ir.TOpaque("")), *args)))
             self.havoc_place(recv, n)  # a list in a field, changed in a way telic does not track
             self.after_extern(writes)
             return out
-        args = [self.hoist(self.expr(a)) for a in argn]
-        if mutating and isinstance(recv, ir.Var):
+        if m in VEC_MUTATORS:
             # the list changes in a way telic does not track: an unchecked call that may change it
-            call = ir.Extern(ir.NONE if m not in ("remove", "drain") else ir.TOpaque(""), loc, f"Vec.{m}", (recv, *args))
-            if m in ("sort", "sort_unstable", "reverse", "sort_by", "sort_by_key"):
-                # same length, same elements in some order
-                before = self.hoist(length)
-                self.pre.append(ir.ExprStmt(loc, call))
+            if m in ("sort", "sort_unstable", "reverse", "sort_by", "sort_by_key", "sort_unstable_by", "sort_unstable_by_key", "fill", "rotate_left", "rotate_right", "swap"):
+                before = self.hoist(length)  # same length, elements rearranged or replaced
+                self.pre.append(ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, f"Vec.{m}", (recv, *args))))
                 self.pre.append(ir.AssumeStmt(loc, ir.Clause("assume", ir.Binary(ir.BOOL, loc, "eq", length, before), loc, f"{m} keeps the length")))
+                self.after_extern(writes)
                 return ir.Lit(ir.NONE, loc, None)
-            return self.hoist(call) if call.ty != ir.NONE else (self.pre.append(ir.ExprStmt(loc, call)) or ir.Lit(ir.NONE, loc, None))  # type: ignore[func-returns-value]
+            call = ir.Extern(ret if m in ("remove", "swap_remove", "drain", "split_off", "pop", "pop_back", "pop_front", "iter_mut", "last_mut", "first_mut", "get_mut", "as_mut_slice") else ir.NONE, loc, f"Vec.{m}", (recv, *args))
+            out = self.hoist(call) if call.ty != ir.NONE else ir.Lit(ir.NONE, loc, None)
+            if call.ty == ir.NONE:
+                self.pre.append(ir.ExprStmt(loc, call))
+            self.after_extern(writes)
+            return out
         pure_recv = self.fl.coerce(recv, ir.TOpaque("")) if isinstance(recv, ir.Var) else recv
-        return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"result of .{m}()"), loc, f"Vec.{m}", (pure_recv, *args)))
+        out = self.hoist(ir.Extern(ret, loc, f"Vec.{m}", (pure_recv, *args)))
+        self.after_extern(writes)
+        return out
 
     def map_method(self, recv: ir.Expr, recv_n: Any, m: str, argn: list[Any], n: Any, expect: Any) -> ir.Expr:
         loc = self.loc(n)

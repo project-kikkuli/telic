@@ -630,6 +630,15 @@ fields to set.
 variants have may be read only where the tag has been checked (`if`, `switch`,
 `?:`, `&&`, `implies`, or an early `return`).
 
+**Rust enums, Result and traits.** An enum with data is a value: `match`,
+`if let`, `while let`, `matches!` (in specs too) and a derived `==` see its
+variant and fields. `Result` is one as well: `?` returns the error (through a
+checked `impl From<E> for F`), and `unwrap` is an obligation that it is `Ok`.
+A trait method's `//@ requires`/`ensures` bind every impl, which is checked
+against them; calls on a generic `T: Trait` or a `dyn Trait` rely on them. A
+crate's files (`mod x;`) are read together, so calls across them use the
+callee's contract.
+
 **Optionals.** `T | None`, `Optional[T]`, `T | undefined`, `x?: T`. Using an
 optional where a value is needed (`x + 1`, `x.f`, `x!`) is an obligation that it
 is present. Proving it uses whatever checks came before, so no narrowing syntax

@@ -40,6 +40,67 @@ A few were soundness bugs, now fixed:
 - an uninterpreted function used at two signatures, which made z3 reject
   the query.
 
+## A Rust crate: hex
+
+telic was run on [hex](https://github.com/KokaKiwi/rust-hex) at `e25a870`
+(`src/`, three files, `--no-lean --no-cache`, default features for replay),
+unmodified and with no contracts added. Test modules (`#[cfg(test)]`) are not
+checked.
+
+| | refuted | proved | trusted | nothing to check | unsupported |
+|---|---|---|---|---|---|
+| before (`f8e8802`) | 1 | 2 | 0 | 5 | 10 |
+| after | 4 | 6 | 3 | 7 | 2 |
+
+Before, `mod error;` was not read (`FromHexError` values were unchecked)
+and traits were skipped. The three trusted functions are trait method
+declarations (`ToHex::encode_hex`, `FromHex::from_hex`): their contracts are
+what generic callers use.
+
+The refutations:
+
+- `val(bytes, idx)` reads `bytes[0]` and `bytes[1]` and computes `idx + 1`
+  without saying it needs two bytes. rustc confirms the panic on `val(&[], 0)`.
+  Its callers always pass two bytes, so this is a missing precondition, not a
+  bug: with `//@ requires bytes.len() >= 2 && idx < usize::MAX` on `val`,
+  `val` and its caller `decode_in_slice` prove (no panic for any input).
+- `encode` and `encode_upper` unwrap the result of `encode_to_slice`, whose
+  helper telic cannot model (below), so nothing says it is `Ok`. They take a
+  generic `T: AsRef<[u8]>`, so the counterexample cannot be replayed.
+- `BytesToHexChars::len` computes `self.inner.len() * 2` on a
+  `slice::Iter<u8>`, which telic does not model: its `len()` is any `usize`
+  (a collection of zero-sized values can hold `usize::MAX`), so the product
+  may overflow. For a byte slice it cannot; the counterexample is not
+  replayable.
+
+What blocked it, now fixed, with a case each in `tests/cases/corpus.rs` or
+`tests/cases/soundness/`:
+
+- `mod x;` and `use crate::...` paths; `#[cfg(test)]` modules;
+- generics bounded by `AsRef<[u8]>` (`data.as_ref()` is now a byte slice);
+- byte strings (`b"0123..."`), `[u8; 16]` parameters and `static` tables of a
+  fixed length;
+- `>>` and `<<` by a constant and masks like `0x0f`, which were opaque, so
+  `table[(byte & 0x0f) as usize]` looked out of bounds;
+- `Option::take`, `x as char`, `len()` of an unchecked value (a `usize`),
+  and names from outside the crate such as `PhantomData`;
+- replay: `#![no_std]` crates need their default features (`--cfg
+  feature="std"`), and fixed-size arrays need array literals.
+
+Still unsupported: `for (a, b) in xs.chunks_exact(2).zip(out)` writing through
+`b`, in two functions (so `encode` above rests on an unchecked helper).
+
+Soundness bugs found while closing the gaps, each with an exploit in
+`tests/cases/soundness/t31.rs` or `t32.rs`: `==` on a struct with a hand-written
+`PartialEq` or on non-`Copy` structs compared as references; `clone()` and
+`Copy` sharing nested objects; `x.unsigned_abs()` typed as `x`;
+`x.pow(12)` read as `x.pow(1)`; `std::mem::replace(&mut x, ..)`,
+`Option::insert`, `String::push` and `Vec::fill`/`append` not changing
+what they are given; a match
+guard's binding substituted into a closure inside the guard; and
+`rem_euclid`, `Vec::remove` and shifts by a variable treated as never
+panicking.
+
 ## telic on itself
 
 `telic check telic/` (`--no-lean --no-cache`, 38 files, 734 functions):

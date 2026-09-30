@@ -82,6 +82,7 @@ TRUE_HELPERS = {
     "t35.ts": {"Acct.__init__", "Checked.__init__"},
     "t36.py": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift", "first_v"},
     "t36.ts": {"Acct.__init__", "peek", "Base.__init__", "Capped.__init__", "lift"},
+    "t32.rs": {"set"},
     "t31.rs": {"f", "f@two", "Ctr.reset", "E2.from", "Five.w", "Loose.eq", "Tr.w@default", "fails", "wrap"},
 }
 

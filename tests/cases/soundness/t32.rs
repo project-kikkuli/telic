@@ -130,3 +130,92 @@ pub fn pw(n: u32) -> u32 {
     //@ ensures result >= 1
     2u32.pow(n)
 }
+
+pub fn powhex(x: u32) -> u32 {
+    //@ requires x == 2
+    //@ ensures result == 1
+    x.pow(0x10)
+}
+
+pub fn fill() -> u32 {
+    //@ ensures result == 1
+    let mut v = vec![1u32];
+    v.fill(5);
+    v[0]
+}
+pub fn swrem() -> usize {
+    //@ ensures result == 2
+    let mut v = vec![1u32, 2];
+    v.swap_remove(0);
+    v.len()
+}
+pub fn rot() -> u32 {
+    //@ ensures result == 1
+    let mut v = vec![1u32, 2];
+    v.rotate_left(1);
+    v[0]
+}
+pub fn app() -> usize {
+    //@ ensures result == 1
+    let mut v = vec![1u32];
+    let mut w = vec![2u32];
+    v.append(&mut w);
+    v.len()
+}
+pub fn app2() -> usize {
+    //@ ensures result == 1
+    let mut v = vec![1u32];
+    let mut w = vec![2u32];
+    v.append(&mut w);
+    w.len()
+}
+pub fn splitoff() -> usize {
+    //@ ensures result == 2
+    let mut v = vec![1u32, 2];
+    let _t = v.split_off(1);
+    v.len()
+}
+pub fn getmut() -> u32 {
+    //@ ensures result == 1
+    let mut v = vec![1u32];
+    if let Some(x) = v.get_mut(0) {
+        *x = 9;
+    }
+    v[0]
+}
+pub fn itermut() -> u32 {
+    //@ ensures result == 1
+    let mut v = vec![1u32];
+    for x in v.iter_mut() {
+        *x = 9;
+    }
+    v[0]
+}
+pub fn cap(v: Vec<()>) -> usize {
+    //@ ensures result <= 9223372036854775807
+    v.capacity()
+}
+pub fn zlen(v: Vec<()>) -> usize {
+    //@ ensures result <= 9223372036854775807
+    v.len()
+}
+
+use std::cell::Cell;
+pub struct W {
+    pub c: Cell<u32>,
+}
+impl AsRef<[u8]> for W {
+    fn as_ref(&self) -> &[u8] {
+        let n = self.c.get();
+        self.c.set(n + 1);
+        if n % 2 == 0 {
+            b"a"
+        } else {
+            b"ab"
+        }
+    }
+}
+pub fn twice<T: AsRef<[u8]>>(x: &T) -> bool {
+    //@ ensures result
+    x.as_ref().len() == x.as_ref().len()
+}

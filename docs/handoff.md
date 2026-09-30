@@ -53,12 +53,20 @@ done looks like. Soundness items come first: they can make telic say
 
 ## Frontends
 
-- **Rust.** Unsupported: data-carrying enums (`enum Shape { Circle(u32) }`),
-  tuple structs (`p.0`), traits and generics (`T: Clone` values are opaque), and
-  modules in other files (`mod x;`; inline `mod x { }` works). `str::len` is
-  opaque. There is no fuzzing for Rust, and a runtime check of an `ensures`
-  skips clauses that use `old(...)` or `implies(...)`
-  (`frontend/rust_replay.py`).
+- **Rust.** Enums with data, tuple structs, `Result` with `?`, traits and
+  generics, and `mod x;` across files are modelled (`frontend/rust.py`,
+  `frontend/rust_crate.py`). Still unsupported or opaque: enums holding a
+  `Vec`, an object or themselves (`Box<Self>`); `ref`/`ref mut` bindings and
+  writing through a binding of a `&mut` match; or-patterns that bind names;
+  tuples (their items are opaque); for-loops over `zip`/`chunks` with tuple
+  patterns; generic arguments that are collections (`Vec<Circle>` for
+  `&[T]`); associated types; closures (opaque, captured variables havocked).
+  A trait method's contract is assumed for impls telic does not check (of
+  unmodelled types, or outside the crate); each such impl is listed as an
+  assumption. `str::len` is opaque. There is no Rust fuzzer, though
+  `rust_replay.run_rust_samples` runs a function on many inputs in one build
+  (the corpus uses it to test proved functions against rustc). A runtime
+  check of an `ensures` skips clauses that use `old(...)`.
 - **TypeScript.** A subclass of a library class (`extends Component`) and a
   value of an interface type with methods are opaque. Generic type parameters
   are opaque. `instanceof` narrows nothing except `this instanceof` its own
