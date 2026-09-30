@@ -116,10 +116,10 @@ let solve_job z (jb : job) : Smt.result =
       let ans, err = try Smt.check z ~timeout_ms:jb.wall_ms ~rlimit text with Smt.Timeout -> ("unknown", "timeout") in
       match ans with
       | "unknown" when err = "timeout" -> { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = err }
-      | ("sat" | "unknown") when prove_only && rest <> [] -> go rest
-      | "sat" when prove_only -> { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "unknown" }
+      | "unknown" when prove_only && rest <> [] -> go rest
       | "unsat" -> { status = "proved"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = "" }
       | "sat" ->
+        let refuted : Smt.result = (
         (* inputs: scalars first, then list lengths, then list elements *)
         let too_big = ref false in
         let model =
@@ -151,7 +151,13 @@ let solve_job z (jb : job) : Smt.result =
             let vals = Smt.get_values_raw z (List.map Smt.term_text jb.state_consts) in
             List.map2 (fun (c : term) v -> ((match c.node with Const n -> n | _ -> "?"), Smt.value_json c.sort v)) jb.state_consts vals
         in
-        { status = "refuted"; seconds = Unix.gettimeofday () -. t0; model; state; reason = (if !too_big then "the model's list input is too large to replay" else "") }
+        { status = "refuted"; seconds = Unix.gettimeofday () -. t0; model; state; reason = (if !too_big then "the model's list input is too large to replay" else "") }) in
+        if not prove_only then refuted
+        else
+          (* a model with recursive definitions opaque: a counterexample only
+             if the program reproduces it (see replay) *)
+          let later = go rest in
+          if later.Smt.status = "unknown" && later.Smt.reason <> "timeout" then { refuted with Smt.reason = "tentative: " ^ (if later.reason = "no phases" then "unknown" else later.reason) } else later
       | _ ->
         if rest <> [] then go rest
         else { status = "unknown"; seconds = Unix.gettimeofday () -. t0; model = []; state = []; reason = (if err <> "" then err else Smt.reason_unknown z) })

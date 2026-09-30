@@ -920,3 +920,19 @@ def items_from_json(body: dict, n: int) -> list[Item]:
         price = int(e["price"])
         out.append(Item(price, n))
     return out
+
+
+class Door:
+    #@ invariant 0 <= self.state <= 1
+    #@ lifecycle state: 0 -> 1
+
+    def __init__(self) -> None:
+        self.state = 0
+
+
+# expect: refuted
+def reset_doors(ds: list[Door]) -> None:
+    # a loop that moves list elements back: the fuzzer builds doors that
+    # satisfy their invariant, and one that is open breaks the lifecycle
+    for d in ds:
+        d.state = 0

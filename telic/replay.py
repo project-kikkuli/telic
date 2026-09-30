@@ -23,6 +23,7 @@ from typing import Any
 
 from . import ir
 from .program import Program
+from .smt import TENTATIVE
 
 # Wall-clock limits on execution are safety nets: a run cut short decides
 # nothing, and the ledger does not count it. A variant's model is expected
@@ -573,7 +574,7 @@ def replay_verdicts(program: Program, rep) -> None:
                 v.replay.fuzz_desc = f"{v.replay.runtime}: {desc}"  # type: ignore[attr-defined]
                 v.replay.fuzz_summary = f"but a real input breaks it: {call} -> {desc}"  # type: ignore[attr-defined]
                 same_clause = v.ob.clause is not None and " ".join(str(text).split()) == v.ob.clause.text
-                if same_clause and ((v.ob.kind in ("inv.entry", "inv.step") and what == "invariant") or (v.ob.kind == "ensures" and what == "ensures")):
+                if same_clause and ((v.ob.kind in ("inv.entry", "inv.step") and what == "invariant") or (v.ob.kind in ("ensures", "lifecycle") and what == v.ob.kind)):
                     v.replay.confirmed = True
         else:
             for v in pending:
@@ -584,7 +585,9 @@ def replay_verdicts(program: Program, rep) -> None:
     # models only in part (unchecked values, trusted predicates) unless a
     # run confirms it.
     for v in rep.verdicts:
-        if v.status == "refuted" and (v.ob.kind == "variant" or v.replay is not None and v.replay.ran and not v.replay.confirmed):
+        if v.status == "refuted" and v.reason.startswith(TENTATIVE) and not (v.replay is not None and v.replay.confirmed):
+            v.status, v.reason = "unknown", v.reason[len(TENTATIVE):]
+        elif v.status == "refuted" and (v.ob.kind == "variant" or v.replay is not None and v.replay.ran and not v.replay.confirmed):
             v.status = "unconfirmed"
         elif v.status == "refuted" and not (v.replay is not None and v.replay.confirmed) and _partial(program, v.ob):
             v.status = "unconfirmed"

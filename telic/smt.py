@@ -497,6 +497,7 @@ def unchecked_json(enc: Z3Encoder, model: z3.ModelRef, t: L.Term, depth: int) ->
 # the same verdict on a loaded machine. It covers stating the problem, solving
 # it and reading a model; wall-clock time is only a safety net.
 RLIMIT = 2_000_000
+TENTATIVE = "tentative: "  # a refutation's reason when its model may not be one
 SEED = 0
 
 
@@ -508,13 +509,15 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int =
 
     An undecided stage is retried with recursive definitions (seqsum)
     opaque: Z3 keeps unfolding them where a proof never needs it. Opaque, a
-    model may be spurious, so only a proof counts."""
+    model may be spurious: it is returned as a tentative refutation, which
+    counts only if the program reproduces it."""
     t0 = time.perf_counter()
     terms = list(ob.hyps) + [ob.goal]
     with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
     stages = [(with_lemmas, rlimit)] if len(with_lemmas[1]) == len(without[1]) else [(without, rlimit // 10), (with_lemmas, rlimit)]
     res = SmtResult("unknown", 0.0)
+    tentative: SmtResult | None = None
     for (defs, axioms), budget in stages:
         res = _solve(ob, (defs, axioms), timeout_ms, budget, t0)
         if res.status != "unknown" or res.reason.startswith("timeout"):
@@ -524,6 +527,11 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int =
             again = _solve(ob, (opaque, axioms), timeout_ms, budget, t0)
             if again.status == "proved":
                 return again
+            if again.status == "refuted" and tentative is None:
+                tentative = again
+    if tentative is not None:
+        # a counterexample only if the program reproduces it (see replay)
+        return dataclasses.replace(tentative, reason=f"{TENTATIVE}{res.reason}")
     return res
 
 

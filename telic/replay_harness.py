@@ -62,9 +62,11 @@ def to_json(v: Any) -> Any:
     return v
 
 
-def gen(ty: dict, rnd, module: Any, depth: int = 0) -> Any:
+def gen(ty: dict, rnd, module: Any, depth: int = 0, small: bool = False) -> Any:
     k = ty["k"]
     if k == "int":
+        if small:
+            return rnd.choice([0, 0, 1, 1, 2, 3])
         r = rnd.random()
         if r < 0.5:
             return rnd.choice([0, 1, -1, 2, 3, 4, 5, 7, 10, -2, 100])
@@ -78,25 +80,39 @@ def gen(ty: dict, rnd, module: Any, depth: int = 0) -> Any:
     if k == "str":
         return rnd.choice(["", "a", "b", "draft", "paid", "x"])
     if k == "list":
-        n = rnd.choice([0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 8])
-        return [gen(ty["elem"], rnd, module, depth + 1) for _ in range(n)]
+        n = rnd.choice([0, 1, 1, 2]) if small else rnd.choice([0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 8])
+        return [gen(ty["elem"], rnd, module, depth + 1, small) for _ in range(n)]
     if k == "record":
         cls = getattr(module, ty["name"])
-        return cls(**{f: gen(t, rnd, module, depth + 1) for f, t in ty["fields"]})
+        return cls(**{f: gen(t, rnd, module, depth + 1, small) for f, t in ty["fields"]})
     if k == "option":
-        return None if rnd.random() < 0.25 else gen(ty["inner"], rnd, module, depth)
+        return None if rnd.random() < 0.25 else gen(ty["inner"], rnd, module, depth, small)
     if k == "dict":
         n = rnd.choice([0, 1, 1, 2, 3])
-        return {gen(ty["key"], rnd, module, depth + 1): gen(ty["val"], rnd, module, depth + 1) for _ in range(n)}
+        return {gen(ty["key"], rnd, module, depth + 1, small): gen(ty["val"], rnd, module, depth + 1, small) for _ in range(n)}
     if k == "enum":
         return getattr(getattr(module, ty["name"]), rnd.choice(ty["members"]))
     if k == "class":
         cls = getattr(module, ty["name"])
-        obj = object.__new__(cls)
-        for f, t in ty.get("fields") or []:
-            object.__setattr__(obj, f, gen(t, rnd, module, depth + 1))
+        # an object the checked code could have built: one its class invariants
+        # hold for (tried at random, then with small values)
+        invs = getattr(module, "__telic_invs__", {}).get(ty["name"], ())
+        obj = None
+        for attempt in range(200 if invs else 1):
+            obj = object.__new__(cls)
+            for f, t in ty.get("fields") or []:
+                object.__setattr__(obj, f, gen(t, rnd, module, depth + 1, small or attempt >= 20))
+            if all(_holds(pred, obj) for _, _, pred in invs):
+                break
         return obj
     return None
+
+
+def _holds(pred: Any, obj: Any) -> bool:
+    try:
+        return bool(pred(obj))
+    except Exception:
+        return False
 
 
 REJECTED: dict = {}

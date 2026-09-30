@@ -17,7 +17,7 @@ from .jobs import exit_with_parent
 from .jobs import take as take_jobs
 from .program import ANY, FuncRef, Program
 from .render_expr import render
-from .smt import RLIMIT, SmtResult, Theory, solve
+from .smt import RLIMIT, TENTATIVE, SmtResult, Theory, solve
 from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
 
 # ---------------------------------------------------------------------------
@@ -967,6 +967,10 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if to_replay:
             with take_jobs(opts.jobs, len(to_replay)) as workers, ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(lambda r: replay_verdicts(program, r), to_replay))
+    for rep, _, _ in staged:
+        for v in rep.verdicts:  # a tentative model no run confirmed refutes nothing
+            if v.status == "refuted" and v.reason.startswith(TENTATIVE) and not (v.replay is not None and v.replay.confirmed):
+                v.status, v.reason = "unknown", v.reason[len(TENTATIVE):]
     vacuous = vacuity.explain(theory, opts, cache)
     for rep, fkey, ft in staged:
         ref = rep.ref
