@@ -32,6 +32,39 @@ def test_exit_codes(tmp_path):
     assert telic("check", "open.py", "--no-cache", "--strict", cwd=tmp_path).returncode == 1
 
 
+JSON_TREE = """from typing import Any
+
+
+#@ trusted
+#@ ensures result >= 0
+def depth(v: Any) -> int: ...
+
+
+#@ trusted
+#@ ensures result == (isinstance(t, dict) and "kind" in t and (t["kind"] == "leaf" or t["kind"] == "node" and "left" in t and wf_tree(t["left"]) and depth(t["left"]) < depth(t)))
+def wf_tree(t: Any) -> bool: ..."""
+
+INFERRED = [
+    ("def f(n: int) -> int:\n    if n <= 0:\n        return 0\n    return f(n - 1)\n", {"f": "n"}),
+    ("def a(m: int, n: int) -> int:\n    #@ requires m >= 0 and n >= 0\n    if m == 0 or n == 0:\n        return 0\n    if n > 1:\n        return a(m, n - 1)\n    return a(m - 1, 5)\n", {"a": "[m, n]"}),
+    (JSON_TREE + "\n\ndef leaves(t: dict[str, Any]) -> int:\n    #@ requires wf_tree(t)\n    if t['kind'] == 'leaf':\n        return 1\n    return leaves(t['left'])\n", {"leaves": "depth(t)"}),
+    ("def e(n: int) -> bool:\n    #@ requires n >= 0\n    if n == 0:\n        return True\n    return o(n - 1)\n\n\ndef o(n: int) -> bool:\n    #@ requires n >= 0\n    if n == 0:\n        return False\n    return e(n - 1)\n", {"e": "n", "o": "n"}),
+]
+
+
+@pytest.mark.parametrize("src,want", INFERRED)
+def test_inferred_measures_are_reported_and_cached(tmp_path, src, want):
+    (tmp_path / "m.py").write_text(src)
+    for _ in range(2):  # the second run rebuilds them from the cache
+        data = json.loads(telic("check", "m.py", "--json", cwd=tmp_path).stdout)
+        checked = [f for f in data["functions"] if f["status"] != "trusted"]
+        assert {f["function"]: f["inferred"]["measure"] for f in checked} == want
+        assert all(f["status"] == "proved" for f in checked)
+    out = telic("check", "m.py", "-v", "--color", "never", cwd=tmp_path).stdout
+    for m in want.values():
+        assert f"inferred @decreases {m}" in out
+
+
 def test_explain_shows_formula(tmp_path):
     (tmp_path / "m.py").write_text("def f(x: int) -> int:\n    #@ requires x > 0\n    #@ ensures result > 1\n    return x + 1\n")
     out = telic("explain", "f", "m.py", "--no-cache", cwd=tmp_path)

@@ -12,10 +12,11 @@ from typing import Any, Callable
 
 from . import ir, irjson
 from . import logic as L
-from .infer import Inferred, infer
+from .infer import Inferred, cached_measures, infer, infer_measures
 from .jobs import exit_with_parent
 from .jobs import take as take_jobs
 from .program import FuncRef, Program
+from .render_expr import render
 from .smt import SmtResult, Theory, solve
 from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
 
@@ -357,7 +358,7 @@ def inference_key(program: Program, key: str) -> str:
             continue
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
-    h = hashlib.sha256(f"infer {__version__} {toolchain_id()}".encode())
+    h = hashlib.sha256(f"infer {__version__} {toolchain_id()} {key}".encode())
     for k in sorted(seen):
         ref = program.ref(k)
         h.update(f"{k}\n{ref.fn.source}\n{sorted(ref.module.records)}".encode())
@@ -426,7 +427,7 @@ def function_key(program: Program, key: str, root: str | None) -> str:
             continue
         seen.add(k)
         todo.extend(program.callees.get(k, ()))
-    h = hashlib.sha256(f"fn {toolchain_id()}".encode())
+    h = hashlib.sha256(f"fn {toolchain_id()} {key}".encode())
     h.update(_classes(program).encode())
     for k in sorted(seen):
         ref = program.ref(k)
@@ -684,12 +685,47 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         inf_results += run_parallel(infer_one, [x for x in todo_inf if x[0] not in done], opts.jobs)
     else:
         inf_results = run_parallel(infer_one, todo_inf, opts.jobs)
+    ikeys: dict[str, str] = {}
     for key, ikey, res in inf_results:
         inferred[key] = res
         if ikey is not None:
-            cache.put(ikey, res.summary())
-        if key in res.options.measures:
-            measures[key] = res.options.measures[key]
+            ikeys[key] = ikey
+    # Recursion measures, one recursion group at a time (every function in it
+    # inferable and none with '@decreases').
+    groups: dict[int, list[str]] = {}
+    for key in inferred:
+        if key in program.recursive:
+            groups.setdefault(program.scc_of[key], []).append(key)
+    todo_groups = []
+    for keys in groups.values():
+        members = [k for k in program.funcs if program.same_scc(keys[0], k)]
+        if set(members) != set(keys) or any(program.ref(k).fn.decreases is not None for k in members):
+            continue
+        hit = cached_measures(program, members, inferred)
+        if hit is None:
+            todo_groups.append(members)
+        else:
+            for k in members:
+                inferred[k].options.measures.update(hit)
+
+    def measure_one(keys: list[str]) -> tuple[list[str], dict[str, ir.Expr], int]:
+        calls = inferred[keys[0]].solver_calls
+        found = infer_measures(program, keys, theory, inferred, timeout_ms=min(opts.timeout_ms, 1000))
+        spent = inferred[keys[0]].solver_calls - calls
+        inferred[keys[0]].solver_calls = calls
+        return keys, found, spent
+
+    for keys, found, calls in run_parallel(measure_one, todo_groups, opts.jobs):
+        inferred[keys[0]].solver_calls += calls
+        for k in keys:
+            inferred[k].measured = True
+            inferred[k].options.measures.update(found)
+            if k in found:
+                inferred[k].measure = render(found[k])
+    for key, res in inferred.items():
+        if key in ikeys:
+            cache.put(ikeys[key], res.summary())
+        measures.update(res.options.measures)
     if measures:
         theory, theory_problems = build_theory(program, measures)
 

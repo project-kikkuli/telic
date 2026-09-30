@@ -637,7 +637,11 @@ class Renderer:
                 ni = sum(len(v) for v in f.inferred.invariants.values())
                 if ni:
                     extras.append(f"{ni} inferred invariant{'s' * (ni != 1)}")
-                if f.inferred.variants or f.inferred.measure:
+                if self.verbose and f.inferred.measure:
+                    extras.append(f"inferred @decreases {f.inferred.measure}")
+                if self.verbose and f.inferred.variants:
+                    extras.extend(f"inferred @decreases {v} (loop at line {line})" for line, v in sorted(f.inferred.variants.items()))
+                if not self.verbose and (f.inferred.variants or f.inferred.measure):
                     extras.append("inferred termination")
             lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
             if lean:

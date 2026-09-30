@@ -19,6 +19,7 @@ from .smt import Theory, solve
 from .vcgen import Options, VCError, VCGen
 
 MAX_ROUNDS = 8
+MAX_LEX = 6  # singles combined into lexicographic pairs
 
 
 def _v(name: str, ty: ir.Type, loc: ir.Loc) -> ir.Var:
@@ -254,26 +255,103 @@ def variant_candidates(fn: ir.Function, s: ir.While) -> list[ir.Expr]:
             out.append(ir.Binary(ir.INT, loc, "add", d_ab, one))
         elif c.op == "ne":
             out += [d_ba, d_ab]
+    changed = ir.assigned_names(s.body)
     for n, t in fn.locals.items():
-        if isinstance(t, ir.TInt) and "$" not in n and n in ir.assigned_names(s.body):
+        if isinstance(t, ir.TInt) and "$" not in n and n in changed:
             out.append(_v(n, ir.INT, loc))
+    for n, t in fn.locals.items():
+        if "$" in n or n not in changed:
+            continue
+        if isinstance(t, ir.TList):
+            out.append(ir.Builtin(ir.INT, loc, "len", (_v(n, t, loc),)))
+        elif isinstance(t, ir.TStr):
+            out.append(ir.Builtin(ir.INT, loc, "str_len", (_v(n, t, loc),)))
     return out
 
 
-def measure_candidates(fn: ir.Function) -> list[ir.Expr]:
+def _bounds(fn: ir.Function, name: str) -> list[int]:
+    """Integer literals ``name`` is compared with anywhere in ``fn``."""
+    out: set[int] = set()
+    for s in ir.walk_stmts(fn.body):
+        for e in ir.stmt_exprs(s):
+            for x in ir.walk_expr(e):
+                if isinstance(x, ir.Binary) and x.op in ("lt", "le", "gt", "ge", "eq", "ne"):
+                    for a, b in ((x.left, x.right), (x.right, x.left)):
+                        if isinstance(a, ir.Var) and a.name == name and isinstance(b, ir.Lit) and type(b.value) is int:
+                            out.add(b.value)
+    return sorted(out)
+
+
+def _sizes(program: Program, module: ir.Module) -> list[tuple[FuncRef, str]]:
+    """(function, name here) of the trusted int predicates of one argument
+    that ``module`` can call: sizes of recursive JSON shapes, like ``depth(t)``."""
+    out = []
+    for key, ref in sorted(program.funcs.items()):
+        if key not in program.predicates or not (isinstance(ref.fn.ret, ir.TInt) and len(ref.fn.params) == 1):
+            continue
+        for name in [ref.fn.name] + sorted(n for n, (path, remote) in module.imports.items() if f"{path}::{remote}" == key):
+            if program.resolve(module, name) is ref:
+                out.append((ref, name))
+                break
+    return out
+
+
+def measure_terms(fn: ir.Function, program: Program | None = None, module: ir.Module | None = None) -> list[tuple[tuple, ir.Expr]]:
+    """Single recursion measures, each keyed by its shape (which parameters it
+    reads, and how) so a mutually recursive group can try one shape in every
+    function: an int parameter (less a bound it is compared with), the size
+    of a list or string, how deep an immutable structure is, a trusted size
+    predicate (``depth(t)``) of a parameter, and ``hi - lo``."""
     loc = fn.loc
-    out: list[ir.Expr] = []
-    ints = [p for p in fn.params if isinstance(p.ty, ir.TInt)]
-    for p in ints:
-        out.append(_v(p.name, ir.INT, loc))
-    for p in fn.params:
+    out: list[tuple[tuple, ir.Expr]] = []
+    ints = [(i, p) for i, p in enumerate(fn.params) if isinstance(p.ty, ir.TInt)]
+    for i, p in ints:
+        out.append((("int", i), _v(p.name, ir.INT, loc)))
+    for i, p in enumerate(fn.params):
         if isinstance(p.ty, ir.TList):
-            out.append(ir.Builtin(ir.INT, loc, "len", (_v(p.name, p.ty, loc),)))
-    for p in ints:
-        for q in ints:
-            if p.name != q.name:
-                out.append(ir.Binary(ir.INT, loc, "sub", _v(q.name, ir.INT, loc), _v(p.name, ir.INT, loc)))
-                out.append(ir.Binary(ir.INT, loc, "add", ir.Binary(ir.INT, loc, "sub", _v(q.name, ir.INT, loc), _v(p.name, ir.INT, loc)), _int(1, loc)))
+            out.append((("len", i), ir.Builtin(ir.INT, loc, "len", (_v(p.name, p.ty, loc),))))
+    for i, p in ints:
+        for j, q in ints:
+            if i != j:
+                d = ir.Binary(ir.INT, loc, "sub", _v(q.name, ir.INT, loc), _v(p.name, ir.INT, loc))
+                out.append((("diff", j, i), d))
+                out.append((("diff1", j, i), ir.Binary(ir.INT, loc, "add", d, _int(1, loc))))
+    for i, p in enumerate(fn.params):
+        if isinstance(p.ty, ir.TStr):
+            out.append((("len", i), ir.Builtin(ir.INT, loc, "str_len", (_v(p.name, p.ty, loc),))))
+        elif isinstance(p.ty, ir.TOpaque):
+            out.append((("depth", i), ir.Builtin(ir.INT, loc, "depth", (_v(p.name, p.ty, loc),))))
+    if program is not None and module is not None:
+        for ref, name in _sizes(program, module):
+            want = ref.fn.params[0].ty
+            for i, p in enumerate(fn.params):
+                arg: ir.Expr = _v(p.name, p.ty, loc)
+                if p.ty != want and isinstance(want, ir.TOpaque):
+                    arg = ir.Builtin(want, loc, "to_opaque", (arg,))
+                if ref.fn is not fn and arg.ty == want:
+                    out.append((("size", ref.key, i), ir.Call(ir.INT, loc, name, (arg,))))
+    for i, p in ints:
+        for c in _bounds(fn, p.name):
+            if c != 0:
+                op, k = ("sub", c) if c > 0 else ("add", -c)
+                out.append((("above", i, c), ir.Binary(ir.INT, loc, op, _v(p.name, ir.INT, loc), _int(k, loc))))
+            out.append((("below", i, c), ir.Binary(ir.INT, loc, "sub", _int(c, loc), _v(p.name, ir.INT, loc))))
+    return out
+
+
+def _lex(*parts: ir.Expr) -> ir.Expr:
+    return ir.ListLit(ir.TList(ir.INT), parts[0].loc, parts)
+
+
+def measure_candidates(fn: ir.Function, group: int = 1, program: Program | None = None, module: ir.Module | None = None) -> list[ir.Expr]:
+    """Every measure group inference can pick for ``fn`` in a recursion group
+    of ``group`` functions: singles, lexicographic pairs, and singles ranked
+    by position in the group."""
+    singles = [e for _, e in measure_terms(fn, program, module)]
+    out = list(singles)
+    out += [_lex(a, b) for a in singles for b in singles if a is not b]
+    if group > 1:
+        out += [_lex(a, _int(r, fn.loc)) for a in singles for r in range(group)]
     return out
 
 
@@ -283,6 +361,8 @@ class Inferred:
     invariants: dict[int, list[ir.Clause]] = field(default_factory=dict)
     variants: dict[int, str] = field(default_factory=dict)
     measure: str | None = None
+    # recursion measures were searched for (cached: the search is not repeated)
+    measured: bool = False
     solver_calls: int = 0
 
     def summary(self) -> dict:
@@ -291,6 +371,7 @@ class Inferred:
             "inv": {str(k): [c.text for c in v] for k, v in self.invariants.items()},
             "var": {str(k): v for k, v in self.variants.items()},
             "measure": self.measure,
+            "measured": self.measured,
         }
 
 
@@ -318,12 +399,8 @@ def from_cache(fn: ir.Function, ref: FuncRef, sites: list[LoopSite], cached: dic
                     inf.variants[line] = want
                     break
     inf.options.extra_invariants = inf.invariants
-    if cached.get("measure"):
-        for cand in measure_candidates(fn):
-            if render(cand) == cached["measure"]:
-                inf.options.measures[ref.key] = cand
-                inf.measure = cached["measure"]
-                break
+    inf.measure = cached.get("measure")
+    inf.measured = bool(cached.get("measured"))
     return inf
 
 
@@ -380,23 +457,116 @@ def infer(program: Program, ref: FuncRef, theory: Theory, timeout_ms: int = 3000
                 inf.variants[s.loc.line] = render(cand)
                 break
 
-    # 3. Recursion measure for self-recursive functions without '@decreases'.
-    if ref.key in program.recursive and fn.decreases is None:
-        scc = [k for k in program.funcs if program.same_scc(ref.key, k)]
-        if scc == [ref.key]:
-            for cand in measure_candidates(fn):
-                opts = Options(
-                    extra_invariants=inf.options.extra_invariants,
-                    variants=inf.options.variants,
-                    measures={ref.key: cand},
-                )
-                try:
-                    obs = VCGen(program, ref, opts).run()
-                except VCError:
-                    break
-                vobs = [o for o in obs if o.kind == "variant" and o.site is None and "recurs" in o.message]
-                if vobs and _all_proved(vobs, theory, timeout_ms, inf):
-                    inf.options.measures[ref.key] = cand
-                    inf.measure = render(cand)
-                    break
     return inf
+
+
+def _recursion_obs(obs) -> list:
+    return [o for o in obs if o.kind == "variant" and o.site is None and "recurs" in o.message]
+
+
+def infer_measures(program: Program, keys: list[str], theory: Theory, inferred: dict[str, Inferred], timeout_ms: int = 3000) -> dict[str, ir.Expr]:
+    """Termination measures for one recursion group (``keys``, none with
+    '@decreases'): the first candidate whose obligations all prove, trying in
+    order one shape of single measure in every function, that shape ranked
+    by where each function sits in the calls that do not decrease it, then
+    lexicographic pairs of shapes. Returns key -> measure, or {} if none
+    proves; each is proved again, like a hand-written one, when the
+    functions are checked."""
+    refs = {k: program.ref(k) for k in keys}
+    terms = {k: dict(measure_terms(refs[k].fn, program, refs[k].module)) for k in keys}
+    shapes = [t for t in terms[keys[0]] if all(t in terms[k] for k in keys)]
+    first = inferred[keys[0]]
+
+    def attempt(assign: dict[str, ir.Expr], every: bool) -> list[tuple[str, object, bool]] | None:
+        """(caller, obligation, proved) for each recursion obligation; None if
+        the measure cannot even be stated. Stops at the first failure unless
+        ``every``."""
+        out = []
+        for k in keys:
+            opts = Options(extra_invariants=inferred[k].options.extra_invariants, variants=inferred[k].options.variants, measures=assign)
+            try:
+                obs = _recursion_obs(VCGen(program, refs[k], opts).run())
+            except VCError:
+                return None
+            for o in obs:
+                first.solver_calls += 1
+                ok = solve(o, theory, timeout_ms).status == "proved"
+                out.append((k, o, ok))
+                if not ok and not every:
+                    return out
+        return out
+
+    def proves(assign: dict[str, ir.Expr]) -> bool:
+        res = attempt(assign, every=False)
+        return res is not None and bool(res) and all(ok for _, _, ok in res)
+
+    names: dict[str, list[str]] = {}
+    for k in keys:
+        names.setdefault(refs[k].fn.name, []).append(k)
+    useful: list[tuple] = []
+    for t in shapes:
+        assign = {k: terms[k][t] for k in keys}
+        res = attempt(assign, every=True)
+        if res is None or not res:
+            continue
+        if all(ok for _, _, ok in res):
+            return assign
+        nonneg = all(ok for _, o, ok in res if "non-negative" in o.message)
+        dec = [(k, o, ok) for k, o, ok in res if "non-negative" not in o.message]
+        if not nonneg or not any(ok for _, _, ok in dec):
+            continue
+        useful.append(t)
+        if len(keys) > 1:
+            # Calls that keep the measure must go down a fixed ranking of the
+            # group's functions: rank each above everything it calls that way.
+            edges: dict[str, set[str]] = {k: set() for k in keys}
+            known = True
+            for k, o, ok in dec:
+                if ok:
+                    continue
+                callee = o.message.split("'")[1]
+                if len(names.get(callee, [])) != 1:
+                    known = False
+                    break
+                edges[k].add(names[callee][0])
+            rank: dict[str, int] = {}
+
+            def height(k: str, path: frozenset[str]) -> int | None:
+                if k in path:
+                    return None
+                if k not in rank:
+                    hs = [height(c, path | {k}) for c in sorted(edges[k])]
+                    if any(h is None for h in hs):
+                        return None
+                    rank[k] = 1 + max(hs, default=-1)  # type: ignore[type-var]
+                return rank[k]
+
+            if known and all(height(k, frozenset()) is not None for k in keys):
+                ranked = {k: _lex(terms[k][t], _int(rank[k], refs[k].fn.loc)) for k in keys}
+                if proves(ranked):
+                    return ranked
+    for a in useful[:MAX_LEX]:
+        for b in useful[:MAX_LEX]:
+            if a != b:
+                pair = {k: _lex(terms[k][a], terms[k][b]) for k in keys}
+                if proves(pair):
+                    return pair
+    return {}
+
+
+def cached_measures(program: Program, keys: list[str], inferred: dict[str, Inferred]) -> dict[str, ir.Expr] | None:
+    """The measures an earlier run inferred for this group, rebuilt from the
+    cache; None when it has to be searched again."""
+    if not all(inferred[k].measured for k in keys):
+        return None
+    out: dict[str, ir.Expr] = {}
+    for k in keys:
+        want = inferred[k].measure
+        if want is None:
+            continue
+        ref = program.ref(k)
+        hits = [c for c in measure_candidates(ref.fn, len(keys), program, ref.module) if render(c) == want]
+        if len(hits) != 1:
+            return None
+        out[k] = hits[0]
+    return out if len(out) in (0, len(keys)) else None

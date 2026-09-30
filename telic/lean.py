@@ -313,8 +313,13 @@ def render_defs(defs: list[L.FunDef], records: list[L.Sort], fn_names: dict[str,
         if d.recursive:
             if d.measure is None:
                 raise LeanUnsupported(f"recursive '{d.name}' has no termination measure; add '@decreases'")
-            meas = pr.t(d.measure, 101)
-            lines.append(f"{doc}def {name} {params} : {lean_sort(d.sort)} :=\n  {body}\ntermination_by {meas}.toNat\ndecreasing_by all_goals (first | omega | (simp_all; omega) | grind)\n")
+            if any("struct.depth" in L.fns(m) for m in d.measure):
+                raise LeanUnsupported(f"'{d.name}' terminates because its argument is a smaller part each time, which Lean does not model")
+            parts = [f"{pr.t(m, 101)}.toNat" for m in d.measure]
+            meas = parts[0] if len(parts) == 1 else f"({', '.join(parts)})"
+            # (a lexicographic measure: lower the first part, or keep it and lower the next)
+            lex = "" if len(parts) == 1 else " | (apply Prod.Lex.left; first | omega | (simp_all; omega)) | (apply Prod.Lex.right; first | omega | (simp_all; omega)) | decreasing_tactic"
+            lines.append(f"{doc}def {name} {params} : {lean_sort(d.sort)} :=\n  {body}\ntermination_by {meas}\ndecreasing_by all_goals (first | omega | (simp_all; omega) | grind{lex})\n")
         else:
             lines.append(f"{doc}def {name} {params} : {lean_sort(d.sort)} :=\n  {body}\n")
         if lemma:

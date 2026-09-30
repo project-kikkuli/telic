@@ -45,10 +45,20 @@ convention). For `for x in xs` / `for (const x of xs)`, name the counter with
 `@index k` or use `enumerate`.
 
 **`decreases E`** is a termination measure: an integer that is non-negative and
-strictly decreases on every loop iteration or recursive call. It is optional:
-telic tries measures derived from the loop condition (`hi - lo + 1`, `len(xs) - i`,
-…) or from the parameters, and proves whichever works. When nothing works,
-termination is reported as open.
+strictly decreases on every loop iteration or recursive call. On a function,
+`decreases [A, B]` is lexicographic: every part is non-negative, and each call
+lowers `A`, or keeps it and lowers `B`. Functions that call each other compare
+their measures, so they must have the same length. It is optional: for a loop
+telic tries measures derived from its condition (`hi - lo + 1`, `len(xs) - i`,
+…) and the variables it changes; for a recursion group (functions calling each
+other, none with `@decreases`) it tries, in order, one shape in every function
+(an int parameter, that parameter less a bound it is compared with, `len` of a
+list or string, `hi - lo`, the depth of a frozen dataclass or NamedTuple
+value, whose fields are always shallower, and a trusted `int` predicate of
+one argument, like `depth(t)` below), that shape paired with each
+function's rank in the calls that keep it, then lexicographic pairs. It proves
+the first that works and shows it (`telic check -v`, and `inferred.measure` in
+`--json`). When nothing works, termination is reported as open.
 
 **`raises C`** is for exceptions you intend. A `raise`/`throw` must only be
 reachable when `C` holds, and the function must not return normally when `C`

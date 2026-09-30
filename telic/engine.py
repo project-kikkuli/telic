@@ -167,11 +167,11 @@ def _call(req: dict[str, Any]) -> dict[str, Any]:
 
 
 def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, jobs: int | None) -> dict[str, Any]:
-    """Houdini invariants, loop variants and recursion measures for ``refs``,
+    """Houdini invariants and loop variants for ``refs``,
     from the same candidates ``telic.infer`` proposes. Returns key ->
     Inferred, or None where the engine could not decide (the caller infers
     those in Python)."""
-    from .infer import Inferred, invariant_candidates, loop_sites, measure_candidates, variant_candidates
+    from .infer import Inferred, invariant_candidates, loop_sites, variant_candidates
     from .render_expr import render
 
     if binary() is None or not refs:
@@ -182,7 +182,7 @@ def infer(program: Program, theory, refs: list[FuncRef], timeout_ms: int, jobs: 
         sites = loop_sites(fn.body)
         inv = {s.stmt.loc.line: cs for s in sites if (cs := invariant_candidates(fn, s))}
         var = {s.stmt.loc.line: vs for s in sites if isinstance(s.stmt, ir.While) and s.stmt.decreases is None and (vs := variant_candidates(fn, s.stmt))}
-        meas = measure_candidates(fn) if ref.key in program.recursive and fn.decreases is None else []
+        meas: list[ir.Expr] = []  # recursion measures: telic.infer.infer_measures, per recursion group
         cands[ref.key] = (inv, var, meas)
     extra = {k: [c for cs in inv.values() for c in cs] for k, (inv, _, _) in cands.items()}
     req, _ = _base(program, theory, extra, timeout_ms, jobs)

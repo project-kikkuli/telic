@@ -565,8 +565,9 @@ class FunDef:
     body: Term | None  # None = uninterpreted
     recursive: bool = False
     # For Lean: a Nat-valued fuel/measure is not needed when the definition is
-    # structural over a builtin (seqsum); user definitions carry a measure.
-    measure: Term | None = None
+    # structural over a builtin (seqsum); user definitions carry a measure,
+    # lexicographic when it has several parts.
+    measure: tuple[Term, ...] | None = None
     doc: str = ""
     # For guarded definitions f(x) = if guard then inner else default:
     guard: Term | None = None
@@ -590,7 +591,7 @@ def seqsum_def(elem: Sort) -> FunDef:
     hi = Const("hi", INT)
     rec = Fn(name, (a, lo, sub(hi, ONE)), elem)
     body = ite(le(hi, lo), lit(0, elem), add(rec, select(a, sub(hi, ONE))))
-    return FunDef(name, (a, lo, hi), elem, body, recursive=True, measure=sub(hi, lo), doc="sum of a[lo:hi]")
+    return FunDef(name, (a, lo, hi), elem, body, recursive=True, measure=(sub(hi, lo),), doc="sum of a[lo:hi]")
 
 
 def theory_lemmas(elem: Sort) -> list[Axiom]:
@@ -643,7 +644,7 @@ def seqcount_def(elem: Sort) -> FunDef:
     v = Const("v", elem)
     rec = Fn(name, (a, lo, sub(hi, ONE), v), INT)
     body = ite(le(hi, lo), ZERO, add(rec, ite(eq(select(a, sub(hi, ONE)), v), ONE, ZERO)))
-    return FunDef(name, (a, lo, hi, v), INT, body, recursive=True, measure=sub(hi, lo), doc="occurrences of v in a[lo:hi]")
+    return FunDef(name, (a, lo, hi, v), INT, body, recursive=True, measure=(sub(hi, lo),), doc="occurrences of v in a[lo:hi]")
 
 
 # ---------------------------------------------------------------------------

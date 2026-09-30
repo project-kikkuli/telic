@@ -3,6 +3,7 @@ the verdict telic must reach. 'refuted' means a counterexample confirmed by
 running the code."""
 
 from dataclasses import dataclass
+from typing import Union
 
 
 @dataclass(frozen=True)
@@ -503,3 +504,97 @@ def top_up(book: dict[str, Wallet], who: str, c: int) -> None:
     #@ requires c >= 0
     if who in book:
         book[who].cents = book[who].cents + c
+
+
+# Termination measures telic infers (none is written below).
+
+
+# expect: proved
+def count_down(n: int) -> int:
+    #@ ensures result >= 0
+    if n <= 0:
+        return 0
+    return 1 + count_down(n - 1)
+
+
+# expect: proved
+def count_to_minus_five(n: int) -> int:
+    if n <= -5:
+        return 0
+    return count_to_minus_five(n - 1)
+
+
+# expect: proved
+def steps_up(i: int, hi: int) -> int:
+    if i >= hi:
+        return 0
+    return 1 + steps_up(i + 1, hi)
+
+
+# expect: proved
+def str_steps(s: str) -> int:
+    if s == "":
+        return 0
+    return 1 + str_steps(s[1:])
+
+
+# expect: proved
+def ackermann(m: int, n: int) -> int:
+    #@ requires m >= 0 and n >= 0
+    #@ ensures result >= 0
+    if m == 0:
+        return n + 1
+    if n == 0:
+        return ackermann(m - 1, 1)
+    return ackermann(m - 1, ackermann(m, n - 1))
+
+
+# expect: proved
+def even_steps(n: int) -> bool:
+    #@ requires n >= 0
+    if n == 0:
+        return True
+    return odd_steps(n - 1)
+
+
+# expect: proved
+def odd_steps(n: int) -> bool:
+    #@ requires n >= 0
+    if n == 0:
+        return False
+    return even_steps(n - 1)
+
+
+# expect: proved
+def hand_off(n: int) -> int:
+    # calls take_back with the same n: the measure is (n, rank in the group)
+    if n <= 0:
+        return 0
+    return take_back(n)
+
+
+# expect: proved
+def take_back(n: int) -> int:
+    #@ requires n >= 1
+    return hand_off(n - 1)
+
+
+@dataclass(frozen=True)
+class Leaf:
+    v: int
+
+
+@dataclass(frozen=True)
+class Fork:
+    left: "Tree"
+    right: "Tree"
+
+
+Tree = Union[Leaf, Fork]
+
+
+# expect: proved
+def leaves(t: Tree) -> int:
+    if isinstance(t, Leaf):
+        return 1
+    return leaves(t.left) + leaves(t.right)

@@ -82,3 +82,11 @@ def test_an_edit_outside_a_function_rechecks_it(tmp_path, engine, old, new, fn):
         (tmp_path / "m.py").write_text(src)
         rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
         assert {f.fn.name: f.status for f in rep.functions}[fn] == want
+
+
+def test_functions_calling_each_other_keep_their_own_verdicts(tmp_path):
+    # they depend on the same functions, but each has its own receipt and inference
+    src = "def ping(n: int) -> int:\n    #@ requires n >= 0\n    #@ ensures result == 0\n    if n == 0:\n        return 0\n    return pong(n - 1)\n\n\ndef pong(n: int) -> int:\n    #@ requires n >= 0\n    #@ ensures result == 1\n    if n == 0:\n        return 0\n    return ping(n - 1)\n"
+    first = {f.fn.name: (f.status, f.inferred.measure) for f in run(tmp_path, src).functions}
+    assert first["ping"][0] != "refuted" and first["pong"] == ("refuted", "n")
+    assert {f.fn.name: (f.status, f.inferred.measure) for f in run(tmp_path, src).functions} == first

@@ -129,6 +129,136 @@ class PythonFrontend:
         if cname in other.dataclass_defaults:
             self.dataclass_defaults[cname] = other.dataclass_defaults[cname]
 
+    def structure_fields(self, text: str) -> frozenset[str] | None:
+        """The fields a value annotated ``text`` can be read through when every
+        class it can be is a frozen dataclass or NamedTuple: set once, to
+        values that existed before the object was built. None otherwise."""
+        try:
+            node = ast.parse(text, mode="eval").body
+        except SyntaxError:
+            return None
+        return self._structure(node, frozenset())
+
+    def _structure(self, n: ast.expr, seen: frozenset[str]) -> frozenset[str] | None:
+        if isinstance(n, ast.Constant) and n.value is None:
+            return frozenset()
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            try:
+                return self._structure(ast.parse(n.value, mode="eval").body, seen)
+            except SyntaxError:
+                return None
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+            parts: list[ast.expr] = [n.left, n.right]
+        elif isinstance(n, ast.Subscript) and _decorator_name(n.value) in ("Union", "Optional"):
+            parts = list(n.slice.elts) if isinstance(n.slice, ast.Tuple) else [n.slice]
+        elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in self.module_aliases:
+            return self.module_aliases[n.value.id]._structure(ast.Name(n.attr), frozenset())
+        elif isinstance(n, ast.Name):
+            if n.id in seen:
+                return frozenset()
+            structs, aliases = self._structures()
+            if n.id in structs:
+                return structs[n.id]
+            if n.id in aliases:
+                return self._structure(aliases[n.id], seen | {n.id})
+            if n.id in self.linked_functions:
+                other, name = self.linked_functions[n.id]
+                return other._structure(ast.Name(name), frozenset())
+            return None
+        else:
+            return None
+        out: frozenset[str] = frozenset()
+        for x in parts:
+            f = self._structure(x, seen)
+            if f is None:
+                return None
+            out |= f
+        return out
+
+    def _structures(self) -> tuple[dict[str, frozenset[str]], dict[str, ast.expr]]:
+        """Module-level frozen dataclasses and NamedTuples (name -> the fields
+        an instance of it or of a subclass has) and type aliases. A class that
+        runs code while it is built or read (``__post_init__``,
+        ``__setattr__``, ...), or has a subclass here that is not one of
+        them, does not count."""
+        if hasattr(self, "_structs"):
+            return self._structs
+        body = self.tree.body if hasattr(self, "tree") else []
+        aliases: dict[str, ast.expr] = {}
+        for node in body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                aliases[node.targets[0].id] = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None and _decorator_name(node.annotation) == "TypeAlias":
+                aliases[node.target.id] = node.value
+            elif sys.version_info >= (3, 12) and isinstance(node, ast.TypeAlias):
+                aliases[node.name.id] = node.value
+        hooks = {"__init__", "__new__", "__post_init__", "__setattr__", "__getattr__", "__getattribute__", "__init_subclass__", "__set_name__", "__class_getitem__"}
+        by_name = {c.name: c for c in body if isinstance(c, ast.ClassDef)}
+        done: dict[str, tuple[frozenset[str], frozenset[str]] | None] = {}
+
+        def attrs_of(name: str) -> tuple[frozenset[str], frozenset[str]] | None:
+            """(fields, every other attribute), inherited ones included."""
+            if name in done:
+                return done[name]
+            done[name] = None
+            c = by_name[name]
+            frozen = any(isinstance(d, ast.Call) and _decorator_name(d) == "dataclass" and any(k.arg == "frozen" and isinstance(k.value, ast.Constant) and k.value.value is True for k in d.keywords) for d in c.decorator_list)
+            named_tuple = any(_decorator_name(b) == "NamedTuple" for b in c.bases)
+            inherits = any(_decorator_name(b) in by_name for b in c.bases)
+            if not (frozen or named_tuple or inherits) or c.keywords:
+                return None
+            if any(_decorator_name(d) not in ("dataclass", "final") for d in c.decorator_list):
+                return None
+            own: set[str] = set()
+            other: set[str] = set()
+            for st in c.body:
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    (other if "ClassVar" in ast.unparse(st.annotation) or not (frozen or named_tuple) else own).add(st.target.id)
+                elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if st.name in hooks:
+                        return None
+                    other.add(st.name)
+                elif isinstance(st, ast.Assign):
+                    other.update(t.id for t in st.targets if isinstance(t, ast.Name))
+                elif isinstance(st, ast.ClassDef):
+                    other.add(st.name)
+            for b in c.bases:
+                bn = _decorator_name(b)
+                if bn in ("NamedTuple", "Generic", "object"):
+                    continue
+                if bn not in by_name or not isinstance(b, (ast.Name, ast.Subscript)):
+                    return None
+                inherited = attrs_of(bn)
+                if inherited is None:
+                    return None
+                own |= inherited[0]
+                other |= inherited[1]
+            done[name] = (frozenset(own), frozenset(other))
+            return done[name]
+
+        subs: dict[str, set[str]] = {n: {n} for n in by_name}
+        for n, c in by_name.items():
+            for b in c.bases:
+                if _decorator_name(b) in subs:
+                    subs[_decorator_name(b)].add(n)
+        changed = True
+        while changed:  # every descendant, not only direct subclasses
+            changed = False
+            for n in subs:
+                more = set().union(*(subs[d] for d in subs[n]))
+                if more - subs[n]:
+                    subs[n] |= more
+                    changed = True
+        structs: dict[str, frozenset[str]] = {}
+        for n in by_name:
+            got = [attrs_of(d) for d in sorted(subs[n])]
+            if all(g is not None for g in got):
+                fields = frozenset().union(*(g[0] for g in got if g))
+                others = frozenset().union(*(g[1] for g in got if g))
+                structs[n] = fields - others
+        self._structs = (structs, aliases)
+        return self._structs
+
     def import_function(self, other: "PythonFrontend", name: str) -> None:
         self.signatures[name] = other.signatures[name]
         for attr in ("defaults", "kwonly", "varargs", "wrapped"):
@@ -1898,7 +2028,10 @@ class ExprLowerer:
                     return ir.Extern(ir.TOpaque(f"{n.value.id}.{n.attr}"), loc, f"{n.value.id}.{n.attr}", ())
             obj = self.need(self.expr(n.value))
             if isinstance(obj.ty, ir.TOpaque):
-                return self.opaque(f"attr.{n.attr}", [obj], ir.TOpaque(""), loc)
+                fields = fe.structure_fields(obj.ty.why) if obj.ty.why else None
+                # (a field of an immutable structure: part of it, built before it)
+                kind = "part" if fields is not None and n.attr in fields else "attr"
+                return self.opaque(f"{kind}.{n.attr}", [obj], ir.TOpaque(""), loc)
             if isinstance(obj.ty, ir.TEnum):
                 if n.attr == "name":
                     return ir.Builtin(ir.STR, loc, "enum_name", (obj,))

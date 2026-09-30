@@ -11,6 +11,9 @@ module SM = Map.Make (String)
 exception Vc_error of string * Ir.loc
 exception Fallback of string  (** outside what this engine models yet *)
 
+(* how deep an immutable structure is: every part of it is shallower *)
+let depth x = fn "struct.depth" [| x |] Int
+
 (* -- values ------------------------------------------------------------ *)
 
 type lv = { arr : term; off : term; len : term; lty : Ir.ty }
@@ -722,10 +725,21 @@ and builtin g ctx (e : Ir.expr) name args =
     | "opaque_op", _ ->
       let op = lit_str (List.hd args) in
       let srt = sort_of e.ty in
-      let r = fn (Printf.sprintf "opaque.%s.%s" op (sort_name srt)) (Array.of_list flat_rest) srt in
+      let part = String.length op > 5 && String.sub op 0 5 = "part." in
+      let sym = if part then "attr." ^ String.sub op 5 (String.length op - 5) else op in
+      let r = fn (Printf.sprintf "opaque.%s.%s" sym (sort_name srt)) (Array.of_list flat_rest) srt in
       if (not ctx.spec) && not ctx.quiet then note_assumed g loc "operations on values from unchecked code do not raise";
       if e.ty = TInt && op = "len" then assume_ (le zero r);
+      (match flat_rest with
+       | [ x ] when part && srt = Opaque ->
+         assume_ (lt (depth r) (depth x));
+         if (not ctx.spec) && not ctx.quiet then note_assumed g loc "a frozen dataclass or NamedTuple holds values built before it"
+       | _ -> ());
       T r
+    | "depth", [ x ] ->
+      let x = tm x in
+      assume_ (le zero (depth x));
+      T (depth x)
     | "await", x :: _ ->
       (match ctx.state with Some _ when not ctx.spec -> await_havoc g ctx loc | _ -> ());
       x
@@ -1216,12 +1230,17 @@ and recursion_check g (callee : finfo) pmap ctx loc =
   match (me, them) with
   | Some me, Some them ->
     let mctx = { ctx with env = g.entry; modpath = g.info.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None } in
-    let m0 = term_of loc (ev g mctx me) in
+    (* a list literal is a lexicographic measure, compared left to right *)
+    let parts (m : Ir.expr) = match m.e with ListLit xs -> xs | _ -> [ m ] in
+    let m0 = List.map (fun e -> term_of loc (ev g mctx e)) (parts me) in
     let cctx = { ctx with env = pmap; modpath = callee.modpath; live = None; bound = SM.empty; spec = true; quiet = true; state = None } in
-    let m1 = term_of loc (ev g cctx them) in
+    let m1 = List.map (fun e -> term_of loc (ev g cctx e)) (parts them) in
+    if List.length m0 <> List.length m1 then
+      raise (Vc_error (Printf.sprintf "'%s' and '%s' recurse into each other but their '@decreases' have different lengths" g.info.fn.name callee.fn.name, loc));
+    let rec lex a b = match (a, b) with [ x ], [ y ] -> lt x y | x :: a', y :: b' -> or_ [ lt x y; and_ [ eq x y; lex a' b' ] ] | _ -> ff in
     let inferred = g.info.fn.decreases = None in
-    oblige g ~inferred "variant" ctx (le zero m0) loc "recursion measure is non-negative";
-    oblige g ~inferred "variant" ctx (lt m1 m0) loc (Printf.sprintf "recursive call to '%s' decreases the measure" callee.fn.name)
+    oblige g ~inferred "variant" ctx (and_ (List.map (le zero) m0)) loc "recursion measure is non-negative";
+    oblige g ~inferred "variant" ctx (lex m1 m0) loc (Printf.sprintf "recursive call to '%s' decreases the measure" callee.fn.name)
   | _ -> oblige g "variant" ctx ff loc (Printf.sprintf "recursive call to '%s' terminates (add '@decreases <measure>')" callee.fn.name)
 
 (* -- statements ----------------------------------------------------------- *)

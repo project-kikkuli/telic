@@ -1578,12 +1578,21 @@ class VCGen:
                 self.lemma(L.Fn("opaque.isinstance.Bool", (boxed, L.StrV("str")), L.BOOL), ctx, (boxed,))
                 same = L.eq(x, boxed)
                 return same if op.value == "cmp.eq" else L.not_(same)
-            r = L.Fn(f"opaque.{op.value}.{srt.name}", tuple(flat), srt)
+            part = str(op.value).startswith("part.")
+            r = L.Fn(f"opaque.{'attr.' + str(op.value)[5:] if part else op.value}.{srt.name}", tuple(flat), srt)
             if not ctx.spec and not ctx.quiet:
                 self.note(e.loc, "operations on values from unchecked code do not raise")
             if isinstance(e.ty, ir.TInt) and op.value == "len":
                 ctx.assume(L.le(L.ZERO, r))
+            if part and srt == L.OPAQUE and len(flat) == 1:
+                ctx.assume(L.lt(depth(r), depth(flat[0])))
+                if not ctx.spec and not ctx.quiet:
+                    self.note(e.loc, "a frozen dataclass or NamedTuple holds values built before it")
             return r
+        if name == "depth":
+            (x,) = args
+            ctx.assume(L.le(L.ZERO, depth(x)))  # type: ignore[arg-type]
+            return depth(x)  # type: ignore[arg-type]
         if name.startswith("str_"):
             return self.string_op(name, args, e, ctx)
         if name == "await":
@@ -2253,12 +2262,32 @@ class VCGen:
             )
             return
         mctx = Ctx(base=ctx.base, env=self.entry, module=self.module, guard=ctx.guard, spec=True, quiet=True)
-        m0 = self.ev(me, mctx)
+        m0 = [self.ev(e, mctx) for e in measure_parts(me)]
         cctx = Ctx(base=ctx.base, env=pmap, module=callee.module, guard=ctx.guard, spec=True, quiet=True)
-        m1 = self.ev(them, cctx)
+        m1 = [self.ev(e, cctx) for e in measure_parts(them)]
+        if len(m0) != len(m1):
+            raise VCError(f"'{self.fn.name}' and '{callee.fn.name}' recurse into each other but their '@decreases' have different lengths", loc)
         inferred = self.fn.decreases is None
-        self.oblige("variant", ctx, L.le(L.ZERO, m0), loc, "recursion measure is non-negative", inferred=inferred)
-        self.oblige("variant", ctx, L.lt(m1, m0), loc, f"recursive call to '{callee.fn.name}' decreases the measure", inferred=inferred)
+        self.oblige("variant", ctx, L.and_(*[L.le(L.ZERO, t) for t in m0]), loc, "recursion measure is non-negative", inferred=inferred)
+        self.oblige("variant", ctx, lex_lt(m1, m0), loc, f"recursive call to '{callee.fn.name}' decreases the measure", inferred=inferred)
+
+
+def depth(x: L.Term) -> L.Term:
+    """How deep an immutable structure is: every part of it is shallower."""
+    return L.Fn("struct.depth", (x,), L.INT)
+
+
+def measure_parts(m: ir.Expr) -> tuple[ir.Expr, ...]:
+    """A list literal is a lexicographic measure, compared left to right."""
+    return m.elems if isinstance(m, ir.ListLit) else (m,)
+
+
+def lex_lt(a: list[L.Term], b: list[L.Term]) -> L.Term:
+    #@ requires len(a) >= 1 and len(a) == len(b)
+    out = L.lt(a[-1], b[-1])
+    for x, y in zip(reversed(a[:-1]), reversed(b[:-1])):
+        out = L.or_(L.lt(x, y), L.and_(L.eq(x, y), out))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2390,7 +2419,7 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
     m = None
     if measure is not None:
         mctx = Ctx(base=[], env=env, module=ref.module, spec=True, quiet=True)
-        m = g.ev(measure, mctx)
+        m = tuple(g.ev(e, mctx) for e in measure_parts(measure))
     return L.FunDef(
         name,
         tuple(params),

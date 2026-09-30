@@ -35,8 +35,10 @@ def render(e: ir.Expr, prec: int = -1) -> str:
     if isinstance(e, ir.Call):
         return f"{e.func}({', '.join(render(a) for a in e.args)})"
     if isinstance(e, ir.Builtin):
-        if e.name == "to_real":
+        if e.name in ("to_real", "to_opaque"):
             return render(e.args[0], prec)
+        if e.name == "str_len":
+            return f"len({render(e.args[0])})"
         if e.name == "slice":
             lo = "" if isinstance(e.args[1], ir.Lit) and e.args[1].value is None else render(e.args[1])
             hi = "" if isinstance(e.args[2], ir.Lit) and e.args[2].value is None else render(e.args[2])
