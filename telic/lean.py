@@ -147,9 +147,10 @@ def lean_sort(s: L.Sort) -> str:
 
 
 class LeanPrinter:
-    def __init__(self, namer: Namer, fn_names: dict[str, str]):
+    def __init__(self, namer: Namer, fn_names: dict[str, str], free_fns: set[str] = frozenset()):  # type: ignore[assignment]
         self.n = namer
         self.fn_names = fn_names
+        self.free_fns = free_fns  # uninterpreted symbols: variables of the theorem
         self.dependent_ite = False
         self.hyp_counter = 0
 
@@ -176,7 +177,7 @@ class LeanPrinter:
             vs = " ".join(f"({self.n(v.name)} : {lean_sort(v.sort)})" for v in x.vars)
             return f"{q} {vs}, {self.t(x.body)}", 0
         if isinstance(x, L.Fn):
-            name = self.fn_names.get(x.name, x.name)
+            name = self.n(x.name) if x.name in self.free_fns else self.fn_names.get(x.name, x.name)
             if not x.args:
                 return name, 100
             return f"{name} {' '.join(self.t(a, 101) for a in x.args)}", 90
@@ -357,12 +358,21 @@ def validated_defs(lean: str, defs_text: str) -> str:
     return text
 
 
-def theorem_statement(ob: Obligation, axioms: list[L.Axiom], fn_names: dict[str, str]) -> str:
+def theorem_statement(ob: Obligation, axioms: list[L.Axiom], fn_names: dict[str, str], defined: set[str] | None = None) -> str:
+    """``defined``: the functions the definitions text declares; any other
+    function symbol is uninterpreted and becomes a variable."""
     namer = Namer()
-    pr = LeanPrinter(namer, fn_names)
     terms = list(ob.hyps) + [ob.goal]
+    free: dict[str, L.Fn] = {}
+    if defined is not None:
+        for t in terms + [ax.formula for ax in axioms]:
+            for x in L.iter_terms(t):
+                if isinstance(x, L.Fn) and x.args and x.name not in defined and x.name not in fn_names:
+                    free.setdefault(x.name, x)
+    pr = LeanPrinter(namer, fn_names, set(free))
     consts = sorted(set().union(*(L.consts(t) for t in terms)), key=lambda c: c.name)
     binders = [f"({namer(c.name)} : {lean_sort(c.sort)})" for c in consts]
+    binders += [f"({namer(f.name)} : {' → '.join(lean_sort(a.sort) for a in f.args)} → {lean_sort(f.sort)})" for _, f in sorted(free.items())]
     lemmas = [f"({re.sub(r'[^A-Za-z0-9_]', '_', ax.name)} : {pr.t(ax.formula)})" for ax in axioms]
     hyps = [f"(h{i + 1} : {pr.t(h)})" for i, h in enumerate(ob.hyps) if h != L.TRUE]
     goal = pr.t(ob.goal)
@@ -387,7 +397,7 @@ def build_context(ob: Obligation, theory: Theory, fn_names: dict[str, str]) -> t
     defs, axioms = theory.closure(terms, ob.exclude_axioms)
     records = collect_records(terms + [a.formula for a in axioms] + [d.body for d in defs if d.body is not None])
     defs_text = render_defs(defs, records, fn_names)
-    stmt = theorem_statement(ob, axioms, fn_names)
+    stmt = theorem_statement(ob, axioms, fn_names, {d.name for d in defs})
     return defs_text, stmt
 
 
