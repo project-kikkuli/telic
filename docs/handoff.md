@@ -95,9 +95,7 @@ work. Re-run them to refresh the numbers when the frontends change.
 ## Local setup reminders
 
 - The engine builds with `make -C core` from any OCaml >= 5.1 (an OxCaml
-  switch, `opam switch 5.2.0+ox`, adds flambda2). Homebrew's OCaml on a
-  newer macOS than its SDK needs
-  `OCAMLFLAGS="-ccopt -Wl,-U,_dup3 -ccopt -Wl,-U,_pipe2"`. Without the
+  switch, `opam switch 5.2.0+ox`, adds flambda2), Homebrew's included. Without the
   binary, telic uses the Python core (`TELIC_ENGINE=ox` selects the engine).
 - Jev: set `JEV_API_KEY` in your environment (never in the repo).
   `telic oracle --probe` checks it.
