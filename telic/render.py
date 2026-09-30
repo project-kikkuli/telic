@@ -558,7 +558,7 @@ class Renderer:
                 who = cov.get("model") or "oracle"
                 prob = f" p={cov['p']:.2f}" if isinstance(cov.get("p"), (int, float)) else ""
                 word = p.cyan("judged sufficient") if v == "sufficient" else p.yellow(f"judged {v}")
-                summary.append(word + p.dim(f" ({who}{prob})"))
+                summary.append(word + p.dim(f" ({who}{prob}, not proof)"))
             elif i.status == "backed":
                 summary.append(p.dim("coverage not reviewed"))
             where = f"{i.loc[0]}:{i.loc[1]}" if i.loc else ""

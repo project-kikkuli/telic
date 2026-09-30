@@ -94,7 +94,7 @@ class FunctionGaps:
     equivalent: int = 0
     gaps: list[Gap] = field(default_factory=list)
     skipped: str = ""
-    invalid: int = 0  # oracle mutants that did not parse, lower, or keep the contract
+    invalid: int = 0  # mutants that did not parse, lower, keep the contract, or run
     proposals: list[Proposal] = field(default_factory=list)
     rejected: int = 0  # proposed @ensures the original does not prove, or that reject nothing
     notes: list[str] = field(default_factory=list)
@@ -194,6 +194,11 @@ def mutants_for(fn: ir.Function, source: str, language: str) -> list[Mutant]:
             for alt in alts[:5]:
                 add(ln, m.group(1) + alt + m.group(3), f"return {alt}")
         elif isinstance(s, ir.If):
+            if language == "rust":
+                m = re.match(r"^(\s*)(\}?\s*else\s+)?if\s+(.*?)(\s*\{\s*)$", text)
+                if m:
+                    add(ln, f"{m.group(1)}{m.group(2) or ''}if !({m.group(3)}){m.group(4)}", "negate condition")
+                continue
             m = re.match(r"^(\s*)(el)?if (.*):\s*$", text) if language == "python" else re.match(r"^(\s*)(\}?\s*else\s+)?if\s*\((.*)\)(\s*\{?\s*)$", text)
             if m:
                 if language == "python":
@@ -204,10 +209,10 @@ def mutants_for(fn: ir.Function, source: str, language: str) -> list[Mutant]:
     text = function_text(source, fn)
     done = {text.strip()} | {m.apply(source) for m in out}
     for key, rule in _RULES.items():
-        got = rule(text, language)
-        if got and got.strip() not in done:
-            done.add(got.strip())
-            out.append(Mutant(fn.loc.line, text, got, key.replace("_", " "), end=max(fn.end_line, fn.loc.line)))
+        for got in rule(text, language):
+            if got.strip() not in done:
+                done.add(got.strip())
+                out.append(Mutant(fn.loc.line, text, got, key.replace("_", " "), end=max(fn.end_line, fn.loc.line)))
     return out
 
 
@@ -308,8 +313,8 @@ def _unfence(text: str) -> str:
     return "\n".join(lines)
 
 
-# The same categories as deterministic operators: delete the first matching
-# guard, or unwrap the first try. They run on every function; a model's
+# The same categories as deterministic operators: delete each matching
+# guard, or unwrap each try. They run on every function; a model's
 # mutants are an opt-in supplement.
 
 _NONE = re.compile(r"\bNone\b|\bnull\b|\bundefined\b")
@@ -320,62 +325,112 @@ def _indent(s: str) -> int:
     return len(s) - len(s.lstrip())
 
 
+_CLOSE = {"(": ")", "[": "]", "{": "}"}
+
+
+def _depth(text: str, opens: str = "([{") -> int:
+    return sum(text.count(c) - text.count(_CLOSE[c]) for c in opens)
+
+
+def _statements(lines: list[str]) -> list[str]:
+    """The statements in ``lines``, each joined from its continuation lines."""
+    out: list[str] = []
+    depth = 0
+    for x in lines:
+        if not x.strip() or x.strip().startswith(("#", "//")):
+            continue
+        if depth > 0 or (out and x.strip().startswith(".")):
+            out[-1] += " " + x.strip()
+        else:
+            out.append(x.strip())
+        depth += _depth(re.sub(r"(#|//).*$", "", x))
+    return out
+
+
+_EXIT = r"^(return|raise|throw|panic!)\b"
+
+
 def _guards(lines: list[str], language: str):
-    """(first, past-last, condition, body) of each ``if`` with no else whose
-    only statement returns, raises or throws."""
+    """(first, past-last, condition, exit) of each ``if`` with no else whose
+    block ends by returning, raising, throwing or panicking. ``exit`` is that
+    last statement."""
+    py = language == "python"
     for i, line in enumerate(lines):
-        if language == "python":
-            m = re.match(r"^(\s*)if (.+?):\s*(\S.*)?$", line)
-            if not m:
+        m = re.match(r"^(\s*)if\b\s*(.*)$", line)
+        if not m:
+            continue
+        ind = len(m.group(1))
+        head, h = m.group(2), i
+        while _depth(head, "([") > 0 and h + 1 < len(lines):
+            h += 1
+            head += " " + lines[h].strip()
+        if py:
+            hm = re.match(r"^(.*?):\s*(\S.*)?$", head)
+            if not hm:
                 continue
-            ind = len(m.group(1))
-            if m.group(3):
-                body, k = m.group(3), i + 1
+            cond, inline = hm.group(1), hm.group(2)
+            if inline:
+                block, k = [inline], h + 1
             else:
-                j = next((j for j in range(i + 1, len(lines)) if lines[j].strip()), None)
-                if j is None or _indent(lines[j]) <= ind:
-                    continue
-                body = lines[j].strip()
-                k = next((k for k in range(j + 1, len(lines)) if lines[k].strip()), len(lines))
-                if k < len(lines) and _indent(lines[k]) > ind:
-                    continue  # more than one statement
-                k = j + 1
+                k = h + 1
+                while k < len(lines) and (not lines[k].strip() or _indent(lines[k]) > ind):
+                    k += 1
+                while k > h + 1 and not lines[k - 1].strip():
+                    k -= 1
+                block = _statements(lines[h + 1 : k])
             nxt = next((x for x in lines[k:] if x.strip()), "")
             if re.match(r"^\s*(elif|else)\b", nxt) and _indent(nxt) == ind:
                 continue
-            if re.match(r"^(return|raise)\b", body):
-                yield i, k, m.group(2), body
         else:
-            m = re.match(r"^(\s*)if\s*\((.*)\)\s*(.*?)\s*$", line)
-            if not m:
-                continue
-            rest = m.group(3)
-            if rest == "{":
-                j = i + 1
-                if j + 1 >= len(lines) or lines[j + 1].strip() != "}":
+            if language == "rust":
+                hm = re.match(r"^(.*?)\s*\{\s*(.*)$", head)
+                if not hm:
                     continue
-                body, k = lines[j].strip(), j + 2
+                cond, rest = hm.group(1), "{" + hm.group(2)
+            else:
+                hm = re.match(r"^\((.*)\)\s*(.*)$", head)
+                if not hm:
+                    continue
+                cond, rest = hm.group(1), hm.group(2)
+            if rest.startswith("{"):
+                if _depth(rest) <= 0:
+                    block, k = _statements([rest.strip()[1:].rstrip()[:-1]]), h + 1
+                else:
+                    k, depth = h + 1, _depth(rest)
+                    while k < len(lines) and depth > 0:
+                        depth += _depth(lines[k])
+                        k += 1
+                    if depth > 0:
+                        continue
+                    block = _statements(lines[h + 1 : k - 1])
+                    if lines[k - 1].strip() != "}":
+                        continue
             elif rest:
-                body, k = rest.strip("{} "), i + 1
+                block, k = [rest], h + 1
+            elif h + 1 < len(lines):
+                block, k = [lines[h + 1].strip()], h + 2
             else:
                 continue
             nxt = next((x for x in lines[k:] if x.strip()), "")
             if re.match(r"^\s*(\}\s*)?else\b", nxt):
                 continue
-            if re.match(r"^(return|throw)\b", body):
-                yield i, k, m.group(2), body
+        if block and re.match(_EXIT, block[-1]):
+            yield i, k, cond, block[-1]
 
 
-def _drop_guard(text: str, language: str, want) -> str | None:
+GUARDS_PER_CATEGORY = 4
+
+
+def _drop_guard(text: str, language: str, want) -> list[str]:
     lines = text.split("\n")
-    for i, k, cond, body in _guards(lines, language):
-        if want(cond, body):
-            return "\n".join(lines[:i] + lines[k:])
-    return None
+    return [
+        "\n".join(lines[:i] + lines[k:]) for i, k, cond, body in _guards(lines, language) if want(cond, body)
+    ][:GUARDS_PER_CATEGORY]
 
 
-def _drop_try(text: str, language: str) -> str | None:
+def _drop_try(text: str, language: str) -> list[str]:
     lines = text.split("\n")
+    out: list[str] = []
     for i, line in enumerate(lines):
         ind = _indent(line)
         if language == "python" and line.strip() == "try:":
@@ -389,7 +444,7 @@ def _drop_try(text: str, language: str) -> str | None:
                 continue
             body = lines[i + 1 : j]
             step = min((_indent(x) for x in body if x.strip()), default=ind) - ind
-            return "\n".join(lines[:i] + [x[step:] if x.strip() else x for x in body] + lines[k:])
+            out.append("\n".join(lines[:i] + [x[step:] if x.strip() else x for x in body] + lines[k:]))
         if language != "python" and re.match(r"^\s*try\s*\{\s*$", line):
             j = next((j for j in range(i + 1, len(lines)) if re.match(r"^\s*\}\s*catch\b.*\{\s*$", lines[j]) and _indent(lines[j]) == ind), None)
             if j is None:
@@ -399,16 +454,20 @@ def _drop_try(text: str, language: str) -> str | None:
                 continue
             body = lines[i + 1 : j]
             step = min((_indent(x) for x in body if x.strip()), default=ind) - ind
-            return "\n".join(lines[:i] + [x[step:] if x.strip() else x for x in body] + lines[k + 1 :])
-    return None
+            out.append("\n".join(lines[:i] + [x[step:] if x.strip() else x for x in body] + lines[k + 1 :]))
+    return out[:GUARDS_PER_CATEGORY]
+
+
+def _rejects(body: str) -> bool:
+    return bool(re.match(r"^(raise|throw|panic!)\b|^return\s+Err\b", body))
 
 
 _RULES = {
     "null_check": lambda t, lang: _drop_guard(t, lang, lambda c, b: bool(_NONE.search(c))),
-    "validation": lambda t, lang: _drop_guard(t, lang, lambda c, b: b.startswith(("raise", "throw")) and not _AUTH.search(c)),
+    "validation": lambda t, lang: _drop_guard(t, lang, lambda c, b: _rejects(b) and not _AUTH.search(c)),
     "auth": lambda t, lang: _drop_guard(t, lang, lambda c, b: bool(_AUTH.search(c))),
     "error_handling": _drop_try,
-    "guard_clause": lambda t, lang: _drop_guard(t, lang, lambda c, b: b.startswith("return") and not _NONE.search(c)),
+    "guard_clause": lambda t, lang: _drop_guard(t, lang, lambda c, b: not _rejects(b) and not _NONE.search(c)),
 }
 
 
@@ -477,17 +536,25 @@ def _proposed_clauses(text: str, fn: ir.Function) -> list[str]:
 
 
 def _stage(tmp: str, tag: str, root: str, mod: ir.Module, source: str) -> str:
-    """Write ``source`` as the module into a fresh directory next to copies
-    of its siblings, so relative imports keep working."""
+    """Write ``source`` as the module into a fresh directory that mirrors the
+    project: every other file and directory on the way down is a symlink to
+    the original, so package imports and relative imports keep working."""
     d = tempfile.mkdtemp(prefix=tag, dir=tmp)
-    src_path = os.path.join(root, mod.path)
-    for sib in os.listdir(os.path.dirname(src_path) or "."):
-        full = os.path.join(os.path.dirname(src_path), sib)
-        if os.path.isfile(full) and sib != os.path.basename(mod.path) and sib.endswith((".py", ".ts")):
-            shutil.copy(full, os.path.join(d, sib))
-    path = os.path.join(d, os.path.basename(mod.path))
-    Path(path).write_text(source)
-    return path
+    src_path = os.path.abspath(os.path.join(root, mod.path))
+    base = os.path.abspath(root)
+    if os.path.relpath(src_path, base).startswith(".."):
+        base = os.path.dirname(src_path)
+    parts = os.path.relpath(src_path, base).split(os.sep)
+    here, there = d, base
+    for i, part in enumerate(parts):
+        for entry in os.listdir(there):
+            if entry != part:
+                os.symlink(os.path.join(there, entry), os.path.join(here, entry))
+        here, there = os.path.join(here, part), os.path.join(there, part)
+        if i < len(parts) - 1:
+            os.mkdir(here)
+    Path(here).write_text(source)
+    return here
 
 
 def clause_statuses(tmp: str, tag: str, root: str, mod: ir.Module, source: str, fn_name: str, clauses: list[str], others: list[ir.Module], opts: CheckOptions) -> dict[str, str]:
@@ -497,7 +564,7 @@ def clause_statuses(tmp: str, tag: str, root: str, mod: ir.Module, source: str, 
 
     path = _stage(tmp, tag, root, mod, source)
     try:
-        fn = _lower(path, source, mod.language, root).functions.get(fn_name)
+        fn = _lower(path, source, mod, others, root).functions.get(fn_name)
         pt = insertion_point(source, fn, mod.language) if fn else None
         if pt is None:
             return {}
@@ -505,7 +572,7 @@ def clause_statuses(tmp: str, tag: str, root: str, mod: ir.Module, source: str, 
         lines[pt[0] : pt[0]] = [f"{pt[1]}{_marker(mod.language)} ensures {c}" for c in clauses]
         text = "\n".join(lines)
         Path(path).write_text(text)
-        m = _lower(path, text, mod.language, root)
+        m = _lower(path, text, mod, others, root)
     except Exception:  # noqa: BLE001 - a clause that does not parse is not a proposal
         return {}
     if m.problems or fn_name not in m.functions or m.functions[fn_name].unsupported:
@@ -558,11 +625,21 @@ def propose_fixes(fg: FunctionGaps, fn: ir.Function, mod: ir.Module, modules: li
 # ---------------------------------------------------------------------------
 
 
-def _lower(path: str, source: str, language: str, root: str) -> ir.Module:
-    if language == "python":
-        from .frontend.python import lower_python
+def _lower(path: str, source: str, mod: ir.Module, others: list[ir.Module], root: str) -> ir.Module:
+    """Lower the staged ``source`` of ``mod`` the way the checker lowered the
+    original: a Python module together with the modules it imports, so calls
+    into them keep their contracts."""
+    if mod.language == "python":
+        from .frontend.python import lower_python_project
 
-        return lower_python(os.path.relpath(path, root), source)
+        context = [(o.path, o.source) for o in others if o.language == "python" and o.source]
+        out = lower_python_project([(mod.path, source)] + context)[0]
+        out.path = os.path.relpath(path, root)
+        return out
+    if mod.language == "rust":
+        from .frontend.rust import lower_rust
+
+        return lower_rust(os.path.relpath(path, root), source)
     from .frontend.typescript import lower_typescript_files
 
     return lower_typescript_files([path], root)[path]
@@ -574,7 +651,7 @@ def attempt(tmp: str, tag: str, mu: Mutant, fn: ir.Function, mod: ir.Module, oth
     src = mu.apply(mod.source)
     mpath = _stage(tmp, tag, root, mod, src)
     try:
-        mmod = _lower(mpath, src, mod.language, root)
+        mmod = _lower(mpath, src, mod, others, root)
     except Exception:  # noqa: BLE001 - a mutant the frontend rejects is not a program
         return "invalid", None
     if mmod.problems or fn.name not in mmod.functions or mmod.functions[fn.name].unsupported:
@@ -589,8 +666,9 @@ def attempt(tmp: str, tag: str, mu: Mutant, fn: ir.Function, mod: ir.Module, oth
 
 
 def trivial_mutants(fn: ir.Function, mod: ir.Module) -> list[Mutant]:
-    """The function with an immediate return of a default value, or an
-    immediate raise, before its first statement."""
+    """The function with an immediate return of a default value, of an
+    argument unchanged (a no-op), or an immediate raise, before its first
+    statement."""
     from .propose import insertion_point
 
     if mod.language not in ("python", "typescript"):
@@ -624,6 +702,7 @@ def trivial_mutants(fn: ir.Function, mod: ir.Module) -> list[Mutant]:
     bodies = []
     if value is not None:
         bodies.append(f"return {value}".rstrip() + ("" if py else ";"))
+    bodies += [f"return {p.name}" + ("" if py else ";") for p in fn.params if p.name not in ("self", "this") and p.ty == ret]
     bodies.append('raise RuntimeError("stub")' if py else 'throw new Error("stub");')
     out = []
     for b in bodies:
@@ -668,8 +747,8 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
             if frep.status != "proved":
                 fg.skipped = f"not proved yet ({frep.status}); gaps only make sense for proved functions"
                 continue
-            if mod.language not in ("python", "typescript"):
-                fg.skipped = f"gaps run on Python and TypeScript; {mod.language} mutants cannot be replayed yet"
+            if mod.language not in ("python", "typescript", "rust"):
+                fg.skipped = f"gaps run on Python, TypeScript and Rust; {mod.language} mutants cannot be lowered yet"
                 continue
             muts = mutants_for(fn, mod.source, mod.language)
             if llm:
@@ -702,7 +781,10 @@ def find_gaps(paths: list[str], opts: CheckOptions, root: str, progress=None, or
                 a = next(r for r in program.funcs.values() if r.fn is afn)
                 b = next(r for r in program.funcs.values() if r.fn is bfn)
                 pr = check_pair(program, theory, a, b, root, fn.loc, opts.timeout_ms, n_tests=200)
-                if pr.status == "refuted" and pr.witness:
+                if pr.witness and not pr.witness["replay"]["ran"]:
+                    fg.invalid += 1  # does not run (it does not compile, say): not a program the contract accepts
+                    fg.total -= 1
+                elif pr.status == "refuted" and pr.witness:
                     w = pr.witness
                     fg.gaps.append(Gap(mu, w["args_text"], w["a_text"].split("→", 1)[1].strip(), w["b_text"].split("→", 1)[1].strip()))
                 else:
@@ -778,7 +860,7 @@ def render_gaps(results: list[FunctionGaps], seconds: float) -> str:
         tail.append(p.dim(f"{eq_total} equivalent"))
     invalid = sum(r.invalid for r in results)
     if invalid:
-        tail.append(p.dim(f"{invalid} unusable model mutant{'s' * (invalid != 1)}"))
+        tail.append(p.dim(f"{invalid} unusable mutant{'s' * (invalid != 1)}"))
     out.append("")
     out.append("  ".join(tail) + p.dim(f"   (mutation score {score}; equivalent mutants excluded)"))
     return "\n".join(out)

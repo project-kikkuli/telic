@@ -146,7 +146,8 @@ open) · `vacuous-risk` (see below) · `unbacked` (declared, nothing cites it) �
 "shall not", "must not") is easy to back with lemmas an empty function also
 meets: `ensures result >= 0` holds of `return 0`. For each such aim that is
 otherwise backed, telic checks stubs of every function its lemmas sit on (an
-immediate `return` of a default value, and an immediate `raise`) against
+immediate `return` of a default value or of an argument unchanged, and an
+immediate `raise`) against
 that function's whole contract. If a stub passes for every one of them, the
 aim is `vacuous-risk` and the stub is named. Add a lemma that says what the
 function still does (`ensures result == a + b`, or a `@raises` that pins
@@ -245,19 +246,23 @@ Answers are cached under `.telic/`, so CI asks once per change. `telic oracle
 
 `telic gaps PATHS` attacks the contracts of proved functions. Each mutant is
 checked against the unchanged contract; one that still proves, and that a
-witness input shows behaves differently, is a gap.
+witness input shows behaves differently, is a gap. Gaps run on Python,
+TypeScript and Rust (Rust needs `rustc`): the mutant is written into a copy
+of the project, so its imports resolve, and both versions are run.
 
 - *Operators*, always, and deterministic: flip a comparison, shift a
   constant, delete an update, return something else, negate a condition;
-  and one realistic bug per category, made by deleting the first matching
-  guard or unwrapping the first `try`: a missing None check, a skipped
+  and realistic bugs by category, made by deleting each matching guard (an
+  `if` with no `else` whose block ends in a return, raise, throw or panic)
+  or unwrapping each `try`, up to four per category: a missing None check, a skipped
   validation, a skipped authorization check, removed error handling, a
   deleted guard clause.
 - *Model mutants*, only with `--llm` (task `mutate`, `claude -p` by
   default): the model sees the function, its contract and the aims it cites,
   and writes the whole function with one bug per category. A mutant that
   edits the contract, renames the function or falls outside the supported
-  subset is counted as unusable, never as killed.
+  subset is counted as unusable, never as killed. So is any mutant that does
+  not run (a Rust mutant `rustc` rejects).
 - *Proposals* (task `strengthen`): for the gaps that survive, telic proposes
   `@ensures` clauses: the template facts `telic propose` tries, or with
   `--llm` the model's clauses and, if the function cites an aim, a rewritten

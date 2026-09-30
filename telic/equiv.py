@@ -142,6 +142,10 @@ def run_one(ref: FuncRef, root: str, args: list[Any]) -> dict[str, Any]:
 
         (out,) = run_swift_batch(path, ref.fn, [_model(ref.fn, args)])
         return _swift_result(out)
+    if ref.module.language == "rust":
+        from .frontend.rust_replay import run_rust
+
+        return run_rust(path, ref.fn, _model(ref.fn, args)) or {"harness_error": "rustc cannot run this function"}
     if ref.module.language == "python":
         return run_python(path, ref.fn.name, args)
     return run_typescript(path, ref.fn.name, args, extra={"contracts": ts_contracts(ref.module)})
@@ -168,12 +172,23 @@ def _swift_result(out: dict[str, Any]) -> dict[str, Any]:
     return {**out, "ok": False}
 
 
+def _rust_result(out: dict[str, Any]) -> dict[str, Any]:
+    """Rust reports a returned value as its Debug text."""
+    if "returned_repr" in out and "violation" not in out:
+        return {"ok": True, "value": out["returned_repr"], "returned_repr": out["returned_repr"]}
+    return _swift_result(out)
+
+
 def run_batch(ref: FuncRef, root: str, batch: list[list[Any]]) -> list[dict[str, Any]]:
     path = _full(root, ref.module.path)
     if ref.module.language == "swift":
         from .frontend.swift_replay import run_swift_batch
 
         return [_swift_result(o) for o in run_swift_batch(path, ref.fn, [_model(ref.fn, a) for a in batch])]
+    if ref.module.language == "rust":
+        from .frontend.rust_replay import run_rust_batch
+
+        return [_rust_result(o) for o in run_rust_batch(path, ref.fn, [_model(ref.fn, a) for a in batch])]
     extra = {"batch": batch}
     if ref.module.language == "python":
         out = run_python(path, ref.fn.name, [], timeout=30, extra=extra)
@@ -337,21 +352,23 @@ def _witness(rep: MirrorReport, a: FuncRef, b: FuncRef, root: str, args_a: list[
     okb, vb, sb = _value_of(ob)
     la, lb = a.module.language, b.module.language
     args_text = ", ".join(f"{p.name}={format_value(v, p.ty, la)}" for p, v in zip(a.fn.params, args_a))
-    differ = not (oka and okb and same_value(va, vb))
+    ran = all("harness_error" not in o and not o.get("timeout") for o in (oa, ob))
+    differ = ran and not (oka and okb and same_value(va, vb))
     rep.witness = {
         "args_text": args_text,
         "a_text": f"{a.fn.name}(...) → {sa}",
         "b_text": f"{b.fn.name}(...) → {sb}",
         "replay": {
+            "ran": ran,
             "confirmed": differ,
-            "summary": f"ran both: {la} returned {sa}, {lb} returned {sb}" if differ else f"ran both: both returned {sa} (the solver's model disagrees with the runtimes)",
+            "summary": f"ran both: {la} returned {sa}, {lb} returned {sb}" if differ else f"ran both: both returned {sa} (the solver's model disagrees with the runtimes)" if ran else f"could not run both: {sa if 'harness_error' in oa or oa.get('timeout') else sb}",
         },
     }
     rep.status = "refuted" if differ else "open"
     if not from_solver:
         rep.method = "testing"
     if not differ:
-        rep.reason = "the solver's disagreement did not reproduce when run"
+        rep.reason = "the solver's disagreement did not reproduce when run" if ran else rep.witness["replay"]["summary"]
     return rep
 
 

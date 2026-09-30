@@ -91,12 +91,13 @@ done looks like. Soundness items come first: they can make telic say
   answers are capped at p=0.7, so it never sounds confident.
 - **Generative oracles.** `telic gaps --llm` asks a model for realistic
   mutants and stronger contracts (`mutate`, `strengthen`), defaulting to
-  `claude -p`. `telic gaps` skips Rust functions: equivalence replay
-  (`equiv.run_one`) runs Python and Node only. The
+  `claude -p`. `telic gaps` skips Swift functions: `_lower` in `gaps.py`
+  lowers Python, TypeScript and Rust only. The
   builtin `strengthen` only offers the template facts `telic propose` tries,
   so offline it rarely closes a gap. Aim rewrites are shown, never checked.
 - **Vacuous-risk is per function.** A safety aim is flagged when every
-  function behind it accepts a stub (`return <default>` or a raise). A stub
+  function behind it accepts a stub (`return <default>`, `return <argument>`
+  or a raise; Python and TypeScript only). A stub
   that returns early from one branch only, or a lemma in a function the
   aim does not list, is not tried.
 

@@ -145,3 +145,130 @@ def test_judgments_reach_the_json_and_the_html_report(tmp_path):
     page = render_html(check([str(tmp_path / "app.py")], opts, root=str(tmp_path)))  # a fresh run shows the cached judgment
     assert "judged sufficient by cmd:" in page and "p=0.90" in page and "not proof" in page
     assert "the shop shall refund at most what was paid" in page and "p=0.30" in page
+
+
+@pytest.mark.parametrize(
+    "language, source, deleted",
+    [
+        (
+            "python",
+            "def f(owner: int, user: int, n: int) -> int:\n    #@ ensures result >= 0\n    if user != owner:\n        raise PermissionError(\n            'forbidden'\n        )\n    return n\n",
+            ["    if user != owner:", "        raise PermissionError(", "            'forbidden'", "        )"],
+        ),
+        (
+            "python",
+            "def f(price: int, discount: int) -> int:\n    #@ ensures result >= 0\n    if discount < 0:\n        raise ValueError('negative')\n    if discount > price:\n        raise ValueError('too large')\n    return price - discount\n",
+            ["    if discount > price:", "        raise ValueError('too large')"],
+        ),
+        (
+            "python",
+            "def f(n: int, is_owner: bool, is_staff: bool) -> int:\n    #@ ensures result >= 0\n    if not is_owner:\n        return 0\n    if (not is_staff\n            and n > 0):\n        return 0\n    return n\n",
+            ["    if (not is_staff", "            and n > 0):", "        return 0"],
+        ),
+        (
+            "typescript",
+            "export function f(n: number, isOwner: boolean): number {\n  //@ ensures result >= 0\n  if (!isOwner) {\n    throw new Error(\n      'forbidden',\n    );\n  }\n  return n;\n}\n",
+            ["  if (!isOwner) {", "    throw new Error(", "      'forbidden',", "    );", "  }"],
+        ),
+        (
+            "rust",
+            "pub fn f(n: i64, is_owner: bool) -> i64 {\n    //@ ensures result >= 0\n    if !is_owner {\n        return 0;\n    }\n    n\n}\n",
+            ["    if !is_owner {", "        return 0;", "    }"],
+        ),
+    ],
+)
+def test_every_guard_is_deleted_whatever_its_layout(tmp_path, language, source, deleted):
+    from telic.checker import load_modules
+    from telic.gaps import mutants_for
+
+    path = tmp_path / {"python": "f.py", "typescript": "f.ts", "rust": "f.rs"}[language]
+    path.write_text(source)
+    (mod,) = load_modules([str(path)], str(tmp_path))
+    removed = [[t for s, _, t in mu.diff() if s == "-"] for mu in mutants_for(mod.functions["f"], mod.source, language) if mu.end]
+    assert deleted in removed
+
+
+def test_a_module_that_imports_from_its_package_keeps_its_callees_contracts(tmp_path):
+    (tmp_path / "app" / "util").mkdir(parents=True)
+    (tmp_path / "app" / "__init__.py").write_text("")
+    (tmp_path / "app" / "util" / "__init__.py").write_text("")
+    (tmp_path / "app" / "util" / "helpers.py").write_text("def clamp(x: int) -> int:\n    #@ ensures result >= 0\n    #@ ensures implies(x >= 0, result == x)\n    if x < 0:\n        return 0\n    return x\n")
+    views = "from app.util.helpers import clamp\n\n\ndef page_size(requested: int, is_admin: bool) -> int:\n    #@ ensures result >= 0\n    if not is_admin:\n        return 10\n    return clamp(requested)\n"
+    (tmp_path / "app" / "views.py").write_text(views)
+    (fg,) = find_gaps([str(tmp_path / "app" / "views.py")], CheckOptions(cache_path=None), str(tmp_path), propose=False)
+    (g,) = [g for g in fg.gaps if g.mutant.what == "auth"]
+    assert (g.original, g.mutated) == ("10", "0")  # the mutant ran, calling the real clamp
+
+
+def test_a_stub_that_returns_an_argument_unchanged_is_a_vacuous_risk(tmp_path):
+    src = (
+        "#@ aim NOCHARGE: The bank shall never change the balance when a charge is declined.\n\n\n"
+        "def charge(balance: int, amount: int, approved: bool) -> int:\n"
+        "    #@ requires balance >= 0 and amount >= 0\n"
+        "    #@ aim NOCHARGE\n"
+        "    #@ ensures implies(not approved, result == balance)\n"
+        "    #@ ensures result >= 0\n"
+        "    if not approved or amount > balance:\n"
+        "        return balance\n"
+        "    return balance - amount\n"
+    )
+    (tmp_path / "bank.py").write_text(src)
+    rep = check([str(tmp_path / "bank.py")], CheckOptions(cache_path=None, lean=False, replay=False), root=str(tmp_path))
+    (r,) = rep.aims
+    assert r.status == "vacuous-risk" and "return balance" in r.stubs[0]
+
+
+def test_a_judgment_is_labelled_and_never_backs_an_aim(tmp_path):
+    from telic.render import Renderer
+
+    src = "#@ aim POS: The shop shall compute a positive total.\n\n\ndef total(a: int) -> int:\n    #@ aim POS\n    #@ ensures result > 0\n    return a\n"
+    (tmp_path / "t.py").write_text(src)
+    script = tmp_path / "judge.py"
+    script.write_text("import json, sys\nreq = json.load(sys.stdin)\nprint(json.dumps({'answers': {k: {'noul': 0.95} for k in req['questions']}}))\n")
+    opts = CheckOptions(cache_path=None, lean=False, replay=False)
+    rep = check([str(tmp_path / "t.py")], opts, root=str(tmp_path))
+    judge(str(tmp_path), rep.aims, oracle=f"cmd:{sys.executable} {script}")
+    (r,) = rep.aims
+    assert r.status == "broken" and r.coverage["kind"] == "judged" and r.coverage["verdict"] == "sufficient"
+    assert "judged sufficient" in Renderer(rep).render() and "not proof" in Renderer(rep).render()
+
+
+RUST_GAPS = """pub fn fee(amount: i64, is_admin: bool) -> i64 {
+    //@ requires amount >= 0 && amount <= 1000000
+    //@ ensures result >= 0
+    if is_admin {
+        return 0;
+    }
+    amount / 100
+}
+
+pub fn add(x: &i64, y: i64) -> i64 {
+    //@ requires *x >= 0 && y >= 0 && *x <= 1000 && y <= 1000
+    //@ ensures result >= 0
+    return *x + y;
+}
+
+pub fn sum_to(n: i64) -> i64 {
+    //@ requires n >= 0 && n <= 1000
+    //@ ensures result >= 0
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        //@ invariant total >= 0 && i <= n && total <= i * 1000
+        //@ decreases n - i
+        total += i;
+        i += 1;
+    }
+    total
+}
+"""
+
+
+@pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not available")
+def test_rust_gaps_run_both_versions_with_rustc(tmp_path):
+    fee, add, sum_to = gaps(tmp_path, {"bank.rs": RUST_GAPS}, propose=False)
+    (g,) = [g for g in fee.gaps if g.mutant.what == "auth"]
+    assert "is_admin=true" in g.args_text and (g.original, g.mutated) != ("0", "0")
+    assert "return x" not in [g.mutant.what for g in add.gaps] and add.invalid == 1  # `return x` on a &i64 does not compile
+    (g,) = [g for g in sum_to.gaps if g.mutant.what == "delete statement"]  # a loop: compared by running both on many inputs
+    assert g.original != "0" and g.mutated == "0"
