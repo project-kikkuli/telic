@@ -236,3 +236,14 @@ def test_by_names_a_ui_lemma_by_name_or_path(tmp_path, item):
     rep = check([str(root)], CheckOptions(cache_path=None, lean=False, replay=False, ui=False), root=str(root))
     (a,) = [x for x in rep.aims if x.id == "HOME"]
     assert not a.pointers
+
+
+def test_an_aim_in_an_imported_module_is_not_reported_by_a_partial_check(tmp_path):
+    files = {
+        "ledger.py": "#@ aim CAP: WHEN a charge is made, the shop shall charge a non-negative amount.\n#@   by: charge\n\n\n" + fn("charge", "CAP"),
+        "app.py": "from ledger import charge\n\n\ndef handler(x: int) -> int:\n    return charge(abs(x))\n",
+    }
+    rep, got = report(tree(tmp_path, files), paths=("app.py",))
+    assert "CAP" not in got
+    rep, got = report(tmp_path)
+    assert got["CAP"].status == "backed" and not got["CAP"].pointers

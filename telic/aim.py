@@ -160,7 +160,7 @@ def build(rep: Any) -> list[AimReport]:
             if d.id in decls:
                 twice.setdefault(d.id, []).append(f"{m.path}:{d.loc.line}")
             else:
-                decls[d.id] = (text, (m.path, d.loc.line), by, scope, m.context and scope is not None)
+                decls[d.id] = (text, (m.path, d.loc.line), by, scope, m.context)
     citing: dict[str, list[Any]] = {}
     for f in rep.functions:
         for i in f.fn.aims:
