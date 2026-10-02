@@ -75,6 +75,7 @@ def snapshot(rep: Report) -> dict[str, Any]:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))
         status = "open" if f.status == "proved" and f.open_deps else f.status
         claims = [f"{c.kind} {c.text}" for c in f.fn.declared_claims]
+        claims += [msg for msg, _ in f.fn.unsupported if msg.startswith("contract:")]
         owner = f.fn.name.rpartition(".")[0]
         if owner in rep.program.classes:
             if status == "proved" and any(lc.cls in rep.program.mro(owner) and lc.status != "proved" for lc in rep.lifecycles):

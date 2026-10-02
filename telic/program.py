@@ -133,6 +133,7 @@ class Program:
             k for k, r in self.funcs.items()
             if not r.module.context and (
                 r.fn.declared_claims or r.fn.aims or r.fn.mirrors
+                or any(msg.startswith("contract:") for msg, _ in r.fn.unsupported)
                 or any(r.fn.name.startswith(c + ".") for c in classes)
                 or any(isinstance(s, ir.FieldAssign) and s.cls in classes for s in ir.walk_stmts(r.fn.body))
                 or any(isinstance(e, ir.New) and e.cls in classes for s in ir.walk_stmts(r.fn.body) for value in ir.stmt_exprs(s) for e in ir.walk_expr(value))
