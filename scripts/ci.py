@@ -88,7 +88,7 @@ def proof(since: str | None, record: bool) -> bool:
     scope = None
     if since and not record:
         changed = changed_files(str(ROOT), since)
-        compiler = KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "telic/lean/*"]
+        compiler = KERNEL + ALL_FRONTENDS + ["telic/aim.py", "telic/ledger.py", "core/*.ml", "core/Makefile", "telic/lean/*"]
         if not any(fnmatch.fnmatch(path, pattern) for path in changed for pattern in compiler):
             scope = affected_files(str(ROOT), changed, old) & set(paths)
             scope |= {k.split("::")[0] for k in (old or {}).get("functions", {}) if not (ROOT / k.split("::")[0]).exists()}
