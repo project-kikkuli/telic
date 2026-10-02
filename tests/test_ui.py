@@ -795,6 +795,17 @@ def test_source_ui_models_imported_forwarding_state_hooks(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
+def test_source_ui_keeps_effectful_imported_hooks_open(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useCounter} from "./useCounter"; export default function App(){const [count]=useCounter(0);return <button aria-label="Counter">{count}</button>}',
+        'reachable button "Counter"',
+        modules={"useCounter.ts": 'import {useEffect,useState} from "react"; export function useCounter(initial:number){const [value,setValue]=useState(initial);useEffect(()=>setValue(value+1),[]);return [value,setValue] as const;}\n'},
+    )
+    assert why and "pure forwarding state hook" in why
+    assert got.status == "open" and got.method != "source proof"
+
+
 def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
