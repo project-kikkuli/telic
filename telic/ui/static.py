@@ -432,6 +432,8 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
             node["value"] = ["lit", _jsx_entities(node["value"][1])]
         if node.get("type") == "element":
             node["props"] = {k: (["lit", _jsx_entities(v[1])] if isinstance(v, list) and len(v) == 2 and v[0] == "jsx-lit" else v) for k, v in node.get("props", {}).items()}
+            if isinstance(node.get("key"), list) and len(node["key"]) == 2 and node["key"][0] == "jsx-lit":
+                node["key"] = ["lit", _jsx_entities(node["key"][1])]
         for child in node.get("children", []):
             decode_jsx(child)
         for key in ("yes", "no"):
@@ -567,11 +569,11 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
         for action in _actions(model["render"], current, model):
             nxt = dict(current)
             _execute(action["handler"], current, nxt, state_defs)
-            before_mounts = _mounted_components(model["render"], current)
-            after_mounts = _mounted_components(model["render"], nxt)
+            before_mounts = _mounted_components(model["render"], current, model)
+            after_mounts = _mounted_components(model["render"], nxt, model)
             for declaration in declarations:
                 owner = declaration.get("owner")
-                if owner and owner in before_mounts and owner not in after_mounts:
+                if owner in before_mounts and before_mounts.get(owner) != after_mounts.get(owner):
                     nxt[declaration["name"]] = declaration["initial"]
             for name, value in nxt.items():
                 if isinstance(value, int) and not isinstance(value, bool) and not -(2**53 - 1) <= value <= 2**53 - 1:
@@ -736,7 +738,7 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
             return
         if kind != "element":
             raise ValueError("render node is malformed")
-        props = {k: _eval(v, state) for k, v in n["props"].items()}
+        props = _source_dom_props({k: _eval(v, state) for k, v in n["props"].items()}, model, n)
         display, visibility = _css_style(n, props, model, inherited_visibility)
         if _dom_hidden(props) or display == "none":
             return
@@ -744,7 +746,7 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
         children = n["children"]
         name = _accessible_name(n, props, state, role, model)
         handlers = [n["events"]["click"], *reversed(ancestors)] if n["events"].get("click") is not None else list(reversed(ancestors))
-        disabled = n["tag"] == "button" and bool(props.get("disabled", False))
+        disabled = n["tag"] == "button" and _truthy(props.get("disabled", False))
         if n["events"].get("click") is not None and not disabled and visibility not in ("hidden", "collapse"):
             action_role = role if role != "generic" else "clickable"
             label = f"click {action_role} {json.dumps(name, ensure_ascii=False)}" if name else f"click {action_role}"
@@ -755,39 +757,83 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
     return out
 
 
-def _mounted_components(tree: dict[str, Any], state: dict[str, Any]) -> set[str]:
-    mounted: set[str] = set()
-    def visit(node: dict[str, Any]) -> None:
+def _mounted_components(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]) -> dict[str, tuple[tuple[str, str], ...]]:
+    mounted: dict[str, tuple[tuple[str, str], ...]] = {}
+    def visit(node: dict[str, Any], identity: tuple[tuple[str, str], ...] = ()) -> None:
         kind = node["type"]
         if kind == "branch":
-            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
+            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"], identity)
         elif kind == "group":
-            for child in node["children"]: visit(child)
+            for child in node["children"]: visit(child, identity)
         elif kind == "component":
-            mounted.add(node["id"])
-            visit(node["child"])
+            mounted[node["id"]] = identity
+            visit(node["child"], identity)
         elif kind == "element":
-            for child in node["children"]: visit(child)
+            child_identity = identity
+            if node.get("key") is not None:
+                key_value = _eval(node["key"], state)
+                child_identity = (*identity, (node["id"], _source_key_string(key_value, model, node)))
+            for child in node["children"]: visit(child, child_identity)
     visit(tree)
     return mounted
+
+
+_REACT_STRING_PROPS = {
+    "className", "id", "title", "lang", "dir", "role", "aria-label", "aria-labelledby",
+    "aria-modal", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected",
+}
+
+
+def _js_string(value: Any) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return ",".join("" if item is None else _js_string(item) for item in value)
+    if isinstance(value, dict):
+        if "toString" in value:
+            raise ValueError("React DOM string coercion calls a non-callable own toString property")
+        return "[object Object]"
+    raise ValueError(f"React DOM cannot stringify source value of type {type(value).__name__}")
+
+
+def _source_dom_props(props: dict[str, Any], model: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    result = dict(props)
+    try:
+        for name in _REACT_STRING_PROPS & result.keys():
+            value = result[name]
+            result[name] = "" if name == "className" and value is None else None if value is None else _js_string(value)
+    except ValueError as e:
+        raise ValueError(f"{e} at {model['path']}:{node['line']}") from e
+    return result
+
+
+def _source_key_string(value: Any, model: dict[str, Any], node: dict[str, Any]) -> str:
+    try:
+        return _js_string(value)
+    except ValueError as e:
+        raise ValueError(f"{e} at {model['path']}:{node['line']}") from e
 
 
 def _display(value: Any) -> str:
     if value is None:
         return ""
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    return str(value).strip()
+    return _js_string(value).strip()
 
 
 def _hidden(props: dict[str, Any]) -> bool:
-    return bool(props.get("hidden")) or props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
+    return _truthy(props.get("hidden")) or props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
 
 
 def _dom_hidden(props: dict[str, Any]) -> bool:
-    return bool(props.get("hidden"))
+    return _truthy(props.get("hidden"))
 
 
 def _accessible_name(node: dict[str, Any], props: dict[str, Any], state: dict[str, Any], role: str, model: dict[str, Any]) -> str:
@@ -833,7 +879,7 @@ def _id_texts(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]
         elif kind == "component":
             visit(node["child"])
         elif kind == "element":
-            props = {k: _eval(v, state) for k, v in node["props"].items()}
+            props = _source_dom_props({k: _eval(v, state) for k, v in node["props"].items()}, model, node)
             key = props.get("id")
             if key:
                 if not isinstance(key, str):
@@ -872,7 +918,7 @@ def _tree_text(n: dict[str, Any], state: dict[str, Any], model: dict[str, Any], 
     if n["type"] == "component": return _tree_text(n["child"], state, model, inherited_visibility, inherited_aria_hidden)
     if n["type"] == "group": return "".join(_tree_text(c, state, model, inherited_visibility, inherited_aria_hidden) for c in n["children"])
     if n["type"] == "branch": return _tree_text(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], state, model, inherited_visibility, inherited_aria_hidden)
-    props = {k: _eval(v, state) for k, v in n.get("props", {}).items()}
+    props = _source_dom_props({k: _eval(v, state) for k, v in n.get("props", {}).items()}, model, n)
     if _dom_hidden(props): return ""
     aria_hidden = props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
     if aria_hidden: return ""
@@ -889,7 +935,7 @@ def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, An
         if kind == "group": return [x for c in n["children"] for x in build(c, inherited_visibility, inherited_aria_hidden)]
         if kind == "branch": return build(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], inherited_visibility, inherited_aria_hidden)
         if kind == "component": return build(n["child"], inherited_visibility, inherited_aria_hidden)
-        props = {k: _eval(v, state) for k, v in n["props"].items()}
+        props = _source_dom_props({k: _eval(v, state) for k, v in n["props"].items()}, model, n)
         if _dom_hidden(props): return []
         aria_hidden = inherited_aria_hidden or props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
         if aria_hidden: return []
@@ -898,7 +944,7 @@ def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, An
         role = _role(n["tag"], props)
         name = _accessible_name(n, props, state, role, model)
         states = set()
-        if (n["tag"] == "button" and bool(props.get("disabled", False))) or props.get("aria-disabled") is True or props.get("aria-disabled") == "true": states.add("disabled")
+        if (n["tag"] == "button" and _truthy(props.get("disabled", False))) or props.get("aria-disabled") is True or props.get("aria-disabled") == "true": states.add("disabled")
         if props.get("checked") or props.get("aria-checked") is True or props.get("aria-checked") == "true": states.add("checked")
         if props.get("aria-checked") == "mixed": states.add("mixed")
         if props.get("aria-expanded") is True or props.get("aria-expanded") == "true": states.add("expanded")

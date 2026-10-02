@@ -989,6 +989,176 @@ def test_source_ui_allows_inert_data_attributes(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
+@pytest.mark.parametrize(
+    ("hook_import", "hook_call"),
+    [
+        ('import {type useState} from "react";', "useState"),
+        ('import type {useState} from "react";', "useState"),
+        ('import type React from "react";', "React.useState"),
+        ('import type * as React from "react";', "React.useState"),
+    ],
+)
+def test_source_ui_rejects_type_only_react_hook_bindings(tmp_path, hook_import, hook_call):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        f'{hook_import} export default function App(){{const [ready,setReady]={hook_call}(true);return <button>Ready</button>}}',
+        'reachable button "Ready"',
+    )
+    assert why and "vite-app/src/App.tsx:" in why
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize("react_import", ['import React from "react";', 'import * as React from "react";'])
+def test_source_ui_keeps_runtime_react_hook_bindings_supported(tmp_path, react_import):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        f'{react_import} export default function App(){{const [ready,setReady]=React.useState(false);return <button onClick={{()=>setReady(true)}}>{{ready?"Ready":"Wait"}}</button>}}',
+        'reachable button "Ready"',
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+@pytest.mark.parametrize("barrel", ['export type {Widget} from "./Widget";', 'export {type Widget} from "./Widget";', 'export type * from "./Widget";'])
+def test_source_ui_rejects_type_only_component_reexports(tmp_path, barrel):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {Widget} from "./Barrel"; export default function App(){return <Widget />} ',
+        'reachable button "Ready"',
+        modules={"Barrel.ts": barrel, "Widget.tsx": 'export function Widget(){return <button>Ready</button>}'},
+    )
+    assert why and "vite-app/src/App.tsx:" in why
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize("barrel", ['export type {useReady} from "./Hook";', 'export {type useReady} from "./Hook";', 'export type * from "./Hook";'])
+def test_source_ui_rejects_type_only_forwarding_hook_reexports(tmp_path, barrel):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useReady} from "./Barrel"; export default function App(){const [ready]=useReady(true);return <button>{ready?"Ready":"Wait"}</button>}',
+        'reachable button "Ready"',
+        modules={
+            "Barrel.ts": barrel,
+            "Hook.ts": 'import {useState} from "react"; export function useReady(initial:boolean){const [ready,setReady]=useState(initial);return [ready,setReady] as const}',
+        },
+    )
+    assert why and "vite-app/src/App.tsx:" in why
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize("hook_import", ['import {type useState} from "react";', 'import type {useState} from "react";'])
+def test_source_ui_rejects_forwarding_hooks_with_erased_react_imports(tmp_path, hook_import):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useReady} from "./Hook"; export default function App(){const [ready]=useReady(true);return <button>{ready?"Ready":"Wait"}</button>}',
+        'reachable button "Ready"',
+        modules={"Hook.ts": f'{hook_import} export function useReady(initial:boolean){{const [ready,setReady]=useState(initial);return [ready,setReady] as const}}'},
+    )
+    assert why and "vite-app/src/App.tsx:" in why
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize(
+    ("hook_import", "hook_call"),
+    [
+        ('import type {useReady} from "./Hook";', "useReady"),
+        ('import type useReady from "./Hook";', "useReady"),
+        ('import type * as Hooks from "./Hook";', "Hooks.useReady"),
+    ],
+)
+def test_source_ui_rejects_type_only_forwarding_hook_imports(tmp_path, hook_import, hook_call):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        f'{hook_import} export default function App(){{const [ready]={hook_call}(true);return <button>{{ready?"Ready":"Wait"}}</button>}}',
+        'reachable button "Ready"',
+        modules={"Hook.ts": 'import {useState} from "react"; export function useReady(initial:boolean){const [ready,setReady]=useState(initial);return [ready,setReady] as const} export default useReady;'},
+    )
+    assert why and "vite-app/src/App.tsx:" in why
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize(
+    ("hook_import", "hook_call", "hook_module"),
+    [
+        ('import useReady from "./Hook";', "useReady", 'import {useState} from "react"; function useReady(initial:boolean){const [ready,setReady]=useState(initial);return [ready,setReady] as const} export default useReady;'),
+        ('import * as Hooks from "./Hook";', "Hooks.useReady", 'import {useState} from "react"; export function useReady(initial:boolean){const [ready,setReady]=useState(initial);return [ready,setReady] as const}'),
+    ],
+)
+def test_source_ui_resolves_runtime_default_and_namespace_forwarding_hooks(tmp_path, hook_import, hook_call, hook_module):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        f'{hook_import} export default function App(){{const [ready]={hook_call}(true);return <button>{{ready?"Ready":"Wait"}}</button>}}',
+        'reachable button "Ready"',
+        modules={"Hook.ts": hook_module},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_resolves_runtime_aliased_forwarding_hook_exports(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useReadyAlias as useReady} from "./Barrel"; export default function App(){const [ready]=useReady(true);return <button>{ready?"Ready":"Wait"}</button>}',
+        'reachable button "Ready"',
+        modules={
+            "Barrel.ts": 'export {useReady as useReadyAlias} from "./Hook";',
+            "Hook.ts": 'import {useState} from "react"; export function useReady(initial:boolean){const [ready,setReady]=useState(initial);return [ready,setReady] as const}',
+        },
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    ("app", "property", "stylesheet", "expected"),
+    [
+        ('const classes=["hidden"]; import {useState} from "react"; export default function App(){const [open,setOpen]=useState(false);return <><main className={classes}><button onClick={()=>setOpen(true)}>Open</button></main>{open?<div role="dialog" aria-label="Help"/>:null}</>}', 'reachable dialog "Help"', '.hidden { visibility: hidden }', "refuted"),
+        ('const label=["Ready"]; export default function App(){return <button aria-label={label}>Other</button>}', 'never button "Ready"', "", "refuted"),
+        ('const label=[true,0]; export default function App(){return <button aria-label={label}>Other</button>}', 'reachable button "true,0"', "", "proved"),
+        ('const hidden=[]; export default function App(){return <button hidden={hidden}>Hidden</button>}', 'reachable button "Hidden"', "", "refuted"),
+        ('const disabled=[]; import {useState} from "react"; export default function App(){const [open,setOpen]=useState(false);return <><button disabled={disabled} onClick={()=>setOpen(true)}>Open</button>{open?<div role="dialog" aria-label="Help"/>:null}</>}', 'reachable dialog "Help"', "", "refuted"),
+    ],
+)
+def test_source_ui_matches_react_native_prop_coercion(tmp_path, app, property, stylesheet, expected):
+    _, _, why, got = _static_source_case(tmp_path, app, property, stylesheet=stylesheet)
+    assert why is None and got.status == expected and got.method == "source proof"
+
+
+def test_source_ui_reports_uncoercible_dom_values_at_the_source(tmp_path):
+    from telic.ui.spec import UiLemma
+    from telic.ui.static import check as check_source
+
+    model, identity, why, got = _static_source_case(
+        tmp_path,
+        'const label={toString:"Ready"}; export default function App(){return <button aria-label={label}>Other</button>}',
+        'reachable button "Ready"',
+    )
+    prop = parse_prop('reachable button "Ready"')[0]
+    source = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, 'reachable button "Ready"', (), prop))
+    assert why is None and source.status == "open" and source.method == "source model"
+    assert "React DOM string coercion" in source.detail and "vite-app/src/App.tsx:" in source.detail
+    assert got.status != "proved" or got.method != "source proof"
+
+
+@pytest.mark.parametrize(
+    ("property", "expected"),
+    [('always dialog "Help" while button "Reset done"', "refuted"), ('always reachable button "Open" from button "Reset done"', "proved")],
+)
+def test_source_ui_resets_descendant_state_when_a_native_key_changes(tmp_path, property, expected):
+    app = '''import {useState} from "react";
+import {Child} from "./Child";
+export default function App(){
+  const [epoch,setEpoch]=useState(false);
+  const [opened,setOpened]=useState(false);
+  const [reset,setReset]=useState(false);
+  return <><div key={epoch}><Child onOpen={()=>setOpened(true)}/></div>{opened?<button onClick={()=>{setEpoch(!epoch);setReset(true)}}>Reset</button>:null}{reset?<button>Reset done</button>:null}</>;
+}'''
+    modules = {"Child.tsx": '''import {useState} from "react";
+export function Child({onOpen}:{onOpen:()=>void}){
+  const [open,setOpen]=useState(false);
+  return open?<div role="dialog" aria-label="Help"/>:<button onClick={()=>{setOpen(true);onOpen()}}>Open</button>;
+}'''}
+    _, _, why, got = _static_source_case(tmp_path, app, property, modules=modules)
+    assert why is None and got.status == expected and got.method == "source proof", f"{got.status=}, {got.detail=}, {got.trace=}, {expected=}"
+
+
 @pytest.mark.parametrize("property", ['always reachable button "Next" from overlay', 'reachable dialog "Welcome to Notes"'])
 def test_source_ui_proves_the_real_notes_react_onboarding_flow(tmp_path, property):
     _, _, why, got = _static_source_case(

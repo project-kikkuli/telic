@@ -134,6 +134,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   const namedHooks = new Set();
   const reactObjects = new Set();
   const customHooks = new Map();
+  const customHookNamespaces = new Map();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
     if (s.moduleSpecifier.text.endsWith(".css")) {
@@ -144,7 +145,15 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (s.moduleSpecifier.text !== "react") {
       const importedPath = s.moduleSpecifier.text.startsWith(".") ? resolveModule(path, s.moduleSpecifier.text) : null;
       if (!importedPath || !s.importClause || !safeComponentModule(importedPath)) fail(sf, s, `import '${s.moduleSpecifier.text}' has module effects outside the source UI model`);
-      if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) {
+      const clause = s.importClause;
+      if (!clause.isTypeOnly) {
+        if (clause.name) {
+          const hook = resolveForwardingStateHook(importedPath, "default");
+          if (hook) customHooks.set(clause.name.text, hook);
+        }
+        if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) customHookNamespaces.set(clause.namedBindings.name.text, importedPath);
+      }
+      if (!clause.isTypeOnly && clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
         for (const item of s.importClause.namedBindings.elements) {
           const localName = item.name.text;
           const exportedName = (item.propertyName || item.name).text;
@@ -155,14 +164,14 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       continue;
     }
     const clause = s.importClause;
-    if (!clause) continue;
+    if (!clause || clause.isTypeOnly) continue;
     if (clause.name) reactObjects.add(clause.name.text);
     if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) reactObjects.add(clause.namedBindings.name.text);
     if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
       for (const specifier of clause.namedBindings.elements) {
         const imported = (specifier.propertyName || specifier.name).text;
         if (/^use[A-Z]/.test(imported) && imported !== "useState") fail(sf, specifier, `React hook '${imported}' is outside the source UI model`);
-        if (imported === "useState") namedHooks.add(specifier.name.text);
+        if (imported === "useState" && !specifier.isTypeOnly) namedHooks.add(specifier.name.text);
       }
     }
   }
@@ -187,6 +196,19 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     const binding = ts.isIdentifier(call.expression) ? call.expression.text : ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) ? call.expression.expression.text : "";
     return isImportedStateHook(call) && !shadows.has(binding);
   };
+  const customHook = (call) => {
+    if (ts.isIdentifier(call.expression)) {
+      const name = call.expression.text;
+      if (shadows.has(name)) return null;
+      return customHooks.get(name) || findForwardingStateHook(sf, name, false);
+    }
+    if (ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression)) {
+      const namespace = call.expression.expression.text;
+      const importedPath = customHookNamespaces.get(namespace);
+      if (importedPath && !shadows.has(namespace)) return resolveForwardingStateHook(importedPath, call.expression.name.text);
+    }
+    return null;
+  };
   const states = new Map();
   const setters = new Map();
   const modeledHooks = new Set();
@@ -209,7 +231,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       if (!directState) {
         const hookBinding = ts.isIdentifier(init.expression) ? init.expression.text : ts.isPropertyAccessExpression(init.expression) && ts.isIdentifier(init.expression.expression) ? init.expression.expression.text : "";
         if (isImportedStateHook(init) && shadows.has(hookBinding)) fail(sf, init, "state initializer call does not resolve to an unshadowed React useState import");
-        const custom = !shadows.has(init.expression.text) && (customHooks.get(init.expression.text) || findForwardingStateHook(sf, init.expression.text, false));
+        const custom = customHook(init);
         if (!custom || init.arguments.length !== 1) fail(sf, init, "state initializer call does not resolve to React useState or a pure forwarding state hook");
         initialArg = literal(init.arguments[0], sf) ? init.arguments[0] : null;
         if (!initialArg) fail(sf, init.arguments[0] || init, "forwarding state hook needs one finite literal initializer");
@@ -327,6 +349,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
 
   const childStates = [];
   let componentInstance = 0;
+  let nativeInstance = 0;
   let renderedStatefulChildren = 0;
   const render = (e, conditionalMount = false) => {
     e = strip(e);
@@ -413,10 +436,17 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (!modeledTags.has(tag)) fail(sf, open.tagName, `native ${tag} accessibility semantics are outside the source UI model`);
     const props = {};
     const events = {};
+    let key = null;
     for (const a of open.attributes.properties) {
       if (!ts.isJsxAttribute(a)) fail(sf, a, "spread JSX attributes are outside the source UI model");
       const name = a.name.getText(sf);
-      if (name === "key") continue;
+      if (name === "key") {
+        if (!a.initializer) key = ["lit", true];
+        else if (ts.isStringLiteral(a.initializer)) key = ["jsx-lit", a.initializer.text];
+        else if (ts.isJsxExpression(a.initializer) && a.initializer.expression) key = enc(a.initializer.expression, new Set());
+        else fail(sf, a, "native key value is outside the source identity model");
+        continue;
+      }
       if (name === "style") fail(sf, a, "inline style objects are outside the source UI model");
       if (name === "value" || name === "checked") fail(sf, a, `native ${name} semantics are outside the source UI model`);
       if (name === "role" && !["div", "span"].includes(tag)) fail(sf, a, `role override on native ${tag} is outside the source UI model`);
@@ -438,7 +468,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         else props[name] = enc(a.initializer.expression, new Set());
       } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
     }
-    return { type: "element", tag, line: lineOf(sf, whole), props, events, children: jsxChildren(children, conditionalMount) };
+    return { type: "element", id: `${statePrefix}native@${nativeInstance++}`, tag, line: lineOf(sf, whole), key, props, events, children: jsxChildren(children, conditionalMount) };
   }
 
   function jsxChildren(children, conditionalMount) {
@@ -528,7 +558,7 @@ function resolveNamedExport(path, exportName, seen = new Set()) {
   const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
   const matches = [];
   for (const statement of sf.statements) {
-    if (!ts.isExportDeclaration(statement)) continue;
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
     if (!statement.moduleSpecifier && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
       for (const item of statement.exportClause.elements) {
         if (item.name.text !== exportName || item.isTypeOnly) continue;
@@ -589,6 +619,7 @@ function findForwardingStateHook(sf, name, requireExport) {
   let reactObjects = new Set();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || s.moduleSpecifier.text !== "react" || !s.importClause) continue;
+    if (s.importClause.isTypeOnly) continue;
     if (s.importClause.name) reactObjects.add(s.importClause.name.text);
     if (s.importClause.namedBindings && ts.isNamespaceImport(s.importClause.namedBindings)) reactObjects.add(s.importClause.namedBindings.name.text);
     if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) for (const i of s.importClause.namedBindings.elements) {
@@ -622,8 +653,21 @@ function resolveForwardingStateHook(path, exportName, seen = new Set()) {
   const direct = findForwardingStateHook(sf, exportName, true);
   if (direct) return direct;
   const matches = [];
+  if (exportName === "default") {
+    for (const statement of sf.statements) {
+      if (ts.isFunctionDeclaration(statement) && statement.name
+        && (ts.getModifiers(statement) || []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) {
+        const hook = findForwardingStateHook(sf, statement.name.text, false);
+        if (hook) matches.push(hook);
+      }
+      if (ts.isExportAssignment(statement) && !statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+        const hook = findForwardingStateHook(sf, statement.expression.text, false);
+        if (hook) matches.push(hook);
+      }
+    }
+  }
   for (const statement of sf.statements) {
-    if (!ts.isExportDeclaration(statement)) continue;
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
     if (ts.isStringLiteralLike(statement.moduleSpecifier)) {
       const resolved = resolveModule(path, statement.moduleSpecifier.text);
       if (!resolved) continue;
@@ -676,8 +720,18 @@ function safeComponentModule(path, seen = new Set()) {
         }
         const importedPath = from.startsWith(".") && resolveModule(path, from);
         if (!importedPath || ts.isImportDeclaration(s) && !s.importClause || !safeComponentModule(importedPath, seen)) return false;
-        continue;
-      }
+      continue;
+    }
+    if (ts.isExportAssignment(s) && !s.isExportEquals && ts.isIdentifier(s.expression)) {
+      const name = s.expression.text;
+      const localFunction = sf.statements.some((statement) =>
+        ts.isFunctionDeclaration(statement) && statement.name?.text === name
+        || ts.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) =>
+          ts.isIdentifier(declaration.name) && declaration.name.text === name && declaration.initializer
+          && (ts.isArrowFunction(strip(declaration.initializer)) || ts.isFunctionExpression(strip(declaration.initializer)))));
+      if (localFunction) continue;
+      return false;
+    }
     if (ts.isFunctionDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || ts.isExportDeclaration(s)) continue;
     if (ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)) continue;
     if (isStaticDeclaration(sf, s) || ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
@@ -692,7 +746,7 @@ function resolveComponent(fromPath, sf, name, current) {
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier) || !s.moduleSpecifier.text.startsWith(".")) continue;
     const clause = s.importClause;
-    if (!clause) continue;
+    if (!clause || clause.isTypeOnly) continue;
     const resolved = resolveModule(fromPath, s.moduleSpecifier.text);
     if (!resolved) continue;
     const imported = [];
