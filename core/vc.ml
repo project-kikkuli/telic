@@ -1106,9 +1106,15 @@ and builtin g ctx (e : Ir.expr) name args =
           end else fold (add total x) false int_total int_fast hi lo rest
       in
       fold (int_ 0) false (int_ 0) (tt) zero_f zero_f vals
-    | ("min" | "max"), x :: rest ->
-      let f = if name = "min" then min_ else max_ in
-      T (List.fold_left (fun acc y -> f acc (tm y)) (tm x) rest)
+    | ("min" | "max" | "py_min" | "py_max"), x :: rest ->
+      let is_min = name = "min" || name = "py_min" in
+      let py = name = "py_min" || name = "py_max" in
+      let choose acc y =
+        let y = tm y in
+        let take_acc = if is_min then (if py then lt acc y else le acc y) else (if py then lt y acc else le y acc) in
+        ite take_acc acc y
+      in
+      T (List.fold_left choose (tm x) rest)
     | name, [ xs ] when String.length name > 7 && String.sub name 0 7 = "py_sum_" ->
       let l = lst xs in
       let version = String.sub name 7 (String.length name - 7) in

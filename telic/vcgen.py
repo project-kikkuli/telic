@@ -2145,12 +2145,17 @@ class VCGen:
             return xs.len
         if name == "abs":
             return L.abs_(args[0])  # type: ignore[arg-type]
-        if name in ("min", "max"):
-            f = L.min_ if name == "min" else L.max_
+        if name in ("min", "max", "py_min", "py_max"):
+            is_min = name in ("min", "py_min")
+            python_order = name.startswith("py_")
             out = args[0]
             for a in args[1:]:
-                out = f(out, a)  # type: ignore[arg-type]
-            return out
+                assert isinstance(out, L.Term) and isinstance(a, L.Term)
+                take_out = L.le(out, a) if is_min else L.le(a, out)
+                if python_order:
+                    take_out = L.lt(out, a) if is_min else L.lt(a, out)
+                out = L.ite(take_out, out, a)
+            return coerce(out, e.ty)
         if name.startswith("py_sum_mixed_cpython_"):
             major, minor = (int(x) for x in name.removeprefix("py_sum_mixed_cpython_").split("_", 1))
             compensated = (major, minor) >= (3, 12)
