@@ -444,7 +444,7 @@ def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
         assert "proved" not in got.detail
 
 
-def _static_source_case(tmp_path, app, property, stylesheet=""):
+def _static_source_case(tmp_path, app, property, stylesheet="", modules=None):
     from telic.ui.config import load
     from telic.ui.run import run
     from telic.ui.static import extract
@@ -458,6 +458,10 @@ def _static_source_case(tmp_path, app, property, stylesheet=""):
     shutil.copytree(example, project, ignore=shutil.ignore_patterns("node_modules", ".telic", "dist"))
     (project / "node_modules").symlink_to(node_modules.resolve(), target_is_directory=True)
     (project / "src" / "App.tsx").write_text(app)
+    for path, text in (modules or {}).items():
+        target = project / "src" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
     (project / "src" / "main.tsx").write_text(
         'import { createRoot } from "react-dom/client";\n'
         'import App from "./App";\n'
@@ -740,6 +744,45 @@ def test_source_ui_models_imported_css_visibility(tmp_path):
         ".off { display: none; } .on { visibility: visible; }",
     )
     assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+def test_source_ui_inlines_imported_stateless_components(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; import { HelpPanel } from "./HelpPanel"; export default function App(){const [ready]=useState(true);return ready ? <main><HelpPanel /></main> : null;}',
+        'reachable button "Close"',
+        modules={"HelpPanel.tsx": 'export function HelpPanel(){return <div role="dialog" aria-label="Help"><button>Close</button></div>}\n'},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_proves_deterministic_root_without_hooks(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'export default function App(){return <main><h1>Notes</h1><button>Menu</button></main>}',
+        'reachable button "Menu"',
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_binds_imported_component_props_and_handlers(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; import { HelpPanel } from "./HelpPanel"; export default function App(){const [open,setOpen]=useState(true);return <main>{open ? <HelpPanel title="Help" onClose={() => setOpen(false)} /> : <h1>Home</h1>}</main>}',
+        'always reachable home from overlay "Help"',
+        modules={"HelpPanel.tsx": 'export function HelpPanel({title,onClose}:{title:string,onClose:()=>void}){return <div role="dialog" aria-label={title}><button onClick={onClose}>Close</button></div>}\n'},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_composes_stateful_imports_with_finite_state(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; import { HelpPanel } from "./HelpPanel"; export default function App(){const [ready]=useState(true);return <main><HelpPanel title="Help" /></main>}',
+        'reachable button "Close"',
+        modules={"HelpPanel.tsx": 'import {useState} from "react"; export function HelpPanel({title}:{title:string}){const [open,setOpen]=useState(false);return <div role="dialog" aria-label={title}>{open?<button>Close</button>:<button onClick={()=>setOpen(true)}>Open help</button>}</div>}\n'},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
 
 
 @pytest.mark.parametrize(

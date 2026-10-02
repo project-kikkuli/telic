@@ -332,6 +332,8 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         if node.get("type") == "jsxText":
             node["type"] = "text"
             node["value"] = html_lib.unescape(node["value"])
+        if node.get("type") == "text" and isinstance(node.get("value"), list) and node["value"][0] == "jsx-lit":
+            node["value"] = ["lit", html_lib.unescape(node["value"][1])]
         if node.get("type") == "element":
             node["props"] = {k: (["lit", html_lib.unescape(v[1])] if isinstance(v, list) and len(v) == 2 and v[0] == "jsx-lit" else v) for k, v in node.get("props", {}).items()}
         for child in node.get("children", []):
