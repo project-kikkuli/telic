@@ -39,6 +39,14 @@ class TReal:
 
 
 @dataclass(frozen=True)
+class TPythonNumber:
+    """A Python numeric value retaining its runtime int/float kind."""
+
+    def __str__(self) -> str:
+        return "python_number"
+
+
+@dataclass(frozen=True)
 class TBool:
     def __str__(self) -> str:
         return "bool"
@@ -146,7 +154,7 @@ class TEnum:
         return self.name
 
 
-Type = Union[TInt, TReal, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass, TOpaque, TEnum]
+Type = Union[TInt, TReal, TPythonNumber, TBool, TStr, TNone, TList, TRecord, TOption, TDict, TClass, TOpaque, TEnum]
 
 
 def reaches_object(t: Type) -> bool:
@@ -167,7 +175,7 @@ INT, REAL, FLOAT32, BOOL, STR, NONE = TInt(), TReal(), TReal(32), TBool(), TStr(
 
 
 def is_numeric(t: Type) -> bool:
-    return isinstance(t, (TInt, TReal))
+    return isinstance(t, (TInt, TReal, TPythonNumber))
 
 
 # ---------------------------------------------------------------------------

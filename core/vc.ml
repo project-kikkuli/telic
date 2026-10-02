@@ -40,6 +40,7 @@ let rec sort_of (ty : Ir.ty) : sort =
   match ty with
   | TInt -> Int
   | TReal -> Float64
+  | TPythonNumber -> Rec ("PythonNumber", [ ("is_int", Bool); ("integer", Int); ("floating", Float64) ])
   | TFloat32 -> Float32
   | TBool -> Bool
   | TStr -> Str
@@ -65,6 +66,7 @@ let complex = function Ir.TList _ | TDict _ | TOption _ -> true | _ -> false
 (* how a value of [ty] is represented in logic, as named components *)
 let components (ty : Ir.ty) : (string * sort) list =
   match ty with
+  | TList TPythonNumber -> [ ("arr", Array (Int, sort_of TPythonNumber)); ("off", Int); ("len", Int) ]
   | TList e -> [ ("arr", Array (Int, sort_of e)); ("off", Int); ("len", Int); ("py_tags", Array (Int, Bool)); ("py_ints", Array (Int, Int)); ("py_floats", Array (Int, Float64)) ]
   | TOption inner ->
     if complex inner then raise (Vc_error ("optional containers are not supported yet", Ir.noloc));
@@ -77,13 +79,14 @@ let components (ty : Ir.ty) : (string * sort) list =
 
 let pack (ty : Ir.ty) comps =
   match (ty, comps) with
+  | TList TPythonNumber, [ a; o; l ] -> L { arr = a; off = o; len = l; py_tags = const_array (Array (Int, Bool)) ff; py_ints = const_array (Array (Int, Int)) zero; py_floats = const_array (Array (Int, Float64)) (fval 0.0); lty = ty }
   | TList _, [ a; o; l; tags; ints; floats ] -> L { arr = a; off = o; len = l; py_tags = tags; py_ints = ints; py_floats = floats; lty = ty }
   | TOption _, [ s; v ] -> O { some = s; v; oty = ty }
   | TDict _, [ v; h ] -> D { vals = v; has = h; dty = ty }
   | _, [ t ] -> T t
   | _ -> invalid_arg "pack"
 
-let flatten = function T t -> [ t ] | L l -> [ l.arr; l.off; l.len; l.py_tags; l.py_ints; l.py_floats ] | O o -> [ o.some; o.v ] | D d -> [ d.vals; d.has ] | NoneV -> []
+let flatten = function T t -> [ t ] | L l when l.lty = TList TPythonNumber -> [ l.arr; l.off; l.len ] | L l -> [ l.arr; l.off; l.len; l.py_tags; l.py_ints; l.py_floats ] | O o -> [ o.some; o.v ] | D d -> [ d.vals; d.has ] | NoneV -> []
 
 let list_value arr off len (lty : Ir.ty) =
   let tags, ints, floats =
@@ -148,7 +151,7 @@ let coerce v (ty : Ir.ty option) =
 
 let rec ty_str (t : Ir.ty) =
   match t with
-  | TInt -> "int" | TReal -> "real" | TFloat32 -> "float32" | TBool -> "bool" | TStr -> "str" | TNone -> "none" | TOpaque -> "opaque"
+  | TInt -> "int" | TReal -> "real" | TPythonNumber -> "python_number" | TFloat32 -> "float32" | TBool -> "bool" | TStr -> "str" | TNone -> "none" | TOpaque -> "opaque"
   | TList e -> "list[" ^ ty_str e ^ "]"
   | TRecord (n, _) | TClass n | TEnum (n, _, _) -> n
   | TOption i -> ty_str i ^ "|None"
@@ -167,8 +170,23 @@ let round_even x =
   let half = real (Q.make 1 2) in
   ite (lt d half) f (ite (lt half d) (add f one) (ite (eq (emod f (int_ 2)) zero) f (add f one)))
 
+let py_num_sort = Rec ("PythonNumber", [ ("is_int", Bool); ("integer", Int); ("floating", Float64) ])
+let py_parts x = (field x "is_int", field x "integer", field x "floating")
+let py_as_float x = let tag, i, f = py_parts x in ite tag (as_float i) f
+let py_lt x y =
+  let xt, xi, xf = py_parts x and yt, yi, yf = py_parts y in
+  or_ [ and_ [ xt; yt; lt xi yi ]; and_ [ xt; not_ yt; xcmp "fp.lt" xi yf ]; and_ [ not_ xt; yt; xcmp "fp.lt" xf yi ]; and_ [ not_ xt; not_ yt; fcmp "fp.lt" xf yf ] ]
+
 let rec rec_equal a b =
   match a.sort with
+  | Rec ("PythonNumber", _) ->
+    let at, ai, af = py_parts a and bt, bi, bf = py_parts b in
+    or_ [
+      and_ [ at; bt; eq ai bi ];
+      and_ [ at; not_ bt; xcmp "fp.eq" bf ai ];
+      and_ [ not_ at; bt; xcmp "fp.eq" af bi ];
+      and_ [ not_ at; not_ bt; fcmp "fp.eq" af bf ];
+    ]
   | Rec (n, fields) when String.length n > 4 && String.sub n 0 4 = "Opt_" ->
     let sa = field a "some" and sb = field b "some" in
     and_ [ eq sa sb; implies sa (rec_equal (field a "val") (field b "val")) ]
@@ -609,6 +627,10 @@ let rec ev g ctx (e : Ir.expr) : value =
     match ctx.old_env with
     | Some oe -> ev g { ctx with env = oe; live = None } x
     | None -> raise (Vc_error ("old(...) is only meaningful in '@ensures'", loc)))
+  | Unary ("neg", x) when x.ty = TPythonNumber ->
+    let v = tm (ev g ctx x) in
+    let tag, integer, floating = py_parts v in
+    T (mkrec py_num_sort [ tag; neg integer; fneg floating ])
   | Unary ("neg", x) -> T (neg (tm (ev g ctx x)))
   | Unary ("not", x) -> T (not_ (tm (ev g ctx x)))
   | Unary (op, _) -> raise (Vc_error ("unknown unary operator " ^ op, loc))
@@ -621,6 +643,40 @@ let rec ev g ctx (e : Ir.expr) : value =
     match op with
     | "eq" -> T (equal g x y)
     | "ne" -> T (not_ (equal g x y))
+    | ("add" | "sub" | "mul" | "lt" | "le" | "gt" | "ge" | "py_rdiv") when a.ty = TPythonNumber || b.ty = TPythonNumber ->
+      let x, y = tm x, tm y in
+      let xt, xi, xf = py_parts x and yt, yi, yf = py_parts y in
+      let both_int = and_ [ xt; yt ] in
+      let cmp_lt = py_lt in
+      let compare op flip =
+        let l = if flip then cmp_lt y x else cmp_lt x y in
+        if op = "lt" || op = "gt" then l else or_ [ l; rec_equal x y ]
+      in
+      (match op with
+       | "lt" | "le" | "gt" | "ge" -> T (compare op (op = "gt" || op = "ge"))
+       | "add" | "sub" | "mul" ->
+         let conversion_limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+         let xfits = lt (abs_ xi) conversion_limit and yfits = lt (abs_ yi) conversion_limit in
+         let mixed = not_ both_int in
+         let conversions = and_ [ implies (and_ [ xt; not_ yt ]) xfits; implies (and_ [ yt; not_ xt ]) yfits ] in
+         oblige g "overflow" ctx (implies mixed conversions) loc "integer converted to float does not overflow";
+         let ix = match op with "add" -> add xi yi | "sub" -> sub xi yi | _ -> mul xi yi in
+         let fx, fy = py_as_float x, py_as_float y in
+         let ff = match op with "add" -> add fx fy | "sub" -> sub fx fy | _ -> mul fx fy in
+         T (mkrec py_num_sort [ both_int; ix; ff ])
+       | "py_rdiv" ->
+         let divisor_nonzero = or_ [ and_ [ yt; ne yi zero ]; and_ [ not_ yt; not_ (fpred "fp.isZero" yf) ] ] in
+         oblige g "div" ctx divisor_nonzero loc "divisor of '/' is non-zero";
+         let conversion_limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+         let conversions = and_ [ implies (and_ [ xt; not_ yt ]) (lt (abs_ xi) conversion_limit); implies (and_ [ yt; not_ xt ]) (lt (abs_ yi) conversion_limit) ] in
+         oblige g "overflow" ctx (implies (not_ both_int) conversions) loc "integer converted to float does not overflow";
+         let exact_q = as_float (rdiv (to_real xi) (to_real yi)) in
+         oblige g "overflow" ctx (implies both_int (is_finite exact_q)) loc "integer division result fits in a float";
+         let negative_zero = and_ [ both_int; eq xi zero; lt yi zero ] in
+         let exact_q = ite negative_zero (fneg (fval 0.0)) exact_q in
+         let q = ite both_int exact_q (rdiv (py_as_float x) (py_as_float y)) in
+         T q
+       | _ -> raise (Vc_error ("unsupported tagged Python numeric operator " ^ op, loc)))
     | _ -> (
       let x = tm x and y = tm y in
       match op with
@@ -819,6 +875,21 @@ and builtin g ctx (e : Ir.expr) name args =
   let lit_str (a : Ir.expr) = match a.e with Lit (LStr s) -> s | Lit (LInt s) -> s | _ -> raise (Vc_error ("expected a literal", loc)) in
   let assume_ t = assume ctx t in
   match name with
+  | "py_mixed_list" ->
+    let arr = ref (const_array (Array (Int, sort_of TPythonNumber)) (default_term (sort_of TPythonNumber))) in
+    List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) args;
+    L (list_value !arr zero (int_ (List.length args)) e.ty)
+  | "py_number" ->
+    let x = List.hd args in
+    let v = tm (ev g ctx x) in
+    (match x.ty with
+     | TPythonNumber -> T v
+     | TInt -> T (mkrec py_num_sort [ tt; v; fval 0.0 ])
+     | TReal | TFloat32 -> T (mkrec py_num_sort [ ff; zero; as_float v ])
+     | _ -> raise (Vc_error ("Python numeric tag requires a number", loc)))
+  | "py_is_kind" ->
+    let x, kind = match args with [ x; k ] -> (tm (ev g ctx x), lit_str k) | _ -> raise (Vc_error ("py_is_kind takes a number and kind", loc)) in
+    if kind = "int" then T (field x "is_int") else T (not_ (field x "is_int"))
   | "py_int_parse" | "py_float_parse" | "js_parse_int" | "js_parse_float" -> parse_number g ctx e name (tm (ev g ctx (List.hd args)))
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
   | "each" ->
@@ -841,9 +912,21 @@ and builtin g ctx (e : Ir.expr) name args =
   | "list_repeat" ->
     let xs, k = match args with [ a; b ] -> (ev g ctx a, tm (ev g ctx b)) | _ -> raise (Vc_error ("list_repeat takes a list and a count", loc)) in
     let xs = match xs with L l -> l | _ -> raise (Vc_error ("list_repeat of a non-list", loc)) in
-    let width = match (List.hd args).e with ListLit es -> List.length es | _ -> raise (Fallback "list_repeat of a non-literal") in
+    let width = match (List.hd args).e with
+      | ListLit es -> List.length es
+      | Builtin ("py_mixed_list", es) -> List.length es
+      | _ -> raise (Fallback "list_repeat of a non-literal")
+    in
     let n = next g in
     let arr, assume = defined_symbol ctx (Printf.sprintf "rep@%d.arr" n) (sort_of xs.lty) in
+    if xs.lty = TList TPythonNumber then begin
+      let i = const (Printf.sprintf "i!%d" n) Int in
+      let ln = mul (int_ width) (max_ k zero) in
+      let src_i = add xs.off (emod i (int_ width)) in
+      let rng = and_ [ le zero i; lt i ln ] in
+      assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) (select xs.arr src_i))) [ [| select arr i |] ]);
+      L (list_value arr zero ln xs.lty)
+    end else begin
     let tags, assume_tags = defined_symbol ctx (Printf.sprintf "rep@%d.py_tags" n) (Array (Int, Bool)) in
     let ints, assume_ints = defined_symbol ctx (Printf.sprintf "rep@%d.py_ints" n) (Array (Int, Int)) in
     let floats, assume_floats = defined_symbol ctx (Printf.sprintf "rep@%d.py_floats" n) (Array (Int, Float64)) in
@@ -856,6 +939,7 @@ and builtin g ctx (e : Ir.expr) name args =
       define ctx (quant "forall" [ i ] (implies rng (eq (select out i) (select src src_i))) [ [| select out i |] ])
     ) [ tags; ints; floats ] [ (xs.py_tags, assume_tags); (xs.py_ints, assume_ints); (xs.py_floats, assume_floats) ];
     L { arr; off = zero; len = ln; py_tags = tags; py_ints = ints; py_floats = floats; lty = xs.lty }
+    end
   | "threw" -> threw g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
     D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
@@ -1024,13 +1108,15 @@ and builtin g ctx (e : Ir.expr) name args =
       let a = lst xs and b = lst ys in
       let n = next g in
       let arr = const (Printf.sprintf "cat@%d.arr" n) a.arr.sort in
-      let tags = const (Printf.sprintf "cat@%d.py_tags" n) (Array (Int, Bool)) in
-      let ints = const (Printf.sprintf "cat@%d.py_ints" n) (Array (Int, Int)) in
-      let floats = const (Printf.sprintf "cat@%d.py_floats" n) (Array (Int, Float64)) in
       let ln = add a.len b.len in
       let i = const (Printf.sprintf "i!%d" n) Int and k = const (Printf.sprintf "k!%d" n) Int in
       assume_ (quant "forall" [ i ] (implies (and_ [ le zero i; lt i a.len ]) (eq (select arr i) (at (a.arr, a.off) i))) [ [| select arr i |] ]);
       assume_ (quant "forall" [ k ] (implies (and_ [ le a.len k; lt k ln ]) (eq (select arr k) (at (b.arr, b.off) (sub k a.len)))) [ [| select arr k |] ]);
+      if a.lty = TList TPythonNumber then L (list_value arr zero ln a.lty)
+      else begin
+      let tags = const (Printf.sprintf "cat@%d.py_tags" n) (Array (Int, Bool)) in
+      let ints = const (Printf.sprintf "cat@%d.py_ints" n) (Array (Int, Int)) in
+      let floats = const (Printf.sprintf "cat@%d.py_floats" n) (Array (Int, Float64)) in
       let outs = [ tags; ints; floats ] in
       let left = [ a.py_tags; a.py_ints; a.py_floats ] and right = [ b.py_tags; b.py_ints; b.py_floats ] in
       List.iter2 (fun out src ->
@@ -1042,6 +1128,7 @@ and builtin g ctx (e : Ir.expr) name args =
         assume_ (quant "forall" [ k ] body [ [| select out k |] ])
       ) outs right;
       L { arr; off = zero; len = ln; py_tags = tags; py_ints = ints; py_floats = floats; lty = a.lty }
+      end
     | "dict_copy", [ d ] -> d
     | "dict_set", [ d; k; v ] ->
       let d = dct d in
@@ -1061,6 +1148,9 @@ and builtin g ctx (e : Ir.expr) name args =
       | _, [ dflt ] -> T (ite has v (tm (coerce dflt (Some (dval d)))))
       | _ -> raise (Vc_error ("dict_get_or needs a default", loc)))
     | "len", [ xs ] -> T (lst xs).len
+    | "abs", [ T v ] when v.sort = py_num_sort ->
+      let tag, integer, floating = py_parts v in
+      T (mkrec py_num_sort [ tag; abs_ integer; fabs floating ])
     | "abs", [ x ] -> T (abs_ (tm x))
     | name, items when name = "py_sum_mixed" || starts_with "py_sum_mixed_cpython_" name ->
       let max_float_int = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791") Int in
@@ -1111,7 +1201,11 @@ and builtin g ctx (e : Ir.expr) name args =
       let py = name = "py_min" || name = "py_max" in
       let choose acc y =
         let y = tm y in
-        let take_acc = if is_min then (if py then lt acc y else le acc y) else (if py then lt y acc else le y acc) in
+        if e.ty = TPythonNumber then
+          let take_acc = if is_min then not_ (py_lt y acc) else not_ (py_lt acc y) in
+          ite take_acc acc y
+        else
+        let take_acc = if is_min then (if py then not_ (lt y acc) else le acc y) else (if py then not_ (lt acc y) else le y acc) in
         ite take_acc acc y
       in
       T (List.fold_left choose (tm x) rest)
@@ -1125,7 +1219,22 @@ and builtin g ctx (e : Ir.expr) name args =
           (int_of_string (List.nth parts 1), int_of_string (List.nth parts 2))
         with _ -> (0, 0)
       in
-      if cpython then begin
+      if cpython && l.lty = TList TPythonNumber then begin
+        let state_name = "py_numeric_sum_state_" ^ version and sum_name = "seqsum_py_numeric_" ^ version in
+        let state_sort = Rec ("PyNumericSumState_" ^ version, [ ("in_float", Bool); ("int_total", Int); ("fast", Bool); ("ordinary", Float64); ("hi", Float64); ("lo", Float64) ]) in
+        let i = const (Printf.sprintf "%d.sum_index" loc.line) Int in
+        let prefix = fn state_name [| l.arr; l.off; i |] state_sort in
+        let item = select l.arr i in
+        let is_int = field item "is_int" and integer = field item "integer" in
+        let limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+        let safe = and_ [
+          implies (and_ [ not_ (field prefix "in_float"); not_ is_int ]) (lt (abs_ (field prefix "int_total")) limit);
+          implies (and_ [ field prefix "in_float"; is_int ]) (lt (abs_ integer) limit);
+        ] in
+        let range = and_ [ le l.off i; lt i (add l.off l.len) ] in
+        oblige g "overflow" ctx (quant "forall" [ i ] (implies range safe) [ [| field prefix "int_total" |] ]) loc "integer values converted by sum fit in a float";
+        T (fn sum_name [| l.arr; l.off; add l.off l.len |] py_num_sort)
+      end else if cpython then begin
         match (num l.off, num l.len) with
         | Some off, Some len when off.d = 1 && len.d = 1 && len.n >= 0 ->
           let max_float_int = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791") Int in
@@ -1234,9 +1343,23 @@ and builtin g ctx (e : Ir.expr) name args =
       let lo2 = norm lo zero and hi2 = norm hi n in
       T (app "str.substr" [| s; lo2; max_ (sub hi2 lo2) zero |] Str)
     | "str_fn", _ -> T (fn ("str." ^ lit_str (List.hd args)) (Array.of_list flat_rest) (sort_of e.ty))
+    | "to_real", [ T v ] when v.sort = py_num_sort ->
+      let tag, integer, floating = py_parts v in
+      let converted = ite tag (as_float integer) floating in
+      oblige g "overflow" ctx (implies tag (is_finite converted)) loc "integer converted to float does not overflow";
+      T converted
     | "to_real", [ x ] -> T (as_float_to (sort_of e.ty) (tm x))
-    | "floor", [ x ] -> T (floor (tm x))
+    | "floor", [ x ] ->
+      let x = tm x in
+      if List.mem x.sort [ Float32; Float64 ] then oblige g "finite" ctx (is_finite x) loc "number is finite where it is rounded to an integer";
+      T (floor x)
     | "ceil", [ x ] -> T (neg (floor (neg (tm x))))
+    | "trunc", [ T v ] when v.sort = py_num_sort ->
+      let tag, integer, floating = py_parts v in
+      oblige g "finite" ctx (implies (not_ tag) (is_finite floating)) loc "number is finite where it is rounded to an integer";
+      let exact = fto_real floating in
+      let rounded = ite (le (real (Q.of_int 0)) exact) (floor exact) (neg (floor (neg exact))) in
+      T (ite tag integer rounded)
     | "trunc", [ x ] -> let x = tm x in T (ite (le (real (Q.of_int 0)) x) (floor x) (neg (floor (neg x))))
     | "trunc_sat", [ x; lo; hi ] ->
       let x = tm x and lo = tm lo and hi = tm hi in
@@ -1494,9 +1617,23 @@ and comprehension g ctx (e : Ir.expr) seq =
   let sym name srt = if under then fn name (Array.of_list ctx.binders) srt else const name srt in
   let assume = if under then assume_for_all_binders else assume in
   let arr = sym (Printf.sprintf "comp@%d.arr" n) (sort_of e.ty) in
+  let filtered_state = ref None in
   let ln =
     match cond with
     | None -> seq.len
+    | Some _ when is_pure ->
+      let prefix = sym (Printf.sprintf "comp@%d.prefix" n) (Array (Int, Int)) in
+      let j = const (Printf.sprintf "j!%d" n) Int in
+      let sub_j = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) j)) ctx.bound } in
+      let cj = term_of loc (ev g sub_j (Option.get cond)) in
+      assume ctx (eq (select prefix zero) zero);
+      assume ctx
+        (quant "forall" [ j ]
+           (implies (and_ [ le zero j; lt j seq.len ])
+              (eq (select prefix (add j one)) (add (select prefix j) (ite cj one zero))))
+           [ [| select prefix (add j one) |] ]);
+      filtered_state := Some (prefix, j, sub_j, cj);
+      select prefix seq.len
     | Some _ ->
       let ln = sym (Printf.sprintf "comp@%d.len" n) Int in
       assume ctx (and_ [ le zero ln; le ln seq.len ]);
@@ -1524,13 +1661,15 @@ and comprehension g ctx (e : Ir.expr) seq =
      | Some c ->
        let cv = term_of loc (ev g sub c) in
        ignore (ev g (sub_ctx ~cond:cv sub) body);
-       let k = const (Printf.sprintf "k!%d" n) Int and j = const (Printf.sprintf "j!%d" n) Int in
-       let sub_j = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) j)) ctx.bound } in
-       let bj = term_of loc (ev g sub_j body) and cj = term_of loc (ev g sub_j c) in
-       assume ctx
-         (quant "forall" [ k ]
-            (implies (and_ [ le zero k; lt k ln ]) (exists [ j ] (and_ [ le zero j; lt j seq.len; cj; eq (select arr k) bj ])))
-            [ [| select arr k |] ]));
+       (match !filtered_state with
+        | Some (prefix, j, sub_j, cj) ->
+          let bj = term_of loc (ev g sub_j body) in
+          let rank = select prefix j in
+          assume ctx
+            (quant "forall" [ j ]
+               (implies (and_ [ le zero j; lt j seq.len; cj ]) (eq (select arr rank) bj))
+               [ [| select arr rank |] ])
+        | None -> raise (Fallback "filtered comprehension rank")));
     L (list_value !comp_arr zero ln e.ty)
   end
 

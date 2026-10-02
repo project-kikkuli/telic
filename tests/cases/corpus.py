@@ -188,12 +188,102 @@ def fib_iter(n: int) -> int:
     return a
 
 
-# expect: proved
+# expect: refuted
 def mean_float(xs: list[float]) -> float:
     #@ requires len(xs) > 0
     #@ requires all(x >= 0 for x in xs)
     #@ ensures result >= 0
     return sum(xs) / len(xs)
+
+
+# expect: proved
+def mean_float_runtime_floats(xs: list[float]) -> float:
+    #@ requires len(xs) > 0
+    #@ requires all(x >= 0 for x in xs)
+    #@ requires all(isinstance(x, float) for x in xs)
+    #@ ensures result >= 0
+    return sum(xs) / len(xs)
+
+
+# expect: proved
+def py_tag_identity(x: float) -> float:
+    #@ requires isinstance(x, int)
+    #@ ensures isinstance(result, int)
+    return x
+
+
+# expect: proved
+def py_tag_call(x: float) -> float:
+    #@ requires isinstance(x, int)
+    #@ ensures isinstance(result, int)
+    return py_tag_identity(x)
+
+
+# expect: proved
+def py_tag_index(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int)
+    #@ ensures isinstance(result, int)
+    return xs[0]
+
+
+# expect: proved
+def py_tag_comprehension(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int)
+    #@ ensures isinstance(result, int)
+    return [x for x in xs][0]
+
+
+# expect: proved
+def py_tag_concat(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int)
+    #@ ensures isinstance(result, int)
+    ys = xs + xs
+    return ys[len(xs)]
+
+
+# expect: proved
+def py_tag_repeat(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int)
+    #@ ensures isinstance(result, int)
+    return ([xs[0]] * 2)[1]
+
+
+# expect: proved
+def py_tag_append(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int)
+    #@ ensures isinstance(result, int)
+    ys = xs.copy()
+    ys.append(xs[0])
+    return ys[len(xs)]
+
+
+# expect: proved
+def py_tag_filtered_comprehension(xs: list[float]) -> float:
+    #@ requires len(xs) > 0 and isinstance(xs[0], int) and xs[0] >= 0
+    #@ ensures isinstance(result, int)
+    return [x for x in xs if x >= 0][0]
+
+
+# expect: refuted
+def python_min_preserves_first_nan(x: float) -> float:
+    #@ requires x != x
+    #@ ensures result == 1.0
+    return min(x, 1.0)
+
+
+# expect: refuted
+def python_tagged_int_division_overflow() -> float:
+    #@ ensures result == 0.0
+    x: float = 10**400
+    return x / 1
+
+
+# expect: proved
+def mixed_integer_cancellation_through_comprehension() -> float:
+    #@ ensures result == 0.0
+    n = 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999
+    xs = [n, -n, 0.0]
+    return sum([x for x in xs])
 
 
 # expect: refuted

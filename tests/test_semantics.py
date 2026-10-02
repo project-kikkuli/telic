@@ -215,6 +215,36 @@ def test_javascript_math_rounding_matches_node(tmp_path):
                 assert got == float(want), (name, value, got, want)
 
 
+@needs_node
+def test_javascript_math_min_max_nan_and_signed_zero_match_node(tmp_path):
+    from telic.frontend.typescript import lower_typescript
+
+    source = """export function f(a: number, b: number): number { return Math.min(a, b); }
+export function g(a: number, b: number): number { return Math.max(a, b); }
+"""
+    path = tmp_path / "math_min_max.ts"
+    path.write_text(source)
+    mod = lower_typescript(str(path), source, root=str(tmp_path))
+    vectors = [(float("nan"), 1.0), (-0.0, 0.0), (0.0, -0.0), (float("inf"), -float("inf"))]
+    for name, op in (("f", "min"), ("g", "max")):
+        for a, b in vectors:
+            program = Program.build([mod])
+            ref = program.resolve(mod, name)
+            gvc = VCGen(program, ref, inputs={"a": L.fval(a, L.FLOAT64), "b": L.fval(b, L.FLOAT64)})
+            gvc.definitional_mode = True
+            gvc.run()
+            (ex,) = [e for e in gvc.exits if e.value is not None]
+            got = to_python(z3.simplify(Z3Encoder([]).term(ex.value)))
+            js_values = ["NaN" if math.isnan(x) else "Infinity" if x == math.inf else "-Infinity" if x == -math.inf else "-0" if x == 0 and math.copysign(1.0, x) < 0 else repr(x) for x in (a, b)]
+            expected = subprocess.run(["node", "-e", f"const x=Math.{op}({js_values[0]},{js_values[1]}); console.log(Number.isNaN(x)?'NaN':Object.is(x,-0)?'-0':String(x))"], capture_output=True, text=True, check=True).stdout.strip()
+            if expected == "NaN":
+                assert math.isnan(got), (op, a, b, got)
+            elif expected == "-0":
+                assert got == 0.0 and math.copysign(1.0, got) < 0, (op, a, b, got)
+            else:
+                assert got == float(expected), (op, a, b, got, expected)
+
+
 def test_python_float_rounding_model():
     """round() is banker's rounding on exact halves; our model agrees."""
     src = "def f(a: int, b: int) -> int:\n    return round(a / b)\n"
@@ -231,7 +261,7 @@ def test_python_float_sum_matches_target_interpreter():
     )
     for xs in vectors:
         literals = ", ".join(repr(x) for x in xs)
-        mod = lower_python("sum_float.py", f"def f() -> float:\n    return sum([{literals}])\n")
+        mod = lower_python("sum_float.py", f"def f() -> float:\n    xs: list[float] = [{literals}]\n    return sum(xs)\n")
         assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
         program = Program.build([mod])
         ref = program.resolve(mod, "f")
@@ -243,9 +273,57 @@ def test_python_float_sum_matches_target_interpreter():
         g.run()
         (ex,) = [e for e in g.exits if e.value is not None]
         enc = Z3Encoder(list(theory.fundefs.values()))
-        actual = to_python(z3.simplify(enc.term(ex.value)))
+        tagged = to_python(z3.simplify(enc.term(ex.value)))
+        fields = next(iter(tagged.values()))
+        assert fields[0] is False, (xs, tagged)
+        actual = fields[2]
         expected = sum(xs)
         assert (math.isnan(actual) if math.isnan(expected) else actual == expected), (xs, actual, expected)
+
+
+def test_python_integer_division_rounds_exact_quotient_like_cpython():
+    cases = ((0, -1), (1, -2), (-1, 2), (-1, 10**400), (10**400, 10**400))
+    for a, b in cases:
+        mod = lower_python("int_division.py", "def f(a: int, b: int) -> float:\n    return a / b\n")
+        program = Program.build([mod])
+        ref = program.resolve(mod, "f")
+        g = VCGen(program, ref, inputs={"a": L.IntV(a), "b": L.IntV(b)})
+        g.definitional_mode = True
+        g.run()
+        (ex,) = [e for e in g.exits if e.value is not None]
+        from telic.vcgen import as_py_number, sort_of
+
+        tagged = L.mkrec(sort_of(mod.functions["f"].ret), as_py_number(ex.value).parts())
+        raw = to_python(z3.simplify(Z3Encoder([]).term(tagged)))
+        fields = next(iter(raw.values()))
+        assert fields[0] is False
+        actual = fields[2]
+        expected = a / b
+        assert actual == expected, (a, b, actual, expected)
+        assert math.copysign(1.0, actual) == math.copysign(1.0, expected), (a, b, actual, expected)
+
+
+def test_python_sum_keeps_integer_prefix_through_identity_comprehension():
+    huge = "9" * 400
+    src = f"def f() -> float:\n    xs = [{huge}, -{huge}, 0.0]\n    return sum([x for x in xs])\n"
+    mod = lower_python("mixed_sum_comp.py", src)
+    assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+    program = Program.build([mod])
+    ref = program.resolve(mod, "f")
+    from telic.checker import build_theory
+
+    theory, _ = build_theory(program, {})
+    g = VCGen(program, ref)
+    g.definitional_mode = True
+    g.run()
+    (ex,) = [e for e in g.exits if e.value is not None]
+    enc = Z3Encoder(list(theory.fundefs.values()))
+    from telic.vcgen import as_py_number
+    value = as_py_number(ex.value)
+    is_int = to_python(z3.simplify(enc.term(value.is_int)))
+    actual = to_python(z3.simplify(enc.term(value.integer if is_int else value.floating)))
+    expected = sum([int(huge), -int(huge), 0.0])
+    assert actual == expected == 0.0
 
 
 def test_python_mixed_sum_keeps_integer_prefix_exact():
@@ -267,7 +345,11 @@ def test_python_mixed_sum_keeps_integer_prefix_exact():
         g.definitional_mode = True
         g.run()
         (ex,) = [e for e in g.exits if e.value is not None]
-        actual = to_python(z3.simplify(Z3Encoder([]).term(ex.value)))
+        from telic.vcgen import as_py_number
+        value = as_py_number(ex.value)
+        enc = Z3Encoder([])
+        is_int = to_python(z3.simplify(enc.term(value.is_int)))
+        actual = to_python(z3.simplify(enc.term(value.integer if is_int else value.floating)))
         expected = sum(xs)
         assert actual == expected, (xs, actual, expected)
 

@@ -60,6 +60,10 @@ def _anything(ty: ir.Type) -> bool:
 
 
 def encode_value(v: Any, ty: ir.Type) -> Any:
+    if isinstance(ty, ir.TPythonNumber):
+        if isinstance(v, dict) and "is_int" in v:
+            return v.get("integer", 0) if v.get("is_int") else v.get("floating", 0.0)
+        return v
     if isinstance(v, dict) and "__json__" in v:
         # rebuilt from the model: a real input only where any value is (a Set is not JSON)
         return v if _anything(ty) else {"__opaque__": True, "any": False}
@@ -219,6 +223,8 @@ def call_text(fn: ir.Function, model: dict[str, Any], lang: str, names: bool = T
 
 
 def type_desc(ty: ir.Type, classes: dict[str, ir.ClassDecl] | None = None, depth: int = 0) -> dict[str, Any]:
+    if isinstance(ty, ir.TPythonNumber):
+        return {"k": "python_number"}
     if isinstance(ty, ir.TOption):
         return {"k": "option", "inner": type_desc(ty.inner, classes, depth)}
     if isinstance(ty, ir.TDict):
@@ -363,7 +369,7 @@ def matches(ob, out: dict[str, Any], fn: ir.Function, lang: str) -> bool:
             return True  # a trap where a native assertion (bounds, precondition, fatalError) fails
         return (v in ("assert", "assume") and _same(out.get("text", ""), ob.clause)) or crash == "AssertionError" or (lang == "rust" and crash == "panic")
     if k == "overflow":
-        return crash == "overflow" or (lang == "swift" and crash == "trap")
+        return crash == "overflow" or (lang == "python" and crash == "OverflowError") or (lang == "swift" and crash == "trap")
     if k == "div":
         return crash == "ZeroDivisionError" or (lang == "typescript" and bool(out.get("nonfinite")))
     if k == "index":

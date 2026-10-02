@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 RECEIPTS = ROOT / ".telic" / "ci-verdicts.json"
 HARNESS = ["scripts/ci.py", ".github/workflows/ci.yml", ".github/constraints.txt", "pyproject.toml", "tests/conftest.py"]
 KERNEL = [f"telic/{name}.py" for name in (
-    "__init__", "ir", "contracts", "program", "logic", "vcgen", "infer", "smt", "checker",
+    "__init__", "ir", "contracts", "program", "logic", "vcgen", "py_number", "infer", "smt", "checker",
     "jobs", "slots", "irjson", "engine", "history", "lifecycle", "equiv", "replay", "replay_harness",
     "lean", "prover", "render_expr", "aim", "oracle", "gaps", "propose", "phrase", "ledger",
 )] + ["telic/ui/spec.py"]

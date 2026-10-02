@@ -24,6 +24,8 @@ def ty(t: ir.Type) -> dict[str, Any]:
         return {"k": "int"}
     if isinstance(t, ir.TReal):
         return {"k": "real"} if t.bits == 64 else {"k": "float32"}
+    if isinstance(t, ir.TPythonNumber):
+        return {"k": "python_number"}
     if isinstance(t, ir.TBool):
         return {"k": "bool"}
     if isinstance(t, ir.TStr):

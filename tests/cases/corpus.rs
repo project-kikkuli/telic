@@ -5,6 +5,12 @@
 use std::collections::HashMap;
 
 // expect: proved
+pub fn negative_float_remainder() -> f64 {
+    //@ ensures result == -1.5
+    -5.5_f64 % 2.0_f64
+}
+
+// expect: proved
 pub fn nonnegative_f32_cast(x: i32) -> f32 {
     //@ requires x >= 0
     //@ ensures result >= 0.0

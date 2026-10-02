@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import traceback
 from fractions import Fraction
@@ -146,6 +147,8 @@ def _smaller(v: Any):
                     yield v - d if v > 0 else v + d
         return
     if isinstance(v, float):
+        if not math.isfinite(v):
+            return
         if v != 0.0:
             yield 0.0
             yield float(int(v))
