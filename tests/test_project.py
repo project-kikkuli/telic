@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from telic.checker import CheckOptions, check
-from telic.ledger import affected_files
+from telic.ledger import affected_files, snapshot
 
 ROOT = Path(__file__).parent / "cases" / "project"
 
@@ -31,6 +31,8 @@ def test_imported_modules_are_context_not_rechecked():
     rep, got = run("app/services.py")
     assert set(got) == {"settle", "total_with_fee", "bad_total", "open_invoice"}
     assert got["settle"].status == "proved" and got["settle"].context_deps
+    assert not rep.ok
+    assert snapshot(rep)["functions"]["app/services.py::settle"]["status"] == "open"
 
 
 def test_importers_are_affected():

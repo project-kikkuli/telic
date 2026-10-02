@@ -64,6 +64,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
 
 def report_json(rep: Report) -> dict[str, Any]:
     from .replay import call_text
+    from .evidence import evidence_status
 
     fns = []
     for f in rep.functions:
@@ -93,11 +94,15 @@ def report_json(rep: Report) -> dict[str, Any]:
                 "function": f.fn.name,
                 "file": f.ref.module.path,
                 "line": f.fn.loc.line,
-                "status": f.status,
+                "status": evidence_status(f),
+                "proof_status": f.status,
                 "problems": [{"message": m, "line": loc.line} for m, loc in f.problems],
                 "aims": f.fn.aims,
                 "obligations": obs,
                 "assumes_unproved": sorted(f.open_deps),
+                "assumes_context": sorted(f.context_deps),
+                "assumes_trusted": sorted(f.trusted_deps),
+                "assumptions": [{"line": loc.line, "text": text} for loc, text in f.assumptions],
                 "inferred": {
                     "invariants": {str(k): [c.text for c in v] for k, v in (f.inferred.invariants.items() if f.inferred else [])},
                     "variants": {str(k): v for k, v in (f.inferred.variants.items() if f.inferred else [])},
@@ -133,7 +138,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         paint = Paint(True if args.color == "always" else False if args.color == "never" else None)
         print(Renderer(rep, paint, verbose=args.verbose, trusted=args.trusted).render())
     if args.strict:
-        return 0 if rep.ok and all(f.status in ("proved", "trusted") for f in rep.functions) and all(m.status == "proved" for m in rep.mirrors) and all(lc.status == "proved" for lc in rep.lifecycles) else 1
+        from .evidence import evidence_status
+
+        return 0 if rep.ok and all(evidence_status(f) == "proved" for f in rep.functions) and all(m.status == "proved" for m in rep.mirrors) and all(lc.status == "proved" for lc in rep.lifecycles) and (rep.ui is None or all(r.status == "proved" for r in rep.ui.results)) and all(i.status == "backed" for i in rep.aims if i.text is not None) else 1
     return 0 if rep.ok else 1
 
 

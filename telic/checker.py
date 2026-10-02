@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ir, irjson
+from .evidence import evidence_status
 from . import logic as L
 from .infer import Inferred, cached_measures, infer, infer_measures, infer_rlimit
 from .jobs import exit_with_parent
@@ -250,10 +251,16 @@ class Report:
 
     @property
     def ok(self) -> bool:
-        return not any(f.status in ("refuted", "error") for f in self.functions) and not any(
-            m.status == "refuted" for m in self.mirrors
-        ) and not any(lc.status == "refuted" for lc in self.lifecycles) and not any(p for m in self.modules for p in m.problems) and not (
-            self.ui is not None and (self.ui.problems or any(r.status == "refuted" for r in self.ui.results))
+        claimed = self.program.claimed()
+        claims = [f for f in self.functions if f.ref.key in claimed]
+        return (
+            not any(f.status in ("refuted", "error") for f in self.functions)
+            and all(evidence_status(f) == "proved" for f in claims)
+            and all(m.status == "proved" for m in self.mirrors)
+            and all(lc.status == "proved" for lc in self.lifecycles)
+            and all(i.status == "backed" for i in self.aims if i.text is not None)
+            and not any(p for m in self.modules for p in m.problems)
+            and (self.ui is None or not self.ui.problems and all(r.status == "proved" for r in self.ui.results))
         )
 
 
@@ -1010,11 +1017,15 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             if dr is None and d in program.funcs and program.funcs[d].module.context:
                 r.context_deps.add(d)  # checked on its own; its contract is what this proof uses
                 continue
-            if dr is not None and dr.status == "trusted":
+            if dr is not None:
+                r.context_deps.update(dr.context_deps)
+                status = evidence_status(dr)
+            else:
+                status = "open"
+            if status == "trusted":
                 r.trusted_deps.add(d)
-            if dr is None or dr.status not in ("proved",):
-                if dr is None or dr.status != "trusted":
-                    r.open_deps.add(d)
+            elif status != "proved":
+                r.open_deps.add(d)
             if dr is not None:
                 todo.extend(dr.deps)
             todo.extend(program.dispatch.get(d, ()))  # a call through a base may run any override
@@ -1028,7 +1039,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if any(f.mirrors for m in modules for f in m.functions.values()):
         from .equiv import check_mirrors
 
-        proved = {r.ref.key for r in reports if r.status == "proved" and not r.open_deps}
+        proved = {r.ref.key for r in reports if evidence_status(r) == "proved"}
         mirrors = check_mirrors(program, theory, opts, root=root, proved=proved)
 
     cache.save()

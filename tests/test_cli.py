@@ -28,8 +28,39 @@ def test_exit_codes(tmp_path):
     (tmp_path / "ok.py").write_text("def f(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
     assert telic("check", "ok.py", "--no-cache", cwd=tmp_path).returncode == 0
     (tmp_path / "open.py").write_text("def g(n: int) -> int:\n    #@ ensures result == 1\n    while n != 1:\n        n = n // 2 if n % 2 == 0 else 3 * n + 1\n    return n\n")
-    assert telic("check", "open.py", "--no-cache", cwd=tmp_path).returncode == 0
+    assert telic("check", "open.py", "--no-cache", cwd=tmp_path).returncode == 1
     assert telic("check", "open.py", "--no-cache", "--strict", cwd=tmp_path).returncode == 1
+
+
+def test_strict_rejects_claims_with_trusted_dependencies(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "#@ trusted\n#@ ensures result == x\ndef valid(x: int) -> int: ...\n\n"
+        "def f(x: int) -> int:\n    #@ ensures result == x\n    return valid(x)\n"
+    )
+    out = telic("check", "m.py", "--no-cache", "--json", cwd=tmp_path)
+    assert out.returncode == 1
+    data = json.loads(out.stdout)
+    (callee, caller) = data["functions"]
+    assert callee["status"] == "trusted"
+    assert caller["status"] == "trusted" and caller["proof_status"] == "proved"
+    assert telic("check", "m.py", "--no-cache", "--strict", cwd=tmp_path).returncode == 1
+
+
+def test_default_check_keeps_unclaimed_glue_quiet(tmp_path):
+    (tmp_path / "m.py").write_text("import os\n\ndef glue() -> str:\n    return os.getcwd()\n")
+    assert telic("check", "m.py", "--no-cache", cwd=tmp_path).returncode == 0
+
+
+def test_default_check_enforces_class_invariants_through_methods(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "class Counter:\n"
+        "    #@ invariant self.value >= 0\n\n"
+        "    def __init__(self):\n        self.value = 0\n\n"
+        "    def set(self, value: int):\n        self.value = value\n"
+    )
+    data = json.loads(telic("check", "m.py", "--no-cache", "--json", cwd=tmp_path).stdout)
+    assert data["ok"] is False
+    assert telic("check", "m.py", "--no-cache", cwd=tmp_path).returncode == 1
 
 
 JSON_TREE = """from typing import Any
@@ -59,7 +90,7 @@ def test_inferred_measures_are_reported_and_cached(tmp_path, src, want):
         data = json.loads(telic("check", "m.py", "--json", cwd=tmp_path).stdout)
         checked = [f for f in data["functions"] if f["status"] != "trusted"]
         assert {f["function"]: f["inferred"]["measure"] for f in checked} == want
-        assert all(f["status"] == "proved" for f in checked)
+        assert all(f["proof_status"] == "proved" for f in checked)
     out = telic("check", "m.py", "-v", "--color", "never", cwd=tmp_path).stdout
     for m in want.values():
         assert f"inferred @decreases {m}" in out

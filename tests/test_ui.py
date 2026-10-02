@@ -198,28 +198,28 @@ def learn(app, lemmas, **kw):
 def test_every_overlay_can_be_left():
     model, got = learn(FakeApp(SCREENS), [("esc", "always reachable home from overlay"), ("about", 'reachable screen "/about"')])
     assert model.complete and len(model.states) == 4
-    assert got["esc"].status == "proved" and "into 2/2 states" in got["esc"].detail
-    assert got["about"].status == "proved" and got["about"].trace == ['click button "About"']
+    assert got["esc"].status == "tested" and "into 2/2 states" in got["esc"].detail
+    assert got["about"].status == "tested" and got["about"].trace == ['click button "About"']
 
 
-def test_a_trap_is_refuted_with_a_replayed_trace():
+def test_a_trap_is_model_only_without_a_refinement_proof():
     screens = dict(SCREENS, **{"about:help": ("Help", {})})
     _, got = learn(FakeApp(screens), [("esc", "always reachable home from overlay")])
     o = got["esc"]
-    assert o.status == "refuted" and o.replay["confirmed"]
+    assert o.status == "open" and o.replay["confirmed"] and "model-only" in o.detail
     assert o.trace == ['click button "About"', 'click button "Help"']
     assert 'dialog "Help"' in o.detail
 
 
 def test_a_covered_close_button_is_no_way_out():
     _, got = learn(FakeApp(SCREENS, covered={"Got it"}), [("esc", "always reachable home from overlay")])
-    assert got["esc"].status == "refuted" and "covered by div.backdrop" in got["esc"].detail
+    assert got["esc"].status == "open" and "covered by div.backdrop" in got["esc"].detail
 
 
-def test_nothing_relevant_is_vacuous_not_proved():
+def test_absence_from_a_complete_learned_graph_is_still_open():
     screens = {"home": (None, {"About": "about"}), "about": (None, {"Back": "home"})}
     _, got = learn(FakeApp(screens), [("esc", "always reachable home from overlay"), ("n", 'never button "Back" while overlay'), ("u", 'unobscured button "Save"')])
-    assert {k: o.status for k, o in got.items()} == {"esc": "vacuous", "n": "vacuous", "u": "vacuous"}
+    assert {k: o.status for k, o in got.items()} == {"esc": "open", "n": "open", "u": "open"}
 
 
 def test_invariants_and_occlusion():
@@ -227,7 +227,7 @@ def test_invariants_and_occlusion():
         FakeApp(SCREENS, menu_covered={"about"}),
         [("no-close", 'never button "Close" while not overlay'), ("help-only-on-about", 'always screen "/about" while overlay "Help"'), ("menu", 'unobscured button "Menu"')],
     )
-    assert got["no-close"].status == "proved" and got["help-only-on-about"].status == "proved"
+    assert got["no-close"].status == "tested" and got["help-only-on-about"].status == "tested"
     m = got["menu"]
     assert m.status == "refuted" and "covered in 1/4 states" in m.detail and m.trace == ['click button "About"']
 
@@ -271,7 +271,7 @@ def test_an_action_a_later_visit_offers_is_explored_too():
     screens = dict(SCREENS, **{"home:tip": ("Tip", {"Close": "home"})})
     model, got = learn(LateTip(screens), [("esc", "always reachable home from overlay"), ("tip", 'reachable overlay "Tip"')])
     assert model.complete, model.stop
-    assert got["esc"].status == "proved" and got["tip"].status == "proved"
+    assert got["esc"].status == "tested" and got["tip"].status == "tested"
 
 
 def test_budgets_make_the_model_incomplete_and_verdicts_open():
@@ -351,8 +351,8 @@ def run_ui(d):
 def test_fixture_app_keeps_every_promise(tmp_path):
     d = fixture_app(tmp_path)
     rep, got = run_ui(d)
-    assert {k: r.status for k, r in got.items()} == {"escape": "proved", "dark-mode-shown": "proved", "dark-mode": "proved", "menu-visible": "proved"}
-    assert {i.id: i.status for i in rep.aims} == {"ESCAPE": "backed", "SETTINGS": "backed", "NAV": "backed"}
+    assert {k: r.status for k, r in got.items()} == {"escape": "tested", "dark-mode-shown": "tested", "dark-mode": "tested", "menu-visible": "tested"}
+    assert {i.id: i.status for i in rep.aims} == {"ESCAPE": "partial", "SETTINGS": "partial", "NAV": "partial"}
     (m,) = rep.ui.apps[0].models
     assert m["complete"] and m["states"] > 5
     # Nothing the app is built from changed: the verdicts come from the cache.
@@ -364,19 +364,19 @@ def test_fixture_app_keeps_every_promise(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bug, lemma, says",
+    "bug, lemma, status, says",
     [
-        ("trap", "escape", 'stuck at screen / with dialog "Help" open'),
-        ("forget", "dark-mode", "reopened the app: unchecked"),
+        ("trap", "escape", "open", "model-only"),
+        ("forget", "dark-mode", "refuted", "reopened the app: unchecked"),
     ],
 )
 @needs_browser
-def test_fixture_bugs_are_found_and_replayed(tmp_path, bug, lemma, says):
+def test_fixture_bugs_keep_counterexamples_at_their_evidence_level(tmp_path, bug, lemma, status, says):
     d = fixture_app(tmp_path, [bug])
     rep, got = run_ui(d)
     r = got[lemma]
-    assert r.status == "refuted" and says in r.detail and r.replay["confirmed"] and r.trace
-    assert {k for k, x in got.items() if x.status == "refuted"} == {lemma}
+    assert r.status == status and says in r.detail and r.replay["confirmed"] and r.trace
+    assert {k for k, x in got.items() if x.status == "refuted"} == ({lemma} if status == "refuted" else set())
     assert not rep.ok
 
 
@@ -386,7 +386,7 @@ def test_a_banner_that_covers_the_menu_on_phones_only(tmp_path):
     _, got = run_ui(d)
     r = got["menu-visible"]
     assert r.status == "refuted" and "at 390x844" in r.detail and 'div.banner "We use cookies"' in r.detail
-    assert [v["status"] for v in r.viewports] == ["refuted", "proved"]
+    assert [v["status"] for v in r.viewports] == ["refuted", "tested"]
 
 
 @pytest.mark.parametrize("viewports, ok", [('["390x844"]', True), ("[]", False)])
@@ -417,6 +417,31 @@ def test_counts_in_names_are_data():
     assert [a.sig for a in actions(one)[0]] == [a.sig for a in actions(two)[0]] == ['link "All tasks #"']
 
 
+@pytest.mark.parametrize(
+    "property, status, method, want",
+    [
+        ("reachable home", "proved", "witness replayed", "tested"),
+        ("reachable home", "proved", "source proof", "proved"),
+        ("reachable home", "refuted", "learned model", "open"),
+        ("always reachable home from overlay", "refuted", "learned model", "open"),
+        ('never overlay "Help"', "refuted", "learned model", "refuted"),
+    ],
+)
+def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
+    from telic.ui.run import _result
+
+    scan = Scan()
+    scan_source(f"//@ [A] ui home: {property}", "app.ts", scan)
+    lemma = scan.lemmas[0]
+    old = {"status": status, "method": method, "detail": "old cached result", "viewports": [{"status": status}]}
+    got = _result(lemma, "telic.toml", old)
+    assert got.status == want and got.viewports == [{"status": want}]
+    if want == "open":
+        assert "model-only" in got.detail
+    if want == "tested":
+        assert "proved" not in got.detail
+
+
 def test_screens_abstraction_keeps_only_what_the_lemmas_see():
     # a wizard on one screen the lemmas do not look into: each step shows other controls
     steps = "ABCDEFGHIJ"
@@ -424,7 +449,7 @@ def test_screens_abstraction_keeps_only_what_the_lemmas_see():
     fine, _ = learn(FakeApp(screens, start="home:A"), [("r", "reachable home")])
     coarse, got = learn(FakeApp(screens, start="home:A"), [("r", "reachable home")], abstraction="screens")
     assert len(fine.states) == 10 and len(coarse.states) == 1 and coarse.complete
-    assert got["r"].status == "proved"
+    assert got["r"].status == "tested"
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +509,7 @@ def test_concurrent_browsers_never_exceed_the_machine_budget(tmp_path, monkeypat
     monkeypatch.setattr(WebDriver, "stop", counted_stop)
     d = fixture_app(tmp_path, viewports=("390x844", "1280x800", "1024x768"))
     _, got = run_ui(d)
-    assert got["escape"].status == "proved", got["escape"].detail
+    assert got["escape"].status == "tested", got["escape"].detail
     assert peak[0] == budget and live[0] == 0
 
 
@@ -617,13 +642,13 @@ MENU = '<button id=menu onclick="">Menu</button>'
     "lemma, body, js, css, status, says",
     [
         ('unobscured button "Save"', '<div style="height:80px;overflow:hidden"><div style="height:600px"></div><button>Save</button></div>', "", "", "refuted", "covered by"),
-        ('unobscured button "Save"', '<div style="height:80px;overflow:auto"><div style="height:600px"></div><button>Save</button></div>', "", "", "proved", ""),
+        ('unobscured button "Save"', '<div style="height:80px;overflow:auto"><div style="height:600px"></div><button>Save</button></div>', "", "", "tested", ""),
         ('unobscured button "Menu"', MENU + "<div class=veil>Sale</div>", "", ".veil{position:fixed;top:0;left:0;width:300px;height:90px;background:#c00;pointer-events:none}", "refuted", "painted over it"),
-        ('unobscured button "Menu"', MENU + "<div class=veil></div>", "", ".veil{position:fixed;inset:0;pointer-events:none}", "proved", ""),
+        ('unobscured button "Menu"', MENU + "<div class=veil></div>", "", ".veil{position:fixed;inset:0;pointer-events:none}", "tested", ""),
         ('unobscured button "Menu"', MENU + '<div role=dialog aria-label="Cookies" class=ban>We use cookies</div>', "", ".ban{position:fixed;top:0;left:0;right:0;height:60px;background:#fd0}", "refuted", "Cookies"),
-        ('unobscured button "Menu" while not overlay', MENU + '<div class=bd><div role=dialog aria-modal=true aria-label="Hi">Hi</div></div>', "", ".bd{position:fixed;inset:0;background:#0006}", "vacuous", ""),
+        ('unobscured button "Menu" while not overlay', MENU + '<div class=bd><div role=dialog aria-modal=true aria-label="Hi">Hi</div></div>', "", ".bd{position:fixed;inset:0;background:#0006}", "open", ""),
         # a dialog titled by its heading is named as a screen reader names it (two such dialogs are not one state)
-        ('reachable overlay "Delete item?"', '<button onclick="document.querySelector(\'main\').insertAdjacentHTML(\'beforeend\', \'<div role=dialog aria-labelledby=t><h2 id=t>Delete item?</h2></div>\')">Delete</button>', "", "", "proved", "reached in 1 step"),
+        ('reachable overlay "Delete item?"', '<button onclick="document.querySelector(\'main\').insertAdjacentHTML(\'beforeend\', \'<div role=dialog aria-labelledby=t><h2 id=t>Delete item?</h2></div>\')">Delete</button>', "", "", "tested", "reached in 1 step"),
         ('never overlay "Expired"', "<p>Hi</p>", "setTimeout(() => document.querySelector('main').insertAdjacentHTML('beforeend', '<div role=dialog aria-label=Expired>Expired</div>'), 1500);", "", "refuted", "Expired"),
     ],
 )

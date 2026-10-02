@@ -205,6 +205,9 @@ def _method(v: Verdict) -> str:
 
 
 def function_panel(f: FunctionReport) -> str:
+    from .evidence import evidence_status
+
+    evidence = evidence_status(f)
     mod = f.ref.module
     lines = mod.source.splitlines()
     lo, hi = _span(f.fn, lines)
@@ -254,6 +257,12 @@ def function_panel(f: FunctionReport) -> str:
             f"<td>{detail}{cex}</td><td class=\"m\">{e(_method(v)) if v.status == 'proved' else ''}</td></tr>"
         )
     problems = "".join(f'<div class="problem">line {loc.line}: {e(msg)}</div>' for msg, loc in f.problems)
+    conditional = []
+    conditional.extend(f"unchecked context contract {d}" for d in sorted(f.context_deps))
+    conditional.extend(f"unproved dependency {d}" for d in sorted(f.open_deps))
+    conditional.extend(f"trusted dependency {d}" for d in sorted(f.trusted_deps))
+    conditional.extend(f"line {loc.line}: {text}" for loc, text in f.assumptions)
+    assumptions = f'<div class="problem">{e("; ".join(conditional))}</div>' if conditional else ""
     count = f"{len(f.verdicts)} obligation{'s' * (len(f.verdicts) != 1)}"
     table = (
         '<div class="obs-wrap"><table class="obs"><thead><tr><th>result</th><th>kind</th><th>line</th><th>obligation</th><th>evidence</th></tr></thead>'
@@ -262,11 +271,11 @@ def function_panel(f: FunctionReport) -> str:
         else ""
     )
     return (
-        f'<article class="fn" id="fn-{e(f.fn.name)}" data-status="{e(f.status)}">'
-        f"<header>{pill(f.status)}<h3>{e(f.fn.name)}</h3><span class=\"muted\">{count}</span>"
+        f'<article class="fn" id="fn-{e(f.fn.name)}" data-status="{e(evidence)}">'
+        f"<header>{pill(evidence)}<h3>{e(f.fn.name)}</h3><span class=\"muted\">{count}</span>"
         f'<span class="where">{e(mod.path)}:{f.fn.loc.line}</span></header>'
         f'{"<div class=tags>" + "".join(tags) + "</div>" if tags else ""}'
-        f'<div class="src"><table>{"".join(rows)}</table></div>{problems}{table}</article>'
+        f'<div class="src"><table>{"".join(rows)}</table></div>{problems}{assumptions}{table}</article>'
     )
 
 
@@ -332,7 +341,9 @@ def _p(part: dict) -> str:
 
 def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = True) -> str:
     fs = rep.functions
-    counts = {s: sum(1 for f in fs if f.status == s) for s in ("proved", "refuted", "vacuous", "open", "unsupported", "trusted", "error")}
+    from .evidence import evidence_status
+
+    counts = {s: sum(1 for f in fs if evidence_status(f) == s) for s in ("proved", "refuted", "vacuous", "open", "unsupported", "trusted", "error")}
     nob = sum(len(f.verdicts) for f in fs)
     lean = sum(1 for f in fs for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
     inferred = sum(sum(len(c) for c in f.inferred.invariants.values()) for f in fs if f.inferred)
@@ -355,7 +366,7 @@ def render_html(rep: Report, title: str = "Proof ledger", standalone: bool = Tru
         tally.append(f"<span><b>{inferred}</b> inferred invariant{'s' * (inferred != 1)}</span>")
     aims = []
     for i in rep.aims:
-        ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
+        ok = sum(1 for x in i.lemmas if x.status == "proved")
         ev = [f"{ok}/{len(i.lemmas)} lemmas proved"] if i.lemmas else ["no lemma cites this aim yet"]
         if i.trusted:
             ev.append(f"assuming trusted {', '.join(i.trusted)}")

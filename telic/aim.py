@@ -117,7 +117,7 @@ class AimReport:
     # counts kept for the ledger and older callers
     @property
     def proved(self) -> int:
-        return sum(1 for x in self.lemmas if x.status in ("proved", "trusted"))
+        return sum(1 for x in self.lemmas if x.status == "proved")
 
     @property
     def refuted(self) -> int:
@@ -248,10 +248,20 @@ def build(rep: Any) -> list[AimReport]:
             _check_scope(r, [f.ref.module.path for item in by for f in rep.functions if _match(item, f.ref.key, f.fn.name)], partial=context, root=getattr(rep, "root", None) or ".")
         if text is not None:
             r.ears = ears_problems(text)
-        status_of = {f.ref.key: f.status for f in rep.functions}
+        from .evidence import evidence_status
+
+        status_of = {f.ref.key: evidence_status(f) for f in rep.functions}
         for f in fns:
             for d in sorted(f.open_deps):
                 r.assumes.append(f"{f.fn.name} assumes {d.split('::')[-1]} ({status_of.get(d, 'not checked')})")
+            for d in sorted(f.context_deps):
+                r.assumes.append(f"{f.fn.name} assumes unchecked context contract {d.split('::')[-1]}")
+            for _, assumption in f.assumptions:
+                if assumption.startswith("assumed: trusted predicate "):
+                    label = "trusted assumption: " + assumption[len("assumed: "):]
+                else:
+                    label = assumption if not assumption.startswith("assumed: ") else "unchecked model: " + assumption[len("assumed: "):]
+                r.assumes.append(f"{f.fn.name} assumes {label}")
         # Status: what the lemmas establish (never "proved").
         fstat = [f.status for f in fns] + [m.status for m in mirrors.get(iid, [])]
         if text is None:
@@ -262,12 +272,12 @@ def build(rep: Any) -> list[AimReport]:
             r.status = "broken"
         elif any(x.status == "vacuous" for x in r.lemmas):
             r.status = "vacuous"
-        elif all(s in ("proved", "trusted") for s in fstat) and all(x.status in ("proved", "trusted") for x in r.lemmas) and not any(f.open_deps for f in fns):
+        elif all(s == "proved" for s in fstat) and all(x.status == "proved" for x in r.lemmas) and not any(evidence_status(f) != "proved" for f in fns):
             r.status = "backed"
         else:
             r.status = "partial"
             if all(x.status in ("proved", "trusted") for x in r.lemmas):
-                why = [f"{f.fn.name} ({f.status})" for f in fns if f.status not in ("proved", "trusted")] + [f"{m.a.fn.name} ≡ {m.b.fn.name} ({m.status})" for m in mirrors.get(iid, []) if m.status != "proved"]
+                why = [f"{f.fn.name} ({evidence_status(f)})" for f in fns if evidence_status(f) != "proved"] + [f"{m.a.fn.name} ≡ {m.b.fn.name} ({m.status})" for m in mirrors.get(iid, []) if m.status != "proved"]
                 if why:
                     r.advice.append(f"every lemma is proved, but not everything the backing functions do: {', '.join(why)}")
         r.trusted = sorted({f.fn.name for f in fns if f.status == "trusted"} | {d.split("::")[-1] for f in fns for d in f.trusted_deps})
@@ -351,7 +361,7 @@ def _check_scope(r: AimReport, targets: list[str], partial: bool, root: str) -> 
         r.advice.append(f"every lemma is in {only}: declare {r.id} there as an '@aim {r.id}: ...' comment")
 
 
-_RANK = {"refuted": 0, "open": 1, "unsupported": 1, "vacuous": 2, "trusted": 3, "proved": 4}
+_RANK = {"refuted": 0, "open": 1, "unsupported": 1, "tested": 2, "vacuous": 2, "trusted": 3, "proved": 4}
 
 
 def _ui_lemma(rep: Any, res: Any, r: AimReport) -> Lemma:
@@ -359,7 +369,7 @@ def _ui_lemma(rep: Any, res: Any, r: AimReport) -> Lemma:
     reachable, and the handler behind it does what its contract says)."""
     lem = res.lemma
     status, detail = res.status, res.detail
-    if res.method and status != "open":
+    if res.method:
         detail = f"{res.method}: {detail}"
     if lem.via:
         hit = [f for f in rep.functions if _match(lem.via, f.ref.key, f.fn.name)]
@@ -367,9 +377,12 @@ def _ui_lemma(rep: Any, res: Any, r: AimReport) -> Lemma:
             r.pointers.append(f"ui {lem.name}: 'via {lem.via}' names no checked function")
             status = min(status, "open", key=lambda s: _RANK.get(s, 1))
         else:
-            fs = hit[0].status if not hit[0].open_deps or hit[0].status != "proved" else "open"
+            f = hit[0]
+            from .evidence import evidence_status
+
+            fs = evidence_status(f)
             fs = {"proved": "proved", "trusted": "trusted", "refuted": "refuted"}.get(fs, "open")
-            detail += f"; handler {hit[0].fn.name} {fs}"
+            detail += f"; handler {f.fn.name} {fs}"
             status = min(status, fs, key=lambda s: _RANK.get(s, 1))
     return Lemma(f"ui:{lem.name}", lem.name, lem.path, lem.line, "ui", lem.text, status, detail)
 
@@ -387,13 +400,15 @@ def _clause_status(f: Any, c: Any) -> str:
         return "unsupported"
     if f.status in ("trusted", "vacuous"):
         return f.status
+    from .evidence import evidence_status
+
     vs = [v for v in f.verdicts if v.ob.clause is c or (v.ob.clause is not None and v.ob.clause.loc == c.loc and v.ob.clause.text == c.text)]
     if not vs:
-        return "proved" if f.status == "proved" else "open"
+        return evidence_status(f)
     if any(v.status == "refuted" for v in vs):
         return "refuted"
     if all(v.status == "proved" for v in vs):
-        return "proved"
+        return evidence_status(f)
     return "open"
 
 

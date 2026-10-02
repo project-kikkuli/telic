@@ -269,10 +269,12 @@ class Renderer:
     def footer(self) -> str:
         p = self.p
         r = self.r
-        refuted = [f for f in r.functions if f.status == "refuted"] + [m for m in r.mirrors if m.status == "refuted"]
-        vacuous = [f for f in r.functions if f.status == "vacuous"] + [m for m in r.mirrors if m.status == "vacuous"]
-        open_ = [f for f in r.functions if f.status in ("open", "error")] + [m for m in r.mirrors if m.status == "open"]
-        proved = [f for f in r.functions if f.status == "proved" and not _empty(f)]
+        from .evidence import evidence_status
+
+        refuted = [f for f in r.functions if evidence_status(f) == "refuted"] + [m for m in r.mirrors if m.status == "refuted"]
+        vacuous = [f for f in r.functions if evidence_status(f) == "vacuous"] + [m for m in r.mirrors if m.status == "vacuous"]
+        open_ = [f for f in r.functions if evidence_status(f) in ("open", "error")] + [m for m in r.mirrors if m.status == "open"]
+        proved = [f for f in r.functions if evidence_status(f) == "proved" and not _empty(f)]
         empty = [f for f in r.functions if _empty(f)]
         problems = sum(len(m.problems) for m in r.modules)
         parts = []
@@ -287,8 +289,8 @@ class Renderer:
         parts.append(p.bgreen(f"{len(proved)} proved"))
         if r.ui is not None and r.ui.results:
             us = [x.status for x in r.ui.results]
-            bits = [f"{us.count(k)} {k}" for k in ("proved", "refuted", "open", "vacuous") if us.count(k)]
-            color = p.bred if "refuted" in us or "vacuous" in us else p.byellow if "open" in us else p.bgreen
+            bits = [f"{us.count(k)} {k}" for k in ("tested", "proved", "refuted", "open", "vacuous") if us.count(k)]
+            color = p.bred if "refuted" in us or "vacuous" in us else p.byellow if "open" in us or "tested" in us else p.bgreen
             parts.append(color("ui: " + ", ".join(bits)))
         if r.lifecycles:
             ls = [x.status for x in r.lifecycles]
@@ -297,7 +299,7 @@ class Renderer:
             parts.append(color("lifecycles: " + ", ".join(bits)))
         if empty:
             parts.append(p.gray(f"{len(empty)} with nothing to check"))
-        unsup = [f for f in r.functions if f.status == "unsupported"]
+        unsup = [f for f in r.functions if evidence_status(f) == "unsupported"]
         if unsup:
             parts.append(p.gray(f"{len(unsup)} unsupported"))
         return "\n" + "  ".join(parts)
@@ -610,7 +612,7 @@ class Renderer:
         glyph = {"backed": p.green("●"), "broken": p.red("✗"), "vacuous": p.red("∅"), "partial": p.yellow("◐"), "vacuous-risk": p.yellow("∅"), "unbacked": p.gray("○"), "undeclared": p.yellow("!")}
         for i in self.r.aims:
             n = len(i.lemmas)
-            ok = sum(1 for x in i.lemmas if x.status in ("proved", "trusted"))
+            ok = sum(1 for x in i.lemmas if x.status == "proved")
             summary = [label[i.status]]
             if n:
                 summary.append(f"{ok}/{n} lemma{'s' * (n != 1)} proved")
@@ -674,25 +676,32 @@ class Renderer:
             fs = empty[:0]
         nw = max([len(f.fn.name) for f in fs] + [8]) + 2
         lw = max([len(fn_loc(f)) for f in fs] + [8]) + 2
+        from .evidence import evidence_status
+
         for f in fs:
             n = len(f.verdicts)
             if _empty(f):
                 out.append(f"  {p.dim('·')} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{p.dim('nothing to check')}")
                 continue
-            if f.status == "proved":
+            evidence = evidence_status(f)
+            if evidence == "proved":
                 desc = p.dim(f"{n} obligation{'s' * (n != 1)}")
+            elif evidence == "trusted":
+                desc = p.blue("trusted") + p.dim(" · proof assumes a trusted contract or explicit assumption")
+            elif evidence == "open" and f.status == "proved":
+                desc = p.yellow("conditional") + p.dim(" · proof depends on unchecked source or model assumptions")
             elif f.status == "refuted":
                 k = f.count("refuted")
                 desc = p.red(f"{k} refuted") + p.dim(f" of {n}")
-            elif f.status == "open":
+            elif evidence == "open":
                 k = sum(1 for v in f.verdicts if v.status != "proved")
                 desc = p.yellow(f"{k} open" if k else "termination open") + p.dim(f" of {n}")
-            elif f.status == "unsupported":
+            elif evidence == "unsupported":
                 msg, loc = f.problems[0] if f.problems else ("", f.fn.loc)
                 desc = p.gray(f"line {loc.line}: {msg}")
-            elif f.status == "vacuous":
+            elif evidence == "vacuous":
                 desc = p.red("vacuous") + p.dim(" · what it assumes on entry can never hold")
-            elif f.status == "trusted":
+            elif evidence == "trusted":
                 desc = p.blue("trusted") + p.dim(" · contract assumed, body not checked")
             else:
                 desc = p.red("error")
@@ -710,14 +719,14 @@ class Renderer:
             lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or (v.method == "cache" and v.reason.startswith("lean")))
             if lean:
                 extras.append(f"{lean} by Lean")
-            if f.context_deps and f.status == "proved" and not f.open_deps:
+            if f.context_deps:
                 deps = ", ".join(sorted(d.split("::")[-1] for d in f.context_deps))
-                extras.append(f"uses the contracts of {deps}")
-            if f.open_deps and f.status == "proved":
+                extras.append(p.yellow(f"assumes unchecked context contracts {deps}"))
+            if f.open_deps:
                 deps = ", ".join(sorted(d.split("::")[-1] for d in f.open_deps))
                 extras.append(p.yellow(f"assumes unproved {deps}"))
             ex = p.dim("  ·  " + "  ·  ".join(extras)) if extras else ""
-            out.append(f"  {mark(p, f.status)} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{desc}{ex}")
+            out.append(f"  {mark(p, evidence)} {pad(f.fn.name, nw)}{pad(p.dim(fn_loc(f)), lw)}{desc}{ex}")
         if len(fs) < len(self.r.functions) and empty and not self.verbose:
             out.append(p.dim(f"  · {len(empty)} more with nothing to check: no contract and no operation that can fail (add '@ensures' to make a claim; --verbose lists them)"))
         out.append("")
@@ -830,6 +839,8 @@ def ui_label(status: str, method: str) -> str:
     """What a ui verdict rests on, in its own words."""
     if status == "proved":
         return {"learned model": "proved on the learned model", "witness replayed": "proved by a replayed witness", "hit-tested": "unobscured wherever it renders", "tested": "passed the test"}.get(method, "proved")
+    if status == "tested":
+        return {"learned model": "observed on the learned model", "witness replayed": "witness replayed in the app", "hit-tested": "hit-tested where it renders", "tested": "passed the persistence test"}.get(method, "tested")
     if status == "refuted":
         return "refuted" + (" on the learned model" if method == "learned model" else "")
     return status

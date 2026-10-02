@@ -1,5 +1,5 @@
 """Running UI lemmas: find each lemma's app, start it, learn its model at each
-viewport, check, and cache the verdicts by exactly what they depend on (the
+viewport, test, and cache the observations by what they depend on (the
 app's sources, the ``[ui]`` config, the lemma, and telic's UI code)."""
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ VERSION = 1
 class UiResult:
     lemma: UiLemma
     app: str  # the telic.toml it ran under ('' when none)
-    status: str  # proved | refuted | open | vacuous
+    status: str  # tested | refuted | open | vacuous
     method: str = ""
     detail: str = ""
     trace: list[str] | None = None
@@ -152,6 +152,7 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
                 rep.results.append(r)
                 app.models = app.models or hit.get("models", [])
                 app.url = app.url or hit.get("url", "")
+                entries[keys[lem.name]] = {**hit, "result": r.to_json()}
             else:
                 todo.append(lem)
         app.cached = not todo
@@ -192,7 +193,28 @@ def route_patterns(declared: list[str], lems: list[UiLemma]) -> list[str]:
 
 def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
     #@ requires "status" in d
-    return UiResult(lem, app, d["status"], d.get("method", ""), d.get("detail", ""), d.get("trace"), d.get("replay"), d.get("viewports", []))
+    status = d["status"]
+    source_proof = d.get("method") in ("source proof", "static proof")
+    detail = d.get("detail", "")
+    if d["status"] == "proved" and not source_proof:
+        status = "tested"
+        detail = detail.replace("proved", "tested")
+    if d["status"] == "vacuous" and not source_proof:
+        status = "open"
+        detail = "model-only: " + detail
+    if d["status"] == "refuted" and d.get("method") == "learned model" and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable"):
+        status = "open"
+        detail = "model-only: " + detail
+    viewports = []
+    for v in d.get("viewports", []):
+        verdict = v.get("status")
+        method = v.get("method", d.get("method"))
+        if verdict == "proved" and method not in ("source proof", "static proof"):
+            verdict = "tested"
+        elif (verdict == "vacuous" and method not in ("source proof", "static proof")) or (verdict == "refuted" and method == "learned model" and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable")):
+            verdict = "open"
+        viewports.append({**v, "status": verdict})
+    return UiResult(lem, app, status, d.get("method", ""), detail, d.get("trace"), d.get("replay"), viewports)
 
 
 def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str], None]) -> dict[str, UiResult]:

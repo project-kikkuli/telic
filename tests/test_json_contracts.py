@@ -70,7 +70,10 @@ def test_the_predicate_is_listed_as_an_assumption(reports):
 def test_an_aim_resting_on_a_predicate_says_so_everywhere(reports):
     rep = reports["payload.py"]
     (aim,) = [a for a in rep.aims if a.id == "ORDER-QTY"]
-    assert aim.status == "backed" and aim.trusted == ["valid_item", "valid_order"]
+    assert aim.status == "partial" and aim.proved == 0 and aim.trusted == ["valid_item", "valid_order"]
+    from telic.ledger import snapshot
+
+    assert snapshot(rep)["functions"]["payload.py::total_quantity"]["status"] == "open"
     assert _aim_json(aim)["trusted"] == ["valid_item", "valid_order"]
     assert "assuming trusted valid_item, valid_order" in render_html(rep)
 

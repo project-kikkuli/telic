@@ -112,11 +112,13 @@ def check(program: Program, functions: list[Any], gens: dict[str, VCGen], solve,
     if not owners:
         return []
     reports: list[LifecycleReport] = []
+    scopes: dict[str, _Scope] = {}
     todo: list[tuple[Obligation, Any]] = []  # (obligation, how to record its answer)
 
     # Class level: reflexive, transitive, and the never lines.
     for cls in owners:
         sc = _Scope(program, cls)
+        scopes[cls] = sc
         mine = [(c, lc) for c, lc in program.lifecycles_for(cls) if c in program.mro(cls)]
         for lc in program.classes[cls].lifecycles:
             rep = LifecycleReport(cls, sc.module, lc)
@@ -190,6 +192,9 @@ def check(program: Program, functions: list[Any], gens: dict[str, VCGen], solve,
 
     # Per-function proofs, and the functions no proof covers.
     for r in reports:
+        if scopes[r.cls].gen.assumptions and r.status == "proved":
+            r.status = "open"
+            r.problems.extend(f"lifecycle proof assumes {text} at line {loc.line}" for loc, text in scopes[r.cls].gen.assumptions)
         family = set(program.mro(r.cls)) | {x for x in program.classes if r.cls in program.mro(x)}
         for f in functions:
             if f.ref.module.context:
@@ -210,10 +215,14 @@ def check(program: Program, functions: list[Any], gens: dict[str, VCGen], solve,
                 elif bad is not None and r.status != "refuted":
                     r.status = "open"
                     r.problems.append(f"{name} is not proved to keep {what}")
-            elif f.status in ("unsupported", "error", "trusted") and _may_change(program, f.ref, family):
+                elif bad is None and (f.open_deps or f.context_deps or f.trusted_deps or f.assumptions) and r.status == "proved":
+                    r.status = "open"
+                    r.problems.append(f"{name} keeps {what} only with unchecked proof dependencies")
+            elif (f.status in ("unsupported", "error", "trusted") or f.open_deps or f.context_deps or f.trusted_deps or f.assumptions) and _may_change(program, f.ref, family):
                 if r.status == "proved":
                     r.status = "open"
-                r.problems.append(f"{ir.source_name(f.fn.name)} may change {ir.source_name(r.cls)} objects but is not checked ({f.status})")
+                why = f.status if f.status != "proved" else "has unchecked proof dependencies"
+                r.problems.append(f"{ir.source_name(f.fn.name)} may change {ir.source_name(r.cls)} objects but {why}")
         if r.status == "proved" and r.steps and all(not s.by and not s.unknown for s in r.steps):
             r.status = "vacuous"
             r.problems.append(_vacuous(r))

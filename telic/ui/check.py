@@ -2,10 +2,10 @@
 
 What each verdict rests on is said with it:
 
-- reachability and invariants are *proved on the learned model* (its size,
+- reachability and invariants are *tested on the learned model* (its size,
   whether exploration finished, and how conformance testing went are shown);
   a route the model promises is replayed in the app before it counts;
-- ``reachable`` is proved by a witness replayed in the app;
+- ``reachable`` is tested with a witness replayed in the app;
 - occlusion is hit-tested in every reachable state where the element renders;
 - persistence is tested by changing the control and reopening the app.
 
@@ -28,7 +28,7 @@ from .tree import Node, Snapshot, controls, value_of
 
 @dataclass
 class Outcome:
-    status: str  # proved | refuted | open | vacuous
+    status: str  # tested | refuted | open | vacuous
     method: str  # learned model | witness replayed | hit-tested | tested
     detail: str
     viewport: str = ""
@@ -174,10 +174,8 @@ class ModelCheck:
         return f"exploration is incomplete: {self.m.stop}" if self.m.stop else ""
 
     def _nothing(self, method: str, what: str) -> Outcome:
-        """Nothing relevant found: vacuous only if exploration found everything there is."""
-        if self.m.complete:
-            return Outcome("vacuous", method, f"{what} ({self._size()})")
-        return Outcome("open", method, f"{what} in the {len(self.m.states)} states found, but {self._stopped()}")
+        """Absence from the learned graph is not evidence of source behavior."""
+        return Outcome("open", method, f"model-only: {what}; no source refinement establishes that the learned graph is complete ({self._size()})")
 
     def _size(self) -> str:
         return f"{len(self.m.states)} states" + ("" if self.m.complete else f", {self._stopped()}")
@@ -201,8 +199,8 @@ class ModelCheck:
         """A proof over every state rests on the model seeing what decides
         what renders: when the source names state it could not read, the
         model may have merged states the app keeps apart."""
-        if (self.m.unread or self.m.unpressed) and out.status in ("proved", "vacuous"):
-            what = "proved" if out.status == "proved" else "vacuous"
+        if (self.m.unread or self.m.unpressed) and out.status in ("tested", "vacuous"):
+            what = "tested" if out.status == "tested" else "vacuous"
             why = []
             if self.m.unread:
                 why.append(f"it cannot see {', '.join(self.m.unread[:3])}: handlers change it and it decides what renders")
@@ -233,9 +231,9 @@ class ModelCheck:
             blocked = sorted(set(s.blocked.values()))
             tail = f"; {len(s.blocked)} blocked ({blocked[0]})" if blocked else ""
             return Outcome(
-                "refuted",
+                "open",
                 "learned model",
-                f"stuck at {s.describe()}: none of its {n} actions leads to {_phrase(p.goal)}{tail}",
+                f"model-only: no route to {_phrase(p.goal)} was found from {s.describe()} among its {n} observed actions{tail}; the learned graph does not establish that no route exists",
                 trace=done,
                 replay={"confirmed": True, "summary": f"reached {s.describe()}"},
                 relevant=len(rel),
@@ -285,20 +283,20 @@ class ModelCheck:
             s, path, why = failed[0]
             return Outcome("open", "learned model", f"the model's route from {s.describe()} to {_phrase(p.goal)} did not replay in the app ({why})", trace=self.m.labels(path), relevant=len(rel))
         extra = f"; routes replayed along {len(paths)} path{'s' * (len(paths) != 1)} into {len(picked)}/{len(todo)} states" if todo else ""
-        return Outcome("proved", "learned model", f"{len(rel)} relevant of {self._size()}{extra}", relevant=len(rel))
+        return Outcome("tested", "learned model", f"{len(rel)} relevant of {self._size()}{extra}", relevant=len(rel))
 
     def reachable(self, p: Prop, lem: UiLemma) -> Outcome:
         assert isinstance(p.goal, Pred)
         goals = sorted(self._states(p.goal), key=lambda s: (s.depth, s.id))
         if not goals:
             if self.m.complete:
-                return Outcome("refuted", "learned model", f"no reachable state has {_phrase(p.goal)} in the complete model ({self._size()})")
+                return Outcome("open", "learned model", f"model-only: no reachable state with {_phrase(p.goal)} was observed; the learned graph does not establish that no such state exists ({self._size()})")
             return Outcome("open", "learned model", f"not reached in {self._size()}, and {self._stopped()}")
         s = goals[0]
         snap, done, why = self.replay(s.access)
         if snap is not None and p.goal.eval(snap, self.m.home):
-            return Outcome("proved", "witness replayed", f"reached in {len(done)} step{'s' * (len(done) != 1)}", trace=done, replay={"confirmed": True, "summary": f"reached {s.describe()}"}, relevant=len(goals))
-        return Outcome("open", "learned model", f"the model reaches it, but the path did not replay ({why or 'ended elsewhere'})", trace=self.trace_of(s))
+            return Outcome("tested", "witness replayed", f"reached in {len(done)} step{'s' * (len(done) != 1)}", trace=done, replay={"confirmed": True, "summary": f"reached {s.describe()}"}, relevant=len(goals))
+            return Outcome("open", "learned model", f"the model reaches it, but the path did not replay ({why or 'ended elsewhere'})", trace=self.trace_of(s))
 
     def invariant(self, p: Prop, lem: UiLemma) -> Outcome:
         assert isinstance(p.goal, Pred)
@@ -317,7 +315,7 @@ class ModelCheck:
             return Outcome("open", "learned model", f"{what} at {s.describe()} in the model, but it did not replay ({why or 'not seen again'})", trace=self.trace_of(s), relevant=len(rel))
         if not self.m.complete:
             return Outcome("open", "learned model", f"holds in all {len(rel)} relevant states found, but {self._stopped()}", relevant=len(rel))
-        return Outcome("proved", "learned model", f"holds in {len(rel)} relevant of {self._size()}", relevant=len(rel))
+        return Outcome("tested", "learned model", f"holds in {len(rel)} relevant of {self._size()}", relevant=len(rel))
 
     def unobscured(self, p: Prop, lem: UiLemma) -> Outcome:
         t = p.goal
@@ -347,7 +345,7 @@ class ModelCheck:
             return Outcome("open", "hit-tested", f"covered at {s.describe()} while exploring ({o.covered[s.id][0]}), but not when replayed ({why or 'uncovered'})", trace=self.m.labels((o.paths.get(s.id) or [s.access])[0]), relevant=len(rendered))
         if not self.m.complete:
             return Outcome("open", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states found where it renders{tests}, but {self._stopped()}", relevant=len(rendered))
-        return Outcome("proved", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states where it renders{tests}", relevant=len(rendered))
+        return Outcome("tested", "hit-tested", f"uncovered in {len(rendered)}/{len(rendered)} states where it renders{tests}", relevant=len(rendered))
 
     # -- persistence -----------------------------------------------------------
 
@@ -407,7 +405,7 @@ class ModelCheck:
         again = value_of(n3) if n3 is not None else None
         steps = done + [what, "reopen the app"] + back
         if again == after:
-            return Outcome("proved", "tested", f"changed it ({before} → {after}), reopened the app: still {after}", trace=steps, viewport=self.m.viewport, relevant=1)
+            return Outcome("tested", "tested", f"changed it ({before} → {after}), reopened the app: still {after}", trace=steps, viewport=self.m.viewport, relevant=1)
         return Outcome(
             "refuted",
             "tested",
@@ -448,17 +446,19 @@ def _change(n: Node) -> tuple[str, str | None, str] | None:
 
 def combine(outs: list[Outcome]) -> Outcome:
     #@ requires len(outs) > 0
-    """One verdict over every viewport: refuted anywhere is refuted; proved
-    needs no open viewport and at least one that was not vacuous."""
+    """One verdict over every viewport: refuted anywhere is refuted; a tested
+    result needs no open viewport and at least one that was not vacuous."""
     for st in ("refuted", "open"):
         hit = [o for o in outs if o.status == st]
         if hit:
             o = hit[0]
             return Outcome(st, o.method, f"at {o.viewport}: {o.detail}" if len(outs) > 1 else o.detail, o.viewport, o.trace, o.replay, o.relevant)
-    real = [o for o in outs if o.status == "proved"]
-    status = "proved" if real else "vacuous"
-    first = (real or outs)[0]
-    return Outcome(status, first.method, _per_viewport(outs), "", first.trace, first.replay, sum(o.relevant for o in real))
+    tested = [o for o in outs if o.status == "tested"]
+    proved = [o for o in outs if o.status == "proved"]
+    status = "tested" if tested else "proved" if proved else "vacuous"
+    evidence = tested or proved or outs
+    first = evidence[0]
+    return Outcome(status, first.method, _per_viewport(outs), "", first.trace, first.replay, sum(o.relevant for o in evidence))
 
 
 def _per_viewport(outs: list[Outcome]) -> str:
