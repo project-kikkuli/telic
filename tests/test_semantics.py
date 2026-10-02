@@ -56,7 +56,8 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
     projection = L.array_lambda(binder, L.add(binder, outer))
     assert L.consts(projection) == {outer}
 
-    substituted = L.substitute(projection, {outer: binder})
+    alpha_name = L.Const("index$alpha", L.INT)
+    substituted = L.substitute(projection, {outer: binder, alpha_name: L.IntV(7)})
     assert isinstance(substituted, L.ArrayLambda)
     assert substituted.binder != binder
     assert L.consts(substituted) == {binder}
@@ -68,7 +69,7 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
     assert solver.check() == z3.unsat
 
     quantified = L.Quant("forall", (binder,), L.gt(binder, outer), patterns=((binder,),))
-    renamed = L.substitute(quantified, {outer: binder})
+    renamed = L.substitute(quantified, {outer: binder, alpha_name: L.IntV(7)})
     assert isinstance(renamed, L.Quant)
     assert renamed.vars[0] != binder
     assert renamed.patterns == ((renamed.vars[0],),)
@@ -77,6 +78,54 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
 
     rendered = LeanPrinter(Namer(), {}).t(projection)
     assert "fun" in rendered and "index" in rendered
+    free_bool = L.Const("shadow", L.BOOL)
+    shadowed = L.array_lambda(L.Const("shadow", L.INT), L.ite(free_bool, L.ONE, L.ZERO))
+    namer = Namer()
+    free_name = namer(free_bool.name)
+    shadowed_text = LeanPrinter(namer, {}).t(shadowed)
+    assert f"{free_name} : Prop" not in shadowed_text
+    assert f"{free_name}" in shadowed_text and "fun (shadow_2 : Int)" in shadowed_text
+
+
+def test_substitution_respects_compound_binder_keys_and_quantifier_triggers():
+    x = L.Const("x", L.INT)
+    compound = L.gt(x, L.ZERO)
+    quantified = L.Quant("forall", (x,), compound)
+    assert L.substitute(quantified, {compound: L.TRUE}) is quantified
+
+    projection = L.array_lambda(x, L.add(x, L.ONE))
+    unchanged = L.substitute(projection, {L.add(x, L.ONE): L.IntV(7)})
+    assert unchanged is projection
+
+    a = L.Const("a", L.INT)
+    b = L.Const("b", L.INT)
+    trigger_only = L.Fn("trigger", (x, a), L.BOOL)
+    with_trigger = L.Quant("forall", (x,), L.gt(x, L.ZERO), patterns=((trigger_only,),))
+    changed = L.substitute(with_trigger, {a: b})
+    assert changed is not with_trigger
+    assert changed.patterns == ((L.Fn("trigger", (x, b), L.BOOL),),)
+
+    colliding_trigger = L.Fn("trigger", (x, L.Const("x$alpha", L.INT)), L.BOOL)
+    capture_case = L.Quant("forall", (x,), L.gt(x, a), patterns=((colliding_trigger,),))
+    renamed = L.substitute(capture_case, {a: x})
+    assert renamed.vars[0] != x
+    assert renamed.patterns[0][0].args == (renamed.vars[0], L.Const("x$alpha", L.INT))
+
+
+def test_lean_binders_do_not_shadow_sort_names():
+    from telic.lean import LeanPrinter, Namer, run_lean
+
+    lean = shutil.which("lean")
+    if not lean:
+        pytest.skip("Lean is not installed")
+    for sort, inner_name in ((L.INT, "Int"), (L.STR, "String"), (L.REAL, "Rat"), (L.UNIT, "Unit")):
+        outer = L.Const(inner_name, sort)
+        inner = L.Const("j", sort)
+        term = L.array_lambda(outer, L.array_lambda(inner, inner))
+        rendered = LeanPrinter(Namer(), {}).t(term)
+        source = f"example : True := by\n  have _f : {rendered} = {rendered} := by rfl\n  trivial\n"
+        result = run_lean(lean, source)
+        assert result.ok, rendered
 
 
 def py_expr(rnd, depth=0):

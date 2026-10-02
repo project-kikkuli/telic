@@ -113,6 +113,11 @@ class Namer:
     def __call__(self, raw: str) -> str:
         if raw in self.names:
             return self.names[raw]
+        name = self.fresh(raw)
+        self.names[raw] = name
+        return name
+
+    def fresh(self, raw: str) -> str:
         base = re.sub(r"[^A-Za-z0-9_]", "_", raw.replace("@", "_").replace(".", "_").replace("!", "_").replace("?", "_q").replace("$", "_").replace("()", "_ret"))
         base = re.sub(r"_+", "_", base).strip("_") or "v"
         if base[0].isdigit():
@@ -125,7 +130,6 @@ class Namer:
             k += 1
             name = f"{base}_{k}"
         self.used.add(name)
-        self.names[raw] = name
         return name
 
 
@@ -155,6 +159,23 @@ class LeanPrinter:
         self.free_fns = free_fns  # uninterpreted symbols: variables of the theorem
         self.dependent_ite = False
         self.hyp_counter = 0
+        self.bound_consts: list[dict[L.Const, str]] = []
+        self.n.used.update({"Int", "Rat", "Prop", "String", "Unit"})
+        for name in self.free_fns:
+            self.n(name)
+        self.n.used.update(fn_names.values())
+
+    def const_name(self, value: L.Const) -> str:
+        for scope in reversed(self.bound_consts):
+            if value in scope:
+                return scope[value]
+        return self.n(value.name)
+
+    def bound_name(self, value: L.Const) -> str:
+        name = self.n.fresh(value.name)
+        while name in self.fn_names.values():
+            name = self.n.fresh(value.name)
+        return name
 
     def t(self, x: L.Term, prec: int = 0) -> str:
         s, p = self._t(x)
@@ -164,7 +185,7 @@ class LeanPrinter:
         if isinstance(x, L.Const):
             if x.sort == L.UNIT:
                 return "()", 1000
-            return self.n(x.name), 1000
+            return self.const_name(x), 1000
         if isinstance(x, L.IntV):
             return (str(x.value), 1000) if x.value >= 0 else (f"({x.value})", 1000)
         if isinstance(x, L.RealV):
@@ -177,12 +198,20 @@ class LeanPrinter:
         if isinstance(x, L.StrV):
             return json.dumps(x.value), 100
         if isinstance(x, L.ArrayLambda):
-            binder = f"({self.n(x.binder.name)} : {lean_sort(x.binder.sort)})"
-            return f"(fun {binder} => {self.t(x.body)})", 100
+            name = self.bound_name(x.binder)
+            self.bound_consts.append({x.binder: name})
+            body = self.t(x.body)
+            self.bound_consts.pop()
+            binder = f"({name} : {lean_sort(x.binder.sort)})"
+            return f"(fun {binder} => {body})", 100
         if isinstance(x, L.Quant):
             q = "∀" if x.kind == "forall" else "∃"
-            vs = " ".join(f"({self.n(v.name)} : {lean_sort(v.sort)})" for v in x.vars)
-            return f"{q} {vs}, {self.t(x.body)}", 0
+            scope = {v: self.bound_name(v) for v in x.vars}
+            self.bound_consts.append(scope)
+            body = self.t(x.body)
+            self.bound_consts.pop()
+            vs = " ".join(f"({scope[v]} : {lean_sort(v.sort)})" for v in x.vars)
+            return f"{q} {vs}, {body}", 0
         if isinstance(x, L.Fn):
             name = self.n(x.name) if x.name in self.free_fns else self.fn_names.get(x.name, x.name)
             if not x.args:
