@@ -725,12 +725,13 @@ export default function App(){const [open,setOpen]=useState(false);return <butto
         ('<button>A &amp; B</button>', 'reachable button "A & B"', "proved"),
         ('<button>{open && <span>Hello</span>}Save</button>', 'reachable button "0Save"', "proved"),
         ('<button>{open && <span>Hello</span>}Save</button>', 'reachable button "Save"', "refuted"),
+        ('<button>{items && <span>Hello</span>}Save</button>', 'reachable button "HelloSave"', "proved"),
     ],
 )
 def test_source_ui_matches_accessible_names_and_react_rendering(tmp_path, app, property, status):
     _, _, why, got = _static_source_case(
         tmp_path,
-        'import { useState } from "react"; export default function App(){const [open]=useState(0);return ' + app + ';}',
+        'import { useState } from "react"; export default function App(){const [open]=useState(0);const items=[];return ' + app + ';}',
         property,
     )
     assert why is None and got.status == status and got.method == "source proof"
@@ -815,6 +816,24 @@ def test_source_ui_models_immutable_values_and_named_arrow_handlers(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
+def test_source_ui_models_static_tables_indexed_by_component_state(tmp_path):
+    model, identity, why, got = _static_source_case(
+        tmp_path,
+        'import {Wizard} from "./Wizard"; export default function App(){return <Wizard />} ',
+        'reachable heading "Complete"',
+        modules={"Wizard.tsx": '''import {useState} from "react";
+const steps = [{title:"Welcome"},{title:"Create and edit"},{title:"Complete"}];
+export function Wizard(){const [step,setStep]=useState(0);const current=steps[step];function next(){if(step<2)setStep(step+1);else setStep(0);}return <main><h1>{current.title}</h1><button onClick={next}>Next</button></main>}
+'''},
+    )
+    from telic.ui.spec import UiLemma
+    from telic.ui.static import check as check_source
+
+    source = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, 'reachable heading "Complete"', (), parse_prop('reachable heading "Complete"')[0]))
+    assert why is None and source.status == "proved", f"{why=}, {source.status=}, {source.detail=}"
+    assert got.status == "proved" and got.method == "source proof"
+
+
 def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
@@ -825,17 +844,26 @@ def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
-def test_source_ui_rejects_conditional_mount_of_stateful_children(tmp_path):
+def test_source_ui_resets_stateful_children_after_conditional_unmount(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
-        'import {useState} from "react"; import {Frame} from "./Frame"; import {Counter} from "./Counter"; export default function App(){const [show]=useState(true);return <Frame show={show}><Counter /></Frame>}',
-        'reachable button "Increment"',
+        'import {useState} from "react"; import {Panel} from "./Panel"; export default function App(){const [open,setOpen]=useState(false);return open?<Panel onClose={()=>setOpen(false)}/>:<button onClick={()=>setOpen(true)}>Open</button>}',
+        'always reachable button "Changed" from button "Close"',
         modules={
-            "Frame.tsx": 'export function Frame({show,children}:{show:boolean,children:React.ReactNode}){return show?<main>{children}</main>:null}\n',
-            "Counter.tsx": 'import {useState} from "react"; export function Counter(){const [n,setN]=useState(0);return <button onClick={()=>setN(n+1)}>Increment</button>}\n',
+            "Panel.tsx": 'import {useState} from "react"; export function Panel({onClose}:{onClose:()=>void}){const [changed,setChanged]=useState(false);return <div role="dialog" aria-label="Panel">{changed?<button onClick={onClose}>Close</button>:<button onClick={()=>setChanged(true)}>Changed</button>}</div>}\n',
         },
     )
-    assert why and "stateful children have a conditional mount" in why
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_keeps_ambiguous_conditional_component_identity_open(tmp_path):
+    model, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; import {Panel} from "./Panel"; export default function App(){const [first]=useState(true);return first?<Panel />:<Panel />}',
+        'reachable button "Ready"',
+        modules={"Panel.tsx": 'import {useState} from "react"; export function Panel(){const [ready]=useState(true);return ready?<button>Ready</button>:null;}\n'},
+    )
+    assert model is None and why and "React instance identity" in why
     assert got.status == "open" and got.method != "source proof"
 
 

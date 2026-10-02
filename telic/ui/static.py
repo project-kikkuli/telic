@@ -341,6 +341,8 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         for key in ("yes", "no"):
             if key in node:
                 decode_jsx(node[key])
+        if node.get("type") == "component":
+            decode_jsx(node["child"])
     decode_jsx(models[0]["render"])
     root_id, entry = models[0].get("mountRoot"), os.path.normpath(models[0].get("mountEntry", ""))
     entry_served = os.path.normpath(os.path.relpath(os.path.join(root, entry), top))
@@ -440,32 +442,7 @@ def _css_style(node: dict[str, Any], props: dict[str, Any], model: dict[str, Any
 
 def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple[int, str]]], list[Snapshot]]:
     declarations = model["states"]
-    domains = {d["name"]: {d["initial"]} for d in declarations}
-    for d in declarations:
-        if isinstance(d["initial"], bool):
-            domains[d["name"]].update((True, False))
-    def visit(stmt: Any) -> None:
-        if not isinstance(stmt, list):
-            return
-        if stmt and stmt[0] == "set":
-            name = stmt[1]
-            update = stmt[2]
-            def literals(node: Any) -> None:
-                if isinstance(node, list):
-                    if len(node) == 2 and node[0] == "lit":
-                        domains[name].add(node[1])
-                    else:
-                        for x in node[1:]: literals(x)
-            literals(update)
-        for x in stmt[1:]: visit(x)
-    def render_events(node: Any) -> None:
-        if not isinstance(node, dict): return
-        for _, handler in node.get("events", {}).items(): visit(handler)
-        for child in node.get("children", []): render_events(child)
-        if node.get("type") == "branch":
-            render_events(node.get("yes")); render_events(node.get("no"))
-    render_events(model["render"])
-    state_defs = {d["name"]: {**d, "domain": domains[d["name"]]} for d in declarations}
+    state_defs = {d["name"]: d for d in declarations}
     initial = {d["name"]: d["initial"] for d in declarations}
     for d in declarations:
         if not isinstance(d["initial"], (bool, int, str)) and d["initial"] is not None:
@@ -481,9 +458,13 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
         for action in _actions(model["render"], current, model):
             nxt = dict(current)
             _execute(action["handler"], current, nxt, state_defs)
+            before_mounts = _mounted_components(model["render"], current)
+            after_mounts = _mounted_components(model["render"], nxt)
+            for declaration in declarations:
+                owner = declaration.get("owner")
+                if owner and owner in before_mounts and owner not in after_mounts:
+                    nxt[declaration["name"]] = declaration["initial"]
             for name, value in nxt.items():
-                if not any(type(value) is type(candidate) and value == candidate for candidate in state_defs[name]["domain"]):
-                    raise ValueError(f"state `{name}` leaves its finite source-derived domain at {model['path']}:{action['line']}")
                 if isinstance(value, int) and not isinstance(value, bool) and not -(2**53 - 1) <= value <= 2**53 - 1:
                     raise ValueError(f"state `{name}` exceeds JavaScript's exact integer range at {model['path']}:{action['line']}")
             key = _key(nxt)
@@ -505,6 +486,16 @@ def _key(state: dict[str, Any]) -> tuple:
     return tuple((k, type(v).__name__, v) for k, v in sorted(state.items()))
 
 
+def _truthy(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return bool(value)
+    return True
+
+
 def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) -> Any:
     locals_ = locals_ or {}
     if not isinstance(e, list):
@@ -516,6 +507,31 @@ def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) 
         return state[e[1]]
     if op == "local":
         return locals_[e[1]]
+    if op == "member":
+        obj, key = _eval(e[1], state, locals_), _eval(e[2], state, locals_)
+        if isinstance(obj, list):
+            if key == "length": return len(obj)
+            if isinstance(key, int) and not isinstance(key, bool):
+                if 0 <= key < len(obj): return obj[key]
+                raise ValueError("JavaScript array access can be out of bounds")
+            if isinstance(key, str) and key.isdecimal():
+                index = int(key)
+                if 0 <= index < len(obj): return obj[index]
+                raise ValueError("JavaScript array access can be out of bounds")
+            raise ValueError("JavaScript array property is outside the finite UI model")
+        if isinstance(obj, str):
+            units = obj.encode("utf-16-le", "surrogatepass")
+            if key == "length": return len(units) // 2
+            if isinstance(key, int) and not isinstance(key, bool) and 0 <= key < len(units) // 2:
+                return units[key * 2:key * 2 + 2].decode("utf-16-le", "surrogatepass")
+            if isinstance(key, str) and key.isdecimal():
+                index = int(key)
+                if 0 <= index < len(units) // 2: return units[index * 2:index * 2 + 2].decode("utf-16-le", "surrogatepass")
+            raise ValueError("JavaScript string property is outside the finite UI model")
+        if isinstance(obj, dict):
+            if str(key) in obj: return obj[str(key)]
+            raise ValueError("JavaScript object property is not present in the static UI value")
+        raise ValueError("JavaScript property access is modeled only for static arrays, objects, and strings")
     if op == "un":
         v = _eval(e[2], state, locals_)
         if e[1] == "not": return not v
@@ -524,9 +540,11 @@ def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) 
             raise ValueError("JavaScript unary numeric coercion is outside the source UI model")
         return -v if e[1] == "neg" else v
     if op == "if":
-        return _eval(e[2] if _eval(e[1], state, locals_) else e[3], state, locals_)
+        return _eval(e[2] if _truthy(_eval(e[1], state, locals_)) else e[3], state, locals_)
     if op == "bin":
         a, b = _eval(e[2], state, locals_), _eval(e[3], state, locals_)
+        if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
+            raise ValueError("JavaScript object identity is outside the source UI expression model")
         same = type(a) is type(b) and a == b
         def number(v: Any) -> bool:
             return isinstance(v, int) and not isinstance(v, bool)
@@ -552,7 +570,7 @@ def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) 
             if number(a) and number(b) or type(a) is bool and type(b) is bool: return fn(a, b)
             raise ValueError("JavaScript relational coercion is outside the source UI model")
         return {
-            "eq": lambda: same, "ne": lambda: not same, "and": lambda: a and b, "or": lambda: a or b,
+            "eq": lambda: same, "ne": lambda: not same, "and": lambda: b if _truthy(a) else a, "or": lambda: a if _truthy(a) else b,
             "add": addition, "sub": lambda: arithmetic(lambda x, y: x - y), "mul": lambda: arithmetic(lambda x, y: x * y), "mod": remainder,
             "lt": lambda: relational(lambda x, y: x < y), "le": lambda: relational(lambda x, y: x <= y), "gt": lambda: relational(lambda x, y: x > y), "ge": lambda: relational(lambda x, y: x >= y),
         }[e[1]]()
@@ -574,7 +592,7 @@ def _execute(stmt: Any, captured: dict[str, Any], updated: dict[str, Any], defs:
     if op == "return":
         return True
     if op == "if":
-        branch = stmt[2] if _eval(stmt[1], captured) else stmt[3]
+        branch = stmt[2] if _truthy(_eval(stmt[1], captured)) else stmt[3]
         return _execute(branch, captured, updated, defs)
     if op == "set":
         name, update = stmt[1], stmt[2]
@@ -600,7 +618,10 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
             for c in n["children"]: visit(c, ancestors)
             return
         if kind == "branch":
-            visit(n["yes"] if _eval(n["test"], state) else n["no"], ancestors)
+            visit(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], ancestors)
+            return
+        if kind == "component":
+            visit(n["child"], ancestors, False, inherited_visibility)
             return
         if kind != "element":
             raise ValueError("render node is malformed")
@@ -621,6 +642,23 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
         for c in children: visit(c, next_ancestors, False, visibility)
     visit(tree, [])
     return out
+
+
+def _mounted_components(tree: dict[str, Any], state: dict[str, Any]) -> set[str]:
+    mounted: set[str] = set()
+    def visit(node: dict[str, Any]) -> None:
+        kind = node["type"]
+        if kind == "branch":
+            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
+        elif kind == "group":
+            for child in node["children"]: visit(child)
+        elif kind == "component":
+            mounted.add(node["id"])
+            visit(node["child"])
+        elif kind == "element":
+            for child in node["children"]: visit(child)
+    visit(tree)
+    return mounted
 
 
 def _display(value: Any) -> str:
@@ -667,12 +705,15 @@ def _role(tag: str, props: dict[str, Any]) -> str:
 def _tree_text(n: dict[str, Any], state: dict[str, Any], model: dict[str, Any], inherited_visibility: str = "visible", inherited_aria_hidden: bool = False) -> str:
     if n["type"] == "text":
         value = _eval(n["value"], state) if isinstance(n["value"], list) else n["value"]
+        if isinstance(value, (list, dict)):
+            raise ValueError("React object and array children need explicit child-node modeling")
         return "" if value is None or isinstance(value, bool) else str(value)
     if n["type"] == "empty": return ""
     if n["type"] == "jsxText": return html_lib.unescape(n["value"])
     if inherited_aria_hidden: return ""
+    if n["type"] == "component": return _tree_text(n["child"], state, model, inherited_visibility, inherited_aria_hidden)
     if n["type"] == "group": return "".join(_tree_text(c, state, model, inherited_visibility, inherited_aria_hidden) for c in n["children"])
-    if n["type"] == "branch": return _tree_text(n["yes"] if _eval(n["test"], state) else n["no"], state, model, inherited_visibility, inherited_aria_hidden)
+    if n["type"] == "branch": return _tree_text(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], state, model, inherited_visibility, inherited_aria_hidden)
     props = {k: _eval(v, state) for k, v in n.get("props", {}).items()}
     if _dom_hidden(props): return ""
     aria_hidden = props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
@@ -688,7 +729,8 @@ def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, An
         if kind == "empty": return []
         if kind == "text": return []
         if kind == "group": return [x for c in n["children"] for x in build(c, inherited_visibility, inherited_aria_hidden)]
-        if kind == "branch": return build(n["yes"] if _eval(n["test"], state) else n["no"], inherited_visibility, inherited_aria_hidden)
+        if kind == "branch": return build(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], inherited_visibility, inherited_aria_hidden)
+        if kind == "component": return build(n["child"], inherited_visibility, inherited_aria_hidden)
         props = {k: _eval(v, state) for k, v in n["props"].items()}
         if _dom_hidden(props): return []
         aria_hidden = inherited_aria_hidden or props.get("aria-hidden") is True or props.get("aria-hidden") == "true"

@@ -12,6 +12,7 @@ const strip = (e) => {
 };
 const modeledAria = new Set(["aria-label", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
 const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6"]);
+const invalidStatic = Symbol("invalid static value");
 const lineOf = (sf, n) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
 
 function literal(e, sf) {
@@ -29,6 +30,34 @@ function literal(e, sf) {
   return null;
 }
 
+function staticValue(e, sf) {
+  e = strip(e);
+  const lit = literal(e, sf);
+  if (lit) return lit[1];
+  if (ts.isArrayLiteralExpression(e)) {
+    const values = [];
+    for (const item of e.elements) {
+      if (!ts.isExpression(item) || ts.isSpreadElement(item)) return invalidStatic;
+      const value = staticValue(item, sf);
+      if (value === invalidStatic) return invalidStatic;
+      values.push(value);
+    }
+    return values;
+  }
+  if (ts.isObjectLiteralExpression(e)) {
+    const values = {};
+    for (const property of e.properties) {
+      if (!ts.isPropertyAssignment(property) || ts.isComputedPropertyName(property.name)) return invalidStatic;
+      const key = ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name) || ts.isNumericLiteral(property.name) ? property.name.text : null;
+      const value = staticValue(property.initializer, sf);
+      if (key === null || key === "__proto__" || value === invalidStatic) return invalidStatic;
+      values[key] = value;
+    }
+    return values;
+  }
+  return invalidStatic;
+}
+
 function expr(e, sf, states, locals = new Set(), substitutions = new Map(), statePrefix = "") {
   e = strip(e);
   const lit = literal(e, sf);
@@ -39,6 +68,8 @@ function expr(e, sf, states, locals = new Set(), substitutions = new Map(), stat
     if (substitutions.has(e.text)) return substitutions.get(e.text);
     fail(sf, e, `reads unmodeled value '${e.text}'`);
   }
+  if (ts.isPropertyAccessExpression(e)) return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix), ["lit", e.name.text]];
+  if (ts.isElementAccessExpression(e) && e.argumentExpression) return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix), expr(e.argumentExpression, sf, states, locals, substitutions, statePrefix)];
   if (ts.isPrefixUnaryExpression(e) && [ts.SyntaxKind.ExclamationToken, ts.SyntaxKind.MinusToken, ts.SyntaxKind.PlusToken].includes(e.operator)) {
     const op = e.operator === ts.SyntaxKind.ExclamationToken ? "not" : e.operator === ts.SyntaxKind.MinusToken ? "neg" : "pos";
     return ["un", op, expr(e.operand, sf, states, locals, substitutions, statePrefix)];
@@ -92,7 +123,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return found;
   };
   for (const s of sf.statements) {
-    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || isForwardingStateHook(sf, s)) continue;
+    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || isForwardingStateHook(sf, s) || isStaticDeclaration(sf, s)) continue;
     if (s === component) continue;
     if (ts.isVariableStatement(s) && s.declarationList.declarations.length === 1 && owns(s, component)) continue;
     fail(sf, s, "module-level executable code outside the mounted component is not modeled");
@@ -191,7 +222,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       const bindings = new Set([...states.keys(), ...setters.keys()]);
       if (bindings.has(value.name.text) || (set && (bindings.has(set.name.text) || value.name.text === set.name.text))) fail(sf, d, "state and setter bindings must be unique in the component");
       const stateName = `${statePrefix}${value.name.text}`;
-      states.set(value.name.text, { name: stateName, setter: set ? set.name.text : null, initial: initial[1], line: lineOf(sf, value) });
+      states.set(value.name.text, { name: stateName, setter: set ? set.name.text : null, initial: initial[1], line: lineOf(sf, value), owner: statePrefix || null });
       if (set) setters.set(set.name.text, stateName);
     }
   }
@@ -214,12 +245,19 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   };
   inspectHooks(component);
   const substitutions = new Map([...componentProps.values]);
+  for (const s of sf.statements) if (isStaticDeclaration(sf, s)) {
+    for (const d of s.declarationList.declarations) substitutions.set(d.name.text, ["lit", staticValue(d.initializer, sf)]);
+  }
   const enc = (e, locals) => expr(e, sf, stateNames, locals, substitutions, statePrefix);
   for (const s of body.statements) {
     if (!ts.isVariableStatement(s)) continue;
     for (const d of s.declarationList.declarations) {
       const init = d.initializer && strip(d.initializer);
       if (!init || modeledHooks.has(init) || ts.isArrowFunction(init) || ts.isFunctionExpression(init)) continue;
+      if (ts.isIdentifier(d.name) && (s.declarationList.flags & ts.NodeFlags.Const)) {
+        const staticValueResult = staticValue(init, sf);
+        if (staticValueResult !== invalidStatic) { substitutions.set(d.name.text, ["lit", staticValueResult]); continue; }
+      }
       const value = enc(init, new Set());
       if (ts.isIdentifier(d.name) && (s.declarationList.flags & ts.NodeFlags.Const)) substitutions.set(d.name.text, value);
     }
@@ -294,7 +332,6 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
     if (ts.isIdentifier(e) && e.text === "children" && componentProps.children) {
-      if (componentProps.children.stateful && conditionalMount) fail(sf, e, "stateful children have a conditional mount through a composed component");
       if (componentProps.children.stateful && ++renderedStatefulChildren > 1) fail(sf, e, "stateful children are rendered more than once by a composed component");
       return componentProps.children;
     }
@@ -326,10 +363,9 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     childTree.stateful = childStates.length > childStateStart;
     const instancePrefix = `${statePrefix}${target.path}@${componentInstance++}/`;
     const nested = scanComponent(target.path, target.text, target.sf, target.node, true, { values, handlers, children: childTree }, instancePrefix, conditionalMount);
-    if (nested.states.length && conditionalMount) fail(target.sf, target.node, `stateful child component '${open.tagName.text}' has a conditional mount`);
     if (nested.states.length && values.has("key")) fail(sf, whole, `stateful child component '${open.tagName.text}' uses a React key whose identity changes are outside the source UI model`);
     childStates.push(...nested.states);
-    return nested.render;
+    return { type: "component", id: instancePrefix, line: lineOf(sf, whole), componentPath: target.path, stateful: nested.states.length > 0, child: nested.render };
   }
 
   function element(open, children, whole, conditionalMount) {
@@ -389,6 +425,20 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     }
   }
   const renderTree = renderFlow(body.statements.filter((s) => !(ts.isVariableStatement(s) || ts.isFunctionDeclaration(s))), false, dynamicMount);
+  const statefulComponents = (node, into = new Set()) => {
+    if (!node || typeof node !== "object") return into;
+    if (node.type === "component" && node.stateful) into.add(node.componentPath);
+    if (node.type === "branch") {
+      const yes = statefulComponents(node.yes);
+      const no = statefulComponents(node.no);
+      if ([...yes].some((name) => no.has(name))) fail(sf, component, "conditional branches reuse a stateful component type whose React instance identity is outside the source model");
+      for (const name of yes) into.add(name);
+      for (const name of no) into.add(name);
+    } else if (node.type === "component") statefulComponents(node.child, into);
+    else if (node.children) for (const child of node.children) statefulComponents(child, into);
+    return into;
+  };
+  statefulComponents(renderTree);
   return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values(), ...childStates], render: renderTree };
 }
 
@@ -408,6 +458,12 @@ function componentCandidates(path, text) {
   };
   find(sf);
   return out;
+}
+
+function isStaticDeclaration(sf, statement) {
+  return ts.isVariableStatement(statement) && (statement.declarationList.flags & ts.NodeFlags.Const)
+    && statement.declarationList.declarations.length > 0
+    && statement.declarationList.declarations.every((d) => ts.isIdentifier(d.name) && d.initializer && staticValue(d.initializer, sf) !== invalidStatic);
 }
 
 function findForwardingStateHook(sf, name, requireExport) {
@@ -489,7 +545,7 @@ function safeComponentModule(path, seen = new Set()) {
     }
     if (ts.isFunctionDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || ts.isExportDeclaration(s)) continue;
     if (ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)) continue;
-    if (ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (literal(d.initializer, sf) || ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
+    if (isStaticDeclaration(sf, s) || ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
     return false;
   }
   return true;
