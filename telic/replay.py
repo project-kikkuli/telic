@@ -13,6 +13,7 @@ the actual runtime (CPython, Node) with contracts enforced, and reported as
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -94,6 +95,10 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(ty, ir.TEnum) and isinstance(v, int) and not isinstance(v, bool):
         return {"__enum__": ty.name, "member": ty.members[v] if 0 <= v < len(ty.members) else ty.members[0]}
     if isinstance(ty, ir.TReal):
+        if isinstance(v, float) and not math.isfinite(v):
+            return {"__float__": "NaN" if math.isnan(v) else "-Infinity" if v < 0 else "Infinity"}
+        if isinstance(v, float):
+            v = Fraction(v)
         if isinstance(v, Fraction):
             return {"__real__": [v.numerator, v.denominator]}
         return {"__real__": [int(v or 0), 1]}
@@ -138,6 +143,8 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return format_value(Fraction(n, d), ir.REAL, lang)
+    if isinstance(v, dict) and "__float__" in v:
+        return {"NaN": "nan", "Infinity": "inf", "-Infinity": "-inf"}[v["__float__"]]
     if isinstance(ty, ir.TRecord) and isinstance(v, dict) and "__record__" not in v:
         v = {"__record__": ty.name, "fields": v}
     if isinstance(v, dict) and "__record__" in v and lang == "rust" and isinstance(ty, ir.TRecord):

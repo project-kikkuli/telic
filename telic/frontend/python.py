@@ -35,7 +35,7 @@ from .python_rewrites import rewrites
 from ..lifecycle import build as build_lifecycle
 
 PY_ASSUMPTIONS = [
-    "float is modelled as exact rational arithmetic (rounding error ignored)",
+    "a float argument annotated float is a binary64 value",
     "distinct list arguments do not alias each other",
     "print() and logging calls have no effect on program state",
 ]
@@ -1431,6 +1431,7 @@ class FunctionLowerer:
                 val = self.expr(value)
                 yield ir.ExprStmt(loc, ir.Extern(ir.NONE, loc, f"setattr .{target.attr}", (obj, val)))
                 return
+
             if isinstance(obj.ty, ir.TRecord):
                 raise LowerError(f"{obj.ty.name} is frozen; build a new one with dataclasses.replace or the constructor", s)
             if not isinstance(obj.ty, ir.TClass):
@@ -1559,6 +1560,7 @@ class FunctionLowerer:
                 yield from self._assign(tgt, load, s, loc) if not isinstance(tgt, ast.Name) else self._assign_tmp(tgt.id, t, s, loc)
             return
         raise LowerError(f"unsupported assignment target: {ast.unparse(target)}", s)
+
 
     def moved(self, val: ir.Expr, node: ast.AST) -> bool:
         """Is ``val`` a local list/dict variable that is never used after
@@ -1735,7 +1737,7 @@ def fresh_list(e: ir.Expr) -> bool:
     may not return their list parameters)."""
     if isinstance(e, (ir.ListLit, ir.Call)):
         return True
-    if isinstance(e, ir.Builtin) and e.name in ("slice", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat", "list_repeat", "range_list"):
+    if isinstance(e, ir.Builtin) and e.name in ("slice", "list_copy", "py_mixed_list", "dict_lit", "dict_copy", "comp", "from_opaque", "dict_keys", "dict_values", "list_append", "list_concat", "list_repeat", "range_list"):
         return True
     if isinstance(e, ir.Builtin) and e.name == "await":
         return fresh_list(e.args[0])
@@ -2149,6 +2151,8 @@ class ExprLowerer:
                 if isinstance(expect, ir.TList):
                     return ir.ListLit(expect, loc, ())
                 return ir.ListLit(ir.TList(ir.NONE), loc, ())
+            if any(isinstance(e.ty, ir.TReal) for e in elems) and any(isinstance(e.ty, ir.TInt) for e in elems):
+                return ir.Builtin(ir.TList(ir.REAL), loc, "py_mixed_list", tuple(elems))
             t = elems[0].ty
             if any(isinstance(e.ty, ir.TReal) for e in elems) and all(ir.is_numeric(e.ty) for e in elems):
                 t = ir.REAL
@@ -2267,7 +2271,7 @@ class ExprLowerer:
             return ir.Binary(t, loc, name, a, b)
         if isinstance(op, ast.Div):
             a, b, _ = self.numeric_pair(a, b, n)
-            return ir.Binary(ir.REAL, loc, "rdiv", self.fl.coerce(a, ir.REAL), self.fl.coerce(b, ir.REAL))
+            return ir.Binary(ir.REAL, loc, "py_rdiv", self.fl.coerce(a, ir.REAL), self.fl.coerce(b, ir.REAL))
         if isinstance(op, ast.FloorDiv):
             a, b, t = self.numeric_pair(a, b, n)
             if t == ir.INT:
@@ -2543,7 +2547,7 @@ class ExprLowerer:
             if not isinstance(x.ty, ir.TList):
                 raise self.err("len() is supported on lists", n)
             return ir.Builtin(ir.INT, loc, "len", (x,))
-        if name in ("abs", "round", "min", "max", "sum") and any(isinstance(self.expr(a).ty, ir.TOpaque) for a in n.args if not isinstance(a, (ast.GeneratorExp, ast.ListComp))):
+        if name in ("abs", "round", "min", "max", "sum") and any(isinstance(self.expr(a).ty, ir.TOpaque) for a in n.args if not isinstance(a, (ast.GeneratorExp, ast.ListComp)) and not (name == "sum" and isinstance(a, ast.List))):
             return self.opaque(name, [self.expr(a) for a in n.args], ir.TOpaque(""), loc)
         if name == "abs":
             (x,) = self._args(n, 1)
@@ -2562,7 +2566,10 @@ class ExprLowerer:
             (x,) = self._args(n, 1)
             if not (isinstance(x.ty, ir.TList) and ir.is_numeric(x.ty.elem)):
                 raise self.err("sum() needs a list of numbers", n)
-            return ir.sum_of(x, loc)
+            total = ir.sum_of(x, loc)
+            if isinstance(x.ty.elem, ir.TReal) and sys.implementation.name == "cpython":
+                return ir.Builtin(total.ty, loc, f"py_sum_cpython_{sys.version_info.major}_{sys.version_info.minor}", total.args)
+            return total
         if name == "float":
             (x,) = self._args(n, 1)
             if x.ty == ir.STR:
@@ -2953,7 +2960,7 @@ class ExprLowerer:
         assert isinstance(obj.ty, ir.TList)
         res = {"pop": obj.ty.elem, "index": ir.INT, "copy": obj.ty}.get(attr, ir.NONE)
         if attr == "copy" and not n.args:
-            return ir.Builtin(obj.ty, loc, "slice", (obj, ir.Lit(ir.NONE, loc, None), ir.Lit(ir.NONE, loc, None)))
+            return ir.Builtin(obj.ty, loc, "list_copy", (obj,))
         if not isinstance(obj, ir.Var) and attr not in ("index",):
             raise self.err(f"'.{attr}()' on a list that is not a variable is not tracked", n)
         return self.extern(f"list.{attr}", [obj], n, loc, res if res != ir.NONE else ir.TOpaque(""))

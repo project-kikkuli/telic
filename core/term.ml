@@ -6,6 +6,8 @@
 type sort =
   | Int
   | Real
+  | Float32
+  | Float64  (** IEEE binary64 *)
   | Bool
   | Str
   | Opaque
@@ -16,6 +18,8 @@ type sort =
 let rec sort_name = function
   | Int -> "Int"
   | Real -> "Real"
+  | Float32 -> "Float32"
+  | Float64 -> "Float64"
   | Bool -> "Bool"
   | Str -> "Str"
   | Opaque -> "Opaque"
@@ -83,7 +87,7 @@ type term = { id : int; node : node; sort : sort }
 and node =
   | Const of string
   | Num of Q.t  (** Int or Real literal (by sort) *)
-  | Big of string  (** a literal too large to fold: kept as text *)
+  | Big of string  (** a literal too large to fold: kept as text; at Float64, its bits in hex *)
   | BoolV of bool
   | StrV of string
   | App of string * term array
@@ -166,9 +170,66 @@ let fn name args sort = mk (Fn (name, args)) sort
 
 let is_bool_lit t = match t.node with BoolV _ -> true | _ -> false
 
+(* -- floating point (mirror telic/logic.py) ----------------------------- *)
+(* A Float64 literal is [Big] of its bits in hex. Arithmetic and comparisons
+   are IEEE's; constants fold with OCaml's floats, the same binary64
+   operations. *)
+
+let fround sort x = if sort = Float32 then Int32.float_of_bits (Int32.bits_of_float x) else x
+let fval_for sort x =
+  if sort = Float32 then mk (Big (Printf.sprintf "%08lx" (Int32.bits_of_float (fround sort x)))) Float32
+  else mk (Big (Printf.sprintf "%016Lx" (Int64.bits_of_float x))) Float64
+let fval x = fval_for Float64 x
+let fconst t = match t.node with
+  | Big s when t.sort = Float32 && not (String.length s >= 2 && (String.sub s 0 2 = "n:" || String.sub s 0 2 = "r:")) -> Some (Int32.float_of_bits (Int32.of_string ("0x" ^ s)))
+  | Big s when t.sort = Float64 && not (String.length s >= 2 && (String.sub s 0 2 = "n:" || String.sub s 0 2 = "r:")) -> Some (Int64.float_of_bits (Int64.of_string ("0x" ^ s)))
+  | _ -> None
+
+let fbin op a b =
+  match (fconst a, fconst b) with
+  | Some x, Some y when op = "fp.add" -> fval_for a.sort (x +. y)
+  | Some x, Some y when op = "fp.sub" -> fval_for a.sort (x -. y)
+  | Some x, Some y when op = "fp.mul" -> fval_for a.sort (x *. y)
+  | Some x, Some y when op = "fp.div" && y <> 0.0 && a.sort <> Float32 -> fval_for a.sort (x /. y)
+  | _ -> app op [| a; b |] a.sort
+
+let fneg a = match (fconst a, a.node) with Some x, _ -> fval_for a.sort (-.x) | _, App ("fp.neg", [| x |]) -> x | _ -> app "fp.neg" [| a |] a.sort
+let fabs a = match fconst a with Some x -> fval_for a.sort (Float.abs x) | None -> app "fp.abs" [| a |] a.sort
+
+(* of an integer rounded to a double these are integer facts: only 0 rounds
+   to zero, and only a magnitude past the largest float to infinity *)
+let fpred_hook : (string -> term -> term) ref = ref (fun op a -> app op [| a |] Bool)
+
+let fpred op a =
+  match fconst a with
+  | Some x when op = "fp.isNegative" -> bool_ (Float.sign_bit x && not (Float.is_nan x))
+  | Some x -> bool_ (if op = "fp.isNaN" then Float.is_nan x else if op = "fp.isInfinite" then Float.abs x = Float.infinity else x = 0.0)
+  | None -> !fpred_hook op a
+
+let fpred_neg a = fpred "fp.isNegative" a
+
+(* decimal strings, for the exact value of a double *)
+let dec_double s =
+  let n = String.length s in
+  let b = Bytes.create (n + 1) in
+  let carry = ref 0 in
+  for i = n - 1 downto 0 do
+    let v = ((Char.code s.[i] - 48) * 2) + !carry in
+    Bytes.set b (i + 1) (Char.chr (48 + (v mod 10)));
+    carry := v / 10
+  done;
+  Bytes.set b 0 (Char.chr (48 + !carry));
+  let r = Bytes.to_string b in
+  if r.[0] = '0' && String.length r > 1 then String.sub r 1 (String.length r - 1) else r
+
+let rec pow2_times s k = if k = 0 then s else pow2_times (dec_double s) (k - 1)
+
+let fcmp_ref : (string -> term -> term -> term) ref = ref (fun _ _ _ -> assert false)
+
 (* -- smart constructors (mirror telic/logic.py) ------------------------- *)
 
 let rec add a b =
+  if a.sort = Float64 || a.sort = Float32 then fbin "fp.add" a b else
   match (num a, num b) with
   | Some x, Some y -> lit_or_app "add" a.sort (Q.add x y) [| a; b |]
   | Some x, _ when x.n = 0 -> b
@@ -181,6 +242,7 @@ let rec add a b =
   | _ -> app "add" [| a; b |] a.sort
 
 and sub a b =
+  if a.sort = Float64 || a.sort = Float32 then fbin "fp.sub" a b else
   match (num a, num b) with
   | Some x, Some y -> lit_or_app "sub" a.sort (Q.sub x y) [| a; b |]
   | _, Some y when y.n = 0 -> a
@@ -195,6 +257,7 @@ and sub a b =
   | _ -> app "sub" [| a; b |] a.sort
 
 let mul a b =
+  if a.sort = Float64 || a.sort = Float32 then fbin "fp.mul" a b else
   match (num a, num b) with
   | Some x, Some y -> lit_or_app "mul" a.sort (Q.mul x y) [| a; b |]
   | Some x, _ when x.n = 0 -> lit_q (Q.of_int 0) a.sort
@@ -204,12 +267,14 @@ let mul a b =
   | _ -> app "mul" [| a; b |] a.sort
 
 let neg a =
+  if a.sort = Float64 || a.sort = Float32 then fneg a else
   match (num a, a.node) with
   | Some x, _ -> lit_or_app "neg" a.sort (Q.neg x) [| a |]
   | _, App ("neg", [| x |]) -> x
   | _ -> app "neg" [| a |] a.sort
 
 let rdiv a b =
+  if a.sort = Float64 || a.sort = Float32 then fbin "fp.div" a b else
   match (num a, num b) with
   | Some x, Some y when y.n <> 0 -> (match Q.div x y with Some q -> real q | None -> app "rdiv" [| a; b |] Real)
   | _, Some y when y.n = 1 && y.d = 1 -> a
@@ -247,12 +312,14 @@ let is_int a =
   | _ -> app "is_int" [| a |] Bool
 
 let lt a b =
+  if List.mem a.sort [ Float32; Float64 ] || List.mem b.sort [ Float32; Float64 ] then !fcmp_ref "fp.lt" a b else
   match (num a, num b) with
   | Some x, Some y -> bool_ (Q.compare x y < 0)
   | _ when a == b -> ff
   | _ -> app "lt" [| a; b |] Bool
 
 let le a b =
+  if List.mem a.sort [ Float32; Float64 ] || List.mem b.sort [ Float32; Float64 ] then !fcmp_ref "fp.leq" a b else
   match (num a, num b) with
   | Some x, Some y -> bool_ (Q.compare x y <= 0)
   | _ when a == b -> tt
@@ -266,7 +333,8 @@ let not_ a = match a.node with BoolV b -> bool_ (not b) | App ("not", [| x |]) -
 let is_value t = match t.node with Num _ | BoolV _ | StrV _ -> true | _ -> false
 
 let eq a b =
-  if a == b then tt
+  if List.mem a.sort [ Float32; Float64 ] || List.mem b.sort [ Float32; Float64 ] then !fcmp_ref "fp.eq" a b
+  else if a == b then tt
   else if is_value a && is_value b then ff (* distinct hash-consed values *)
   else if a.sort = Bool then
     if b == tt then a else if b == ff then not_ a else if a == tt then b else if a == ff then not_ b else app "eq" [| a; b |] Bool
@@ -353,7 +421,91 @@ let exists vs body =
   let vs = List.filter (fun v -> occurs v body) vs in
   if vs = [] || is_bool_lit body then body else quant "exists" vs body []
 
-let abs_ a = ite (le (lit_q (Q.of_int 0) a.sort) a) a (neg a)
+let abs_ a = if List.mem a.sort [ Float32; Float64 ] then fabs a else ite (le (lit_q (Q.of_int 0) a.sort) a) a (neg a)
+
+(* the exact value of a finite float (unspecified for NaN and infinities) *)
+let fto_real a =
+  match fconst a with
+  | Some x when x = 0.0 -> real (Q.of_int 0)
+  | Some x when Float.is_finite x ->
+    let fr, e = Float.frexp (Float.abs x) in
+    let m = ref (Int64.of_float (Float.ldexp fr 53)) and e = ref (e - 53) in
+    while !m <> 0L && Int64.rem !m 2L = 0L && !e < 0 do
+      m := Int64.div !m 2L;
+      incr e
+    done;
+    let ms = Int64.to_string !m in
+    let n, d = if !e >= 0 then (pow2_times ms !e, "1") else (ms, pow2_times "1" (- !e)) in
+    let n = if Float.sign_bit x && !m <> 0L then "-" ^ n else n in
+    (match (int_of_string_opt n, int_of_string_opt d) with
+     | Some n, Some d when abs n < 1 lsl 61 && d < 1 lsl 61 -> real (Q.make n d)
+     | _ -> mk (Big (n ^ "/" ^ d)) Real)
+  | _ -> app "fp.to_real" [| a |] Real
+
+let fnear_int (s : string) = fval (float_of_string s)
+
+(* an Int or Real term at sort Float64, rounded to nearest *)
+let as_float a =
+  if a.sort = Float64 then a
+  else
+    match (a.node, a.sort) with
+    | Num _, Int -> app "fp.of_int" [| a |] Float64
+    | Num q, Real -> app "fp.of_real" [| real q |] Float64
+    | Big _, Int -> app "fp.of_int" [| a |] Float64
+    | _, Int -> app "fp.of_int" [| a |] Float64
+    | _ -> app "fp.of_real" [| a |] Float64
+
+(* a float against an exact number: NaN is unordered, the infinities lie
+   beyond every number, a finite float compares by its exact value *)
+let xcmp op a b =
+  let flip = not (List.mem a.sort [ Float32; Float64 ]) in
+  let f, x = if flip then (b, a) else (a, b) in
+  let xr = if x.sort = Real then x else to_real x in
+  let fr = fto_real f in
+  let nan = fpred "fp.isNaN" f and inf = fpred "fp.isInfinite" f in
+  let pos = not_ (fpred_neg f) in
+  if op = "fp.eq" then and_ [ not_ nan; not_ inf; eq fr xr ]
+  else
+    let exact = if flip then (if op = "fp.lt" then lt xr fr else le xr fr) else if op = "fp.lt" then lt fr xr else le fr xr in
+    let beyond = if flip then pos else not_ pos in
+    and_ [ not_ nan; ite inf beyond exact ]
+
+let is_float = function Float32 | Float64 -> true | _ -> false
+
+let as_float_to target a =
+  if a.sort = target then a
+  else match a.node, a.sort with
+  | Num _, Int -> app "fp.of_int" [| a |] target
+  | Num q, Real -> app "fp.of_real" [| real q |] target
+  | Big _, Int -> app "fp.of_int" [| a |] target
+  | _ when is_float a.sort -> app "fp.cast" [| a |] target
+  | _, Int -> app "fp.of_int" [| a |] target
+  | _ -> app "fp.of_real" [| a |] target
+
+let fcmp op a b =
+  if is_float a.sort && is_float b.sort then
+    (match (fconst a, fconst b) with
+    | Some x, Some y -> bool_ (if op = "fp.lt" then x < y else if op = "fp.leq" then x <= y else x = y)
+    | _ -> app op [| a; b |] Bool)
+  else if not (is_float a.sort || is_float b.sort) then app op [| a; b |] Bool
+  else xcmp op a b
+
+let () = fcmp_ref := fcmp
+
+let () =
+  fpred_hook :=
+    fun op a ->
+      match a.node with
+      | App ("ite", [| c; x; y |]) -> ite c (fpred op x) (fpred op y)
+      | App ("fp.of_int", [| i |]) -> (
+        match op with
+        | "fp.isNaN" -> ff
+        | "fp.isZero" -> eq i zero
+        | "fp.isNegative" -> lt i zero
+        | _ -> le (mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") Int) (abs_ i))
+      | _ -> app op [| a |] Bool
+let feq a b = fcmp "fp.eq" a b
+let is_finite a = and_ [ not_ (fpred "fp.isNaN" a); not_ (fpred "fp.isInfinite" a) ]
 let min_ a b = ite (le a b) a b
 let max_ a b = ite (le a b) b a
 
@@ -362,6 +514,17 @@ let lit_of_int n sort = lit_q (Q.of_int n) sort
 (* -- traversal ---------------------------------------------------------- *)
 
 let children t = match t.node with App (_, xs) | Fn (_, xs) -> Array.to_list xs | Quant (_, _, b, _) -> [ b ] | _ -> []
+
+(* does any subterm have sort [s]? *)
+let mentions_sort s (t : term) =
+  let seen = Hashtbl.create 64 in
+  let rec go t =
+    t.sort = s
+    || (not (Hashtbl.mem seen t.id))
+       && (Hashtbl.add seen t.id ();
+           List.exists go (children t))
+  in
+  go t
 
 (* free constants, respecting binders *)
 let consts (t : term) : term list =

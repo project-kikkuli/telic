@@ -3,7 +3,7 @@
 
 open Term
 
-type fundef = { fname : string; params : term list; fsort : sort; body : term option }
+type fundef = { fname : string; params : term list; fsort : sort; body : term option; expands : bool  (** a non-recursive definition over floats, expanded where it is used *) }
 type axiom = { aname : string; formula : term; about : string; symbol : string }
 type theory = { fundefs : (string, fundef) Hashtbl.t; axioms : axiom list }
 
@@ -49,8 +49,11 @@ let q_fn n = quote ("f!" ^ n)
    Functions the theory defines keep their names. *)
 let defined_fns : (string, unit) Hashtbl.t = Hashtbl.create 64
 
+(* definitions printed as a [let] where they are applied (see [fundef.expands]) *)
+let expanded : (string, term list * term) Hashtbl.t = Hashtbl.create 16
+
 let rec sort_tag = function
-  | Int -> "I" | Real -> "R" | Bool -> "B" | Str -> "S" | Opaque -> "O" | Unit -> "U"
+  | Int -> "I" | Real -> "R" | Float32 -> "F32" | Float64 -> "F64" | Bool -> "B" | Str -> "S" | Opaque -> "O" | Unit -> "U"
   | Array (i, e) -> "A" ^ sort_tag i ^ sort_tag e
   | Rec (n, _) -> "{" ^ n ^ "}"
 
@@ -64,6 +67,8 @@ let q_field r f = quote ("fld!" ^ r ^ "." ^ f)
 let rec sort_smt = function
   | Int | Unit -> "Int"
   | Real -> "Real"
+  | Float32 -> "(_ FloatingPoint 8 24)"
+  | Float64 -> "(_ FloatingPoint 11 53)"
   | Bool -> "Bool"
   | Str -> "String"
   | Opaque -> "Opaque"
@@ -118,6 +123,25 @@ let num_smt sort (q : Q.t) =
   let body n = if q.d = 1 then pos n else Printf.sprintf "(/ %d.0 %d.0)" n q.d in
   if q.n < 0 then Printf.sprintf "(- %s)" (body (-q.n)) else body q.n
 
+let fp_literal sort payload =
+  let eb, sb = if sort = Float32 then (8, 24) else (11, 53) in
+  let fp = Printf.sprintf "((_ to_fp %d %d) RNE " eb sb in
+  if not (String.length payload >= 2 && (String.sub payload 0 2 = "n:" || String.sub payload 0 2 = "r:")) then
+    Printf.sprintf "((_ to_fp %d %d) #x%s)" eb sb payload
+  else
+  let exact =
+    if String.length payload >= 2 && String.sub payload 0 2 = "n:" then
+      let n = String.sub payload 2 (String.length payload - 2) in
+      if String.length n > 0 && n.[0] = '-' then Printf.sprintf "(- %s.0)" (String.sub n 1 (String.length n - 1)) else n ^ ".0"
+    else if String.length payload >= 2 && String.sub payload 0 2 = "r:" then
+      let q = String.sub payload 2 (String.length payload - 2) in
+      match String.index_opt q '/' with
+      | Some k -> Printf.sprintf "(/ %s %s)" (let n = String.sub q 0 k in if String.length n > 0 && n.[0] = '-' then Printf.sprintf "(- %s.0)" (String.sub n 1 (String.length n - 1)) else n ^ ".0") (String.sub q (k + 1) (String.length q - k - 1) ^ ".0")
+      | None -> q ^ ".0"
+    else assert false
+  in
+  fp ^ exact ^ ")"
+
 type printer = { buf : Buffer.t; names : (int, string) Hashtbl.t  (** shared subterms defined up front *) }
 
 let op_smt op =
@@ -140,6 +164,7 @@ and pr_node p t =
   match t.node with
   | Const n -> Buffer.add_string b (q_const n)
   | Num q -> Buffer.add_string b (num_smt t.sort q)
+  | Big s when t.sort = Float32 || t.sort = Float64 -> Buffer.add_string b (fp_literal t.sort s)
   | Big s -> (
     match String.index_opt s '/' with
     | Some k -> Buffer.add_string b (Printf.sprintf "(/ %s.0 %s.0)" (String.sub s 0 k) (String.sub s (k + 1) (String.length s - k - 1)))
@@ -150,6 +175,11 @@ and pr_node p t =
   | App ("str.from_int", [| a |]) ->
     Buffer.add_string b "(ite (>= "; pr p a; Buffer.add_string b " 0) (str.from_int "; pr p a; Buffer.add_string b ") (str.++ \"-\" (str.from_int (- "; pr p a; Buffer.add_string b "))))"
   | App ("str.in_re", [| s; { node = StrV re; _ } |]) -> Buffer.add_string b "(str.in_re "; pr p s; Buffer.add_char b ' '; Buffer.add_string b re; Buffer.add_char b ')'
+  | App (("fp.add" | "fp.sub" | "fp.mul" | "fp.div") as op, xs) -> Buffer.add_string b ("(" ^ op ^ " RNE"); args xs; Buffer.add_char b ')'
+  | App ("fp.of_real", [| x |]) -> Buffer.add_string b (if t.sort = Float32 then "((_ to_fp 8 24) RNE " else "((_ to_fp 11 53) RNE "); pr p x; Buffer.add_char b ')'
+  | App ("fp.cast", [| x |]) -> Buffer.add_string b (if t.sort = Float32 then "((_ to_fp 8 24) RNE " else "((_ to_fp 11 53) RNE "); pr p x; Buffer.add_char b ')'
+  | App ("fp.of_int", [| i |]) ->
+    Buffer.add_string b (if t.sort = Float32 then "((_ to_fp 8 24) RNE (to_real " else "((_ to_fp 11 53) RNE (to_real "); pr p i; Buffer.add_string b "))"
   | App ("str.at", [| s; i |]) -> Buffer.add_string b "(str.substr "; pr p s; Buffer.add_char b ' '; pr p i; Buffer.add_string b " 1)"
   | App (op, xs) when String.length op > 6 && String.sub op 0 6 = "field:" -> (
     match xs.(0).sort with
@@ -159,6 +189,16 @@ and pr_node p t =
     let rn = String.sub op 3 (String.length op - 3) in
     if Array.length xs = 0 then Buffer.add_string b (q_mk rn) else (Buffer.add_string b ("(" ^ q_mk rn); args xs; Buffer.add_char b ')')
   | App (op, xs) -> Buffer.add_string b ("(" ^ op_smt op); args xs; Buffer.add_char b ')'
+  | Fn (n, xs) when Hashtbl.mem expanded n ->
+    let params, body = Hashtbl.find expanded n in
+    if xs = [||] then pr { p with names = Hashtbl.create 1 } body
+    else begin
+      Buffer.add_string b "(let (";
+      List.iteri (fun i v -> match v.node with Const c -> Buffer.add_string b (Printf.sprintf "(%s " (q_const c)); pr p xs.(i); Buffer.add_char b ')' | _ -> ()) params;
+      Buffer.add_string b ") ";
+      pr { p with names = Hashtbl.create 1 } body;
+      Buffer.add_char b ')'
+    end
   | Fn (n, xs) ->
     let sym = fn_symbol n xs t.sort in
     if Array.length xs = 0 then Buffer.add_string b sym else (Buffer.add_string b ("(" ^ sym); args xs; Buffer.add_char b ')')
@@ -204,7 +244,9 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
       see_sort t.sort;
       match t.node with
       | Const _ -> if not (Hashtbl.mem bound t.id) then consts := t :: !consts
-      | App (_, xs) -> Array.iter visit xs
+      | App (op, xs) ->
+        if op = "fp.of_int" && not (Hashtbl.mem ufs (q_fn "f64.of_big_int")) then Hashtbl.add ufs (q_fn "f64.of_big_int") ([ Int ], Float64);
+        Array.iter visit xs
       | Fn (n, xs) ->
         Array.iter visit xs;
         let sym = fn_symbol n xs t.sort in
@@ -239,6 +281,9 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
   List.iter (fun c -> match c.node with Const n -> add (Printf.sprintf "(declare-const %s %s)" (q_const n) (sort_smt c.sort)) | _ -> ()) (List.rev !consts);
   Hashtbl.fold (fun sym sg acc -> (sym, sg) :: acc) ufs [] |> List.sort compare |> List.iter (fun (sym, (args, r)) -> add (Printf.sprintf "(declare-fun %s (%s) %s)" sym (String.concat " " (List.map sort_smt args)) (sort_smt r)));
   let p = { buf = b; names = Hashtbl.create 64 } in
+  Hashtbl.reset expanded;
+  List.iter (fun d -> match d.body with Some body when d.expands -> Hashtbl.replace expanded d.fname (d.params, body) | _ -> ()) defs;
+  let defs = List.filter (fun d -> not d.expands) defs in
   if defs <> [] then begin
     Buffer.add_string b "(define-funs-rec (";
     List.iter
@@ -358,6 +403,7 @@ let rec value_json (sort : sort) (v : sx) : Json.t =
   match sort with
   | Int | Unit -> ( match num_q v with Some q -> Json.Int q.n | None -> Json.Null)
   | Real -> ( match num_q v with Some q -> Json.Assoc [ ("__real__", Json.List [ Json.Int q.n; Json.Int q.d ]) ] | None -> Json.Null)
+  | Float32 | Float64 -> Json.Null  (* float obligations stay with the Python core *)
   | Bool -> ( match v with Atom "true" -> Json.Bool true | Atom "false" -> Json.Bool false | _ -> Json.Null)
   | Str -> ( match v with Str s -> Json.String s | _ -> Json.Null)
   | Opaque -> Json.Assoc [ ("__opaque__", Json.Bool true) ]

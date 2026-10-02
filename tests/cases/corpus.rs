@@ -5,6 +5,13 @@
 use std::collections::HashMap;
 
 // expect: proved
+pub fn nonnegative_f32_cast(x: i32) -> f32 {
+    //@ requires x >= 0
+    //@ ensures result >= 0.0
+    x as f32
+}
+
+// expect: proved
 pub fn add_small(a: u32, b: u32) -> u32 {
     //@ requires a <= 1000 && b <= 1000
     //@ ensures result == a + b

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -88,6 +89,10 @@ class Z3Encoder:
             return z3.IntSort(c)
         if s == L.REAL:
             return z3.RealSort(c)
+        if s == L.FLOAT32:
+            return z3.FPSort(8, 24, c)
+        if s == L.FLOAT64:
+            return z3.FPSort(11, 53, c)
         if s == L.BOOL:
             return z3.BoolSort(c)
         if s == L.STR:
@@ -148,6 +153,10 @@ class Z3Encoder:
             return z3.IntVal(t.value, c)
         if isinstance(t, L.RealV):
             return z3.RealVal(f"{t.value.numerator}/{t.value.denominator}", c)
+        if isinstance(t, L.FloatV):
+            width = 32 if t.sort == L.FLOAT32 else 64
+            ebits, sbits = (8, 24) if width == 32 else (11, 53)
+            return z3.fpBVToFP(z3.BitVecVal(t.bits, width, c), z3.FPSort(ebits, sbits, c), ctx=c)
         if isinstance(t, L.BoolV):
             return z3.BoolVal(t.value, c)
         if isinstance(t, L.StrV):
@@ -173,6 +182,38 @@ class Z3Encoder:
         assert isinstance(t, L.App)
         a = [self.term(x) for x in t.args]
         op = t.op
+        if op == "fp.add":
+            return z3.fpAdd(z3.RNE(c), a[0], a[1], ctx=c)
+        if op == "fp.sub":
+            return z3.fpSub(z3.RNE(c), a[0], a[1], ctx=c)
+        if op == "fp.mul":
+            return z3.fpMul(z3.RNE(c), a[0], a[1], ctx=c)
+        if op == "fp.div":
+            return z3.fpDiv(z3.RNE(c), a[0], a[1], ctx=c)
+        if op == "fp.neg":
+            return z3.fpNeg(a[0], ctx=c)
+        if op == "fp.abs":
+            return z3.fpAbs(a[0], ctx=c)
+        if op == "fp.lt":
+            return z3.fpLT(a[0], a[1], ctx=c)
+        if op == "fp.leq":
+            return z3.fpLEQ(a[0], a[1], ctx=c)
+        if op == "fp.eq":
+            return z3.fpEQ(a[0], a[1], ctx=c)
+        if op == "fp.isNaN":
+            return z3.fpIsNaN(a[0], ctx=c)
+        if op == "fp.isInfinite":
+            return z3.fpIsInf(a[0], ctx=c)
+        if op == "fp.isZero":
+            return z3.fpIsZero(a[0], ctx=c)
+        if op == "fp.isNegative":
+            return z3.fpIsNegative(a[0], ctx=c)
+        if op == "fp.to_real":
+            return z3.fpToReal(a[0], ctx=c)
+        if op in ("fp.of_int", "fp.of_real", "fp.from_int", "fp.from_real", "fp.cast"):
+            target = self.sort(t.sort)
+            exact = z3.ToReal(a[0]) if op in ("fp.of_int", "fp.from_int") else a[0]
+            return z3.fpToFP(z3.RNE(c), exact, target, ctx=c)
         if op == "add":
             return a[0] + a[1]
         if op == "sub":
@@ -292,6 +333,13 @@ def _lit(k: Any, sort: L.Sort | None) -> L.Term:
 
 
 def to_python(v: z3.ExprRef) -> Any:
+    if z3.is_fp_value(v):
+        if v.isNaN():
+            return float("nan")
+        if v.isInf():
+            return float("-inf") if v.isNegative() else float("inf")
+        bits = z3.simplify(z3.fpToIEEEBV(v, ctx=v.ctx)).as_long()
+        return struct.unpack("<f" if v.sort().ebits() == 8 else "<d", bits.to_bytes(4 if v.sort().ebits() == 8 else 8, "little"))[0]
     if z3.is_int_value(v):
         return v.as_long()
     if z3.is_rational_value(v):
@@ -580,8 +628,8 @@ def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> 
         return SmtResult("proved", dt)
     if r == z3.sat:
         with _Deadline(enc.ctx, timeout_ms) as d:
-            _small_lists(ob, enc, s)
-            res = _refutation(ob, enc, s, terms, dt)
+            model = _small_lists(ob, enc, s)
+            res = _refutation(ob, enc, s, terms, dt, model)
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout reading the model")
         return res
@@ -591,19 +639,19 @@ def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> 
 SMALL_LIST = 8
 
 
-def _small_lists(ob: Obligation, enc: "Z3Encoder", s: z3.Solver) -> None:
+def _small_lists(ob: Obligation, enc: "Z3Encoder", s: z3.Solver) -> z3.ModelRef:
     """Leave the solver at a model whose input lists are short, if one
     exists: a counterexample is only confirmed by running it."""
     lens = [enc.term(v.len) for _, v in ob.inputs if isinstance(v, ListVal)]
     m = s.model()
     if not any(m.eval(n, model_completion=True).as_long() > SMALL_LIST for n in lens):
-        return
+        return m
     s.push()
     s.add(*[n <= SMALL_LIST for n in lens])
     if s.check() == z3.sat:
-        return  # the frame stays: the model is read before the solver is dropped
+        return s.model()  # keep the short-list frame active for model reads
     s.pop()
-    s.check()
+    return m
 
 
 def _unknown_reason(why: str) -> str:
@@ -611,8 +659,7 @@ def _unknown_reason(why: str) -> str:
     return "resource limit" if "canceled" in why or "resource limit" in why else why or "unknown"
 
 
-def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Term], dt: float) -> SmtResult:
-    m = s.model()
+def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Term], dt: float, m: z3.ModelRef) -> SmtResult:
     enc.key_candidates = {}
     for _, v in ob.inputs:
         if isinstance(v, L.Term) and v.sort in (L.INT, L.REAL, L.STR, L.BOOL):

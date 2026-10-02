@@ -73,6 +73,7 @@ function decode(v, ty = null, memo = new Map()) {
   if (typeof v !== "object") return v;
   if ("__json__" in v) return structuredClone(v.__json__);
   if ("__real__" in v) return v.__real__[0] / v.__real__[1];
+  if ("__float__" in v) return Number(v.__float__);
   if ("__opaque__" in v) return stub("opaque", !!v.any);
   if ("__enum__" in v) {
     const E = SCOPE[v.__enum__];

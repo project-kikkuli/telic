@@ -51,7 +51,7 @@ from ..contracts import (
 from .swift_syntax import Unsupported, named, parser, text
 
 SWIFT_ASSUMPTIONS = [
-    "Double/Float are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
+    "Double and Float use IEEE 754 binary64 and binary32 semantics; Float80 is opaque",
     "Int and UInt are 64 bits wide",
     "String equality (Unicode canonical equivalence) and other String operations are uninterpreted functions",
     "assert and precondition are checked (debug build semantics)",
@@ -682,6 +682,10 @@ class Project:
             if name in INT_KINDS:
                 return ir.INT, name
             if name in REAL_TYPES:
+                if name in {"Float", "Float32"}:
+                    return ir.FLOAT32, None
+                if name == "Float80":
+                    return ir.TOpaque("Swift Float80 is not IEEE binary32 or binary64"), None
                 return ir.REAL, None
             if name == "Bool":
                 return ir.BOOL, None

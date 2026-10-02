@@ -101,6 +101,8 @@ TRUE_HELPERS = {
     "cb1.rs": {"pos"},
     "cb1.swift": {"pos"},
 }
+if sys.implementation.name == "cpython" and sys.version_info < (3, 12):
+    TRUE_HELPERS["t49.py"] = {"compensated_mixed_sum_is_not_zero"}
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.
 TRUE_LIFECYCLES = {
