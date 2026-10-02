@@ -53,6 +53,10 @@ def ARRAY(elem: Sort, index: Sort | None = None) -> Sort:
     return Sort("Array", elem=elem, index=None if index == INT else index)
 
 
+def array_lambda(binder: "Const", body: "Term") -> "ArrayLambda":
+    return ArrayLambda(binder, body, ARRAY(body.sort, binder.sort))
+
+
 def index_sort(s: Sort) -> Sort:
     return s.index or INT
 
@@ -174,6 +178,17 @@ class App(Term):
     op: str
     args: tuple[Term, ...]
     sort: Sort
+
+
+@dataclass(frozen=True, repr=False)
+class ArrayLambda(Term):
+    binder: Const
+    body: Term
+    sort: Sort
+
+    def __post_init__(self) -> None:
+        if self.sort.name != "Array" or index_sort(self.sort) != self.binder.sort or self.sort.elem != self.body.sort:
+            raise TypeError(f"array lambda sort {self.sort} does not match {self.binder.sort} -> {self.body.sort}")
 
 
 @dataclass(frozen=True, repr=False)
@@ -480,6 +495,10 @@ def ite(c: Term, a: Term, b: Term) -> Term:
 
 
 def select(arr: Term, idx: Term) -> Term:
+    if isinstance(arr, ArrayLambda):
+        if arr.binder.sort != idx.sort:
+            raise TypeError(f"array lambda index has sort {arr.binder.sort}, got {idx.sort}")
+        return substitute(arr.body, {arr.binder: idx})
     if isinstance(arr, App) and arr.op == "K":
         return arr.args[0]
     if isinstance(arr, App) and arr.op == "store":
@@ -648,6 +667,8 @@ def max_(a: Term, b: Term) -> Term:
 def children(t: Term) -> tuple[Term, ...]:
     if isinstance(t, (App, Fn)):
         return t.args
+    if isinstance(t, ArrayLambda):
+        return (t.body,)
     if isinstance(t, Quant):
         return (t.body,)
     return ()
@@ -683,6 +704,12 @@ def consts(t: Term) -> set[Const]:
             go(x.body)
             bound.clear()
             bound.update(saved)
+        elif isinstance(x, ArrayLambda):
+            saved = set(bound)
+            bound.add(x.binder)
+            go(x.body)
+            bound.clear()
+            bound.update(saved)
         else:
             for c in children(x):
                 go(c)
@@ -706,12 +733,52 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
     if isinstance(t, Fn):
         args = tuple(substitute(a, m) for a in t.args)
         return t if args == t.args else Fn(t.name, args, t.sort)
+    if isinstance(t, ArrayLambda):
+        inner = {k: v for k, v in m.items() if k != t.binder}
+        body, binder = t.body, t.binder
+        replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
+        if binder in replacements:
+            used = consts(body) | replacements | {binder}
+            stem = f"{binder.name}$alpha"
+            name, suffix = stem, 0
+            while any(c.name == name for c in used):
+                suffix += 1
+                name = f"{stem}{suffix}"
+            renamed = Const(name, binder.sort)
+            body = substitute(body, {binder: renamed})
+            binder = renamed
+        new_body = substitute(body, inner)
+        return t if binder == t.binder and new_body is t.body else ArrayLambda(binder, new_body, t.sort)
     if isinstance(t, Quant):
         inner = {k: v for k, v in m.items() if k not in t.vars}
-        body = substitute(t.body, inner)
-        if body is t.body:
+        body, vars_ = t.body, t.vars
+        renaming = {}
+        replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
+        if replacements.intersection(vars_):
+            used = consts(body) | replacements | set(vars_)
+            renamed = []
+            renaming = {}
+            for var in vars_:
+                if var not in replacements:
+                    renamed.append(var)
+                    continue
+                stem, suffix = f"{var.name}$alpha", 0
+                name = stem
+                while any(c.name == name for c in used):
+                    suffix += 1
+                    name = f"{stem}{suffix}"
+                fresh = Const(name, var.sort)
+                used.add(fresh)
+                renaming[var] = fresh
+                renamed.append(fresh)
+            if renaming:
+                body = substitute(body, renaming)
+                vars_ = tuple(renamed)
+        body = substitute(body, inner)
+        if body is t.body and vars_ == t.vars:
             return t
-        return Quant(t.kind, t.vars, body, patterns=tuple(tuple(substitute(p, inner) for p in ps) for ps in t.patterns))
+        patterns = tuple(tuple(substitute(substitute(p, renaming), inner) for p in ps) for ps in t.patterns)
+        return Quant(t.kind, vars_, body, patterns=patterns)
     return t
 
 
@@ -1085,6 +1152,9 @@ def show(t: Term, prec: int = -1) -> str:
         vs = ", ".join(v.name for v in t.vars)
         s = f"{t.kind} {vs}. {show(t.body, 0)}"
         return f"({s})" if prec >= 0 else s
+    if isinstance(t, ArrayLambda):
+        s = f"fun {t.binder.name} => {show(t.body)}"
+        return f"({s})" if prec >= 0 else s
     if isinstance(t, Fn):
         return f"{t.name}({', '.join(show(a) for a in t.args)})"
     assert isinstance(t, App)
@@ -1133,6 +1203,8 @@ def canonical(t: Term) -> str:
         return f"f{t.bits:x}:{t.sort}"
     if isinstance(t, Quant):
         return f"({t.kind} ({' '.join(canonical(v) for v in t.vars)}) {canonical(t.body)})"
+    if isinstance(t, ArrayLambda):
+        return f"(array_lambda {canonical(t.binder)} {canonical(t.body)} : {t.sort})"
     if isinstance(t, Fn):
         return f"({t.name} {' '.join(canonical(a) for a in t.args)})"
     assert isinstance(t, App)

@@ -50,6 +50,35 @@ def model_value_one(module, fname, x, sort=L.FLOAT64):
     return to_python(z3.simplify(enc.term(ex.value)))
 
 
+def test_array_lambda_projection_is_capture_safe_and_matches_python():
+    binder = L.Const("index", L.INT)
+    outer = L.Const("outer", L.INT)
+    projection = L.array_lambda(binder, L.add(binder, outer))
+    assert L.consts(projection) == {outer}
+
+    substituted = L.substitute(projection, {outer: binder})
+    assert isinstance(substituted, L.ArrayLambda)
+    assert substituted.binder != binder
+    assert L.consts(substituted) == {binder}
+
+    enc = Z3Encoder([])
+    selected = enc.term(L.select(substituted, L.IntV(3)))
+    solver = z3.Solver(ctx=enc.ctx)
+    solver.add(selected != enc.term(L.add(L.IntV(3), binder)))
+    assert solver.check() == z3.unsat
+
+    quantified = L.Quant("forall", (binder,), L.gt(binder, outer), patterns=((binder,),))
+    renamed = L.substitute(quantified, {outer: binder})
+    assert isinstance(renamed, L.Quant)
+    assert renamed.vars[0] != binder
+    assert renamed.patterns == ((renamed.vars[0],),)
+
+    from telic.lean import LeanPrinter, Namer
+
+    rendered = LeanPrinter(Namer(), {}).t(projection)
+    assert "fun" in rendered and "index" in rendered
+
+
 def py_expr(rnd, depth=0):
     if depth > 2 or rnd.random() < 0.25:
         return rnd.choice(["a", "b", str(rnd.randint(-5, 9))])

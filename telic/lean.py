@@ -176,6 +176,9 @@ class LeanPrinter:
             return ("True" if x.value else "False"), 100
         if isinstance(x, L.StrV):
             return json.dumps(x.value), 100
+        if isinstance(x, L.ArrayLambda):
+            binder = f"({self.n(x.binder.name)} : {lean_sort(x.binder.sort)})"
+            return f"(fun {binder} => {self.t(x.body)})", 100
         if isinstance(x, L.Quant):
             q = "∀" if x.kind == "forall" else "∃"
             vs = " ".join(f"({self.n(v.name)} : {lean_sort(v.sort)})" for v in x.vars)
@@ -267,6 +270,8 @@ def collect_records(terms: list[L.Term]) -> list[L.Sort]:
     for t in terms:
         for x in L.iter_terms(t):
             visit_sort(x.sort)
+            if isinstance(x, L.ArrayLambda):
+                visit_sort(x.binder.sort)
             if isinstance(x, L.Quant):
                 for v in x.vars:
                     visit_sort(v.sort)
