@@ -62,6 +62,7 @@ class Z3Encoder:
         self.ctx = ctx or z3.Context(rlimit=rlimit)
         self.consts: dict[L.Const, z3.ExprRef] = {}
         self.funcs: dict[str, z3.FuncDeclRef] = {}
+        self.encoded_sorts: set[str] = set()
         self.encoded_constants: list[str] = []
         self.datatypes: dict[str, Any] = {}
         self.key_candidates: dict[str, list[Any]] = {}
@@ -88,25 +89,28 @@ class Z3Encoder:
     def sort(self, s: L.Sort) -> z3.SortRef:
         c = self.ctx
         if s == L.INT:
-            return z3.IntSort(c)
-        if s == L.REAL:
-            return z3.RealSort(c)
-        if s == L.BOOL:
-            return z3.BoolSort(c)
-        if s == L.STR:
-            return z3.StringSort(c)
-        if s.name == "Array":
+            result = z3.IntSort(c)
+        elif s == L.REAL:
+            result = z3.RealSort(c)
+        elif s == L.BOOL:
+            result = z3.BoolSort(c)
+        elif s == L.STR:
+            result = z3.StringSort(c)
+        elif s.name == "Array":
             assert s.elem is not None
-            return z3.ArraySort(self.sort(L.index_sort(s)), self.sort(s.elem))
-        if s.name == "Rec":
-            return self.record(s)[0]
-        if s.name == "None":
-            return z3.IntSort(c)
-        if s == L.OPAQUE:
+            result = z3.ArraySort(self.sort(L.index_sort(s)), self.sort(s.elem))
+        elif s.name == "Rec":
+            result = self.record(s)[0]
+        elif s.name == "None":
+            result = z3.IntSort(c)
+        elif s == L.OPAQUE:
             if "Opaque" not in self.datatypes:
                 self.datatypes["Opaque"] = z3.DeclareSort("Opaque", c)
-            return self.datatypes["Opaque"]
-        raise TypeError(s)
+            result = self.datatypes["Opaque"]
+        else:
+            raise TypeError(s)
+        self.encoded_sorts.add(repr((s, result.sexpr())))
+        return result
 
     def record(self, s: L.Sort):
         assert s.rec is not None
@@ -137,6 +141,20 @@ class Z3Encoder:
 
     def _record_signature(self, f: z3.FuncDeclRef) -> None:
         self.encoded_signatures.append(f.sexpr())
+
+    def sort_declarations(self) -> list[tuple[Any, ...]]:
+        declarations = []
+        for name, declaration in sorted(self.datatypes.items()):
+            if isinstance(declaration, tuple):
+                sort, spec = declaration
+                fields = tuple(
+                    (f"{spec.rec}.{field}", self.sort(field_sort).sexpr())
+                    for field, field_sort in spec.fields
+                )
+                declarations.append(("datatype", name, sort.sexpr(), f"mk_{spec.rec}", fields))
+            else:
+                declarations.append(("uninterpreted-sort", name, declaration.sexpr()))
+        return declarations
 
     def define(self, d: L.FunDef) -> None:
         args = [self.term(p) for p in d.params]
@@ -586,6 +604,8 @@ def query_fingerprint(ob: Obligation, theory: Theory, timeout_ms: int, rlimit: i
             return None
         enc, assertions = prepared
         material.append(f"stage-rlimit={stage_budget}")
+        material.extend(f"sort={sort}" for sort in sorted(enc.encoded_sorts))
+        material.extend(f"sort-declaration={declaration!r}" for declaration in enc.sort_declarations())
         material.extend(f"constant={constant}" for constant in enc.encoded_constants)
         material.extend(f"signature={signature}" for signature in enc.encoded_signatures)
         material.extend(f"definition={definition}" for definition in enc.encoded_definitions)

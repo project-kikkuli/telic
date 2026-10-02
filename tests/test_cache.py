@@ -105,6 +105,64 @@ def test_mathematical_receipts_bind_unused_parameter_signature(tmp_path):
     assert first.solved > 0 and second.solved > 0
 
 
+@pytest.mark.parametrize("case", ["local-record", "nested-record", "array-index", "array-element"])
+def test_math_receipt_reuse_binds_encoded_sorts(tmp_path, case):
+    from telic import ir, logic as L
+    from telic.checker import ProofCache, Theory
+    from telic.smt import solve
+    from telic.vcgen import Obligation
+
+    if case == "local-record":
+        sorts = (L.REC("LocalShape", ()), L.REC("LocalShape", (("value", L.INT),)))
+        goals = lambda sort: L.eq(L.Const("a", sort), L.Const("b", sort))
+    elif case == "nested-record":
+        empty = L.REC("InnerShape", ())
+        populated = L.REC("InnerShape", (("value", L.INT),))
+        sorts = (L.REC("OuterShape", (("child", empty),)), L.REC("OuterShape", (("child", populated),)))
+        goals = lambda sort: L.eq(L.Const("a", sort), L.Const("b", sort))
+    elif case == "array-index":
+        sorts = (L.REC("IndexShape", ()), L.BOOL)
+
+        def goals(index):
+            array = L.Const("array", L.ARRAY(L.INT, index))
+            origin = L.Const("origin", index)
+            index_value = L.Const("index", index)
+            return L.forall((index_value,), L.eq(L.select(array, index_value), L.select(array, origin)))
+
+    else:
+        sorts = (L.ARRAY(L.REC("ArrayValue", ())), L.ARRAY(L.INT))
+        goals = lambda sort: L.eq(L.Const("a", sort), L.Const("b", sort))
+
+    def obligation(sort):
+        return Obligation(
+            id="sort receipt",
+            func="sort receipt",
+            kind="test",
+            loc=ir.Loc(1),
+            site=None,
+            message="",
+            hyps=[],
+            goal=goals(sort),
+            inputs=[],
+        )
+
+    theory = Theory()
+    cache_path = str(tmp_path / ".telic/cache.json")
+    options = (10_000, 2_000_000)
+    first = obligation(sorts[0])
+    first_key = obligation_key(first, theory, options[1], options[0], schema="")
+    assert first_key is not None and solve(first, theory, *options).status == "proved"
+    cache = ProofCache(cache_path)
+    cache.put(first_key, {"method": "z3"})
+    cache.save()
+
+    second = obligation(sorts[1])
+    second_key = obligation_key(second, theory, options[1], options[0], schema="")
+    reloaded = ProofCache(cache_path)
+    assert second_key is not None and reloaded.get(second_key) is None
+    assert solve(second, theory, *options).status == "refuted"
+
+
 @pytest.mark.parametrize("engine", ["python", "ox"])
 def test_mathematical_receipts_bind_unused_record_field_sorts(tmp_path, engine):
     if engine == "ox" and binary() is None:
