@@ -16,12 +16,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 RECEIPTS = ROOT / ".telic" / "ci-verdicts.json"
-HARNESS = ["scripts/ci.py", ".github/workflows/ci.yml", ".github/constraints.txt", "pyproject.toml", "tests/conftest.py"]
+TEST_SETUP = [".github/constraints.txt", "pyproject.toml", "tests/conftest.py"]
+PROOF_SETUP = [".github/constraints.txt", "pyproject.toml"]
 KERNEL = [f"telic/{name}.py" for name in (
     "__init__", "ir", "contracts", "program", "logic", "vcgen", "infer", "smt", "checker",
     "jobs", "slots", "irjson", "engine", "history", "lifecycle", "equiv", "replay", "replay_harness",
-    "lean", "prover", "render_expr", "aim", "oracle", "gaps", "propose", "phrase", "ledger",
+    "lean", "prover",
 )] + ["telic/ui/spec.py"]
+KERNEL += ["lean-toolchain", "telic/lean/*"]
 FRONTENDS = {
     "python": ["telic/frontend/__init__.py", "telic/frontend/python*.py", "telic/frontend/aim_file.py"],
     "typescript": ["telic/frontend/typescript.py", "telic/frontend/ts/*.mjs", "telic/frontend/ts/package*.json"],
@@ -30,7 +32,7 @@ FRONTENDS = {
 }
 ALL_FRONTENDS = [p for paths in FRONTENDS.values() for p in paths]
 GROUPS = {
-    "proof": {"inputs": ["telic/**/*.py", "telic/**/*.proof.lean", "telic/frontend/ts/*.mjs", "telic/frontend/ts/package*.json", "core/*.ml", "core/Makefile", "telic/lean/*", "telic.ledger.json"], "native": True},
+    "proof": {"inputs": ["telic/**/*.py", "telic/**/*.proof.lean", "telic/frontend/ts/*.mjs", "telic/frontend/ts/package*.json", "core/*.ml", "core/Makefile", "telic/lean/*", "telic.ledger.json"] + PROOF_SETUP, "native": True},
     "corpus-python": {"inputs": KERNEL + FRONTENDS["python"] + ["tests/test_corpus.py", "tests/cases/corpus.py"], "tests": ["tests/test_corpus.py::test_python_corpus", "tests/test_corpus.py::test_python_refutations_are_confirmed_by_execution"]},
     "corpus-typescript": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["typescript"] + ["tests/test_corpus.py", "tests/cases/corpus.ts"], "tests": ["tests/test_corpus.py::test_typescript_corpus"]},
     "corpus-rust": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["rust"] + ["tests/test_rust.py", "tests/cases/corpus.rs", "tests/cases/rust_crate/**/*"], "tests": [f"tests/test_rust.py::{name}" for name in ("test_rust_corpus", "test_rust_refutations_are_real_panics", "test_crate_across_files", "test_crate_file_alone_uses_its_crate", "test_crate_is_valid_rust_and_refutations_replay")]},
@@ -57,7 +59,8 @@ def baseline(since: str | None) -> dict | None:
 
 
 def key(name: str, since: str | None) -> str:
-    paths = inputs(HARNESS + GROUPS[name]["inputs"])
+    setup = PROOF_SETUP if name == "proof" else TEST_SETUP
+    paths = inputs(setup + GROUPS[name]["inputs"])
     identity = os.environ.get("TELIC_CI_ID", f"{platform.system()} {platform.machine()} {platform.python_version()}")
     h = hashlib.sha256(json.dumps([name, GROUPS[name], identity], sort_keys=True).encode())
     if name == "proof":
@@ -85,7 +88,7 @@ def proof(since: str | None, record: bool) -> bool:
     scope = None
     if since and not record:
         changed = changed_files(str(ROOT), since)
-        compiler = KERNEL + ALL_FRONTENDS + HARNESS + ["core/*.ml", "core/Makefile", "telic/lean/*"]
+        compiler = KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "telic/lean/*"]
         if not any(fnmatch.fnmatch(path, pattern) for path in changed for pattern in compiler):
             scope = affected_files(str(ROOT), changed, old) & set(paths)
             scope |= {k.split("::")[0] for k in (old or {}).get("functions", {}) if not (ROOT / k.split("::")[0]).exists()}

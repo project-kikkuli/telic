@@ -72,6 +72,20 @@ def lim() -> int:
 """
 
 
+INVARIANT_CONSTANT = """
+MINIMUM = {minimum}
+
+class Box:
+    #@ invariant self.value >= MINIMUM
+    def __init__(self, value: int):
+        self.value = value
+
+def read(box: Box) -> int:
+    #@ ensures result >= 0
+    return box.value
+"""
+
+
 @pytest.mark.parametrize("engine", ["python", "ox"])
 @pytest.mark.parametrize("old,new,fn", [("self.v >= 0", "self.v >= -5", "read"), ("LIMIT = 5", "LIMIT = 10", "lim")])
 def test_an_edit_outside_a_function_rechecks_it(tmp_path, engine, old, new, fn):
@@ -82,6 +96,20 @@ def test_an_edit_outside_a_function_rechecks_it(tmp_path, engine, old, new, fn):
         (tmp_path / "m.py").write_text(src)
         rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
         assert {f.fn.name: f.status for f in rep.functions}[fn] == want
+
+
+@pytest.mark.parametrize("engine", ["python", "ox"])
+def test_a_class_invariant_constant_change_invalidates_function_receipt(tmp_path, engine):
+    if engine == "ox" and binary() is None:
+        pytest.skip("telic-core not built")
+    opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), lean=False, engine=engine)
+    statuses = []
+    for minimum in (0, -1):
+        (tmp_path / "m.py").write_text(INVARIANT_CONSTANT.format(minimum=minimum))
+        rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+        read = next(f for f in rep.functions if f.fn.name == "read")
+        statuses.append((read.status, read.from_receipt))
+    assert statuses == [("proved", False), ("refuted", False)]
 
 
 def test_functions_calling_each_other_keep_their_own_verdicts(tmp_path):
