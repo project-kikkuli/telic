@@ -2561,7 +2561,7 @@ class ExprLowerer:
             if len(args) < 2 or not all(ir.is_numeric(a.ty) for a in args):
                 raise self.err(f"{name}() needs two or more numbers", n)
             t = ir.REAL if any(isinstance(a.ty, ir.TReal) for a in args) else ir.INT
-            return ir.Builtin(t, loc, name, tuple(self.fl.coerce(a, t) for a in args))
+            return ir.Builtin(t, loc, f"py_{name}", tuple(self.fl.coerce(a, t) for a in args))
         if name == "sum":
             (x,) = self._args(n, 1)
             if not (isinstance(x.ty, ir.TList) and ir.is_numeric(x.ty.elem)):

@@ -1991,7 +1991,7 @@ class ExprLowerer:
                 if op == "/":
                     return ir.Binary(a.ty, loc, "rdiv", a, b)
                 if op == "%":
-                    return ir.Binary(a.ty, loc, "fmod", a, b)
+                    return ir.Binary(a.ty, loc, "tmod", a, b)
                 return ir.Binary(a.ty, loc, BINOPS[op], a, b)
             name = {"+": "add", "-": "sub", "*": "mul", "/": "tdiv", "%": "tmod"}[op]
             # an integer whose type nothing fixes is an i32 in Rust
