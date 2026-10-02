@@ -623,6 +623,15 @@ def theory_lemmas(elem: Sort) -> list[Axiom]:
     out.append(Axiom(f"{ss}_nonneg", q((a, lo, hi), implies(inner, le(zero, S(a, lo, hi))), ((S(a, lo, hi),),)), "", "sum of non-negatives is non-negative", ss))
     inner_np = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(select(a, i), zero)))
     out.append(Axiom(f"{ss}_nonpos", q((a, lo, hi), implies(inner_np, le(S(a, lo, hi), zero)), ((S(a, lo, hi),),)), "", "sum of non-positives is non-positive", ss))
+    if elem == INT:
+        bound = Const("bound", INT)
+        inner_bound = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(select(a, i), bound)))
+        conclusion = le(S(a, lo, hi), mul(bound, sub(hi, lo)))
+        out.append(Axiom(f"{ss}_upper_bound", q((a, lo, hi, bound), implies(and_(le(lo, hi), le(lit(0, INT), bound), inner_bound), conclusion), ((conclusion,),)), "", "sum of values bounded by a non-negative constant", ss))
+        zero_bound = mul(bound, hi)
+        zero_inner = Quant("forall", (i,), implies(and_(le(lit(0, INT), i), lt(i, hi)), le(select(a, i), bound)))
+        zero_conclusion = le(S(a, lit(0, INT), hi), zero_bound)
+        out.append(Axiom(f"{ss}_upper_bound_from_zero", q((a, hi, bound), implies(and_(le(lit(0, INT), hi), le(lit(0, INT), bound), zero_inner), zero_conclusion), ((S(a, lit(0, INT), hi), zero_bound),)), "", "sum from zero of values bounded by a non-negative constant", ss))
     upd = store(a, k, v)
     out.append(
         Axiom(

@@ -186,6 +186,7 @@ class Replay:
     fuzz_desc: str | None = None
     timed_out: bool = False  # cut short by the wall-clock safety net: decided nothing
     shrunk: str | None = None  # the same failure on a smaller input
+    resource_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

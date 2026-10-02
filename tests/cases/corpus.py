@@ -107,6 +107,22 @@ def resource_any_upper_bound(xs: list[int]) -> bool:
 
 
 # expect: proved
+#@ ensures cost("peak") <= cost("alloc")
+def resource_peak_upper_bound() -> int:
+    first = [1]
+    second = [2]
+    return len(first) + len(second)
+
+
+# expect: open
+#@ ensures cost("peak") >= cost("alloc")
+def resource_peak_is_not_cumulative_alloc() -> int:
+    first = [1]
+    first = [2]
+    return len(first)
+
+
+# expect: proved
 def resource_recursion(n: int) -> int:
     #@ requires n >= 0
     #@ ensures cost("work") == 9 * n + 6
@@ -156,6 +172,127 @@ def resource_raise() -> None:
     #@ ensures cost("work") == 1
     #@ raises True
     raise ValueError()
+
+
+# expect: proved
+def resource_in_requires(n: int) -> int:
+    #@ requires n >= 0 and cost("work") == 0
+    #@ ensures result == n and cost("work") >= 0
+    return n
+
+
+# expect: proved
+def resource_in_assertion() -> int:
+    xs = [1, 2, 3]
+    #@ assert cost("alloc") == 3
+    return len(xs)
+
+
+# expect: proved
+def resource_in_invariant(n: int) -> int:
+    #@ requires n >= 0
+    #@ ensures result == n
+    total = 0
+    for i in range(n):
+        #@ invariant total == i
+        #@ invariant cost("work") >= 0
+        total += 1
+    return total
+
+
+# expect: proved
+def resource_raises_parameter(n: int) -> None:
+    #@ requires n >= 100
+    #@ ensures cost("work") <= n
+    #@ raises True
+    raise ValueError()
+
+
+# expect: proved
+def resource_raises_mutated_parameter(xs: list[int]) -> None:
+    #@ requires len(xs) == 0
+    #@ ensures cost("alloc") == len(xs)
+    #@ raises True
+    xs.append(0)
+    raise ValueError()
+
+
+# expect: proved
+def resource_old_call(xs: list[int]) -> list[int]:
+    #@ ensures cost("alloc") == len(xs)
+    return resource_old_slice(xs)
+
+
+# expect: proved
+def resource_old_slice(xs: list[int]) -> list[int]:
+    #@ ensures cost("alloc") - old(cost("alloc")) == len(xs)
+    return xs[:]
+
+
+# expect: proved
+def resource_inc(x: int) -> int:
+    #@ requires x >= 0 and cost("work") == 0
+    #@ ensures result == x + 1
+    #@ ensures cost("work") >= 1
+    return x + 1
+
+
+# expect: proved
+def resource_inc_nested(x: int) -> int:
+    #@ requires x >= 0
+    #@ ensures result == x + 2
+    #@ ensures cost("work") >= 2
+    return resource_inc(x) + 1
+
+
+# expect: proved
+def resource_recursive_count(n: int) -> int:
+    #@ requires n >= 0
+    #@ ensures result == n
+    #@ ensures cost("work") >= n
+    #@ decreases n
+    if n == 0:
+        return 0
+    return resource_recursive_count(n - 1) + 1
+
+
+# expect: refuted
+def resource_inc_wrong_result() -> int:
+    #@ ensures result == 17
+    return resource_inc(0)
+
+
+# expect: proved
+def resource_logging_evaluates_arguments(xs: list[int]) -> None:
+    #@ ensures cost("external_calls") == 1
+    #@ ensures cost("alloc") == len(xs)
+    print(xs[:])
+
+
+# expect: refuted
+def resource_external_call_underreported(xs: list[int]) -> list[int]:
+    #@ ensures cost("external_calls") == 0
+    return sorted(xs)
+
+
+# expect: refuted
+def resource_bulk_comprehension(xs: list[int]) -> list[int]:
+    #@ requires len(xs) == 1
+    #@ ensures cost("work") <= 40
+    return [sum([x] * 100) for x in xs]
+
+
+# expect: refuted
+def resource_string_comprehension(xs: list[str]) -> list[str]:
+    #@ requires len(xs) == 1
+    #@ ensures cost("alloc") <= 1
+    return [s + "a" for s in xs]
+
+
+# expect: refuted
+def resource_literal_string_comprehension() -> list[str]:
+    #@ ensures cost("alloc") <= 1
+    return [s + "a" for s in ["hello"]]
 
 
 # expect: refuted

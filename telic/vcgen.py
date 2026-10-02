@@ -395,10 +395,33 @@ class VCGen:
         self.program = program
         self.ref = ref
         self.fn = ref.fn
+        cost_clauses = [*self.fn.requires, *self.fn.ensures, *self.fn.raises]
+        for stmt in ir.walk_stmts(self.fn.body):
+            if isinstance(stmt, (ir.While, ir.ForRange, ir.ForEach)):
+                cost_clauses.extend(stmt.invariants)
+                if isinstance(stmt, ir.While) and stmt.decreases is not None:
+                    cost_clauses.append(stmt.decreases)
+            elif isinstance(stmt, (ir.AssertStmt, ir.AssumeStmt)):
+                cost_clauses.append(stmt.clause)
+        cost_exprs = [clause.expr for clause in cost_clauses]
+        cost_exprs.extend(expr for stmt in ir.walk_stmts(self.fn.body) for expr in ir.stmt_exprs(stmt))
         self.resource_tracking = any(
             isinstance(node, ir.Builtin) and node.name == "cost"
-            for clause in self.fn.ensures
-            for node in ir.walk_expr(clause.expr)
+            for expr in cost_exprs
+            for node in ir.walk_expr(expr)
+        )
+        self.peak_tracking = any(
+            isinstance(node, ir.Builtin)
+            and node.name == "cost"
+            and node.args
+            and isinstance(node.args[0], ir.Lit)
+            and node.args[0].value == "peak"
+            for expr in cost_exprs
+            for node in ir.walk_expr(expr)
+        )
+        self.resource_models = tuple(
+            model for model in ir.RESOURCE_STATE_MODELS
+            if model != "peak" or self.peak_tracking
         )
         self.module = ref.module
         self.opts = opts or Options()
@@ -1529,7 +1552,19 @@ class VCGen:
         old = ctx.state.env.get(key)
         if not isinstance(old, L.Term):
             raise VCError(f"resource model '{model}' has no execution state")
-        ctx.state.env[key] = L.add(old, amount)
+        if model == "peak":
+            ctx.state.env[key] = L.max_(old, amount)
+            return
+        next_value = L.add(old, amount)
+        ctx.state.env[key] = next_value
+        if model == "alloc" and self.peak_tracking:
+            peak_key = ir.RESOURCE_KEYS["peak"]
+            peak = ctx.state.env.get(peak_key)
+            if isinstance(peak, L.Term):
+                next_peak = self.fresh("peak_live", ir.INT)
+                assert isinstance(next_peak, L.Term)
+                ctx.assume(L.and_(L.le(peak, next_peak), L.le(next_peak, next_value)))
+                ctx.state.env[peak_key] = next_peak
 
     def resource_state(self, ctx: Ctx) -> dict[str, L.Term]:
         if ctx.state is None:
@@ -1546,6 +1581,8 @@ class VCGen:
     def unknown_resource(self, ctx: Ctx, model: str, where: str, loc: ir.Loc) -> L.Term:
         if ctx.spec or ctx.state is None or not self.resource_tracking:
             return L.ZERO
+        if model == "peak":
+            return ctx.state.env.get(ir.RESOURCE_KEYS["peak"], L.ZERO)  # type: ignore[return-value]
         amount = self.fresh(f"{model}_{where}", ir.INT)
         assert isinstance(amount, L.Term)
         ctx.assume(L.le(L.ZERO, amount))
@@ -1778,16 +1815,18 @@ class VCGen:
         body = self.ev(e.body, sub)
         assert not isinstance(body, ListVal)
         if local is not None:
-            size = L.max_(L.sub(hi, lo), L.ZERO)
-            for model in ir.RESOURCE_STATE_MODELS:
-                bound = self.comprehension_resource_bound(e.body, None, model)
+            for model in self.resource_models:
                 key = ir.RESOURCE_KEYS[model]
-                if bound is not None and (bound != L.ZERO or local.env[key] == L.ZERO):
-                    if bound != L.ZERO:
-                        amount = self.bounded_resource_delta(ctx, f"quant_{model}", L.mul(size, bound))
-                        self.charge_resource(ctx, model, amount)
-                elif local.env[key] != L.ZERO:
-                    self.unknown_resource(ctx, model, "quantifier callback without a checked cost bound", e.loc)
+                callback_cost = local.env[key]
+                if callback_cost != L.ZERO:
+                    if not any(term == i for term in L.iter_terms(callback_cost)):
+                        self.charge_resource(ctx, model, L.mul(L.sub(hi, lo), callback_cost))
+                        continue
+                    values, assume = self.defined_symbol(ctx, f"quant_cost_{model}@{next(self.counter)}", L.ARRAY(L.INT))
+                    assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(values, i), callback_cost)), patterns=((L.select(values, i),),)))
+                    self.theory_fns.add("seqsum")
+                    amount = L.Fn("seqsum", (values, lo, hi), L.INT)
+                    self.charge_resource(ctx, model, amount)
         if e.kind == "forall":
             return L.forall([i], L.implies(rng, body))
         return L.exists([i], L.and_(rng, body))
@@ -1837,6 +1876,27 @@ class VCGen:
             self.charge_resource(ctx, "alloc", allocated)
             return DictVal(vals, has, e.ty)
         args = [self.ev(a, ctx) for a in e.args]
+        if name == "log":
+            self.charge_resource(ctx, "external_calls", L.ONE)
+            return NONE_V
+        if name == "vec_repeat":
+            (value, count) = args
+            length = L.max_(count, L.ZERO)  # type: ignore[arg-type]
+            arr, assume = self.defined_symbol(ctx, f"vec_repeat@{next(self.counter)}.arr", sort_of(e.ty))
+            i = L.Const(f"i!{next(self.counter)}", L.INT)
+            assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, length)), L.eq(L.select(arr, i), value)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
+            self.charge_resource(ctx, "work", length)
+            self.charge_resource(ctx, "alloc", length)
+            return ListVal(arr, L.ZERO, length, e.ty)
+        if name == "list_copy":
+            (source,) = args
+            assert isinstance(source, ListVal)
+            arr, assume = self.defined_symbol(ctx, f"list_copy@{next(self.counter)}.arr", sort_of(e.ty))
+            i = L.Const(f"i!{next(self.counter)}", L.INT)
+            assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, source.len)), L.eq(L.select(arr, i), source.at(i))), patterns=((L.select(arr, i),),)))
+            self.charge_resource(ctx, "work", source.len)
+            self.charge_resource(ctx, "alloc", source.len)
+            return ListVal(arr, L.ZERO, source.len, e.ty)
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
@@ -2295,7 +2355,6 @@ class VCGen:
         return ListVal(arr, L.ZERO, ln, e.ty)
 
     def comprehension_callback_costs(self, seq: ListVal, elem: str, body: ir.Expr, cond: ir.Expr | None, ctx: Ctx, models: set[str]) -> dict[str, L.Term]:
-        models = {"alloc" if model == "peak" else model for model in models}
         if ctx.state is None:
             return {model: L.ZERO for model in models}
         i = L.Const(f"cost!{next(self.counter)}", L.INT)
@@ -2321,8 +2380,10 @@ class VCGen:
             callback_cost = L.add(cond_costs[key], body_cost)
             if callback_cost == L.ZERO:
                 sums[model] = L.ZERO
-            elif not isinstance(seq.len, L.IntV) and (bound := self.comprehension_resource_bound(body, cond, model)) is not None:
-                sums[model] = self.bounded_resource_delta(ctx, f"comp_{model}", L.mul(seq.len, bound))
+            elif not any(term == i for term in L.iter_terms(callback_cost)):
+                sums[model] = L.mul(seq.len, callback_cost)
+            elif (upper := self.resource_upper_bound(callback_cost, ctx.base, i)) is not None:
+                sums[model] = self.bounded_resource_delta(ctx, f"comp_cost_{model}", L.mul(seq.len, upper))
             elif isinstance(seq.len, L.IntV):
                 total = L.ZERO
                 for index in range(seq.len.value):
@@ -2335,6 +2396,44 @@ class VCGen:
                 sums[model] = L.Fn("seqsum", (values, L.ZERO, seq.len), L.INT)
         return sums
 
+    def resource_upper_bound(self, term: L.Term, facts: list[L.Term], binder: L.Term) -> L.Term | None:
+        """Find a uniform nonnegative upper bound already established for a callback cost."""
+        bounds: list[L.Term] = []
+
+        def inspect(fact: L.Term) -> None:
+            if isinstance(fact, L.Quant):
+                inspect(fact.body)
+            elif isinstance(fact, L.App) and fact.op == "implies":
+                inspect(fact.args[1])
+            elif isinstance(fact, L.App) and fact.op == "and":
+                for arg in fact.args:
+                    inspect(arg)
+            elif isinstance(fact, L.App) and fact.op == "le" and fact.args[0] == term:
+                bounds.append(fact.args[1])
+            elif isinstance(fact, L.App) and fact.op == "eq":
+                if fact.args[0] == term:
+                    bounds.append(fact.args[1])
+                elif fact.args[1] == term:
+                    bounds.append(fact.args[0])
+
+        for fact in facts:
+            inspect(fact)
+        if bounds:
+            usable = [bound for bound in bounds if not any(part == binder for part in L.iter_terms(bound))]
+            return min(usable, key=lambda value: value.value) if usable and all(isinstance(value, L.IntV) for value in usable) else (usable[0] if usable else None)
+        if isinstance(term, L.IntV):
+            return term if term.value >= 0 else None
+        if isinstance(term, L.App):
+            if term.op == "add":
+                left = self.resource_upper_bound(term.args[0], facts, binder)
+                right = self.resource_upper_bound(term.args[1], facts, binder)
+                return L.add(left, right) if left is not None and right is not None else None
+            if term.op == "ite":
+                yes = self.resource_upper_bound(term.args[1], facts, binder)
+                no = self.resource_upper_bound(term.args[2], facts, binder)
+                return L.max_(yes, no) if yes is not None and no is not None else None
+        return None
+
     def bounded_resource_delta(self, ctx: Ctx, name: str, upper: L.Term) -> L.Term:
         """An abstract aggregate cost constrained by a proved upper bound."""
         stem = f"{name}@{next(self.counter)}"
@@ -2342,48 +2441,6 @@ class VCGen:
         assume = ctx.assume_for_all_binders if ctx.binders else ctx.assume
         assume(L.and_(L.le(L.ZERO, amount), L.le(amount, upper)))
         return amount
-
-    def comprehension_resource_bound(self, body: ir.Expr, cond: ir.Expr | None, model: str) -> L.Term | None:
-        """Upper-bound one callback's resource use from checked callee summaries."""
-        model = "alloc" if model == "peak" else model
-        exprs = [body] + ([cond] if cond is not None else [])
-        calls = [node for expr in exprs for node in ir.walk_expr(expr) if isinstance(node, ir.Call)]
-        if any(isinstance(node, (ir.Extern, ir.New)) for expr in exprs for node in ir.walk_expr(expr)):
-            return None
-        if model == "alloc" and any(
-            isinstance(node, ir.ListLit)
-            or isinstance(node, ir.Builtin) and node.name in ("slice", "list_concat", "list_repeat", "dict_copy", "comp", "str_of_int")
-            for expr in exprs
-            for node in ir.walk_expr(expr)
-        ):
-            return None
-        limits: list[int] = []
-        for call in calls:
-            target = self.program.resolve(self.module, call.func)
-            if target is None:
-                return None
-            found: list[int] = []
-            for clause in target.fn.ensures:
-                for part in self.resource_parts(clause.expr):
-                    if not isinstance(part, ir.Binary) or part.op not in ("<=", "le"):
-                        continue
-                    lhs = part.left
-                    if (
-                        isinstance(lhs, ir.Builtin)
-                        and lhs.name == "cost"
-                        and lhs.args
-                        and isinstance(lhs.args[0], ir.Lit)
-                        and lhs.args[0].value == model
-                        and isinstance(part.right, ir.Lit)
-                        and isinstance(part.right.value, int)
-                        and part.right.value >= 0
-                    ):
-                        found.append(part.right.value)
-            if not found:
-                return None
-            limits.append(max(found))
-        steps = sum(1 for expr in exprs for _ in ir.walk_expr(expr)) if model == "work" else 0
-        return L.IntV(steps + sum(limits))
 
     def same_comp(self, arr: L.Term, b: L.Term, seq: ListVal, i: L.Const, ctx: Ctx) -> L.Term:
         """The array of an earlier comprehension computing the same elements
@@ -2823,17 +2880,24 @@ class VCGen:
         if ctx.state is not None and not ctx.spec:
             post.update(self.call_effects(callee, args, arg_exprs, ctx, new_self))
             if self.resource_tracking:
-                for model in ir.RESOURCE_STATE_MODELS:
+                for model in self.resource_models:
                     key = ir.RESOURCE_KEYS[model]
                     name = f"{model}_{fn.name}@{next(self.counter)}"
                     delta: L.Term = L.Fn(name, ctx.binders, L.INT) if ctx.binders else L.Const(name, L.INT)
                     assume = ctx.assume_for_all_binders if ctx.binders else ctx.assume
                     assume(L.le(L.ZERO, delta))
+                    if model == "peak":
+                        allocated = post[ir.RESOURCE_KEYS["alloc"]]
+                        assert isinstance(allocated, L.Term)
+                        assume(L.le(delta, allocated))
                     post[key] = delta
                     self.charge_resource(ctx, model, delta)
         # Assume the postcondition (code context; spec calls use lemma axioms).
         if (not ctx.spec or contractual) and fn.ensures and not predicate:
-            ectx = Ctx(base=ctx.base, env=post, module=callee.module, guard=ctx.guard, old_env={**heap_pre, **pmap}, result=r if r is not NONE_V else None, spec=True, quiet=True)
+            old_env = {**heap_pre, **pmap}
+            if self.resource_tracking:
+                old_env.update({ir.RESOURCE_KEYS[model]: L.ZERO for model in self.resource_models})
+            ectx = Ctx(base=ctx.base, env=post, module=callee.module, guard=ctx.guard, old_env=old_env, result=r if r is not NONE_V else None, spec=True, quiet=True)
             for en in fn.ensures:
                 has_cost = any(isinstance(x, ir.Builtin) and x.name == "cost" for x in ir.walk_expr(en.expr))
                 if has_cost and not self.resource_tracking:
@@ -2910,12 +2974,16 @@ class VCGen:
             exprs: list[ir.Expr | None] = [None if isinstance(a, ir.Var) and a.name in ctx.bound else a for a in c.args]
             self.call_effects(callee, args, exprs, ctx, new_self=callee.fn.name.endswith(".__init__"), returned=False)
             if self.resource_tracking:
-                post = {ir.RESOURCE_KEYS[model]: self.fresh(f"raised_{model}_{callee.fn.name}", ir.INT) for model in ir.RESOURCE_STATE_MODELS}
-                for model in ir.RESOURCE_STATE_MODELS:
+                post = {ir.RESOURCE_KEYS[model]: self.fresh(f"raised_{model}_{callee.fn.name}", ir.INT) for model in self.resource_models}
+                for model in self.resource_models:
                     key = ir.RESOURCE_KEYS[model]
                     delta = post[key]
                     assert isinstance(delta, L.Term)
                     ctx.assume(L.le(L.ZERO, delta))
+                    if model == "peak":
+                        allocated = post[ir.RESOURCE_KEYS["alloc"]]
+                        assert isinstance(allocated, L.Term)
+                        ctx.assume(L.le(delta, allocated))
                     self.charge_resource(ctx, model, delta)
                 ectx = Ctx(base=ctx.base, env={**{p.name: a for p, a in zip(callee.fn.params, args)}, **post}, module=callee.module, spec=True, quiet=True)
                 for en in callee.fn.ensures:
@@ -3313,6 +3381,8 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
     g = VCGen(program, ref)
     g.definitional_mode = True
     env: dict[str, Val] = {}
+    if g.resource_tracking:
+        env.update({key: L.ZERO for key in ir.RESOURCE_KEYS.values()})
     params: list[L.Const] = []
     for p in ref.fn.params:
         v = g.param_val(p.name, p.ty)
@@ -3402,7 +3472,10 @@ def build_axioms(program: Program, ref: FuncRef, fundef: L.FunDef) -> list[L.Axi
         env[key] = next(it)
     call = L.Fn(fundef.name, fundef.params, fundef.sort)
     base: list[L.Term] = []
-    ctx = Ctx(base=base, env=env, module=ref.module, spec=True, quiet=True)
+    entry_env = dict(env)
+    if g.resource_tracking:
+        entry_env.update({key: L.ZERO for key in ir.RESOURCE_KEYS.values()})
+    ctx = Ctx(base=base, env=entry_env, module=ref.module, spec=True, quiet=True)
     # The body was proved assuming the invariants of the objects passed in,
     # so the lemma assumes them too (over any heap maps they read beyond the
     # definition's own, quantified as well).
@@ -3425,7 +3498,20 @@ def build_axioms(program: Program, ref: FuncRef, fundef: L.FunDef) -> list[L.Axi
         v = env[p.name]
         if isinstance(v, ListVal):
             hyps.append(L.le(L.ZERO, v.len))
-    ectx = Ctx(base=base, env=env, module=ref.module, old_env=env, result=call, spec=True, quiet=True)
+    post_env = dict(env)
+    resource_vars: list[L.Const] = []
+    if g.resource_tracking:
+        for model in g.resource_models:
+            key = ir.RESOURCE_KEYS[model]
+            value = L.Const(f"{program.logic_names[ref.key]}_{model}_spec", L.INT)
+            post_env[key] = value
+            resource_vars.append(value)
+    ectx = Ctx(base=base, env=post_env, module=ref.module, old_env=entry_env, result=call, spec=True, quiet=True)
     goals = [g.ev(en.expr, ectx) for en in ref.fn.ensures]
-    formula = L.forall(tuple(fundef.params) + tuple(extra), L.implies(L.and_(*base, *hyps), L.and_(*goals)))
+    if not goals:
+        return []
+    post = L.and_(*goals)
+    if resource_vars:
+        post = L.Quant("exists", tuple(resource_vars), post)
+    formula = L.forall(tuple(fundef.params) + tuple(extra), L.implies(L.and_(*base, *hyps), post))
     return [L.Axiom(f"{fundef.name}_spec", formula, about=ref.key, doc=f"@ensures of {ref.fn.name}")]

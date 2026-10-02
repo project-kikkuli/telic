@@ -784,3 +784,11 @@ func shortCircuitAndExecuted(_ x: Bool) -> Bool {
     //@ ensures cost("work") == 4
     return x && true
 }
+
+// expect: proved
+func loggingEvaluatesArguments() -> Int {
+    //@ ensures cost("external_calls") == 1
+    //@ ensures cost("alloc") == 3
+    print([1, 2, 3])
+    return 0
+}

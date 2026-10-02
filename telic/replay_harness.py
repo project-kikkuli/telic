@@ -12,7 +12,7 @@ import traceback
 from fractions import Fraction
 from typing import Any
 
-from telic.runtime import settle, show
+from telic.runtime import reset_resource_trace, resource_trace, settle, show
 
 
 def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
@@ -113,13 +113,14 @@ def _outcome(fn: Any, args: list, module: Any, ContractViolation: Any, fname: st
 def _run(fn: Any, args: list, module: Any, ContractViolation: Any, fname: str) -> dict | None:
     import copy
 
+    reset_resource_trace()
     try:
         settle(fn(*copy.deepcopy(args)))
         return None
     except ContractViolation as e:
         if e.kind == "requires" and e.func == fname:
             return REJECTED
-        return {"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}
+        return {"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail, "resource_trace": resource_trace()}
     except RecursionError:
         return {"crash": "RecursionError"}
     except Exception as e:
@@ -127,7 +128,7 @@ def _run(fn: Any, args: list, module: Any, ContractViolation: Any, fname: str) -
         for fr in traceback.extract_tb(e.__traceback__):
             if fr.filename == getattr(module, "__file__", None):
                 line = fr.lineno
-        return {"crash": type(e).__name__, "msg": str(e), "line": line}
+        return {"crash": type(e).__name__, "msg": str(e), "line": line, "resource_trace": resource_trace()}
 
 
 def _smaller(v: Any):
@@ -294,11 +295,12 @@ def main() -> None:
         print(json.dumps({**d, "stand_in": True} if STAND_IN else d))
 
     STAND_IN.clear()
+    reset_resource_trace()
     try:
         r = settle(fn(*args))
-        emit({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED})
+        emit({"returned_repr": show(r), "returned_is_none": r is None, "stubbed": STUBBED, "resource_trace": resource_trace()})
     except ContractViolation as e:
-        emit(_shrunk(req, fn, mod, ContractViolation, {"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail}))
+        emit(_shrunk(req, fn, mod, ContractViolation, {"violation": e.kind, "text": e.text, "line": e.line, "func": e.func, "detail": e.detail, "resource_trace": resource_trace()}))
     except RecursionError:
         emit({"crash": "RecursionError", "msg": "maximum recursion depth exceeded"})
     except Exception as e:
@@ -306,7 +308,7 @@ def main() -> None:
         for fr in traceback.extract_tb(e.__traceback__):
             if fr.filename == path:
                 line = fr.lineno
-        emit(_shrunk(req, fn, mod, ContractViolation, {"crash": type(e).__name__, "msg": str(e), "line": line}))
+        emit(_shrunk(req, fn, mod, ContractViolation, {"crash": type(e).__name__, "msg": str(e), "line": line, "resource_trace": resource_trace()}))
 
 
 def _shrunk(req: dict, fn: Any, mod: Any, ContractViolation: Any, found: dict) -> dict:

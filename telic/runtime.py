@@ -17,6 +17,7 @@ import importlib.abc
 import importlib.util
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from typing import Any
 from . import ir
 
 RUNTIME_NAME = "__telic_rt__"
+_cost_state = threading.local()
 
 
 class ContractViolation(AssertionError):
@@ -50,6 +52,116 @@ def implies(a: Any, b: Any) -> bool:
 
 def snapshot(v: Any) -> Any:
     return copy.deepcopy(v)
+
+
+def _cost_stack() -> list[dict[str, Any]]:
+    stack = getattr(_cost_state, "stack", None)
+    if stack is None:
+        stack = []
+        _cost_state.stack = stack
+    return stack
+
+
+def enter_cost() -> None:
+    _cost_stack().append({"work": 0, "alloc": 0, "external_calls": 0, "unknown_models": set(), "trace": []})
+
+
+def leave_cost() -> None:
+    stack = _cost_stack()
+    if not stack:
+        return
+    frame = stack.pop()
+    if stack:
+        parent = stack[-1]
+        for model, amount in frame.items():
+            if model not in ("trace", "unknown_models"):
+                parent[model] += amount
+        parent["unknown_models"].update(frame["unknown_models"])
+        parent["trace"].extend(frame["trace"])
+    else:
+        _cost_state.last = frame
+
+
+def resource_cost(model: str) -> int:
+    stack = _cost_stack()
+    if not stack or model not in stack[-1]:
+        raise RuntimeError(f"cost('{model}') is unavailable outside an instrumented function")
+    if model in stack[-1]["unknown_models"]:
+        raise RuntimeError(f"cost('{model}') is unavailable after unchecked code ran")
+    return stack[-1][model]
+
+
+def _work_expr(line: int, operation: str) -> None:
+    stack = _cost_stack()
+    if stack:
+        stack[-1]["work"] += 1
+        stack[-1]["trace"].append({"model": "work", "line": line, "operation": operation, "amount": 1})
+
+
+def _work_step(line: int, operation: str) -> None:
+    stack = _cost_stack()
+    if stack:
+        stack[-1]["work"] += 1
+        stack[-1]["trace"].append({"model": "work", "line": line, "operation": operation, "amount": 1})
+
+
+def _work_iter(line: int) -> bool:
+    _work_step(line, "comprehension_iteration")
+    return True
+
+
+def resource_extra(value: Any, kind: str, line: int, source_items: int = 0) -> None:
+    stack = _cost_stack()
+    if not stack:
+        return
+    frame = stack[-1]
+    size = len(value) if isinstance(value, (str, list, tuple, dict, set)) else 0
+    models: tuple[str, ...] = ()
+    if kind in ("list", "listcomp", "dict", "set"):
+        models = ("alloc",)
+    elif kind == "slice":
+        models = ("work", "alloc")
+    elif kind in ("concat", "repeat") and isinstance(value, (str, list)):
+        models = ("work", "alloc")
+    for model in models:
+        frame[model] += size
+        frame["trace"].append({"model": model, "line": line, "operation": kind, "amount": size})
+    if kind == "dict":
+        frame["work"] += source_items
+        frame["trace"].append({"model": "work", "line": line, "operation": "dict_pairs", "amount": source_items})
+    if kind == "log":
+        frame["external_calls"] += 1
+        frame["trace"].append({"model": "external_calls", "line": line, "operation": "log", "amount": 1})
+
+
+def resource_const(model: str, amount: int, kind: str, line: int) -> None:
+    stack = _cost_stack()
+    if stack and model in stack[-1]:
+        stack[-1][model] += amount
+        stack[-1]["trace"].append({"model": model, "line": line, "operation": kind, "amount": amount})
+
+
+def external_callee(func: Any, line: int, name: str) -> Any:
+    def invoke(*args: Any, **kwargs: Any) -> Any:
+        stack = _cost_stack()
+        if stack:
+            stack[-1]["external_calls"] += 1
+            stack[-1]["trace"].append({"model": "external_calls", "line": line, "operation": name, "amount": 1})
+            for model in ("work", "alloc"):
+                stack[-1]["unknown_models"].add(model)
+                stack[-1]["trace"].append({"model": model, "line": line, "operation": f"unchecked:{name}", "lower_bound": 0, "upper_bound": None})
+        return func(*args, **kwargs)
+
+    return invoke
+
+
+def resource_trace() -> list[dict[str, Any]]:
+    frame = getattr(_cost_state, "last", None)
+    return list(frame["trace"]) if frame else []
+
+
+def reset_resource_trace() -> None:
+    _cost_state.last = None
 
 
 def show(v: Any, depth: int = 0) -> str:
@@ -87,7 +199,25 @@ def check_written(objs: list, invs: dict, func: str) -> None:
 
 
 def _rt_namespace() -> types.SimpleNamespace:
-    return types.SimpleNamespace(check=check, implies=implies, snapshot=snapshot, show=show, check_written=check_written, ContractViolation=ContractViolation)
+    return types.SimpleNamespace(
+        check=check,
+        implies=implies,
+        snapshot=snapshot,
+        show=show,
+        check_written=check_written,
+        resource_cost=resource_cost,
+        resource_extra=resource_extra,
+        resource_const=resource_const,
+        external_callee=external_callee,
+        resource_trace=resource_trace,
+        reset_resource_trace=reset_resource_trace,
+        enter_cost=enter_cost,
+        leave_cost=leave_cost,
+        _work_expr=_work_expr,
+        _work_iter=_work_iter,
+        _work_step=_work_step,
+        ContractViolation=ContractViolation,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +248,200 @@ class _Specs(ast.NodeTransformer):
         self.generic_visit(node)
         if isinstance(node.func, ast.Name) and node.func.id == "implies":
             node.func = ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="implies", ctx=ast.Load())
+        elif isinstance(node.func, ast.Name) and node.func.id == "cost":
+            node.func = ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="resource_cost", ctx=ast.Load())
         elif isinstance(node.func, ast.Name) and node.func.id == "old" and len(node.args) == 1:
             k = len(self.olds)
             self.olds.append(node.args[0])
             return ast.copy_location(ast.Name(id=f"__telic_old{k}", ctx=ast.Load()), node)
         return node
+
+
+class _CostTrace:
+    def __init__(self, externs: dict[tuple[int, int], str] | None = None) -> None:
+        self.temps = 0
+        self.no_alloc: set[int] = set()
+        self.fallback_line = 0
+        self.externs = externs or {}
+
+    def line(self, node: ast.AST) -> int:
+        return getattr(node, "lineno", 0) or self.fallback_line
+
+    def block(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
+        out = []
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.append(stmt)
+                continue
+            previous_line = self.fallback_line
+            self.fallback_line = self.line(stmt)
+            self.node(stmt)
+            if isinstance(stmt, ast.AugAssign):
+                opname = f"binary:{type(stmt.op).__name__}"
+                out.append(self.work_event(self.line(stmt), opname))
+                out.append(self.work_event(self.line(stmt), "augmented_target_read"))
+            tick = ast.Expr(ast.Call(
+                func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_step", ctx=ast.Load()),
+                args=[ast.Constant(self.line(stmt)), ast.Constant(f"statement:{type(stmt).__name__}")],
+                keywords=[],
+            ))
+            ast.copy_location(tick, stmt)
+            out.append(tick)
+            out.append(stmt)
+            self.fallback_line = previous_line
+        return out
+
+    @staticmethod
+    def work_event(line: int, operation: str) -> ast.stmt:
+        event = ast.Expr(ast.Call(
+            func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_expr", ctx=ast.Load()),
+            args=[ast.Constant(line), ast.Constant(operation)],
+            keywords=[],
+        ))
+        event.lineno = line
+        event.col_offset = 0
+        event.end_lineno = line
+        event.end_col_offset = 0
+        return event
+
+    def node(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Call):
+            key = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+            if isinstance(node.func, ast.Attribute):
+                node.func.value = self.node_value(node.func.value)
+            name = self.externs.get(key)
+            if name is not None:
+                node.func = ast.Call(
+                    func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="external_callee", ctx=ast.Load()),
+                    args=[node.func, ast.Constant(getattr(node, "lineno", 0)), ast.Constant(name)],
+                    keywords=[],
+                )
+            for i, arg in enumerate(node.args):
+                node.args[i] = self.node_value(arg)
+            for kw in node.keywords:
+                kw.value = self.node_value(kw.value)
+            return
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and isinstance(node.left, ast.List):
+            self.no_alloc.add(id(node.left))
+        if isinstance(node, ast.ListComp) and node.generators:
+            gen = node.generators[0]
+            gen.ifs.insert(0, ast.Call(
+                func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_iter", ctx=ast.Load()),
+                args=[ast.Constant(getattr(node, "lineno", 0))],
+                keywords=[],
+            ))
+        for field, value in ast.iter_fields(node):
+            if isinstance(node, ast.AnnAssign) and field == "annotation":
+                continue
+            if isinstance(value, list):
+                transformed = []
+                for item in value:
+                    if isinstance(item, ast.stmt):
+                        transformed.extend(self.block([item]))
+                    elif isinstance(item, ast.AST):
+                        transformed.append(self.node_value(item, iterable=isinstance(node, ast.comprehension) and field == "iter"))
+                    else:
+                        transformed.append(item)
+                setattr(node, field, transformed)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, self.node_value(value, iterable=isinstance(node, ast.comprehension) and field == "iter"))
+
+    def node_value(self, node: ast.AST, iterable: bool = False) -> ast.AST:
+        if isinstance(node, ast.Slice):
+            self.node(node)
+            return node
+        if isinstance(node, ast.expr):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_work_iter":
+                return node
+            if iterable:
+                self.node_iter_expr(node)
+                tick = ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_expr", ctx=ast.Load()), args=[ast.Constant(self.line(node)), ast.Constant(f"iterable:{type(node).__name__}")], keywords=[])
+                parts = [tick]
+                if isinstance(node, ast.List):
+                    parts.append(ast.Call(func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="resource_const", ctx=ast.Load()), args=[ast.Constant("alloc"), ast.Constant(len(node.elts)), ast.Constant("list"), ast.Constant(self.line(node))], keywords=[]))
+                parts.append(node)
+                return ast.copy_location(ast.Subscript(value=ast.Tuple(elts=parts, ctx=ast.Load()), slice=ast.Constant(len(parts) - 1), ctx=ast.Load()), node)
+            kind = ""
+            if isinstance(node, ast.List):
+                kind = "" if id(node) in self.no_alloc else "list"
+            elif isinstance(node, ast.ListComp):
+                kind = "listcomp"
+            elif isinstance(node, ast.Dict):
+                kind = "dict"
+            elif isinstance(node, ast.Set):
+                kind = "set"
+            elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+                kind = "slice"
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                kind = "concat"
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+                kind = "repeat"
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+                kind = "log"
+            self.node(node)
+            if hasattr(node, "ctx") and not isinstance(node.ctx, ast.Load):
+                return node
+            self.temps += 1
+            name = f"__telic_cost_value_{self.temps}"
+            tick = ast.Call(
+                func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_expr", ctx=ast.Load()),
+                args=[ast.Constant(self.line(node)), ast.Constant(self.operation(node))],
+                keywords=[],
+            )
+            value = ast.NamedExpr(target=ast.Name(id=name, ctx=ast.Store()), value=node)
+            extra = ast.Call(
+                func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="resource_extra", ctx=ast.Load()),
+                args=[ast.Name(id=name, ctx=ast.Load()), ast.Constant(kind), ast.Constant(self.line(node)), ast.Constant(len(node.keys) if isinstance(node, ast.Dict) else 0)],
+                keywords=[],
+            )
+            wrapped = ast.Subscript(value=ast.Tuple(elts=[tick, value, extra, ast.Name(id=name, ctx=ast.Load())], ctx=ast.Load()), slice=ast.Constant(3), ctx=ast.Load())
+            return ast.copy_location(wrapped, node)
+        self.node(node)
+        return node
+
+    def node_iter_expr(self, node: ast.AST) -> None:
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                transformed = [self.iter_value(item) if isinstance(item, ast.AST) else item for item in value]
+                setattr(node, field, transformed)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, self.iter_value(value))
+
+    def iter_value(self, node: ast.AST) -> ast.AST:
+        if not isinstance(node, ast.expr):
+            self.node_iter_expr(node)
+            return node
+        self.node_iter_expr(node)
+        if hasattr(node, "ctx") and not isinstance(node.ctx, ast.Load):
+            return node
+        tick = ast.Call(
+            func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="_work_expr", ctx=ast.Load()),
+            args=[ast.Constant(self.line(node)), ast.Constant(self.operation(node))],
+            keywords=[],
+        )
+        return ast.copy_location(ast.Subscript(value=ast.Tuple(elts=[tick, node], ctx=ast.Load()), slice=ast.Constant(1), ctx=ast.Load()), node)
+
+    @staticmethod
+    def operation(node: ast.AST) -> str:
+        if isinstance(node, ast.BinOp):
+            return f"binary:{type(node.op).__name__}"
+        if isinstance(node, ast.BoolOp):
+            return f"boolean:{type(node.op).__name__}"
+        if isinstance(node, ast.Compare):
+            return "comparison"
+        if isinstance(node, ast.Call):
+            return "call"
+        if isinstance(node, ast.Name):
+            return "name"
+        if isinstance(node, ast.Constant):
+            return "literal"
+        if isinstance(node, ast.Subscript):
+            return "subscript"
+        if isinstance(node, ast.ListComp):
+            return "list_comprehension"
+        if isinstance(node, ast.List):
+            return "list_literal"
+        return type(node).__name__.lower()
 
 
 def _check_stmt(expr: ast.expr, kind: str, clause: ir.Clause, func: str, detail: ast.expr | None = None) -> ast.stmt:
@@ -167,6 +486,17 @@ class FunctionInstrumenter:
     def run(self) -> None:
         fn = self.fn
         name = fn.name
+        source_body = self.node.body
+        doc = []
+        if source_body and isinstance(source_body[0], ast.Expr) and isinstance(source_body[0].value, ast.Constant) and isinstance(source_body[0].value.value, str):
+            doc, source_body = [source_body[0]], source_body[1:]
+        externs = {
+            (e.loc.line, e.loc.col): e.name
+            for s in ir.walk_stmts(fn.body)
+            for e in (x for root in ir.stmt_exprs(s) for x in ir.walk_expr(root))
+            if isinstance(e, ir.Extern)
+        }
+        self.node.body = doc + _CostTrace(externs).block(source_body)
         pre: list[ast.stmt] = []
         # Snapshot scalar parameters: @ensures sees their entry values.
         mapping = {"result": "__telic_r"}
@@ -314,7 +644,18 @@ class FunctionInstrumenter:
                     finalbody=[],
                 )
             ]
-        self.node.body = doc + pre + body
+        enter = ast.Expr(ast.Call(
+            func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="enter_cost", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        ))
+        leave = ast.Expr(ast.Call(
+            func=ast.Attribute(value=ast.Name(id=RUNTIME_NAME, ctx=ast.Load()), attr="leave_cost", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        ))
+        traced = ast.Try(body=pre + body, handlers=[], orelse=[], finalbody=[leave])
+        self.node.body = doc + [enter, traced]
 
     def _instrument_block(self, parent: ast.AST, field: str) -> None:
         stmts: list[ast.stmt] = getattr(parent, field)

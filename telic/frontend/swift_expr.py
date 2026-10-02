@@ -1166,11 +1166,7 @@ class ExprLowerer:
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ir.Lit(ir.BOOL, loc, False), loc, f"{name} is unreachable"), native=True))
             return self._never(expect, loc)
         if name in LOGGING:
-            for _, a in args:
-                v = self.expr(a, None)
-                if not isinstance(v, (ir.Lit, ir.Var)):
-                    self.hoist(v) if v.ty != ir.NONE else self.pre.append(ir.ExprStmt(loc, v))
-            return ir.Lit(ir.NONE, loc, None)
+            return ir.Builtin(ir.NONE, loc, "log", tuple(self.expr(a, None) for _, a in args))
         if name == "stride":
             raise self.err("stride(...) is supported as the sequence of a for loop", x)
         ev = [self.expr(a, None) for a in vals()]

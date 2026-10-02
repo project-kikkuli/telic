@@ -2260,6 +2260,8 @@ class ExprLowerer:
             raise self.err("vec![v; n] in a specification", vn)
         v = self.hoist(self.expr(vn, expect.elem if isinstance(expect, ir.TList) else None))
         cnt = self.expr(cn, ir.INT, "usize")
+        if isinstance(v.ty, (ir.TInt, ir.TReal, ir.TBool, ir.TStr, ir.TEnum)):
+            return ir.Builtin(ir.TList(v.ty), loc, "vec_repeat", (v, cnt))
         t = self.fl.fresh("rep", ir.TList(v.ty))
         i = self.fl.fresh("i", ir.INT)
         self.pre.append(ir.Assign(loc, t, ir.ListLit(ir.TList(v.ty), loc, ())))
@@ -2968,7 +2970,8 @@ class ExprLowerer:
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", self._eq(a, b, n, op), loc, text), native=True))
             return ir.Lit(ir.NONE, loc, None)
         if name in ("println", "print", "eprintln", "eprint", "dbg", "trace", "debug", "info", "warn", "error", "log"):
-            return ir.Lit(ir.NONE, loc, None)
+            args = self._parse_exprs(body, n)
+            return ir.Builtin(ir.NONE, loc, "log", tuple(self.expr(arg) for arg in args))
         if name == "format":
             return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "format"), ir.Lit(ir.STR, loc, body)))
         return self.hoist(ir.Extern(expect if expect is not None and expect != ir.NONE else ir.TOpaque(f"{name}!"), loc, f"{name}!", ()))
@@ -3235,7 +3238,9 @@ class ExprLowerer:
             inb = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), i), ir.Binary(ir.BOOL, loc, "lt", i, length))
             ot = ir.TOption(t.elem)
             return self.kinded(ir.Ite(ot, loc, inb, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, recv, i, wrap=False),)), ir.Lit(ot, loc, None)), ek)
-        if m in ("clone", "to_vec", "iter", "into_iter", "as_slice", "to_owned"):
+        if m == "to_vec":
+            return ir.Builtin(t, loc, "list_copy", (recv,))
+        if m in ("clone", "iter", "into_iter", "as_slice", "to_owned"):
             return recv
         if self.spec:
             raise self.err(f"Vec method .{m}() in a specification", n)

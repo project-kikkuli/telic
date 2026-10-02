@@ -85,6 +85,45 @@ theorem seqsum_nonneg (a : Int → Int) (lo hi : Int)
     have e : lo + ((hi - lo).toNat : Int) = hi := by omega
     rwa [e] at this
 
+theorem seqsum_le_const_aux (a : Int → Int) (lo : Int) (k : Nat) (bound : Int)
+    (h : ∀ i, lo ≤ i → i < lo + k → a i ≤ bound) (hb : 0 ≤ bound) :
+    seqsum a lo (lo + k) ≤ bound * k := by
+  induction k with
+  | zero => rw [seqsum_empty a lo _ (by omega)]; omega
+  | succ k ih =>
+    rw [seqsum_last a lo _ (by omega)]
+    have e : lo + ((k + 1 : Nat) : Int) - 1 = lo + k := by omega
+    rw [e]
+    have h1 := ih (fun i hi1 hi2 => h i hi1 (by omega))
+    have h2 := h (lo + k) (by omega) (by omega)
+    have hk : ((k : Nat) : Int) + 1 = ((k + 1 : Nat) : Int) := by omega
+    calc
+      seqsum a lo (lo + k) + a (lo + k) ≤ bound * (k : Int) + bound := by omega
+      _ = bound * ((k : Int) + 1) := by simp [Int.mul_add]
+      _ = bound * ((k + 1 : Nat) : Int) := by rw [← hk]
+
+/-- A bounded sequence has a sum bounded by its pointwise bound times its length. -/
+theorem seqsum_upper_bound (a : Int → Int) (lo hi bound : Int)
+    (hle : lo ≤ hi) (hbound : 0 ≤ bound)
+    (h : ∀ i, lo ≤ i ∧ i < hi → a i ≤ bound) :
+    seqsum a lo hi ≤ bound * (hi - lo) := by
+  have n_nonneg : 0 ≤ hi - lo := by omega
+  let n := (hi - lo).toNat
+  have hsum := seqsum_le_const_aux a lo n bound
+    (fun i hi1 hi2 => h i ⟨hi1, by have := Int.toNat_of_nonneg n_nonneg; omega⟩) hbound
+  have hn : (n : Int) = hi - lo := by simp [n, Int.toNat_of_nonneg n_nonneg]
+  have hend : lo + (n : Int) = hi := by omega
+  rw [hend] at hsum
+  rw [hn] at hsum
+  exact hsum
+
+theorem seqsum_upper_bound_from_zero (a : Int → Int) (hi bound : Int)
+    (hhi : 0 ≤ hi) (hbound : 0 ≤ bound)
+    (h : ∀ i, 0 ≤ i ∧ i < hi → a i ≤ bound) :
+    seqsum a 0 hi ≤ bound * hi := by
+  have := seqsum_upper_bound a 0 hi bound (by omega) hbound h
+  simpa using this
+
 theorem seqsum_nonpos_aux (a : Int → Int) (lo : Int) (k : Nat)
     (h : ∀ i, lo ≤ i → i < lo + k → a i ≤ 0) : seqsum a lo (lo + k) ≤ 0 := by
   induction k with

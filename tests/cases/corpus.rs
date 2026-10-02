@@ -653,3 +653,24 @@ pub fn short_circuit_and_executed(x: bool) -> bool {
     //@ ensures cost("work") == 4
     x && true
 }
+
+// expect: proved
+pub fn resource_vec_repeat_alloc(n: usize) -> Vec<i64> {
+    //@ requires n == 100
+    //@ ensures cost("alloc") == 100
+    vec![0i64; n]
+}
+
+// expect: proved
+pub fn resource_to_vec_alloc(xs: Vec<i64>) -> Vec<i64> {
+    //@ requires xs.len() == 100
+    //@ ensures cost("alloc") == 100
+    xs.to_vec()
+}
+
+// expect: proved
+pub fn resource_print_evaluates_arguments() {
+    //@ ensures cost("external_calls") == 1
+    //@ ensures cost("alloc") == 100
+    println!("{:?}", vec![0i64; 100]);
+}

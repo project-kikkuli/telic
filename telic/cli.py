@@ -84,7 +84,7 @@ def report_json(rep: Report) -> dict[str, Any]:
                 if v.model:
                     d["counterexample"] = call_text(f.fn, v.model, f.ref.module.language)
                 if v.replay:
-                    d["replay"] = {"confirmed": v.replay.confirmed, "summary": v.replay.summary, "fuzz": v.replay.fuzz_summary}
+                    d["replay"] = {"confirmed": v.replay.confirmed, "summary": v.replay.summary, "fuzz": v.replay.fuzz_summary, "resource_trace": v.replay.resource_trace}
                 if v.reason:
                     d["reason"] = v.reason
             obs.append(d)

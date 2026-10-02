@@ -544,6 +544,7 @@ def replay_verdicts(program: Program, rep) -> None:
             runtime="node" if lang == "typescript" else "python",
             timed_out=cut_short(out),
             shrunk=f"{fn.name}({out['shrunk_repr']})" if confirmed and out.get("shrunk_repr") is not None else None,
+            resource_trace=out.get("resource_trace", []),
         )
     # The solver's state was unreachable? Search for a real failing input.
     pending = [v for v in rep.verdicts if v.status == "refuted" and v.replay is not None and v.replay.ran and not v.replay.confirmed]
@@ -558,7 +559,7 @@ def replay_verdicts(program: Program, rep) -> None:
             for v in stuck:
                 if text == v.ob.clause.text:  # type: ignore[union-attr]
                     v.status = "refuted"
-                    v.replay = Replay(ran=True, confirmed=True, summary=f"{runtime}: '@{out['violation']} {text}' fails", violation=str(out["violation"]), runtime=runtime)
+                    v.replay = Replay(ran=True, confirmed=True, summary=f"{runtime}: '@{out['violation']} {text}' fails", violation=str(out["violation"]), runtime=runtime, resource_trace=out.get("resource_trace", []))
                     v.replay.fuzz_witness = call  # type: ignore[attr-defined]
                     v.replay.fuzz_desc = v.replay.summary  # type: ignore[attr-defined]
                     v.replay.fuzz_summary = f"the solver gave up, but a real input breaks it: {call}"  # type: ignore[attr-defined]
@@ -582,6 +583,7 @@ def replay_verdicts(program: Program, rep) -> None:
                 same_clause = v.ob.clause is not None and " ".join(str(text).split()) == v.ob.clause.text
                 if same_clause and ((v.ob.kind in ("inv.entry", "inv.step") and what == "invariant") or (v.ob.kind == "ensures" and what == "ensures")):
                     v.replay.confirmed = True
+                    v.replay.resource_trace = out.get("resource_trace", [])
         else:
             for v in pending:
                 v.replay.fuzz_summary = f"{out.get('tried', 0)} random inputs found no failure"  # type: ignore[attr-defined]

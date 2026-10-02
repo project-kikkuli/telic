@@ -1202,8 +1202,9 @@ class FunctionLowerer:
                     isinstance(f, ast.Attribute) and f.attr in IGNORED_ATTR_CALLS and isinstance(f.value, ast.Name) and f.value.id in {"logger", "logging", "log"}
                 )
                 if logging_call:
-                    # Output is ignored, but its arguments are still evaluated.
-                    yield from self._effects_of(list(v.args) + [k.value for k in v.keywords], loc)
+                    args = [self.expr(a) for a in v.args]
+                    args.extend(self.expr(k.value) for k in v.keywords)
+                    yield ir.ExprStmt(loc, ir.Builtin(ir.NONE, loc, "log", tuple(args)))
                     return
                 if isinstance(f, ast.Attribute) and f.attr == "append" and isinstance(f.value, ast.Attribute):
                     fld = self.expr(f.value)
