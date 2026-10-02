@@ -12,6 +12,7 @@ import subprocess
 from collections import deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from html.entities import html5 as HTML5_ENTITIES
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -26,13 +27,79 @@ MAX_STATES = 4096
 ARIA_ROLES = {"alert", "alertdialog", "application", "article", "banner", "blockquote", "button", "caption", "cell", "checkbox", "code", "columnheader", "combobox", "complementary", "contentinfo", "definition", "deletion", "dialog", "document", "emphasis", "feed", "figure", "form", "generic", "grid", "gridcell", "group", "heading", "img", "insertion", "link", "list", "listbox", "listitem", "log", "main", "mark", "marquee", "math", "menu", "menubar", "menuitem", "menuitemcheckbox", "menuitemradio", "meter", "navigation", "note", "option", "paragraph", "progressbar", "radio", "radiogroup", "region", "row", "rowgroup", "rowheader", "scrollbar", "search", "searchbox", "separator", "slider", "spinbutton", "status", "strong", "subscript", "superscript", "switch", "tab", "table", "tablist", "tabpanel", "term", "textbox", "timer", "toolbar", "tooltip", "tree", "treegrid", "treeitem"}
 
 
-def _vite_react_inputs(top: str) -> tuple[bool, list[str], str | None]:
+def _jsx_entities(text: str) -> str:
+    reference = re.compile(r"&(#(?:[xX][0-9a-fA-F]+|[0-9]+)|[A-Za-z][A-Za-z0-9]+);")
+
+    def decode(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key.startswith("#"):
+            return html_lib.unescape(match.group(0))
+        return HTML5_ENTITIES.get(f"{key};", match.group(0))
+
+    return reference.sub(decode, text)
+
+
+def _installed_package_closure(top: str, roots: tuple[tuple[str, str], ...]) -> tuple[list[str], str, list[tuple[str, str, str]], bool]:
+    seen: dict[str, tuple[str, Path]] = {}
+    installed: list[tuple[str, str, str]] = []
+    complete = True
+
+    def locate(name: str, importer: Path) -> tuple[Path, Path] | None:
+        parts = name.split("/")
+        for parent in (importer, *importer.parents):
+            candidate = parent / "node_modules" / Path(*parts)
+            if (candidate / "package.json").is_file():
+                return candidate, candidate.resolve()
+        return None
+
+    pending = [(name, Path(importer).resolve(), False) for name, importer in roots]
+    while pending:
+        name, importer, optional = pending.pop()
+        located = locate(name, importer)
+        if located is None:
+            if not optional:
+                complete = False
+            continue
+        logical_dir, package_dir = located
+        if str(package_dir) in seen:
+            continue
+        try:
+            package = json.loads((package_dir / "package.json").read_text())
+        except (OSError, ValueError):
+            complete = False
+            continue
+        seen[str(package_dir)] = (package.get("name", name), package_dir)
+        lock_path = logical_dir.as_posix().split("node_modules/", 1)
+        if len(lock_path) == 2:
+            installed.append((package.get("name", name), package.get("version", ""), f"node_modules/{lock_path[1]}"))
+        pending.extend((dependency, package_dir, False) for dependency in package.get("dependencies", {}))
+        pending.extend((dependency, package_dir, True) for dependency in package.get("optionalDependencies", {}))
+        pending.extend((peer, package_dir, True) for peer in package.get("peerDependencies", {}))
+
+    digest = hashlib.sha256()
+    files: list[str] = []
+    for package_name, package_dir in sorted(seen.values()):
+        for full in sorted(package_dir.rglob("*")):
+            if not full.is_file():
+                continue
+            try:
+                data = full.read_bytes()
+                rel = f"{package_name}/{full.relative_to(package_dir).as_posix()}"
+            except OSError:
+                complete = False
+                continue
+            digest.update(rel.encode() + b"\0" + data + b"\0")
+            files.append(str(full))
+    return files, digest.hexdigest(), installed, complete
+
+
+def _vite_react_inputs(top: str) -> tuple[bool, list[str], str, str | None]:
     package_path = os.path.join(top, "package.json")
     lock_path = os.path.join(top, "package-lock.json")
     tsconfig_path = os.path.join(top, "tsconfig.json")
     configs = [os.path.join(top, f"vite.config.{ext}") for ext in ("js", "mjs", "ts") if os.path.isfile(os.path.join(top, f"vite.config.{ext}"))]
     if not os.path.isfile(package_path) or not os.path.isfile(lock_path) or not os.path.isfile(tsconfig_path) or len(configs) != 1:
-        return False, [], "source proof needs a locked Vite React project and one Vite config"
+        return False, [], "", "source proof needs a locked Vite React project and one Vite config"
     try:
         package = json.loads(Path(package_path).read_text())
         lock = json.loads(Path(lock_path).read_text())
@@ -43,7 +110,7 @@ def _vite_react_inputs(top: str) -> tuple[bool, list[str], str | None]:
             installed_path = os.path.join(top, "node_modules", *name.split("/"), "package.json")
             installed[name] = json.loads(Path(installed_path).read_text())
     except (OSError, ValueError, KeyError) as e:
-        return False, [], f"cannot establish the installed Vite React toolchain: {e}"
+        return False, [], "", f"cannot establish the installed Vite React toolchain: {e}"
     expected = "import{defineConfig}from'vite'importreactfrom'@vitejs/plugin-react'exportdefaultdefineConfig({plugins:[react()]})"
     compact = re.sub(r",([}\]])", r"\1", re.sub(r"\s+", "", re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", config))).rstrip(";")
     deps = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
@@ -55,15 +122,21 @@ def _vite_react_inputs(top: str) -> tuple[bool, list[str], str | None]:
     compiler = tsconfig.get("compilerOptions", {})
     unsupported_configs = (".babelrc", ".babelrc.json", ".babelrc.js", ".babelrc.cjs", "babel.config.js", "babel.config.cjs", "babel.config.mjs", ".swcrc")
     if compact != expected or tsconfig.get("extends") or compiler.get("jsx") != "react-jsx" or any(k in compiler for k in ("jsxImportSource", "jsxFactory", "jsxFragmentFactory", "plugins")):
-        return False, [], "Vite React JSX compilation options are outside the verified pipeline"
+        return False, [], "", "Vite React JSX compilation options are outside the verified pipeline"
     if any(os.path.isfile(os.path.join(top, f)) for f in unsupported_configs):
-        return False, [], "custom Babel or SWC transforms are outside the verified Vite pipeline"
+        return False, [], "", "custom Babel or SWC transforms are outside the verified Vite pipeline"
     if any(name not in deps or lock_root.get("dependencies", {}).get(name) != deps[name] and lock_root.get("devDependencies", {}).get(name) != deps[name]
            or locked.get(f"node_modules/{name}", {}).get("version") != installed[name].get("version") for name in required):
-        return False, [], "Vite config, package lock, or installed React toolchain is outside the verified pipeline"
+        return False, [], "", "Vite config, package lock, or installed React toolchain is outside the verified pipeline"
     if not vite_bin or not os.path.isfile(bin_path) or os.path.realpath(bin_path) != os.path.realpath(os.path.join(top, "node_modules", "vite", vite_bin)):
-        return False, [], "Vite config, package lock, or installed React toolchain is outside the verified pipeline"
-    return True, [package_path, lock_path, configs[0], tsconfig_path, *(os.path.join(top, "node_modules", *name.split("/"), "package.json") for name in required), bin_path], None
+        return False, [], "", "Vite config, package lock, or installed React toolchain is outside the verified pipeline"
+    roots = tuple((name, top) for name in ("vite", "@vitejs/plugin-react", "react", "react-dom")) + (("typescript", str(EXTRACTOR.parent)),)
+    closure, closure_digest, installed_closure, complete = _installed_package_closure(top, roots)
+    if not closure or not complete:
+        return False, [], "", "cannot establish installed compiler and React runtime package contents"
+    if any(locked.get(path, {}).get("version") != version for _, version, path in installed_closure):
+        return False, [], "", "an installed compiler or runtime dependency differs from the locked Vite React toolchain"
+    return True, [package_path, lock_path, configs[0], tsconfig_path, *(os.path.join(top, "node_modules", *name.split("/"), "package.json") for name in required), bin_path], closure_digest, None
 
 
 def _css_model(texts: list[str]) -> tuple[list[dict[str, Any]], bool]:
@@ -139,6 +212,7 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         return None, None, f"CSS can change the accessibility tree ({os.path.relpath(css[0], root)}); layout/style semantics are not modeled"
     entries = []
     css_texts: list[str] = []
+    resolutions: dict[str, str | None] = {}
     dig = hashlib.sha256()
     for full in files:
         try:
@@ -181,9 +255,31 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         if (ui.get("command") != command or args not in allowed or ui.get("static") or ui.get("build") or ui.get("inputs") is not None
                 or actual_digest != config_digest or not url_matches_server):
             return None, None, "source proof is not bound to this configured Vite app, command, URL, and UI inputs"
-        verified, tool_inputs, why = _vite_react_inputs(top)
+        verified, tool_inputs, toolchain_digest, why = _vite_react_inputs(top)
         if not verified:
             return None, None, why
+        resolver = EXTRACTOR.with_name("uivite-resolve.mjs")
+        try:
+            resolved = subprocess.run(
+                [typescript._node(), str(resolver)],
+                input=json.dumps({
+                    "projectRoot": top,
+                    "workspaceRoot": root,
+                    "config": next(p for p in (os.path.join(top, f"vite.config.{ext}") for ext in ("js", "mjs", "ts")) if os.path.isfile(p)),
+                    "files": entries,
+                }),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if resolved.returncode:
+                return None, None, resolved.stderr.strip() or "the configured Vite resolver failed"
+            resolutions = json.loads(resolved.stdout).get("resolutions", {})
+        except (typescript.FrontendUnavailable, subprocess.SubprocessError, OSError, ValueError, StopIteration) as e:
+            return None, None, f"cannot resolve the configured Vite module graph: {e}"
+        dig.update(toolchain_digest.encode())
+        dig.update(resolver.read_bytes())
         for full in css:
             try:
                 data = Path(full).read_bytes()
@@ -299,7 +395,7 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         typescript.ensure_installed()
         got = subprocess.run(
             [typescript._node(), str(EXTRACTOR)],
-            input=json.dumps({"files": entries}),
+            input=json.dumps({"files": entries, "resolutions": resolutions, "pipeline": pipeline}),
             capture_output=True,
             text=True,
             timeout=120,
@@ -331,11 +427,11 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
             return
         if node.get("type") == "jsxText":
             node["type"] = "text"
-            node["value"] = html_lib.unescape(node["value"])
+            node["value"] = _jsx_entities(node["value"])
         if node.get("type") == "text" and isinstance(node.get("value"), list) and node["value"][0] == "jsx-lit":
-            node["value"] = ["lit", html_lib.unescape(node["value"][1])]
+            node["value"] = ["lit", _jsx_entities(node["value"][1])]
         if node.get("type") == "element":
-            node["props"] = {k: (["lit", html_lib.unescape(v[1])] if isinstance(v, list) and len(v) == 2 and v[0] == "jsx-lit" else v) for k, v in node.get("props", {}).items()}
+            node["props"] = {k: (["lit", _jsx_entities(v[1])] if isinstance(v, list) and len(v) == 2 and v[0] == "jsx-lit" else v) for k, v in node.get("props", {}).items()}
         for child in node.get("children", []):
             decode_jsx(child)
         for key in ("yes", "no"):
@@ -359,6 +455,7 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         return None, identity, "a browser cannot execute TypeScript or JSX from a raw static directory"
     models[0]["dependencies"] = sorted([*(e["path"] for e in entries), *html_deps, *([os.path.relpath(p, root).replace(os.sep, "/") for p in tool_inputs] if pipeline == "vite-react" else [])])
     models[0]["pipeline"] = pipeline or "raw-static"
+    models[0]["trust"] = ["configured Vite plugin resolver selected each analyzed local module", "installed Vite, React plugin, React, React DOM, and transitive package contents match the hashed toolchain identity", "the finite React and browser accessibility semantics implemented by this extractor match the selected runtime behavior"] if pipeline == "vite-react" else []
     models[0]["styles"] = styles
     models[0]["layout_sensitive"] = layout_sensitive
     return models[0], identity, None
@@ -706,7 +803,7 @@ def _id_texts(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]
             if isinstance(value, (list, dict)):
                 raise ValueError("React object and array children need explicit child-node modeling")
             return "" if value is None or isinstance(value, bool) else str(value)
-        if kind == "jsxText": return html_lib.unescape(node["value"])
+        if kind == "jsxText": return _jsx_entities(node["value"])
         if kind == "empty": return ""
         if kind == "component": return raw_text(node["child"])
         if kind == "group": return "".join(raw_text(c) for c in node["children"])
@@ -743,6 +840,7 @@ def _role(tag: str, props: dict[str, Any]) -> str:
     return {
         "button": "button", "main": "main", "nav": "navigation", "aside": "complementary", "article": "article",
         "p": "paragraph", "h1": "heading", "h2": "heading", "h3": "heading", "h4": "heading", "h5": "heading", "h6": "heading",
+        "table": "table", "thead": "rowgroup", "tbody": "rowgroup", "tfoot": "rowgroup", "tr": "row", "td": "cell", "th": "columnheader",
         "div": "generic", "span": "generic",
     }.get(tag, "generic")
 
@@ -754,7 +852,7 @@ def _tree_text(n: dict[str, Any], state: dict[str, Any], model: dict[str, Any], 
             raise ValueError("React object and array children need explicit child-node modeling")
         return "" if value is None or isinstance(value, bool) else str(value)
     if n["type"] == "empty": return ""
-    if n["type"] == "jsxText": return html_lib.unescape(n["value"])
+    if n["type"] == "jsxText": return _jsx_entities(n["value"])
     if inherited_aria_hidden: return ""
     if n["type"] == "component": return _tree_text(n["child"], state, model, inherited_visibility, inherited_aria_hidden)
     if n["type"] == "group": return "".join(_tree_text(c, state, model, inherited_visibility, inherited_aria_hidden) for c in n["children"])

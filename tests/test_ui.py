@@ -789,9 +789,12 @@ def test_source_ui_composes_stateful_imports_with_finite_state(tmp_path):
 def test_source_ui_models_imported_forwarding_state_hooks(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
-        'import { useDisclosure } from "./useDisclosure"; export default function App(){const [open,setOpen]=useDisclosure(false);return open?<div role="dialog" aria-label="Help"><button onClick={()=>setOpen(false)}>Close</button></div>:<button onClick={()=>setOpen(true)}>Open help</button>}',
+        'import { useDisclosure } from "./hooks"; export default function App(){const [open,setOpen]=useDisclosure(false);return open?<div role="dialog" aria-label="Help"><button onClick={()=>setOpen(false)}>Close</button></div>:<button onClick={()=>setOpen(true)}>Open help</button>}',
         'always reachable button "Open help" from overlay "Help"',
-        modules={"useDisclosure.ts": 'import {useState} from "react"; export function useDisclosure(initial:boolean){const [value,setValue]=useState(initial);return [value,setValue] as const;}\n'},
+        modules={
+            "hooks.ts": 'export {useDisclosure} from "./useDisclosure";\n',
+            "useDisclosure.ts": 'import {useState} from "react"; export function useDisclosure(initial:boolean){const [value,setValue]=useState(initial);return [value,setValue] as const;}\n',
+        },
     )
     assert why is None and got.status == "proved" and got.method == "source proof"
 
@@ -832,6 +835,62 @@ export function Wizard(){const [step,setStep]=useState(0);const current=steps[st
     source = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, 'reachable heading "Complete"', (), parse_prop('reachable heading "Complete"')[0]))
     assert why is None and source.status == "proved", f"{why=}, {source.status=}, {source.detail=}"
     assert got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_uses_configured_vite_extensionless_module_resolution(tmp_path):
+    model, identity, why, got = _static_source_case(
+        tmp_path,
+        'import {Widget} from "./Widget"; export default function App(){return <Widget />} ',
+        'reachable button "Good"',
+        modules={
+            "Widget.tsx": 'export function Widget(){return <button>Good</button>}',
+            "Widget.jsx": 'export function Widget(){return <button>Bad</button>}',
+        },
+    )
+    from telic.ui.spec import UiLemma
+    from telic.ui.static import check as check_source
+
+    assert why is None, why
+    bad = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, 'reachable button "Bad"', (), parse_prop('reachable button "Bad"')[0]))
+    assert got.status == "refuted" and got.method == "source proof"
+    assert bad.status == "proved" and bad.method == "source proof", f"{bad.status=}, {bad.detail=}"
+
+
+@pytest.mark.parametrize(
+    ("location", "jsx_value", "accessible_name"),
+    [
+        ("text", "A &amp; B", "A & B"),
+        ("text", "A &not; B", "A ¬ B"),
+        ("text", "A &notit; B", "A &notit; B"),
+        ("text", "A &#169; B", "A © B"),
+        ("text", "A &#x1F642; B", "A 🙂 B"),
+        ("text", "\n  A\n  B\n", "A B"),
+        ("attribute", "A &amp; B", "A & B"),
+        ("attribute", "A &notit; B", "A &notit; B"),
+        ("attribute", "A &#x1F642; B", "A 🙂 B"),
+    ],
+)
+def test_source_ui_matches_vite_jsx_entities_and_text_whitespace(tmp_path, location, jsx_value, accessible_name):
+    button = f'<button aria-label="{jsx_value}" />' if location == "attribute" else f'<button>{jsx_value}</button>'
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        f"export default function App(){{return {button}}}",
+        f'reachable button "{accessible_name}"',
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_follows_configured_vite_component_reexports(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {Widget} from "./Barrel"; export default function App(){return <Widget />} ',
+        'reachable button "Ready"',
+        modules={
+            "Barrel.ts": 'export {Widget} from "./Widget";',
+            "Widget.tsx": 'export function Widget(){return <button>Ready</button>}',
+        },
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
 
 
 @pytest.mark.parametrize("property", ['always reachable button "Next" from overlay', 'reachable dialog "Welcome to Notes"'])

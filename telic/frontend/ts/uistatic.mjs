@@ -5,13 +5,14 @@ const require = createRequire(import.meta.url);
 const ts = require("typescript");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const files = new Map(input.files.map((f) => [f.path, f]));
+const resolutions = input.resolutions || {};
 const fail = (sf, node, why) => { throw new Error(`${sf.fileName}:${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${why}`); };
 const strip = (e) => {
   while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isTypeAssertionExpression(e))) e = e.expression;
   return e;
 };
 const modeledAria = new Set(["aria-label", "aria-labelledby", "aria-modal", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
-const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6"]);
+const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "kbd"]);
 const invalidStatic = Symbol("invalid static value");
 const lineOf = (sf, n) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
 
@@ -142,13 +143,10 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       const importedPath = s.moduleSpecifier.text.startsWith(".") ? resolveModule(path, s.moduleSpecifier.text) : null;
       if (!importedPath || !s.importClause || !safeComponentModule(importedPath)) fail(sf, s, `import '${s.moduleSpecifier.text}' has module effects outside the source UI model`);
       if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) {
-        const importedFile = files.get(importedPath);
-        const importedKind = /\.(tsx|jsx)$/.test(importedPath) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(importedPath) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
-        const importedSf = ts.createSourceFile(importedPath, importedFile.text, ts.ScriptTarget.Latest, true, importedKind);
         for (const item of s.importClause.namedBindings.elements) {
           const localName = item.name.text;
           const exportedName = (item.propertyName || item.name).text;
-          const hook = /^use[A-Z]/.test(localName) && !item.isTypeOnly && findForwardingStateHook(importedSf, exportedName, true);
+          const hook = /^use[A-Z]/.test(localName) && !item.isTypeOnly && resolveForwardingStateHook(importedPath, exportedName);
           if (hook) customHooks.set(localName, hook);
         }
       }
@@ -339,11 +337,46 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     }
     if (ts.isJsxFragment(e)) return { type: "group", children: e.children.map((c) => render(c, conditionalMount)) };
     if (ts.isParenthesizedExpression(e)) return render(e.expression, conditionalMount);
+    if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression) && e.expression.name.text === "map") return renderStaticMap(e, conditionalMount);
     if (containsJsx(e) && ts.isConditionalExpression(e)) return { type: "branch", test: enc(e.condition, new Set()), yes: render(e.whenTrue, true), no: render(e.whenFalse, true) };
     if (containsJsx(e) && ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) return { type: "branch", test: enc(e.left, new Set()), yes: render(e.right, true), no: { type: "text", value: enc(e.left, new Set()) } };
     if (ts.isArrayLiteralExpression(e)) return { type: "group", children: e.elements.map((c) => render(c, conditionalMount)) };
     return { type: "text", value: enc(e, new Set()) };
   };
+
+  function renderStaticMap(call, conditionalMount) {
+    if (call.arguments.length !== 1) fail(sf, call, "static UI map needs one source-defined callback");
+    const callback = strip(call.arguments[0]);
+    if ((!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) || callback.parameters.length !== 1 || !ts.isExpression(callback.body)) fail(sf, callback, "static UI map callback must be one expression over one item");
+    const sourceExpr = strip(call.expression.expression);
+    let sourceValue = staticValue(sourceExpr, sf);
+    if (ts.isIdentifier(sourceExpr) && substitutions.has(sourceExpr.text)) {
+      const replacement = substitutions.get(sourceExpr.text);
+      if (replacement[0] === "lit") sourceValue = replacement[1];
+    }
+    if (!Array.isArray(sourceValue)) fail(sf, sourceExpr, "UI map source must be an immutable literal array");
+    const parameter = callback.parameters[0].name;
+    let names = [];
+    if (ts.isIdentifier(parameter)) names = [parameter.text];
+    else if (ts.isArrayBindingPattern(parameter) && parameter.elements.every((item) => ts.isBindingElement(item) && ts.isIdentifier(item.name) && !item.initializer && !item.dotDotDotToken)) names = parameter.elements.map((item) => item.name.text);
+    else fail(sf, callback.parameters[0], "static UI map callback needs an identifier or simple tuple parameter");
+    if (names.some((name) => stateNames.has(name) || substitutions.has(name))) fail(sf, callback.parameters[0], "static UI map parameter shadows a source state or constant");
+    const rendered = [];
+    for (const item of sourceValue) {
+      const values = ts.isIdentifier(parameter) ? [item] : Array.isArray(item) ? item : null;
+      if (!values || values.length !== names.length) fail(sf, callback, "static UI map item does not match its callback parameter");
+      const previous = names.map((name) => [name, substitutions.has(name), substitutions.get(name)]);
+      names.forEach((name, index) => substitutions.set(name, ["lit", values[index]]));
+      try { rendered.push(render(callback.body, conditionalMount)); }
+      finally {
+        for (const [name, hadValue, oldValue] of previous) {
+          if (hadValue) substitutions.set(name, oldValue);
+          else substitutions.delete(name);
+        }
+      }
+    }
+    return { type: "group", children: rendered };
+  }
 
   function componentElement(open, children, whole, conditionalMount) {
     if (!ts.isIdentifier(open.tagName) || !/^[A-Z]/.test(open.tagName.text)) return null;
@@ -380,6 +413,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     for (const a of open.attributes.properties) {
       if (!ts.isJsxAttribute(a)) fail(sf, a, "spread JSX attributes are outside the source UI model");
       const name = a.name.getText(sf);
+      if (name === "key") continue;
       if (name === "style") fail(sf, a, "inline style objects are outside the source UI model");
       if (name === "value" || name === "checked") fail(sf, a, `native ${name} semantics are outside the source UI model`);
       if (name === "role" && !["div", "span"].includes(tag)) fail(sf, a, `role override on native ${tag} is outside the source UI model`);
@@ -462,6 +496,43 @@ function componentCandidates(path, text) {
   return out;
 }
 
+function resolveNamedExport(path, exportName, seen = new Set()) {
+  const key = `${path}\0${exportName}`;
+  if (seen.has(key)) return null;
+  seen.add(key);
+  const file = files.get(path);
+  if (!file) return null;
+  const candidates = componentCandidates(path, file.text);
+  const direct = candidates.find((candidate) => {
+    const own = ts.canHaveModifiers(candidate.node) ? ts.getModifiers(candidate.node) || [] : [];
+    const parent = candidate.node.parent;
+    const declaration = ts.isVariableDeclaration(parent) && ts.isVariableDeclarationList(parent.parent) && ts.isVariableStatement(parent.parent.parent) ? parent.parent.parent : null;
+    const statementMods = declaration && ts.canHaveModifiers(declaration) ? ts.getModifiers(declaration) || [] : [];
+    const defaultExport = candidate.name === "default" || [...own, ...statementMods].some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+    const namedExport = [...own, ...statementMods].some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    return exportName === "default" ? defaultExport : candidate.name === exportName && namedExport;
+  });
+  if (direct) return { path, sf: direct.sf, node: direct.node, name: direct.name };
+  const kind = /\.(tsx|jsx)$/.test(path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
+  const matches = [];
+  for (const statement of sf.statements) {
+    if (!ts.isExportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
+    const resolved = resolveModule(path, statement.moduleSpecifier.text);
+    if (!resolved) continue;
+    if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const item of statement.exportClause.elements) {
+        if (item.name.text !== exportName || item.isTypeOnly) continue;
+        matches.push(resolveNamedExport(resolved, (item.propertyName || item.name).text, seen));
+      }
+    } else if (!statement.exportClause && exportName !== "default") {
+      matches.push(resolveNamedExport(resolved, exportName, seen));
+    }
+  }
+  const found = matches.filter(Boolean);
+  return found.length === 1 ? found[0] : null;
+}
+
 function isStaticDeclaration(sf, statement) {
   return ts.isVariableStatement(statement) && (statement.declarationList.flags & ts.NodeFlags.Const)
     && statement.declarationList.declarations.length > 0
@@ -519,10 +590,50 @@ function isForwardingStateHook(sf, statement) {
   return false;
 }
 
+function resolveForwardingStateHook(path, exportName, seen = new Set()) {
+  const key = `${path}\0${exportName}`;
+  if (seen.has(key)) return null;
+  seen.add(key);
+  const file = files.get(path);
+  if (!file) return null;
+  const kind = /\.(tsx|jsx)$/.test(path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
+  const direct = findForwardingStateHook(sf, exportName, true);
+  if (direct) return direct;
+  const matches = [];
+  for (const statement of sf.statements) {
+    if (!ts.isExportDeclaration(statement)) continue;
+    if (ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      const resolved = resolveModule(path, statement.moduleSpecifier.text);
+      if (!resolved) continue;
+      if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        for (const item of statement.exportClause.elements) {
+          if (item.name.text === exportName && !item.isTypeOnly) matches.push(resolveForwardingStateHook(resolved, (item.propertyName || item.name).text, seen));
+        }
+      } else if (!statement.exportClause && exportName !== "default") {
+        matches.push(resolveForwardingStateHook(resolved, exportName, seen));
+      }
+    } else if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const item of statement.exportClause.elements) {
+        if (item.name.text === exportName && !item.isTypeOnly) {
+          const localName = (item.propertyName || item.name).text;
+          const hook = findForwardingStateHook(sf, localName, false);
+          if (hook) matches.push(hook);
+        }
+      }
+    }
+  }
+  const found = matches.filter(Boolean);
+  return found.length === 1 ? found[0] : null;
+}
+
 function resolveModule(fromPath, specifier) {
+  const path = resolutions[`${fromPath}\0${specifier}`];
+  if (typeof path === "string" && files.has(path)) return path;
+  if (input.pipeline === "vite-react") return null;
   const base = require("node:path").posix.normalize(require("node:path").posix.join(require("node:path").posix.dirname(fromPath), specifier));
   const candidates = /\.[cm]?[jt]sx?$/.test(base) ? [base] : [base, ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"].map((ext) => base + ext), ...["index.tsx", "index.ts", "index.jsx", "index.js"].map((name) => `${base}/${name}`)];
-  return candidates.find((p) => files.has(p)) || null;
+  return candidates.find((candidate) => files.has(candidate)) || null;
 }
 
 function safeComponentModule(path, seen = new Set()) {
@@ -533,18 +644,19 @@ function safeComponentModule(path, seen = new Set()) {
   const kind = /\.(tsx|jsx)$/.test(path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
   const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
   for (const s of sf.statements) {
-    if (ts.isImportDeclaration(s) && ts.isStringLiteralLike(s.moduleSpecifier)) {
-      const from = s.moduleSpecifier.text;
-      if (from === "react") continue;
-      if (from.endsWith(".css")) {
-        const css = require("node:path").posix.normalize(require("node:path").posix.join(require("node:path").posix.dirname(path), from));
-        if (!files.has(css)) return false;
+      if ((ts.isImportDeclaration(s) || ts.isExportDeclaration(s)) && ts.isStringLiteralLike(s.moduleSpecifier)) {
+        const from = s.moduleSpecifier.text;
+        if (from === "react") continue;
+        if (from.endsWith(".css")) {
+          if (ts.isExportDeclaration(s)) return false;
+          const css = require("node:path").posix.normalize(require("node:path").posix.join(require("node:path").posix.dirname(path), from));
+          if (!files.has(css)) return false;
+          continue;
+        }
+        const importedPath = from.startsWith(".") && resolveModule(path, from);
+        if (!importedPath || ts.isImportDeclaration(s) && !s.importClause || !safeComponentModule(importedPath, seen)) return false;
         continue;
       }
-      const importedPath = from.startsWith(".") && resolveModule(path, from);
-      if (!importedPath || !s.importClause || !safeComponentModule(importedPath, seen)) return false;
-      continue;
-    }
     if (ts.isFunctionDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || ts.isExportDeclaration(s)) continue;
     if (ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)) continue;
     if (isStaticDeclaration(sf, s) || ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
@@ -571,29 +683,14 @@ function resolveComponent(fromPath, sf, name, current) {
     }
     for (const binding of imported) {
       if (!binding.exported) continue;
-      const file = files.get(resolved);
-      const match = componentCandidates(resolved, file.text).find((c) => {
-        if (binding.source !== "default") return c.name === binding.source;
-        if (c.name === "default") return true;
-        const own = ts.canHaveModifiers(c.node) ? ts.getModifiers(c.node) || [] : [];
-        const parent = c.node.parent;
-        const variable = ts.isVariableDeclaration(parent) && ts.isVariableDeclarationList(parent.parent) && ts.isVariableStatement(parent.parent.parent) ? parent.parent.parent : null;
-        const exported = variable && ts.canHaveModifiers(variable) ? ts.getModifiers(variable) || [] : [];
-        return [...own, ...exported].some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
-      });
-      if (!match) continue;
-      const mods = ts.canHaveModifiers(match.node) ? ts.getModifiers(match.node) || [] : [];
-      const parent = match.node.parent;
-      const declaration = ts.isVariableDeclaration(parent) && ts.isVariableDeclarationList(parent.parent) && ts.isVariableStatement(parent.parent.parent) ? parent.parent.parent : null;
-      const exported = mods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) || declaration && (ts.getModifiers(declaration) || []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
-      if (exported || binding.source === "default") return { path: resolved, text: file.text, sf: match.sf, node: match.node };
+      const match = resolveNamedExport(resolved, binding.source);
+      if (match) return { path: match.path, text: files.get(match.path).text, sf: match.sf, node: match.node };
     }
   }
   return null;
 }
 
 function mountedComponent(target, files) {
-  const noExt = (p) => p.replace(/\.(tsx?|jsx?|mts|cts|mjs|cjs)$/, "");
   const rootLookup = (e) => {
     e = strip(e);
     if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression) || !ts.isIdentifier(e.expression.expression) || e.expression.expression.text !== "document" || e.arguments.length !== 1 || !ts.isStringLiteralLike(e.arguments[0])) return false;
@@ -614,9 +711,9 @@ function mountedComponent(target, files) {
       if (from === "react-dom/client" && clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
         for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
       } else if (from.startsWith(".")) {
-        const importedPath = noExt(require("node:path").posix.normalize(require("node:path").posix.join(require("node:path").posix.dirname(f.path), from)));
-        if (from.endsWith(".css") && files.some((f) => f.path === importedPath)) continue;
-        if (importedPath === noExt(target.path) && clause) {
+        const importedPath = resolveModule(f.path, from);
+        if (from.endsWith(".css") && importedPath) continue;
+        if (importedPath === target.path && clause) {
           if (target.defaultExport && clause.name) targetBinding = clause.name.text;
           if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
             for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === target.name) targetBinding = item.name.text;
