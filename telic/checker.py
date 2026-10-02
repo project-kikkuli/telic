@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -397,13 +398,34 @@ def toolchain_id() -> str:
 
         h = hashlib.sha256(f"z3 {z3.get_version_string()}".encode())
         pkg = Path(__file__).resolve().parent
-        for f in sorted(pkg.rglob("*")):
-            if f.suffix in (".py", ".mjs", ".lean") and "node_modules" not in f.parts and "demo" not in f.parts:
-                h.update(f.relative_to(pkg).as_posix().encode())
-                h.update(f.read_bytes())
-        for f in sorted(f for f in (pkg.parent / "core").glob("*.ml") if f.name != "source_hash.ml"):
+        semantic = (
+            "__init__.py", "ir.py", "contracts.py", "program.py", "logic.py", "vcgen.py",
+            "infer.py", "smt.py", "checker.py", "jobs.py", "slots.py", "irjson.py", "engine.py",
+            "history.py", "lifecycle.py", "equiv.py", "replay.py", "replay_harness.py", "lean.py",
+            "prover.py",
+        )
+        for name in semantic:
+            f = pkg / name
             h.update(f.name.encode())
             h.update(f.read_bytes())
+        for f in sorted((pkg / "frontend").rglob("*")):
+            if f.is_file() and (f.suffix in (".py", ".mjs") or f.name.startswith("package") and f.suffix == ".json") and "node_modules" not in f.parts:
+                h.update(f.relative_to(pkg).as_posix().encode())
+                h.update(f.read_bytes())
+        for f in sorted((pkg / "ui").rglob("*.py")):
+            h.update(f.relative_to(pkg).as_posix().encode())
+            h.update(f.read_bytes())
+        for f in sorted(pkg.rglob("*.lean")):
+            if "demo" not in f.parts:
+                h.update(f.relative_to(pkg).as_posix().encode())
+                h.update(f.read_bytes())
+        lean_toolchain = pkg.parent / "lean-toolchain"
+        if lean_toolchain.exists():
+            h.update(b"lean-toolchain\0" + lean_toolchain.read_bytes())
+        for f in sorted((pkg.parent / "core").glob("*.ml")):
+            if f.name != "source_hash.ml":
+                h.update(f.name.encode())
+                h.update(f.read_bytes())
         _TOOLCHAIN = h.hexdigest()[:16]
     return _TOOLCHAIN
 
@@ -417,35 +439,172 @@ def _lowered(program: Program, key: str) -> str:
     return memo[key]
 
 
-def _classes(program: Program) -> str:
+def _classes(program: Program, names: set[str] | None = None) -> str:
     memo = program.__dict__.setdefault("_lowered", {})
-    if "" not in memo:
-        decls = {n: {"fields": [[f, irjson.ty(t)] for f, t in c.fields], "invariants": [i.text for i in c.invariants], "lifecycles": [lc.clause.text for lc in c.lifecycles], "bases": c.bases, "owner": c.owner} for n, c in program.classes.items()}
-        memo[""] = json.dumps(decls, sort_keys=True, default=str)
-    return memo[""]
+    if names is None:
+        names = set(program.classes)
+    if "@classes:" + ",".join(sorted(names)) not in memo:
+        expanded = set(names)
+        changed = True
+        while changed:
+            changed = False
+            for name, decl in program.classes.items():
+                if name in expanded or any(base in expanded for base in decl.bases) or any(name in program.mro(parent) for parent in expanded if parent in program.classes):
+                    before = len(expanded)
+                    expanded.add(name)
+                    expanded.update(base for base in decl.bases if base in program.classes)
+                    for _, ty in decl.fields:
+                        expanded.update(_class_refs(ty))
+                    changed |= len(expanded) != before
+        decls = {
+            n: {
+                "fields": [[f, irjson.ty(t)] for f, t in program.classes[n].fields],
+                "invariants": [irjson.clause(i) for i in program.classes[n].invariants],
+                "lifecycles": [
+                    {
+                        "kind": lc.kind,
+                        "clause": irjson.clause(lc.clause),
+                        "code": lc.code,
+                        "probes": [{"label": p.label, "step": irjson.expr(p.step), "created": irjson.expr(p.created) if p.created else None} for p in lc.probes],
+                    }
+                    for lc in program.classes[n].lifecycles
+                ],
+                "bases": program.classes[n].bases,
+                "owner": program.classes[n].owner,
+            }
+            for n in sorted(expanded)
+            if n in program.classes
+        }
+        memo["@classes:" + ",".join(sorted(names))] = json.dumps(decls, sort_keys=True, default=str)
+    return memo["@classes:" + ",".join(sorted(names))]
+
+
+def _class_refs(value: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, ir.TClass):
+        names.add(value.name)
+    elif isinstance(value, ir.New):
+        names.add(value.cls)
+    if is_dataclass(value):
+        for member in fields(value):
+            names.update(_class_refs(getattr(value, member.name)))
+    elif isinstance(value, dict):
+        for key, member in value.items():
+            names.update(_class_refs(key))
+            names.update(_class_refs(member))
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for member in value:
+            names.update(_class_refs(member))
+    return names
+
+
+def _class_closure(program: Program, names: set[str]) -> set[str]:
+    expanded = set(names)
+    changed = True
+    while changed:
+        changed = False
+        for name, decl in program.classes.items():
+            if name in expanded or any(base in expanded for base in decl.bases) or any(name in program.mro(parent) for parent in expanded if parent in program.classes):
+                before = len(expanded)
+                expanded.add(name)
+                expanded.update(base for base in decl.bases if base in program.classes)
+                for _, ty in decl.fields:
+                    expanded.update(_class_refs(ty))
+                changed |= len(expanded) != before
+    return expanded
+
+
+def _function_classes(program: Program, keys: set[str]) -> set[str]:
+    names: set[str] = set()
+    for key in keys:
+        ref = program.funcs.get(key)
+        if ref is None:
+            continue
+        fn = ref.fn
+        names.update(_class_refs((fn.params, fn.ret, fn.locals, fn.requires, fn.ensures, fn.raises, fn.body)))
+        expressions = [e for stmt in ir.walk_stmts(fn.body) for expr in ir.stmt_exprs(stmt) for e in ir.walk_expr(expr)]
+        if program.classes and (fn.escaped or any(isinstance(e, ir.Extern) or isinstance(e, ir.Builtin) and e.name == "await" for e in expressions)):
+            return set(program.classes)
+    return names
+
+
+def _callee_contract(ref: FuncRef, program: Program) -> dict[str, Any]:
+    fn = ref.fn
+    return {
+        "language": ref.module.language,
+        "params": [(p.name, irjson.ty(p.ty)) for p in fn.params],
+        "ret": irjson.ty(fn.ret),
+        "requires": [irjson.clause(c) for c in fn.requires],
+        "ensures": [irjson.clause(c) for c in fn.ensures],
+        "raises": [irjson.clause(c) for c in fn.raises],
+        "unsupported": [(message, loc.line) for message, loc in fn.unsupported],
+        "trusted": fn.trusted,
+        "is_async": fn.is_async,
+        "rejects": fn.rejects,
+        "unit": fn.unit,
+        "definitional": ref.key in program.definitional,
+        "predicate": ref.key in program.predicates,
+        "effects": {
+            "mutated": sorted(program.mutated.get(ref.key, ())),
+            "appends": sorted(program.appends.get(ref.key, ())),
+            "heap_writes": {name: sorted(targets) for name, targets in sorted(program.heap_writes.get(ref.key, {}).items())},
+            "heap_reads": sorted(program.heap_reads.get(ref.key, ())),
+            "allocates": ref.key in program.allocates,
+            "hands_out": ref.key in program.hands_out,
+            "unchecked_writer": ref.key in program.unchecked_writers,
+            "passthrough": ref.key in program.passthrough,
+        },
+    }
 
 
 def function_key(program: Program, key: str, root: str | None, rlimit: int) -> str:
-    """A function's verdict depends on its own source, everything it calls
-    (contracts, and bodies of pure callees used as definitions), the records
-    and class invariants it uses, the module constants it reads, its Lean
-    sidecar proofs, the toolchain and the solver's resource limit. Nothing else."""
+    """Bind a report to its source, call contracts and effects, unfolded
+    definitions, relevant class schemas, sidecars and verifier semantics."""
     seen: set[str] = set()
+    value_targets: set[str] = set()
+    classes = _function_classes(program, {key})
+    class_clauses: set[str] = set()
     todo = [key]
-    while todo:
-        k = todo.pop()
-        if k in seen:
-            continue
-        seen.add(k)
-        todo.extend(program.callees.get(k, ()))
+    while todo or classes - class_clauses:
+        while todo:
+            k = todo.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            todo.extend(program.callees.get(k, ()))
+            todo.extend(program.dispatch.get(k, ()))
+            for _, _, targets in program.code_calls.get(k, ()):
+                value_targets.update(targets)
+                todo.extend(targets)
+            classes |= _function_classes(program, {k})
+        classes = _class_closure(program, classes)
+        for name in classes - class_clauses:
+            class_clauses.add(name)
+            module = program.class_module.get(name)
+            decl = program.classes.get(name)
+            if module is None or decl is None:
+                continue
+            expressions = [clause.expr for clause in decl.invariants]
+            for lifecycle in decl.lifecycles:
+                expressions.extend([lifecycle.clause.expr, *(p.step for p in lifecycle.probes)])
+                expressions.extend(p.created for p in lifecycle.probes if p.created is not None)
+            for expression in expressions:
+                for expr in ir.walk_expr(expression):
+                    if isinstance(expr, ir.Call):
+                        callee = program.resolve(module, expr.func)
+                        if callee is not None:
+                            todo.append(callee.key)
     h = hashlib.sha256(f"fn {toolchain_id()} {key} {rlimit}".encode())
-    h.update(_classes(program).encode())
+    h.update(_classes(program, classes).encode())
     for k in sorted(seen):
         if k not in program.funcs:
             h.update(f"{k}\n{program.units[k][3] if k in program.units else ''}".encode())
             continue
         ref = program.ref(k)
-        h.update(f"{k}\n{ref.module.language}\n{ref.fn.source}\n{sorted((n, str(t)) for n, t in ref.module.records.items())}\n{_lowered(program, k)}".encode())
+        records = {name: irjson.ty(record) for name, record in sorted(ref.module.records.items())}
+        h.update(f"{k}\n{json.dumps(_callee_contract(ref, program), sort_keys=True, default=str)}\n{json.dumps(records, sort_keys=True, default=str)}".encode())
+        if k == key or k in value_targets or k in program.definitional or k in program.predicates:
+            h.update(_lowered(program, k).encode())
     ref = program.ref(key)
     from .lean import sidecar_path
 
