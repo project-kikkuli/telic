@@ -160,6 +160,7 @@ class LeanPrinter:
         self.dependent_ite = False
         self.hyp_counter = 0
         self.bound_consts: list[dict[L.Const, str]] = []
+        self.n.used.update({"Int", "Rat", "Prop", "String", "Unit"})
         for name in self.free_fns:
             self.n(name)
         self.n.used.update(fn_names.values())

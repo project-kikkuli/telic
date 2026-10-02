@@ -670,7 +670,7 @@ def children(t: Term) -> tuple[Term, ...]:
     if isinstance(t, ArrayLambda):
         return (t.body,)
     if isinstance(t, Quant):
-        return (t.body,)
+        return (t.body, *(term for pattern in t.patterns for term in pattern))
     return ()
 
 
@@ -702,6 +702,9 @@ def consts(t: Term) -> set[Const]:
             saved = set(bound)
             bound.update(x.vars)
             go(x.body)
+            for pattern in x.patterns:
+                for term in pattern:
+                    go(term)
             bound.clear()
             bound.update(saved)
         elif isinstance(x, ArrayLambda):
@@ -756,7 +759,7 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
         args = tuple(substitute(a, m) for a in t.args)
         return t if args == t.args else Fn(t.name, args, t.sort)
     if isinstance(t, ArrayLambda):
-        inner = {k: v for k, v in m.items() if k != t.binder}
+        inner = {k: v for k, v in m.items() if k != t.binder and t.binder not in consts(k)}
         body, binder = t.body, t.binder
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if binder in replacements:
@@ -767,16 +770,21 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
             renamed = _fresh_binder(binder, used)
             body = substitute(body, {binder: renamed})
             binder = renamed
-            inner.pop(binder, None)
         new_body = substitute(body, inner)
         return t if binder == t.binder and new_body is t.body else ArrayLambda(binder, new_body, t.sort)
     if isinstance(t, Quant):
-        inner = {k: v for k, v in m.items() if k not in t.vars}
+        inner = {
+            k: v for k, v in m.items()
+            if k not in t.vars and not any(var in consts(k) for var in t.vars)
+        }
         body, vars_ = t.body, t.vars
         renaming = {}
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if replacements.intersection(vars_):
             used = _term_names(body) | {var.name for var in vars_}
+            for pattern in t.patterns:
+                for term in pattern:
+                    used.update(_term_names(term))
             for key, value in inner.items():
                 used.update(_term_names(key))
                 used.update(_term_names(value))
@@ -792,9 +800,9 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
                 body = substitute(body, renaming)
                 vars_ = tuple(renamed)
         body = substitute(body, inner)
-        if body is t.body and vars_ == t.vars:
-            return t
         patterns = tuple(tuple(substitute(substitute(p, renaming), inner) for p in ps) for ps in t.patterns)
+        if body is t.body and vars_ == t.vars and patterns == t.patterns:
+            return t
         return Quant(t.kind, vars_, body, patterns=patterns)
     return t
 
