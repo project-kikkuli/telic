@@ -59,7 +59,7 @@ function staticValue(e, sf) {
   return invalidStatic;
 }
 
-function expr(e, sf, states, locals = new Set(), substitutions = new Map(), statePrefix = "") {
+function expr(e, sf, states, locals = new Set(), substitutions = new Map(), statePrefix = "", routeBindings = new Set()) {
   e = strip(e);
   const lit = literal(e, sf);
   if (lit) return lit;
@@ -69,11 +69,14 @@ function expr(e, sf, states, locals = new Set(), substitutions = new Map(), stat
     if (substitutions.has(e.text)) return substitutions.get(e.text);
     fail(sf, e, `reads unmodeled value '${e.text}'`);
   }
-  if (ts.isPropertyAccessExpression(e)) return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix), ["lit", e.name.text]];
-  if (ts.isElementAccessExpression(e) && e.argumentExpression) return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix), expr(e.argumentExpression, sf, states, locals, substitutions, statePrefix)];
+  if (ts.isPropertyAccessExpression(e)) {
+    if (e.name.text === "pathname" && ts.isIdentifier(e.expression) && routeBindings.has(e.expression.text)) return ["route"];
+    return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix, routeBindings), ["lit", e.name.text]];
+  }
+  if (ts.isElementAccessExpression(e) && e.argumentExpression) return ["member", expr(e.expression, sf, states, locals, substitutions, statePrefix, routeBindings), expr(e.argumentExpression, sf, states, locals, substitutions, statePrefix, routeBindings)];
   if (ts.isPrefixUnaryExpression(e) && [ts.SyntaxKind.ExclamationToken, ts.SyntaxKind.MinusToken, ts.SyntaxKind.PlusToken].includes(e.operator)) {
     const op = e.operator === ts.SyntaxKind.ExclamationToken ? "not" : e.operator === ts.SyntaxKind.MinusToken ? "neg" : "pos";
-    return ["un", op, expr(e.operand, sf, states, locals, substitutions, statePrefix)];
+    return ["un", op, expr(e.operand, sf, states, locals, substitutions, statePrefix, routeBindings)];
   }
   if (ts.isBinaryExpression(e)) {
     const ops = new Map([
@@ -86,9 +89,9 @@ function expr(e, sf, states, locals = new Set(), substitutions = new Map(), stat
     ]);
     const op = ops.get(e.operatorToken.kind);
     if (!op) fail(sf, e, "uses an operator outside the finite UI expression model");
-    return ["bin", op, expr(e.left, sf, states, locals, substitutions, statePrefix), expr(e.right, sf, states, locals, substitutions, statePrefix)];
+    return ["bin", op, expr(e.left, sf, states, locals, substitutions, statePrefix, routeBindings), expr(e.right, sf, states, locals, substitutions, statePrefix, routeBindings)];
   }
-  if (ts.isConditionalExpression(e)) return ["if", expr(e.condition, sf, states, locals, substitutions, statePrefix), expr(e.whenTrue, sf, states, locals, substitutions, statePrefix), expr(e.whenFalse, sf, states, locals, substitutions, statePrefix)];
+  if (ts.isConditionalExpression(e)) return ["if", expr(e.condition, sf, states, locals, substitutions, statePrefix, routeBindings), expr(e.whenTrue, sf, states, locals, substitutions, statePrefix, routeBindings), expr(e.whenFalse, sf, states, locals, substitutions, statePrefix, routeBindings)];
   fail(sf, e, "uses an expression outside the finite UI model");
 }
 
@@ -131,6 +134,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   }
   const namedHooks = new Set();
   const reactObjects = new Set();
+  const routerHooks = new Map();
   const customHooks = new Map();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
@@ -139,7 +143,17 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       if (!files.has(importedPath)) fail(sf, s, `stylesheet '${s.moduleSpecifier.text}' is outside the source closure`);
       continue;
     }
-    if (s.moduleSpecifier.text !== "react") {
+      if (s.moduleSpecifier.text === "react-router-dom") {
+        const clause = s.importClause;
+        if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+          for (const specifier of clause.namedBindings.elements) {
+            const imported = (specifier.propertyName || specifier.name).text;
+            if (["useNavigate", "useLocation"].includes(imported) && !specifier.isTypeOnly) routerHooks.set(specifier.name.text, imported);
+          }
+        }
+        continue;
+      }
+      if (s.moduleSpecifier.text !== "react") {
       const importedPath = s.moduleSpecifier.text.startsWith(".") ? resolveModule(path, s.moduleSpecifier.text) : null;
       if (!importedPath || !s.importClause || !safeComponentModule(importedPath)) fail(sf, s, `import '${s.moduleSpecifier.text}' has module effects outside the source UI model`);
       if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) {
@@ -187,6 +201,8 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   };
   const states = new Map();
   const setters = new Map();
+  const navigateBindings = new Set();
+  const locationBindings = new Set();
   const modeledHooks = new Set();
   const localFns = new Map();
   const body = component.body;
@@ -197,6 +213,14 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     for (const d of s.declarationList.declarations) {
       const init = d.initializer && strip(d.initializer);
       if (ts.isIdentifier(d.name) && (s.declarationList.flags & ts.NodeFlags.Const) && init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) localFns.set(d.name.text, init);
+      if (ts.isIdentifier(d.name) && init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && routerHooks.has(init.expression.text)) {
+        const hook = routerHooks.get(init.expression.text);
+        if (hook === "useNavigate" && init.arguments.length === 0) navigateBindings.add(d.name.text);
+        else if (hook === "useLocation" && init.arguments.length === 0) locationBindings.add(d.name.text);
+        else fail(sf, init, `${hook} call is outside the route model`);
+        modeledHooks.add(init);
+        continue;
+      }
       if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "useEffect") fail(sf, init, "React effects are outside the source UI model");
       if (!ts.isArrayBindingPattern(d.name) || !init || !ts.isCallExpression(init)) {
         if (init && ts.isCallExpression(init)) fail(sf, init, "component initializer calls an unmodeled function");
@@ -246,7 +270,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   for (const s of sf.statements) if (isStaticDeclaration(sf, s)) {
     for (const d of s.declarationList.declarations) substitutions.set(d.name.text, ["lit", staticValue(d.initializer, sf)]);
   }
-  const enc = (e, locals) => expr(e, sf, stateNames, locals, substitutions, statePrefix);
+  const enc = (e, locals) => expr(e, sf, stateNames, locals, substitutions, statePrefix, locationBindings);
   for (const s of body.statements) {
     if (!ts.isVariableStatement(s)) continue;
     for (const d of s.declarationList.declarations) {
@@ -278,7 +302,14 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     const e = strip(st.expression);
     if (ts.isConditionalExpression(e)) return ["if", enc(e.condition, localVars), statement(ts.factory.createExpressionStatement(e.whenTrue), localVars), statement(ts.factory.createExpressionStatement(e.whenFalse), localVars)];
     if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && componentProps.handlers.has(e.expression.text) && e.arguments.length === 0) return ["invoke", componentProps.handlers.get(e.expression.text)];
-    if (!ts.isCallExpression(e) || !ts.isIdentifier(e.expression) || !setters.has(e.expression.text) || e.arguments.length !== 1) fail(sf, e, "event handler performs an effect other than a useState update");
+    if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && navigateBindings.has(e.expression.text) && e.arguments.length >= 1 && e.arguments.length <= 2) {
+      const destination = strip(e.arguments[0]);
+      if (!ts.isStringLiteralLike(destination)) fail(sf, destination || e, "navigation destination must be a literal path");
+      if (!destination.text.startsWith("/")) fail(sf, destination, "relative navigation paths are outside the route model");
+      if (destination.text.includes("?") || destination.text.includes("#")) fail(sf, destination, "query strings and URL fragments are outside the route model");
+      return ["navigate", destination.text];
+    }
+    if (!ts.isCallExpression(e) || !ts.isIdentifier(e.expression) || !setters.has(e.expression.text) || e.arguments.length !== 1) fail(sf, e, "event handler performs an effect other than a useState update or route navigation");
     const stateName = setters.get(e.expression.text);
     const arg = strip(e.arguments[0]);
     let update;
@@ -329,6 +360,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   const render = (e, conditionalMount = false) => {
     e = strip(e);
     if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
+    if (ts.isJsxElement(e) && ts.isIdentifier(e.openingElement.tagName) && e.openingElement.tagName.text === "Routes") return renderRoutes(e, conditionalMount);
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
     if (ts.isIdentifier(e) && e.text === "children" && componentProps.children) {
@@ -343,6 +375,28 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (ts.isArrayLiteralExpression(e)) return { type: "group", children: e.elements.map((c) => render(c, conditionalMount)) };
     return { type: "text", value: enc(e, new Set()) };
   };
+
+  function renderRoutes(e, conditionalMount) {
+    const routes = [];
+    for (const child of e.children) {
+      if (!ts.isJsxSelfClosingElement(child) && !ts.isJsxElement(child)) continue;
+      const open = ts.isJsxSelfClosingElement(child) ? child : child.openingElement;
+      if (!ts.isIdentifier(open.tagName) || open.tagName.text !== "Route") fail(sf, child, "Routes accepts only explicit Route children");
+      let routePath = null, routeElement = null;
+      for (const attr of open.attributes.properties) {
+        if (!ts.isJsxAttribute(attr) || !ts.isIdentifier(attr.name)) fail(sf, attr, "Route attributes must use explicit path and element expressions");
+        if (attr.name.text === "path" && ts.isStringLiteralLike(attr.initializer)) routePath = attr.initializer.text;
+        else if (attr.name.text === "path" && ts.isJsxExpression(attr.initializer) && attr.initializer.expression && ts.isStringLiteralLike(strip(attr.initializer.expression))) routePath = strip(attr.initializer.expression).text;
+        else if (attr.name.text === "element" && ts.isJsxExpression(attr.initializer) && attr.initializer.expression) routeElement = render(attr.initializer.expression, conditionalMount);
+        else if (attr.name.text !== "path" && attr.name.text !== "element") fail(sf, attr, `Route attribute '${attr.name.text}' is outside the route model`);
+        else fail(sf, attr, "Route attributes must use a literal path and explicit element expression");
+      }
+      if (routePath === null || routeElement === null) fail(sf, child, "Route needs a literal path and element");
+      if (routePath !== "*" && !routePath.startsWith("/")) fail(sf, child, "route paths must be absolute");
+      routes.push({ path: routePath, render: routeElement, sourcePath: path, line: lineOf(sf, child) });
+    }
+    return { type: "routes", routes };
+  }
 
   function renderStaticMap(call, conditionalMount) {
     if (call.arguments.length !== 1) fail(sf, call, "static UI map needs one source-defined callback");
@@ -427,7 +481,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         else props[name] = enc(a.initializer.expression, new Set());
       } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
     }
-    return { type: "element", tag, line: lineOf(sf, whole), props, events, children: jsxChildren(children, conditionalMount) };
+    return { type: "element", tag, path, line: lineOf(sf, whole), props, events, children: jsxChildren(children, conditionalMount) };
   }
 
   function jsxChildren(children, conditionalMount) {

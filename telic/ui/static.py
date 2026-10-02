@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlsplit
 from ..frontend import typescript
 from . import source
 from .spec import Pred, Prop, Target, UiLemma
-from .tree import Node, Snapshot
+from .tree import Node, Snapshot, route_matches
 
 EXTRACTOR = Path(__file__).resolve().parent.parent / "frontend" / "ts" / "uistatic.mjs"
 MAX_STATES = 4096
@@ -437,9 +437,31 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         for key in ("yes", "no"):
             if key in node:
                 decode_jsx(node[key])
+        if node.get("type") == "routes":
+            for route in node.get("routes", []):
+                decode_jsx(route["render"])
         if node.get("type") == "component":
             decode_jsx(node["child"])
     decode_jsx(models[0]["render"])
+    source_transitions: set[tuple[str, int]] = set()
+    def collect_transition_lines(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "element" and node.get("events", {}).get("click") is not None:
+            source_transitions.add((node.get("path", models[0]["path"]), node["line"]))
+        if node.get("type") == "routes":
+            source_transitions.update((route.get("sourcePath", models[0]["path"]), route["line"]) for route in node.get("routes", []))
+            for route in node.get("routes", []):
+                collect_transition_lines(route["render"])
+        for child in node.get("children", []):
+            collect_transition_lines(child)
+        for branch in ("yes", "no"):
+            if branch in node:
+                collect_transition_lines(node[branch])
+        if node.get("type") == "component":
+            collect_transition_lines(node.get("child"))
+    collect_transition_lines(models[0]["render"])
+    models[0]["transition_sources"] = [{"path": path, "line": line} for path, line in sorted(source_transitions)]
     root_id, entry = models[0].get("mountRoot"), os.path.normpath(models[0].get("mountEntry", ""))
     entry_served = os.path.normpath(os.path.relpath(os.path.join(root, entry), top))
     def hosts_model(ids: set[str], scripts: set[str], invalid_script: bool, body: list[tuple[str, str | None, int, set[str]]], invalid_markup: bool, body_attrs: set[str], html_attrs: set[str]) -> bool:
@@ -455,7 +477,7 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         return None, identity, "a browser cannot execute TypeScript or JSX from a raw static directory"
     models[0]["dependencies"] = sorted([*(e["path"] for e in entries), *html_deps, *([os.path.relpath(p, root).replace(os.sep, "/") for p in tool_inputs] if pipeline == "vite-react" else [])])
     models[0]["pipeline"] = pipeline or "raw-static"
-    models[0]["trust"] = ["configured Vite plugin resolver selected each analyzed local module", "installed Vite, React plugin, React, React DOM, and transitive package contents match the hashed toolchain identity", "the finite React and browser accessibility semantics implemented by this extractor match the selected runtime behavior"] if pipeline == "vite-react" else []
+    models[0]["assumptions"] = ["configured Vite plugin resolver selected each analyzed local module", "installed Vite, React plugin, React, React DOM, and transitive package contents match the hashed toolchain identity", "the finite React and browser accessibility semantics implemented by this extractor match the selected runtime behavior"] if pipeline == "vite-react" else []
     models[0]["styles"] = styles
     models[0]["layout_sensitive"] = layout_sensitive
     return models[0], identity, None
@@ -486,19 +508,21 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
                 q.append(j)
     relevant = [i for i, snap in enumerate(snaps) if prop.cond.eval(snap, "home")]
     good = [i for i, snap in enumerate(snaps) if _goal(prop.goal, snap)]
-    source_lines = [f"{model['path']}:{model['line']}"]
-    receipt = {"source_hash": identity, "dependencies": model.get("dependencies", [])}
+    source_lines = list(dict.fromkeys([f"{model['path']}:{model['line']}", *(f"{item['path']}:{item['line']}" for item in model.get("transition_sources", []))]))
+    assumptions = model.get("assumptions", [])
+    receipt = {"source_hash": identity, "dependencies": model.get("dependencies", []), "assumptions": assumptions}
+    premise = f"; assumptions: {'; '.join(assumptions)}" if assumptions else ""
     if prop.kind == "reachable":
         if good:
-            return StaticOutcome("proved", "source proof", f"all source-reachable finite states were closed ({len(states)} states); witness {paths[good[0]] or ['initial state']}", paths[good[0]], source_lines, receipt)
-        return StaticOutcome("refuted", "source proof", f"the source model closes with no state satisfying {prop.goal}", [], source_lines, receipt)
+            return StaticOutcome("proved", "source proof", f"all source-reachable finite states were closed ({len(states)} states); witness {paths[good[0]] or ['initial state']}{premise}", paths[good[0]], source_lines, receipt)
+        return StaticOutcome("refuted", "source proof", f"the source model closes with no state satisfying {prop.goal}{premise}", [], source_lines, receipt)
     if prop.kind in ("always", "never"):
         bad = [i for i in relevant if _goal(prop.goal, snaps[i]) == (prop.kind == "never")]
         if bad:
-            return StaticOutcome("refuted", "source proof", f"source state violates {prop}", paths[bad[0]], source_lines, receipt)
+            return StaticOutcome("refuted", "source proof", f"source state violates {prop}{premise}", paths[bad[0]], source_lines, receipt)
         if not relevant:
             return StaticOutcome("open", "source proof", f"{prop} has no reachable state where its condition holds", None, source_lines, receipt)
-        return StaticOutcome("proved", "source proof", f"all {len(relevant)} relevant source-reachable states satisfy {prop}", None, source_lines, receipt)
+        return StaticOutcome("proved", "source proof", f"all {len(relevant)} relevant source-reachable states satisfy {prop}{premise}", None, source_lines, receipt)
     if prop.kind == "always_reachable":
         if not relevant:
             return StaticOutcome("open", "source proof", f"{prop} has no reachable source state where its condition holds", None, source_lines, receipt)
@@ -512,8 +536,8 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
                         seen.add(nxt)
                         todo.append(nxt)
             if not any(_goal(prop.goal, snaps[x]) for x in seen):
-                return StaticOutcome("refuted", "source proof", f"no source transition path from a state satisfying {prop.cond} reaches {prop.goal}", paths[start], source_lines, receipt)
-        return StaticOutcome("proved", "source proof", f"from each of {len(relevant)} relevant states, all source transitions include a path to {prop.goal}", None, source_lines, receipt)
+                return StaticOutcome("refuted", "source proof", f"no source transition path from a state satisfying {prop.cond} reaches {prop.goal}{premise}", paths[start], source_lines, receipt)
+        return StaticOutcome("proved", "source proof", f"from each of {len(relevant)} relevant states, all source transitions include a path to {prop.goal}{premise}", None, source_lines, receipt)
     return StaticOutcome("open", "source model", f"{prop.kind} is not supported by this source model")
 
 
@@ -541,6 +565,7 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
     declarations = model["states"]
     state_defs = {d["name"]: d for d in declarations}
     initial = {d["name"]: d["initial"] for d in declarations}
+    initial["@route"] = model.get("initial_route", "/")
     for d in declarations:
         if not isinstance(d["initial"], (bool, int, str)) and d["initial"] is not None:
             raise ValueError(f"state `{d['name']}` has a non-finite initial value at {model['path']}:{d['line']}")
@@ -602,6 +627,8 @@ def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) 
         return e[1]
     if op == "state":
         return state[e[1]]
+    if op == "route":
+        return state["@route"]
     if op == "local":
         return locals_[e[1]]
     if op == "member":
@@ -693,6 +720,9 @@ def _execute(stmt: Any, captured: dict[str, Any], updated: dict[str, Any], defs:
         return _execute(branch, captured, updated, defs)
     if op == "invoke":
         return _execute(stmt[1], captured, updated, defs)
+    if op == "navigate":
+        updated["@route"] = stmt[1]
+        return False
     if op == "set":
         name, update = stmt[1], stmt[2]
         if update[0] == "functional":
@@ -706,6 +736,7 @@ def _execute(stmt: Any, captured: dict[str, Any], updated: dict[str, Any], defs:
 
 def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
+    tree = _active_render(tree, state)
     def visit(n: dict[str, Any], ancestors: list[Any] | None = None, parent_display_none: bool = False, inherited_visibility: str = "visible") -> None:
         ancestors = ancestors or []
         if parent_display_none:
@@ -745,6 +776,7 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
 
 def _mounted_components(tree: dict[str, Any], state: dict[str, Any]) -> set[str]:
     mounted: set[str] = set()
+    tree = _active_render(tree, state)
     def visit(node: dict[str, Any]) -> None:
         kind = node["type"]
         if kind == "branch":
@@ -867,6 +899,7 @@ def _tree_text(n: dict[str, Any], state: dict[str, Any], model: dict[str, Any], 
 
 
 def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, Any]) -> Snapshot:
+    render = _active_render(render, state)
     def build(n: dict[str, Any], inherited_visibility: str = "visible", inherited_aria_hidden: bool = False) -> list[Node]:
         kind = n["type"]
         if kind == "empty": return []
@@ -892,6 +925,40 @@ def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, An
         children = [x for c in n["children"] for x in build(c, visibility, aria_hidden)]
         if visibility in ("hidden", "collapse"):
             return children
-        ref = f"{model['path']}:{n['line']}"
+        ref = f"{n.get('path', model['path'])}:{n['line']}"
         return [Node(role, name, str(props.get("value")) if "value" in props else None, frozenset(states), ref, props.get("href"), role == "generic" and "click" in n["events"], children=children)]
-    return Snapshot("home", Node("generic", children=[x for x in build(render)]), hidden={k: [v] for k, v in state.items()})
+    return Snapshot(state.get("@route", "home"), Node("generic", children=[x for x in build(render)]), hidden={k: [v] for k, v in state.items() if k != "@route"})
+
+
+def _active_render(node: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Select one declared route using the current browser path."""
+    kind = node.get("type")
+    if kind == "routes":
+        path = state.get("@route", "/")
+        routes = node.get("routes", [])
+        selected = next((r for r in routes if r["path"] == path), None)
+        if selected is None:
+            matching = [r for r in routes if r["path"] != "*" and route_matches(r["path"], path)]
+            selected = max(matching, key=lambda r: _route_score(r["path"])) if matching else None
+        if selected is None:
+            selected = next((r for r in routes if r["path"] == "*"), None)
+        return _active_render(selected["render"], state) if selected else {"type": "empty"}
+    if kind == "branch":
+        branch = node["yes"] if _truthy(_eval(node["test"], state)) else node["no"]
+        return _active_render(branch, state)
+    if kind == "group":
+        return {**node, "children": [_active_render(child, state) for child in node["children"]]}
+    if kind == "component":
+        return {**node, "child": _active_render(node["child"], state)}
+    if kind == "element" and node.get("children"):
+        return {**node, "children": [_active_render(child, state) for child in node["children"]]}
+    return node
+
+
+def _route_score(pattern: str) -> tuple[int, int, int]:
+    segments = pattern.strip("/").split("/") if pattern != "/" else []
+    return (
+        sum(2 if segment.startswith(":") else 0 if segment == "*" else 3 for segment in segments),
+        len(segments),
+        -int(bool(segments and segments[-1] == "*")),
+    )

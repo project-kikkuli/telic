@@ -90,7 +90,7 @@ class Pred:
         if op == "true":
             return True
         if op == "home":
-            return snap.screen == home and not snap.overlays()
+            return snap.screen in (home, "/") and not snap.overlays()
         if op == "overlay":
             ns = [n for n in snap.nodes() if n.role in OVERLAYS]
             return any(_name_ok(a[0], n.name) for n in ns) if a else bool(ns)

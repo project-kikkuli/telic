@@ -766,6 +766,36 @@ def test_source_ui_proves_deterministic_root_without_hooks(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
+@pytest.mark.parametrize(
+    ("routes", "property", "status"),
+    [
+        ('<Route path="/" element={<h1>Home</h1>} /><Route path="/settings" element={<h1>Settings</h1>} />', 'reachable heading "Settings"', "proved"),
+        ('<Route path="/" element={<h1>Home</h1>} />', 'reachable heading "Settings"', "refuted"),
+        ('<Route path="/" element={<h1>Home</h1>} />', 'reachable home', "proved"),
+        ('<Route path="/notes/:id" element={<h1>Note</h1>} />', 'reachable heading "Note"', "proved"),
+        ('<Route path="/notes/:id" element={<h1>Note</h1>} /><Route path="/notes/new" element={<h1>New note</h1>} />', 'reachable heading "New note"', "proved"),
+    ],
+)
+def test_source_ui_models_guarded_router_navigation(tmp_path, routes, property, status):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import {useNavigate, useLocation, Routes, Route} from "react-router-dom";
+export default function App(){
+  const navigate=useNavigate();
+  const location=useLocation();
+  const settings=location.pathname === "/settings";
+  return <main><button onClick={()=>navigate("/settings")}>Settings</button><button onClick={()=>navigate("/notes/42")}>Open note</button><button onClick={()=>navigate("/notes/new")}>New note</button><Routes>'''
+        + routes
+        + '''</Routes>{settings && <p>Current settings</p>}</main>;
+}''',
+        property,
+    )
+    assert why is None, why
+    assert got.status == status and got.method == "source proof", got.detail
+    assert got.replay and got.replay["receipt"]["assumptions"]
+    assert any(source.endswith("App.tsx:6") for source in got.replay["source"])
+
+
 def test_source_ui_binds_imported_component_props_and_handlers(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
