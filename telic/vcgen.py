@@ -57,7 +57,7 @@ class OptVal:
     """An optional: present iff ``some``; ``val`` is meaningful only then."""
 
     some: L.Term
-    val: L.Term
+    val: "Val"
     ty: ir.TOption
 
 
@@ -112,9 +112,10 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     if isinstance(ty, ir.TList):
         return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT)]
     if isinstance(ty, ir.TOption):
-        if isinstance(ty.inner, (ir.TList, ir.TDict, ir.TOption)):
-            raise VCError(f"optional {ty.inner} is not supported yet")
-        return [("some", L.BOOL), ("val", sort_of(ty.inner))]
+        return [("some", L.BOOL)] + [
+            (f"val.{name}" if name else "val", sort)
+            for name, sort in components(ty.inner)
+        ]
     if isinstance(ty, ir.TDict):
         if isinstance(ty.val, (ir.TList, ir.TDict, ir.TOption)):
             raise VCError(f"dict values of type {ty.val} are not supported yet")
@@ -127,7 +128,9 @@ def arity(ty: ir.Type) -> int:
     """How many logical components a value of ``ty`` has."""
     if isinstance(ty, ir.TList):
         return 3
-    if isinstance(ty, (ir.TOption, ir.TDict)):
+    if isinstance(ty, ir.TOption):
+        return len(components(ty))
+    if isinstance(ty, ir.TDict):
         return 2
     return 1
 
@@ -137,7 +140,7 @@ def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
     if isinstance(ty, ir.TList):
         return ListVal(comps[0], comps[1], comps[2], ty)
     if isinstance(ty, ir.TOption):
-        return OptVal(comps[0], comps[1], ty)
+        return OptVal(comps[0], pack(ty.inner, comps[1:]), ty)
     if isinstance(ty, ir.TDict):
         return DictVal(comps[0], comps[1], ty)
     return comps[0]
@@ -192,7 +195,7 @@ def flatten(v: Val) -> tuple[L.Term, ...]:
     if isinstance(v, ListVal):
         return (v.arr, v.off, v.len)
     if isinstance(v, OptVal):
-        return (v.some, v.val)
+        return (v.some, *flatten(v.val))
     if isinstance(v, DictVal):
         return (v.vals, v.has)
     return (v,)
@@ -238,6 +241,26 @@ def default_term(s: L.Sort) -> L.Term:
     raise VCError(f"no default value for {s}")
 
 
+def default_val(ty: ir.Type) -> Val:
+    if isinstance(ty, ir.TList):
+        elem = sort_of(ty.elem)
+        return ListVal(L.const_array(L.ARRAY(elem), default_term(elem)), L.ZERO, L.ZERO, ty)
+    if isinstance(ty, ir.TDict):
+        key, val = sort_of(ty.key), sort_of(ty.val)
+        return DictVal(L.const_array(L.ARRAY(val, key), default_term(val)), L.const_array(L.ARRAY(L.BOOL, key), L.FALSE), ty)
+    if isinstance(ty, ir.TOption):
+        return OptVal(L.FALSE, default_val(ty.inner), ty)
+    return default_term(sort_of(ty))
+
+
+def valid_container_facts(v: Val, ty: ir.Type) -> list[L.Term]:
+    if isinstance(ty, ir.TList) and isinstance(v, ListVal):
+        return [L.le(L.ZERO, v.len)]
+    if isinstance(ty, ir.TOption) and isinstance(v, OptVal):
+        return [L.implies(v.some, L.and_(*valid_container_facts(v.val, ty.inner)))] if valid_container_facts(v.val, ty.inner) else []
+    return []
+
+
 def coerce(v: Val, ty: ir.Type | None) -> Val:
     """Lift a plain value into an optional slot (``None`` -> absent, ``x`` ->
     present ``x``). Frontends need not insert the wrapping themselves. An
@@ -250,7 +273,7 @@ def coerce(v: Val, ty: ir.Type | None) -> Val:
         return DictVal(L.const_array(L.ARRAY(vs, ks), default_term(vs)), L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE), ty)
     if isinstance(ty, ir.TOption) and not isinstance(v, OptVal):
         if v is NONE_V:
-            return OptVal(L.FALSE, default_term(sort_of(ty.inner)), ty)
+            return OptVal(L.FALSE, default_val(ty.inner), ty)
         return OptVal(L.TRUE, v, ty)  # type: ignore[arg-type]
     return v
 
@@ -733,8 +756,7 @@ class VCGen:
             v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
             env[p.name] = v
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
-            if isinstance(v, ListVal):
-                facts.append(L.le(L.ZERO, v.len))
+            facts.extend(valid_container_facts(v, p.ty))
             facts.extend(self.alloc_facts(v, p.ty, env))
         self.entry = dict(env)
         if any(suspends(x) for st_ in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st_) for x in ir.walk_expr(e)):
@@ -1610,8 +1632,8 @@ class VCGen:
             if b is NONE_V:
                 return L.not_(a.some)
             if isinstance(b, OptVal):
-                return L.and_(L.eq(a.some, b.some), L.implies(a.some, L.eq(a.val, b.val)))
-            return L.and_(a.some, L.eq(a.val, b))  # type: ignore[arg-type]
+                return L.and_(L.eq(a.some, b.some), L.implies(a.some, self.equal(a.val, b.val)))
+            return L.and_(a.some, self.equal(a.val, b))
         if isinstance(a, DictVal) or isinstance(b, DictVal):
             raise VCError("comparing whole dicts with == is not supported")
         return rec_equal(a, b)  # type: ignore[arg-type]
@@ -2487,6 +2509,9 @@ class VCGen:
             if p.name in muts and not isinstance(a_e, ir.Var) and not _fresh_expr(a_e):
                 raise VCError(f"'{fn.name}' mutates its list parameter '{p.name}'; pass a variable (or a copy) so the change is tracked", loc)
         pmap: dict[str, Val] = {p.name: a for p, a in zip(fn.params, args)}
+        for p, a in zip(fn.params, args):
+            for fact in valid_container_facts(a, p.ty):
+                ctx.assume(fact)
         heap_pre = self.heap_env(ctx.env) if ctx.state is None else self.heap_env(ctx.state.env)
         predicate = callee.key in self.program.predicates
         definitional = callee.key in self.program.definitional or predicate

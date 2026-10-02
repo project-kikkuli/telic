@@ -6,6 +6,7 @@
    assume its @ensures), loops are cut by their invariants. *)
 
 open Term
+open Ir
 module SM = Map.Make (String)
 
 exception Vc_error of string * Ir.loc
@@ -16,16 +17,16 @@ let depth x = fn "struct.depth" [| x |] Int
 
 (* -- values ------------------------------------------------------------ *)
 
-type lv = { arr : term; off : term; len : term; lty : Ir.ty }
-type ov = { some : term; v : term; oty : Ir.ty }  (** an optional: present iff [some] *)
-type dv = { vals : term; has : term; dty : Ir.ty }  (** a finite map: [has k] says whether k is a key *)
-
 type value =
   | T of term
   | L of lv
   | O of ov
   | D of dv
   | NoneV
+
+and lv = { arr : term; off : term; len : term; lty : Ir.ty }
+and ov = { some : term; v : value; oty : Ir.ty }  (** an optional: present iff [some] *)
+and dv = { vals : term; has : term; dty : Ir.ty }  (** a finite map: [has k] says whether k is a key *)
 
 let at (arr, off) i = select arr (add off i)
 
@@ -62,42 +63,41 @@ and sort_tag = function Rec (n, _) -> n | Array (_, e) -> "Arr" ^ sort_tag e | s
 let complex = function Ir.TList _ | TDict _ | TOption _ -> true | _ -> false
 
 (* how a value of [ty] is represented in logic, as named components *)
-let components (ty : Ir.ty) : (string * sort) list =
+let rec components (ty : Ir.ty) : (string * sort) list =
   match ty with
   | TList e -> [ ("arr", Array (Int, sort_of e)); ("off", Int); ("len", Int) ]
   | TOption inner ->
-    if complex inner then raise (Vc_error ("optional containers are not supported yet", Ir.noloc));
-    [ ("some", Bool); ("val", sort_of inner) ]
+    ("some", Bool) :: List.map (fun (n, s) -> ((if n = "" then "val" else "val." ^ n), s)) (components inner)
   | TDict (k, v) ->
     if complex v then raise (Vc_error ("dict values that are containers are not supported yet", Ir.noloc));
     let ks = sort_of k in
     [ ("vals", Array (ks, sort_of v)); ("has", Array (ks, Bool)) ]
   | t -> [ ("", sort_of t) ]
 
-let pack (ty : Ir.ty) comps =
+let rec pack (ty : Ir.ty) comps =
   match (ty, comps) with
   | TList _, [ a; o; l ] -> L { arr = a; off = o; len = l; lty = ty }
-  | TOption _, [ s; v ] -> O { some = s; v; oty = ty }
+  | TOption inner, s :: rest -> O { some = s; v = pack inner rest; oty = ty }
   | TDict _, [ v; h ] -> D { vals = v; has = h; dty = ty }
   | _, [ t ] -> T t
   | _ -> invalid_arg "pack"
 
-let flatten = function T t -> [ t ] | L l -> [ l.arr; l.off; l.len ] | O o -> [ o.some; o.v ] | D d -> [ d.vals; d.has ] | NoneV -> []
+let rec flatten = function T t -> [ t ] | L l -> [ l.arr; l.off; l.len ] | O o -> o.some :: flatten o.v | D d -> [ d.vals; d.has ] | NoneV -> []
 
-let ite_val c a b =
+let rec ite_val c a b =
   match (a, b) with
   | L x, L y -> L { arr = ite c x.arr y.arr; off = ite c x.off y.off; len = ite c x.len y.len; lty = x.lty }
-  | O x, O y -> O { some = ite c x.some y.some; v = ite c x.v y.v; oty = x.oty }
+  | O x, O y -> O { some = ite c x.some y.some; v = ite_val c x.v y.v; oty = x.oty }
   | D x, D y -> D { vals = ite c x.vals y.vals; has = ite c x.has y.has; dty = x.dty }
   | T x, T y -> T (ite c x y)
   | NoneV, NoneV -> NoneV
   | _ -> raise (Vc_error ("branches disagree on a value's shape", Ir.noloc))
 
-let value_equal a b =
+let rec value_equal a b =
   match (a, b) with
   | T x, T y -> x == y
   | L x, L y -> x.arr == y.arr && x.off == y.off && x.len == y.len
-  | O x, O y -> x.some == y.some && x.v == y.v
+  | O x, O y -> x.some == y.some && value_equal x.v y.v
   | D x, D y -> x.vals == y.vals && x.has == y.has
   | NoneV, NoneV -> true
   | _ -> false
@@ -113,6 +113,25 @@ let rec default_term (s : sort) =
   | Opaque -> const "opaque!default" Opaque
   | Unit -> unit
 
+let rec default_value (ty : Ir.ty) =
+  match ty with
+  | TList e ->
+    let sort = sort_of e in
+    L { arr = const_array (Array (Int, sort)) (default_term sort); off = zero; len = zero; lty = ty }
+  | TDict (k, v) ->
+    let ks = sort_of k and vs = sort_of v in
+    D { vals = const_array (Array (ks, vs)) (default_term vs); has = const_array (Array (ks, Bool)) ff; dty = ty }
+  | TOption inner -> O { some = ff; v = default_value inner; oty = ty }
+  | t -> T (default_term (sort_of t))
+
+let rec valid_container_facts v ty =
+  match (ty, v) with
+  | TList _, L l -> [ le zero l.len ]
+  | TOption inner, O o ->
+    let facts = valid_container_facts o.v inner in
+    if facts = [] then [] else [ implies o.some (and_ facts) ]
+  | _ -> []
+
 (* lift a plain value into an optional slot: None -> absent, x -> present x *)
 let coerce v (ty : Ir.ty option) =
   match (ty, v) with
@@ -121,9 +140,8 @@ let coerce v (ty : Ir.ty option) =
   | Some (TDict (k, vt) as dty), D d when (match d.dty with TDict (TNone, _) -> true | _ -> false) && k <> TNone ->
     let ks = sort_of k and vs = sort_of vt in
     D { vals = const_array (Array (ks, vs)) (default_term vs); has = const_array (Array (ks, Bool)) ff; dty }
-  | Some (TOption inner as oty), NoneV -> O { some = ff; v = default_term (sort_of inner); oty }
-  | Some (TOption _ as oty), T t -> O { some = tt; v = t; oty }
-  | Some (TOption _), (L _ | D _) -> raise (Vc_error ("optional containers are not supported yet", Ir.noloc))
+  | Some (TOption _ as oty), NoneV -> O { some = ff; v = default_value (match oty with TOption t -> t | _ -> assert false); oty }
+  | Some (TOption _ as oty), ((T _ | L _ | D _ | O _) as value) -> O { some = tt; v = value; oty }
   | _ -> v
 
 let rec ty_str (t : Ir.ty) =
@@ -484,11 +502,11 @@ let rec alloc_facts g v (ty : Ir.ty) env =
   | TEnum (_, ms, _), T t -> [ le zero t; lt t (int_ (List.length ms)) ]
   (* an enum field of a record (a union's tag) is one of its members *)
   | TRecord (_, fs), T t -> List.concat_map (fun (n, (ft : Ir.ty)) -> match ft with TEnum _ | TRecord _ -> alloc_facts g (T (field t n)) ft env | _ -> []) fs
-  | TOption (TEnum (_, ms, _)), O o -> [ implies o.some (and_ [ le zero o.v; lt o.v (int_ (List.length ms)) ]) ]
+  | TOption (TEnum (_, ms, _)), O o -> [ implies o.some (and_ [ le zero (term_of Ir.noloc o.v); lt (term_of Ir.noloc o.v) (int_ (List.length ms)) ]) ]
   | TClass _, T t ->
     let self_ = match SM.find_opt "self" g.entry with Some (T s) -> s == t | _ -> false in
     if is_init g && self_ then [] else [ select (alloc_of env) t ]
-  | TOption (TClass _), O o -> [ implies o.some (select (alloc_of env) o.v) ]
+  | TOption (TClass _), O o -> [ implies o.some (select (alloc_of env) (term_of Ir.noloc o.v)) ]
   | TList (TClass _), L l ->
     let i = const (Printf.sprintf "i!%d" (next g)) Int in
     [ quant "forall" [ i ] (implies (and_ [ le zero i; lt i l.len ]) (select (alloc_of env) (at (l.arr, l.off) i))) [ [| at (l.arr, l.off) i |] ] ]
@@ -654,14 +672,14 @@ let rec ev g ctx (e : Ir.expr) : value =
       v
     | _ -> (
       let raw = field obj f in
-      match e.ty with TOption _ -> O { some = field raw "some"; v = field raw "val"; oty = e.ty } | _ -> T raw))
+      match e.ty with TOption _ -> O { some = field raw "some"; v = T (field raw "val"); oty = e.ty } | _ -> T raw))
   | RecordLit fs ->
     let ftys = match e.ty with TRecord (_, ftys) -> ftys | _ -> raise (Vc_error ("record literal of a non-record type", loc)) in
     let vals =
       List.map
         (fun ((_, fty), (_, x)) ->
           match coerce (ev g ctx x) (Some fty) with
-          | O o -> mkrec (field_sort fty) [ o.some; o.v ]
+          | O o -> mkrec (field_sort fty) [ o.some; tm o.v ]
           | v -> tm v)
         (zip ftys fs)
     in
@@ -743,8 +761,8 @@ and equal g a b =
     let same = forall [ i ] (implies (and_ [ le zero i; lt i x.len ]) (eq (at (x.arr, x.off) i) (at (y.arr, y.off) i))) in
     and_ [ eq x.len y.len; same ]
   | O o, NoneV | NoneV, O o -> not_ o.some
-  | O x, O y -> and_ [ eq x.some y.some; implies x.some (eq x.v y.v) ]
-  | O o, T t | T t, O o -> and_ [ o.some; eq o.v t ]
+  | O x, O y -> and_ [ eq x.some y.some; implies x.some (equal g x.v y.v) ]
+  | O o, T t | T t, O o -> and_ [ o.some; equal g o.v (T t) ]
   | D _, _ | _, D _ -> raise (Vc_error ("comparing whole dicts with == is not supported", Ir.noloc))
   | T x, T y -> rec_equal x y
   | NoneV, NoneV -> tt
@@ -854,7 +872,7 @@ and builtin g ctx (e : Ir.expr) name args =
       match o with
       | O o ->
         oblige g "none" ctx o.some loc (Printf.sprintf "'%s' is not None here" (expr_name (List.hd args)));
-        T o.v
+        o.v
       | NoneV ->
         oblige g "none" ctx ff loc (Printf.sprintf "'%s' is not None here" (expr_name (List.hd args)));
         raise (Vc_error ("value is always None here", loc))
@@ -989,7 +1007,7 @@ and builtin g ctx (e : Ir.expr) name args =
       let has = select d.has (tm k) and v = select d.vals (tm k) in
       match (name, rest) with
       | "dict_has", _ -> T has
-      | "dict_get_opt", _ -> O { some = has; v; oty = TOption (dval d) }
+      | "dict_get_opt", _ -> O { some = has; v = T v; oty = TOption (dval d) }
       | _, [ dflt ] -> T (ite has v (tm (coerce dflt (Some (dval d)))))
       | _ -> raise (Vc_error ("dict_get_or needs a default", loc)))
     | "len", [ xs ] -> T (lst xs).len
@@ -1609,6 +1627,7 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
         raise (Vc_error (Printf.sprintf "'%s' mutates its list parameter '%s'; pass a variable (or a copy) so the change is tracked" fn.name p, loc)))
     (zip fn.params arg_exprs);
   let pmap = List.fold_left (fun m ((p, _), a) -> SM.add p a m) SM.empty (zip fn.params args) in
+  List.iter2 (fun (_, ty) v -> List.iter (assume ctx) (valid_container_facts v ty)) fn.params args;
   let heap_pre = heap_env (match ctx.state with Some st -> st.env | None -> ctx.env) in
   let with_pmap h = SM.union (fun _ _ b -> Some b) h pmap in
   let definitional = callee.definitional in
@@ -2331,7 +2350,7 @@ let run g =
       let v = param_val p ty in
       st.env <- SM.add p v st.env;
       g.inputs <- (p, v) :: g.inputs;
-      (match v with L l -> Dynarray.add_last st.facts (le zero l.len) | _ -> ());
+      List.iter (Dynarray.add_last st.facts) (valid_container_facts v ty);
       List.iter (Dynarray.add_last st.facts) (alloc_facts g v ty st.env))
     fn.params;
   g.entry <- st.env;

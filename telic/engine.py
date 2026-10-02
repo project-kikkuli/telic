@@ -24,6 +24,7 @@ from typing import Any
 from . import ir
 from . import irjson
 from . import logic as L
+from . import heap
 from .jobs import take as take_jobs
 from .program import FuncRef, Program
 from .smt import solve
@@ -160,6 +161,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "untrusted": sorted([c, i] for c, i in program.untrusted.get(key, ())),
         }
     req = {
+        "heap_abi": heap.layout(program).json(),
         "modules": [irjson.module(m) for m in program.modules],
         "program": info,
         "classes": classes,

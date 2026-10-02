@@ -45,6 +45,16 @@ EXCEPTION_BASES = {"Exception", "BaseException", "ValueError", "KeyError", "Runt
 IGNORED_ATTR_CALLS = {"debug", "info", "warning", "error", "exception", "critical"}
 
 
+def _has_mutable_child(ty: ir.Type) -> bool:
+    if isinstance(ty, (ir.TList, ir.TDict)):
+        return True
+    if isinstance(ty, ir.TOption):
+        return _has_mutable_child(ty.inner)
+    if isinstance(ty, ir.TRecord):
+        return any(_has_mutable_child(field) for _, field in ty.fields)
+    return False
+
+
 class LowerError(Exception):
     def __init__(self, msg: str, node: ast.AST | None = None, line: int | None = None):
         super().__init__(msg)
@@ -753,6 +763,15 @@ class PythonFrontend:
         if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
             return self.type_of_annotation(ast.parse(ann.value, mode="eval").body)
         if isinstance(ann, ast.Attribute):
+            owner, name = self._annotation_origin(ann)
+            if owner is not None:
+                if name in owner.module.records:
+                    return owner.module.records[name]
+                if name in owner.enum_types:
+                    return owner.enum_types[name]
+                if name in owner.module.classes:
+                    self.linked_classes.setdefault(name, owner)
+                    return ir.TClass(name)
             return ir.TOpaque(ast.unparse(ann))  # e.g. datetime.date
         if isinstance(ann, ast.Name):
             simple = {"int": ir.INT, "float": ir.REAL, "bool": ir.BOOL, "str": ir.STR}
@@ -789,7 +808,34 @@ class PythonFrontend:
                 if not isinstance(k, (ir.TInt, ir.TStr, ir.TBool)) or isinstance(v, (ir.TList, ir.TDict, ir.TOption)):
                     return ir.TOpaque(ast.unparse(ann))
                 return ir.TDict(k, v)
+            if name in {"tuple", "Tuple"} and isinstance(ann.slice, ast.Tuple):
+                if any(isinstance(x, ast.Constant) and x.value is Ellipsis for x in ann.slice.elts):
+                    return ir.TOpaque(ast.unparse(ann))
+                fields = tuple((f"_{i}", self.type_of_annotation(x)) for i, x in enumerate(ann.slice.elts))
+                if any(_has_mutable_child(t) for _, t in fields):
+                    raise LowerError("tuples containing mutable containers need identity-preserving product storage", ann)
+                return ir.TRecord("tuple", fields)
         return ir.TOpaque(ast.unparse(ann))
+
+    def _annotation_origin(self, ann: ast.Attribute) -> tuple["PythonFrontend | None", str]:
+        """Resolve a qualified annotation through a checked module import."""
+        parts: list[str] = []
+        node: ast.expr = ann
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None, ann.attr
+        parts.append(node.id)
+        parts.reverse()
+        owner = self.module_aliases.get(parts[0])
+        if owner is None:
+            return None, parts[-1]
+        for part in parts[1:-1]:
+            owner = owner.module_aliases.get(part)
+            if owner is None:
+                return None, parts[-1]
+        return owner, parts[-1]
 
     def _union(self, ts: list[ir.Type], node: ast.AST) -> ir.Type:
         rest = [t for t in ts if t != ir.NONE]
@@ -803,8 +849,6 @@ class PythonFrontend:
         inner = rest[0]
         if isinstance(inner, ir.TOpaque):
             return inner  # an unknown value may as well be None
-        if isinstance(inner, (ir.TList, ir.TDict, ir.TOption)):
-            return ir.TOpaque(ast.unparse(node))
         return ir.TOption(inner)
 
     def _signature(self, node: ast.FunctionDef, cls: str | None = None, static: bool = False, clsmethod: bool = False) -> tuple[list[ir.Param], ir.Type]:
@@ -2016,9 +2060,23 @@ class ExprLowerer:
             return ir.Builtin(inner.ty, loc, "await", (inner,))
         if isinstance(n, ast.JoinedStr):
             return self.fstring(n, loc)
-        if isinstance(n, (ast.Tuple, ast.Set)) and not self.spec:
+        if isinstance(n, ast.Tuple):
             parts = [self.expr(x) for x in n.elts]
-            return self.opaque("tuple" if isinstance(n, ast.Tuple) else "set", parts, ir.TOpaque("tuple"), loc)
+            if isinstance(expect, ir.TRecord) and expect.name == "tuple":
+                if len(parts) != len(expect.fields):
+                    raise self.err(f"tuple has {len(parts)} values, expected {len(expect.fields)}", n)
+                parts = [self.fl.coerce(x, t) for x, (_, t) in zip(parts, expect.fields)]
+                ty = expect
+            else:
+                if any(_has_mutable_child(x.ty) for x in parts):
+                    raise self.err("tuples containing mutable containers need identity-preserving product storage", n)
+                ty = ir.TRecord("tuple", tuple((f"_{i}", x.ty) for i, x in enumerate(parts)))
+            if any(_has_mutable_child(x.ty) for x in parts):
+                raise self.err("tuples containing mutable containers need identity-preserving product storage", n)
+            return ir.RecordLit(ty, loc, tuple((field, value) for (field, _), value in zip(ty.fields, parts)))
+        if isinstance(n, ast.Set) and not self.spec:
+            parts = [self.expr(x) for x in n.elts]
+            return self.opaque("set", parts, ir.TOpaque("set"), loc)
         if isinstance(n, ast.UnaryOp) and not isinstance(n.op, ast.Not) and isinstance(self.expr(n.operand).ty, ir.TOpaque):
             return self.opaque(type(n.op).__name__.lower(), [self.expr(n.operand)], ir.TOpaque(""), loc)
         if isinstance(n, ast.UnaryOp):
@@ -2088,6 +2146,14 @@ class ExprLowerer:
                 if k.ty != seq.ty.key:
                     raise self.err(f"key must be {seq.ty.key}, got {k.ty}", n)
                 return ir.Index(seq.ty.val, loc, seq, k, wrap=False)
+            if isinstance(seq.ty, ir.TRecord) and seq.ty.name == "tuple" and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, int):
+                index = n.slice.value
+                if index < 0:
+                    index += len(seq.ty.fields)
+                if 0 <= index < len(seq.ty.fields):
+                    name, ty = seq.ty.fields[index]
+                    return ir.Field(ty, loc, seq, name)
+                raise self.err("tuple index is out of range", n)
             if not isinstance(seq.ty, ir.TList):
                 raise self.err(f"cannot index a {seq.ty}", n)
             if isinstance(n.slice, ast.Slice):
@@ -2429,6 +2495,13 @@ class ExprLowerer:
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in fe.module_aliases and f.value.id not in self.fl.env:
             other = fe.module_aliases[f.value.id]
             key = f"{f.value.id}.{f.attr}"
+            if f.attr in other.class_names and f.attr in other.module.classes:
+                fe.class_names.add(f.attr)
+                fe.linked_classes[f.attr] = other
+                fe.foreign_classes[f.attr] = other.module.classes[f.attr]
+                fe.module.class_origin[f.attr] = other.path
+                fe.import_class_info(other, f.attr)
+                return self.new(f.attr, n, loc)
             if f.attr in other.signatures and "." not in f.attr:
                 if key not in fe.signatures:
                     fe.signatures[key] = other.signatures[f.attr]
@@ -2536,6 +2609,7 @@ class ExprLowerer:
             return self.quant(n, loc, "forall" if name == "all" else "exists")
         if name == "len":
             (x,) = self._args(n, 1)
+            x = self.need(x)
             if x.ty == ir.STR:
                 return ir.Builtin(ir.INT, loc, "str_len", (x,))
             if isinstance(x.ty, (ir.TOpaque, ir.TDict)):

@@ -391,6 +391,18 @@ let () =
   if Array.length Sys.argv > 1 && Sys.argv.(1) = "--source-hash" then (print_endline Source_hash.value; exit 0);
   let input = In_channel.input_all stdin in
   let req = Json.parse input in
+  let heap_abi = Json.member "heap_abi" req in
+  (match Json.member "version" heap_abi with Json.Int 1 -> () | _ -> raise (Json.Error "unsupported heap ABI version"));
+  (match Json.member "records" heap_abi with
+   | Json.Assoc records ->
+     if not (List.mem_assoc "number" records && List.mem_assoc "box" records && List.mem_assoc "key" records && List.mem_assoc "cell" records) then
+       raise (Json.Error "incomplete heap ABI records");
+     (match List.assoc "number" records with
+      | Json.List [ Json.String "PythonNumber"; Json.List [ Json.List [ Json.String "is_int"; Json.String "Bool" ]; Json.List [ Json.String "integer"; Json.String "Int" ]; Json.List [ Json.String "floating"; Json.String "Float64" ] ] ] -> ()
+      | _ -> raise (Json.Error "incompatible PythonNumber heap ABI"));
+     List.iter (fun (key, expected) -> if List.assoc key records <> Json.String expected then raise (Json.Error ("incompatible heap ABI " ^ key)))
+       [ ("box", "TelicValueV1"); ("key", "TelicKeyV1"); ("cell", "TelicCellV1") ]
+   | _ -> raise (Json.Error "missing heap ABI records"));
   phase "parse";
   let terms = read_terms (Json.member "theory" req) in
   (match Json.member "regexes" (Json.member "theory" req) with
