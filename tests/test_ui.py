@@ -785,6 +785,40 @@ def test_source_ui_composes_stateful_imports_with_finite_state(tmp_path):
     assert why is None and got.status == "proved" and got.method == "source proof"
 
 
+def test_source_ui_models_imported_forwarding_state_hooks(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useDisclosure } from "./useDisclosure"; export default function App(){const [open,setOpen]=useDisclosure(false);return open?<div role="dialog" aria-label="Help"><button onClick={()=>setOpen(false)}>Close</button></div>:<button onClick={()=>setOpen(true)}>Open help</button>}',
+        'always reachable button "Open help" from overlay "Help"',
+        modules={"useDisclosure.ts": 'import {useState} from "react"; export function useDisclosure(initial:boolean){const [value,setValue]=useState(initial);return [value,setValue] as const;}\n'},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; import {Frame} from "./Frame"; export default function App(){const [open,setOpen]=useState(true);return <Frame>{open?<div role="dialog" aria-label="Help"><button onClick={()=>setOpen(false)}>Close</button></div>:<h1>Home</h1>}</Frame>}',
+        'always reachable heading "Home" from overlay "Help"',
+        modules={"Frame.tsx": 'import type {ReactNode} from "react"; export function Frame({children}:{children:ReactNode}){return <main>{children}</main>}\n'},
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_rejects_conditional_mount_of_stateful_children(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; import {Frame} from "./Frame"; import {Counter} from "./Counter"; export default function App(){const [show]=useState(true);return <Frame show={show}><Counter /></Frame>}',
+        'reachable button "Increment"',
+        modules={
+            "Frame.tsx": 'export function Frame({show,children}:{show:boolean,children:React.ReactNode}){return show?<main>{children}</main>:null}\n',
+            "Counter.tsx": 'import {useState} from "react"; export function Counter(){const [n,setN]=useState(0);return <button onClick={()=>setN(n+1)}>Increment</button>}\n',
+        },
+    )
+    assert why and "stateful children have a conditional mount" in why
+    assert got.status == "open" and got.method != "source proof"
+
+
 @pytest.mark.parametrize(
     "html",
     [

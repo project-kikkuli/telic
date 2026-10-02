@@ -70,7 +70,7 @@ function jsxText(s) {
   return parts.join(" ");
 }
 
-function scanComponent(path, text, sf, component, asChild = false, componentProps = { values: new Map(), handlers: new Map() }, statePrefix = "", dynamicMount = false) {
+function scanComponent(path, text, sf, component, asChild = false, componentProps = { values: new Map(), handlers: new Map(), children: null }, statePrefix = "", dynamicMount = false) {
   if (!asChild && component.parameters.length) fail(sf, component.parameters[0], "component props and parameter defaults are outside the source UI model");
   if (asChild) {
     const parameter = component.parameters[0];
@@ -81,7 +81,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     }
     if (parameter) for (const e of parameter.name.elements) {
         const sourceName = e.propertyName ? e.propertyName.getText(sf) : e.name.text;
-        if (!componentProps.values.has(sourceName) && !componentProps.handlers.has(sourceName)) fail(sf, e, `composed component prop '${sourceName}' has no static binding`);
+        if (!componentProps.values.has(sourceName) && !componentProps.handlers.has(sourceName) && !(sourceName === "children" && componentProps.children)) fail(sf, e, `composed component prop '${sourceName}' has no static binding`);
       }
   }
   const owns = (node, target) => {
@@ -92,13 +92,14 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return found;
   };
   for (const s of sf.statements) {
-    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) continue;
+    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || isForwardingStateHook(sf, s)) continue;
     if (s === component) continue;
     if (ts.isVariableStatement(s) && s.declarationList.declarations.length === 1 && owns(s, component)) continue;
     fail(sf, s, "module-level executable code outside the mounted component is not modeled");
   }
   const namedHooks = new Set();
   const reactObjects = new Set();
+  const customHooks = new Map();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
     if (s.moduleSpecifier.text.endsWith(".css")) {
@@ -109,6 +110,17 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (s.moduleSpecifier.text !== "react") {
       const importedPath = s.moduleSpecifier.text.startsWith(".") ? resolveModule(path, s.moduleSpecifier.text) : null;
       if (!importedPath || !s.importClause || !safeComponentModule(importedPath)) fail(sf, s, `import '${s.moduleSpecifier.text}' has module effects outside the source UI model`);
+      if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) {
+        const importedFile = files.get(importedPath);
+        const importedKind = /\.(tsx|jsx)$/.test(importedPath) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(importedPath) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+        const importedSf = ts.createSourceFile(importedPath, importedFile.text, ts.ScriptTarget.Latest, true, importedKind);
+        for (const item of s.importClause.namedBindings.elements) {
+          const localName = item.name.text;
+          const exportedName = (item.propertyName || item.name).text;
+          const hook = /^use[A-Z]/.test(localName) && !item.isTypeOnly && findForwardingStateHook(importedSf, exportedName, true);
+          if (hook) customHooks.set(localName, hook);
+        }
+      }
       continue;
     }
     const clause = s.importClause;
@@ -133,13 +145,16 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (ts.isVariableStatement(s)) for (const d of s.declarationList.declarations) bindingNames(d.name);
     else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.name) shadows.add(s.name.text);
   }
-  const isHook = (call, sf) => {
-    if (ts.isIdentifier(call.expression)) return namedHooks.has(call.expression.text) && !shadows.has(call.expression.text);
+  const isImportedStateHook = (call) => {
+    if (ts.isIdentifier(call.expression)) return namedHooks.has(call.expression.text);
     if (ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "useState" && ts.isIdentifier(call.expression.expression)) {
-      const base = call.expression.expression.text;
-      return reactObjects.has(base) && !shadows.has(base);
+      return reactObjects.has(call.expression.expression.text);
     }
     return false;
+  };
+  const isHook = (call) => {
+    const binding = ts.isIdentifier(call.expression) ? call.expression.text : ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) ? call.expression.expression.text : "";
+    return isImportedStateHook(call) && !shadows.has(binding);
   };
   const states = new Map();
   const setters = new Map();
@@ -157,12 +172,21 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         if (init && ts.isCallExpression(init)) fail(sf, init, "component initializer calls an unmodeled function");
         continue;
       }
-      if (!isHook(init, sf)) fail(sf, init, "state initializer call does not resolve to an unshadowed React useState import");
+      const directState = isHook(init);
+      let initialArg = init.arguments[0];
+      if (!directState) {
+        const hookBinding = ts.isIdentifier(init.expression) ? init.expression.text : ts.isPropertyAccessExpression(init.expression) && ts.isIdentifier(init.expression.expression) ? init.expression.expression.text : "";
+        if (isImportedStateHook(init) && shadows.has(hookBinding)) fail(sf, init, "state initializer call does not resolve to an unshadowed React useState import");
+        const custom = !shadows.has(init.expression.text) && (customHooks.get(init.expression.text) || findForwardingStateHook(sf, init.expression.text, false));
+        if (!custom || init.arguments.length !== 1) fail(sf, init, "state initializer call does not resolve to React useState or a pure forwarding state hook");
+        initialArg = literal(init.arguments[0], sf) ? init.arguments[0] : null;
+        if (!initialArg) fail(sf, init.arguments[0] || init, "forwarding state hook needs one finite literal initializer");
+      }
       modeledHooks.add(init);
       const [value, set] = d.name.elements;
-      if (!value || !ts.isIdentifier(value.name) || (set && !ts.isIdentifier(set.name)) || !init.arguments[0]) fail(sf, d, "useState must have a named state and explicit initial value");
-      const initial = literal(init.arguments[0], sf);
-      if (!initial) fail(sf, init.arguments[0], "state initializer is not a finite boolean, number, string, or null literal");
+      if (!value || !ts.isIdentifier(value.name) || (set && !ts.isIdentifier(set.name)) || !initialArg) fail(sf, d, "state hook must bind a named state and setter with an explicit initial value");
+      const initial = literal(initialArg, sf);
+      if (!initial) fail(sf, initialArg, "state initializer is not a finite boolean, number, string, or null literal");
       const bindings = new Set([...states.keys(), ...setters.keys()]);
       if (bindings.has(value.name.text) || (set && (bindings.has(set.name.text) || value.name.text === set.name.text))) fail(sf, d, "state and setter bindings must be unique in the component");
       const stateName = `${statePrefix}${value.name.text}`;
@@ -251,11 +275,17 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
 
   const childStates = [];
   let componentInstance = 0;
+  let renderedStatefulChildren = 0;
   const render = (e, conditionalMount = false) => {
     e = strip(e);
     if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
+    if (ts.isIdentifier(e) && e.text === "children" && componentProps.children) {
+      if (componentProps.children.stateful && conditionalMount) fail(sf, e, "stateful children have a conditional mount through a composed component");
+      if (componentProps.children.stateful && ++renderedStatefulChildren > 1) fail(sf, e, "stateful children are rendered more than once by a composed component");
+      return componentProps.children;
+    }
     if (ts.isJsxFragment(e)) return { type: "group", children: e.children.map((c) => render(c, conditionalMount)) };
     if (ts.isParenthesizedExpression(e)) return render(e.expression, conditionalMount);
     if (containsJsx(e) && ts.isConditionalExpression(e)) return { type: "branch", test: enc(e.condition, new Set()), yes: render(e.whenTrue, true), no: render(e.whenFalse, true) };
@@ -279,9 +309,11 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       if (/^on[A-Z]/.test(name)) handlers.set(name, handler(a.initializer.expression));
       else values.set(name, enc(a.initializer.expression, new Set()));
     }
-    if (children.length) fail(sf, whole, `composed component '${open.tagName.text}' children need an explicit children prop model`);
+    const childStateStart = childStates.length;
+    const childTree = { type: "group", children: jsxChildren(children, conditionalMount) };
+    childTree.stateful = childStates.length > childStateStart;
     const instancePrefix = `${statePrefix}${target.path}@${componentInstance++}/`;
-    const nested = scanComponent(target.path, target.text, target.sf, target.node, true, { values, handlers }, instancePrefix, conditionalMount);
+    const nested = scanComponent(target.path, target.text, target.sf, target.node, true, { values, handlers, children: childTree }, instancePrefix, conditionalMount);
     if (nested.states.length && conditionalMount) fail(target.sf, target.node, `stateful child component '${open.tagName.text}' has a conditional mount`);
     if (nested.states.length && values.has("key")) fail(sf, whole, `stateful child component '${open.tagName.text}' uses a React key whose identity changes are outside the source UI model`);
     childStates.push(...nested.states);
@@ -311,7 +343,11 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         else props[name] = enc(a.initializer.expression, new Set());
       } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
     }
-    return { type: "element", tag, line: lineOf(sf, whole), props, events, children: children.map((c) => ts.isJsxText(c) ? { type: "jsxText", value: jsxText(c.text) } : ts.isJsxExpression(c) ? c.expression ? render(c.expression, conditionalMount) : { type: "empty" } : ts.isJsxElement(c) || ts.isJsxSelfClosingElement(c) || ts.isJsxFragment(c) ? render(c, conditionalMount) : (fail(sf, c, "JSX child is outside the source UI model"), { type: "empty" })) };
+    return { type: "element", tag, line: lineOf(sf, whole), props, events, children: jsxChildren(children, conditionalMount) };
+  }
+
+  function jsxChildren(children, conditionalMount) {
+    return children.map((c) => ts.isJsxText(c) ? { type: "jsxText", value: jsxText(c.text) } : ts.isJsxExpression(c) ? c.expression ? render(c.expression, conditionalMount) : { type: "empty" } : ts.isJsxElement(c) || ts.isJsxSelfClosingElement(c) || ts.isJsxFragment(c) ? render(c, conditionalMount) : (fail(sf, c, "JSX child is outside the source UI model"), { type: "empty" }));
   }
 
   const renderFlow = (statements, allowFallthrough = false, conditionalMount = false) => {
@@ -360,6 +396,57 @@ function componentCandidates(path, text) {
   };
   find(sf);
   return out;
+}
+
+function findForwardingStateHook(sf, name, requireExport) {
+  let node = null;
+  let exported = false;
+  for (const s of sf.statements) {
+    if (ts.isFunctionDeclaration(s) && s.name?.text === name) {
+      node = s;
+      exported = (ts.getModifiers(s) || []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    }
+    if (ts.isVariableStatement(s)) for (const d of s.declarationList.declarations) {
+      const init = d.initializer && strip(d.initializer);
+      if (ts.isIdentifier(d.name) && d.name.text === name && init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) {
+        node = init;
+        exported = (ts.getModifiers(s) || []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+      }
+    }
+  }
+  if (!node || requireExport && !exported || !/^use[A-Z]/.test(name) || node.parameters.length !== 1 || !ts.isIdentifier(node.parameters[0].name) || node.parameters[0].initializer || !node.body || !ts.isBlock(node.body)) return null;
+  const statements = node.body.statements;
+  if (statements.length !== 2 || !ts.isVariableStatement(statements[0]) || !ts.isReturnStatement(statements[1])) return null;
+  const decls = statements[0].declarationList.declarations;
+  if (decls.length !== 1 || !ts.isArrayBindingPattern(decls[0].name) || decls[0].name.elements.length !== 2) return null;
+  const [state, setter] = decls[0].name.elements;
+  const call = decls[0].initializer && strip(decls[0].initializer);
+  if (!ts.isBindingElement(state) || !ts.isIdentifier(state.name) || !ts.isBindingElement(setter) || !ts.isIdentifier(setter.name)
+      || !ts.isCallExpression(call) || call.arguments.length !== 1 || !ts.isIdentifier(call.arguments[0]) || call.arguments[0].text !== node.parameters[0].name.text) return null;
+  let useStateNames = new Set();
+  let reactObjects = new Set();
+  for (const s of sf.statements) {
+    if (!ts.isImportDeclaration(s) || s.moduleSpecifier.text !== "react" || !s.importClause) continue;
+    if (s.importClause.name) reactObjects.add(s.importClause.name.text);
+    if (s.importClause.namedBindings && ts.isNamespaceImport(s.importClause.namedBindings)) reactObjects.add(s.importClause.namedBindings.name.text);
+    if (s.importClause.namedBindings && ts.isNamedImports(s.importClause.namedBindings)) for (const i of s.importClause.namedBindings.elements) {
+      if ((i.propertyName || i.name).text === "useState" && !i.isTypeOnly) useStateNames.add(i.name.text);
+    }
+  }
+  const genuine = ts.isIdentifier(call.expression) && useStateNames.has(call.expression.text)
+    || ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "useState" && ts.isIdentifier(call.expression.expression) && reactObjects.has(call.expression.expression.text);
+  if (!genuine || useStateNames.has(node.parameters[0].name.text) || reactObjects.has(node.parameters[0].name.text)
+      || useStateNames.has(state.name.text) || useStateNames.has(setter.name.text) || reactObjects.has(state.name.text) || reactObjects.has(setter.name.text)) return null;
+  const result = strip(statements[1].expression);
+  if (!result || !ts.isArrayLiteralExpression(result) || result.elements.length !== 2 || !ts.isIdentifier(result.elements[0]) || !ts.isIdentifier(result.elements[1])
+      || result.elements[0].text !== state.name.text || result.elements[1].text !== setter.name.text) return null;
+  return { initial: node.parameters[0].name.text };
+}
+
+function isForwardingStateHook(sf, statement) {
+  if (ts.isFunctionDeclaration(statement) && statement.name) return !!findForwardingStateHook(sf, statement.name.text, false);
+  if (ts.isVariableStatement(statement)) return statement.declarationList.declarations.some((d) => ts.isIdentifier(d.name) && findForwardingStateHook(sf, d.name.text, false));
+  return false;
 }
 
 function resolveModule(fromPath, specifier) {
