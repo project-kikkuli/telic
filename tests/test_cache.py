@@ -1,5 +1,7 @@
 """Proofs are cached by formula, so edits re-verify only what they touch."""
 
+from pathlib import Path
+
 import pytest
 
 from telic.checker import CheckOptions, check
@@ -50,6 +52,17 @@ def test_toolchain_receipts_bind_solver_overrides(tmp_path, monkeypatch, variabl
     monkeypatch.setenv(variable, str(executable))
     monkeypatch.setattr(checker, "_TOOLCHAIN", None)
     assert checker.toolchain_id() != original
+
+
+def test_python_z3_identity_hashes_loaded_library(monkeypatch, tmp_path):
+    import hashlib
+    import z3.z3core as z3core
+
+    from telic.toolchain import python_z3
+
+    loaded = z3core.Z3_get_version.__defaults__[0].f._objects["0"]
+    monkeypatch.setattr(z3core, "_z3_lib_resource_path", str(tmp_path))
+    assert python_z3()[1] == hashlib.sha256(Path(loaded._name).read_bytes()).hexdigest()
 
 
 def test_each_check_refreshes_selected_tool_identity(tmp_path, monkeypatch):
@@ -119,6 +132,9 @@ OVERRIDE_ENTRY = """class Base:
     def __init__(self, x: int):
         self.x = x
 {base_method}
+
+
+
 class Sub(Base):
     #@ invariant self.x >= 0
     def m(self) -> int:

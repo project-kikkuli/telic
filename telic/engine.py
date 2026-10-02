@@ -37,17 +37,22 @@ def binary() -> str | None:
     env = os.environ.get("TELIC_CORE")
     local = CORE_DIR / "telic-core"
     exe = env if env and os.path.exists(env) else str(local) if local.exists() else shutil.which("telic-core")
-    if exe is not None and exe not in _FRESH:
+    if exe is not None:
+        binary_path = Path(exe).resolve()
+        binary_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
         want = source_hash()
+        identity = (str(binary_path), binary_hash, want)
+        if identity in _FRESH:
+            return exe
         if want is not None:
             got = subprocess.run([exe, "--source-hash"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
             if got != want:
                 raise RuntimeError(f"{exe} is stale: it was built from other sources than {CORE_DIR}; rebuild it with 'make -C {CORE_DIR}'")
-        _FRESH.add(exe)
+        _FRESH.add(identity)
     return exe
 
 
-_FRESH: set[str] = set()
+_FRESH: set[tuple[str, str, str | None]] = set()
 
 
 def source_hash() -> str | None:
