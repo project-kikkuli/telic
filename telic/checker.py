@@ -336,8 +336,10 @@ def restore_receipt(rep: "FunctionReport", r: dict[str, Any]) -> None:
     """Rebuild a proved function's report from its receipt (no formulas are
     kept; `telic explain` recomputes them)."""
     rep.status = r["status"]
-    rep.deps = set(r.get("deps", []))
-    rep.assumptions = [(ir.Loc(line), text) for line, text in r.get("assumptions", [])]
+    if "deps" in r:
+        rep.deps = set(r["deps"])
+    if "assumptions" in r:
+        rep.assumptions = [(ir.Loc(line), text) for line, text in r["assumptions"]]
     for o in r["obs"]:
         ob = Obligation(
             id=o["id"],

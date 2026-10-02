@@ -137,6 +137,68 @@ def test_mirror_sides_keep_their_own_symbols():
     assert all(m.status == "refuted" and m.witness["replay"]["confirmed"] for m in got.values())
 
 
+def test_mirror_does_not_prove_from_an_assume(tmp_path):
+    path = tmp_path / "m.py"
+    path.write_text(
+        "def a(x: int) -> int:\n"
+        "    #@ assume x >= 0\n"
+        "    return x if x >= 0 else -x\n\n"
+        "def b(x: int) -> int:\n"
+        "    #@ mirrors m.py::a\n"
+        "    return x\n"
+    )
+    opts = CheckOptions(cache_path=None, lean=False, replay=False, infer=False, ui=False)
+    rep = check([str(path)], opts, root=str(tmp_path))
+    from telic.evidence import evidence_status
+
+    reports = {f.fn.name: f for f in rep.functions}
+    assert evidence_status(reports["a"]) == "trusted"
+    assert evidence_status(reports["b"]) == "proved"
+    assert rep.mirrors and all(m.status != "proved" for m in rep.mirrors)
+    assert not rep.ok
+
+
+def test_claimed_mirror_checks_the_target_and_its_callees(tmp_path):
+    path = tmp_path / "m.py"
+    path.write_text(
+        "def helper(x: int) -> int:\n"
+        "    return x + 1\n\n"
+        "def a(x: int) -> int:\n"
+        "    return helper(x)\n\n"
+        "def b(x: int) -> int:\n"
+        "    #@ mirrors m.py::a\n"
+        "    return helper(x)\n"
+    )
+    opts = CheckOptions(cache_path=None, lean=False, replay=False, infer=False, ui=False, claims_only=True)
+    rep = check([str(path)], opts, root=str(tmp_path))
+    assert {f.fn.name for f in rep.functions} == {"helper", "a", "b"}
+    assert rep.mirrors and all(m.status == "proved" for m in rep.mirrors)
+
+
+def test_mirror_does_not_prove_from_a_trusted_callee(tmp_path):
+    path = tmp_path / "m.py"
+    path.write_text(
+        "#@ trusted\n"
+        "#@ ensures result == x\n"
+        "def helper(x: int) -> int:\n"
+        "    return x + 1\n\n"
+        "def a(x: int) -> int:\n"
+        "    return helper(x)\n\n"
+        "def b(x: int) -> int:\n"
+        "    #@ mirrors m.py::a\n"
+        "    return helper(x)\n"
+    )
+    opts = CheckOptions(cache_path=None, lean=False, replay=False, infer=False, ui=False, claims_only=True)
+    rep = check([str(path)], opts, root=str(tmp_path))
+    from telic.evidence import evidence_status
+
+    reports = {f.fn.name: f for f in rep.functions}
+    assert {"helper", "a", "b"} <= reports.keys()
+    assert evidence_status(reports["a"]) == evidence_status(reports["b"]) == "trusted"
+    assert rep.mirrors and all(m.status != "proved" for m in rep.mirrors)
+    assert not rep.ok
+
+
 @needs_node
 def test_strings_are_not_compared_symbolically_across_languages():
     rep = check([str(DIR / "mirstr")], CheckOptions(cache_path=None, lean=False), root=str(DIR / "mirstr"))

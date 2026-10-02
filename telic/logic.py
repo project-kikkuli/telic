@@ -41,6 +41,7 @@ INT = Sort("Int")
 REAL = Sort("Real")
 BOOL = Sort("Bool")
 STR = Sort("Str")
+UNIT = Sort("None")
 OPAQUE = Sort("Opaque")  # values of unchecked code: an uninterpreted sort
 
 

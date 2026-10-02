@@ -194,7 +194,14 @@ def route_patterns(declared: list[str], lems: list[UiLemma]) -> list[str]:
 def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
     #@ requires "status" in d
     status = d["status"]
-    source_proof = d.get("method") in ("source proof", "static proof")
+    raw_method = d.get("method")
+    result_method = ""
+    source_proof = False
+    learned_model = False
+    if isinstance(raw_method, str):
+        result_method = raw_method
+        source_proof = raw_method in ("source proof", "static proof")
+        learned_model = raw_method in ("learned model",)
     detail = d.get("detail", "")
     if d["status"] == "proved" and not source_proof:
         status = "tested"
@@ -202,19 +209,25 @@ def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
     if d["status"] == "vacuous" and not source_proof:
         status = "open"
         detail = "model-only: " + detail
-    if d["status"] == "refuted" and d.get("method") == "learned model" and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable"):
+    if d["status"] == "refuted" and learned_model and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable"):
         status = "open"
         detail = "model-only: " + detail
     viewports = []
+    default_method = d.get("method")
     for v in d.get("viewports", []):
         verdict = v.get("status")
-        method = v.get("method", d.get("method"))
-        if verdict == "proved" and method not in ("source proof", "static proof"):
+        raw_method = v.get("method", default_method)
+        source_proof = False
+        learned_model = False
+        if isinstance(raw_method, str):
+            source_proof = raw_method in ("source proof", "static proof")
+            learned_model = raw_method in ("learned model",)
+        if verdict == "proved" and not source_proof:
             verdict = "tested"
-        elif (verdict == "vacuous" and method not in ("source proof", "static proof")) or (verdict == "refuted" and method == "learned model" and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable")):
+        elif (verdict == "vacuous" and not source_proof) or (verdict == "refuted" and learned_model and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable")):
             verdict = "open"
         viewports.append({**v, "status": verdict})
-    return UiResult(lem, app, status, d.get("method", ""), detail, d.get("trace"), d.get("replay"), viewports)
+    return UiResult(lem, app, status, result_method, detail, d.get("trace"), d.get("replay"), viewports)
 
 
 def run_app(cfg: UiConfig, lems: list[UiLemma], app: UiApp, log: Callable[[str], None]) -> dict[str, UiResult]:

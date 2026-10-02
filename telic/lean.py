@@ -138,6 +138,8 @@ def lean_sort(s: L.Sort) -> str:
         return "Prop"
     if s == L.STR:
         return "String"
+    if s == L.UNIT:
+        return "Unit"
     if s.name == "Array":
         assert s.elem is not None
         return f"({lean_sort(L.index_sort(s))} → {lean_sort(s.elem)})"
@@ -160,6 +162,8 @@ class LeanPrinter:
 
     def _t(self, x: L.Term) -> tuple[str, int]:
         if isinstance(x, L.Const):
+            if x.sort == L.UNIT:
+                return "()", 1000
             return self.n(x.name), 1000
         if isinstance(x, L.IntV):
             return (str(x.value), 1000) if x.value >= 0 else (f"({x.value})", 1000)

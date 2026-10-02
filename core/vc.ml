@@ -111,13 +111,13 @@ let rec default_term (s : sort) =
   | Array (_, e) -> const_array s (default_term e)
   | Rec (_, fs) -> mkrec s (List.map (fun (_, fs) -> default_term fs) fs)
   | Opaque -> const "opaque!default" Opaque
-  | Unit -> zero
+  | Unit -> unit
 
 (* lift a plain value into an optional slot: None -> absent, x -> present x *)
 let coerce v (ty : Ir.ty option) =
   match (ty, v) with
   (* an empty [] / {} takes the type of the variable it is stored in *)
-  | Some (TList e as lty), L l when l.lty = TList TNone && e <> TNone -> L { arr = const_array (Array (Int, sort_of e)) (default_term (sort_of e)); off = zero; len = l.len; lty }
+  | Some (TList e as lty), L l when l.lty = TList TNone -> L { arr = const_array (Array (Int, sort_of e)) (default_term (sort_of e)); off = zero; len = l.len; lty }
   | Some (TDict (k, vt) as dty), D d when (match d.dty with TDict (TNone, _) -> true | _ -> false) && k <> TNone ->
     let ks = sort_of k and vs = sort_of vt in
     D { vals = const_array (Array (ks, vs)) (default_term vs); has = const_array (Array (ks, Bool)) ff; dty }
@@ -668,10 +668,14 @@ let rec ev g ctx (e : Ir.expr) : value =
     T (mkrec (sort_of e.ty) vals)
   | ListLit elems ->
     (* an empty [] of unknown type is a placeholder until it is stored (see coerce) *)
-    let ty = match e.ty with TList TNone -> Ir.TList TInt | t -> t in
+    let ty = match (elems, e.ty) with [], TList TNone -> Ir.TList TInt | _, t -> t in
     let base = match fresh g "lit" ty ~len:zero () with L l -> l | _ -> assert false in
     let arr = ref base.arr in
-    List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) elems;
+    List.iteri
+      (fun i x ->
+        let value = match ev g ctx x with NoneV -> unit | v -> tm v in
+        arr := store !arr (int_ i) value)
+      elems;
     L { arr = !arr; off = zero; len = int_ (List.length elems); lty = e.ty }
   | Quant q when (not ctx.spec) && effectful g q.body ->
     (* an unknown truth value; the body's obligations and effects for every element *)

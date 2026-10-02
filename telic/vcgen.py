@@ -92,7 +92,7 @@ class TypedView:
 
 
 Val = Union[L.Term, ListVal, OptVal, DictVal]
-NONE_V = L.Const("None", L.Sort("None"))
+NONE_V = L.Const("None", L.UNIT)
 # the objects of a class a function has written a field of (a ghost set, not heap:
 # callees and other tasks do not add to it)
 WRITTEN = "%written."
@@ -156,6 +156,8 @@ def sort_of(ty: ir.Type) -> L.Sort:
         return L.BOOL
     if isinstance(ty, ir.TStr):
         return L.STR
+    if isinstance(ty, ir.TNone):
+        return L.UNIT
     if isinstance(ty, ir.TRecord):
         return L.REC(ty.name, tuple((n, field_sort(t)) for n, t in ty.fields))
     if isinstance(ty, ir.TList):
@@ -224,6 +226,8 @@ def default_term(s: L.Sort) -> L.Term:
         return L.FALSE
     if s == L.STR:
         return L.StrV("")
+    if s == L.UNIT:
+        return NONE_V
     if s.name == "Array":
         assert s.elem is not None
         return L.const_array(s, default_term(s.elem))
@@ -239,7 +243,7 @@ def coerce(v: Val, ty: ir.Type | None) -> Val:
     present ``x``). Frontends need not insert the wrapping themselves. An
     empty literal (``[]``, ``{}``) takes the type of the variable it is
     stored in."""
-    if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList) and ty.elem != ir.NONE:
+    if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList):
         return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty)
     if isinstance(v, DictVal) and v.ty.key == ir.NONE and isinstance(ty, ir.TDict) and ty.key != ir.NONE:
         ks, vs = sort_of(ty.key), sort_of(ty.val)
@@ -443,6 +447,8 @@ class VCGen:
 
     def fresh(self, base: str, ty: ir.Type, len_: L.Term | None = None) -> Val:
         n = next(self.counter)
+        if isinstance(ty, ir.TNone):
+            return NONE_V
         if isinstance(ty, ir.TList):
             arr = L.Const(f"{base}@{n}.arr", sort_of(ty))
             ln = len_ if len_ is not None else L.Const(f"{base}@{n}.len", L.INT)
@@ -453,6 +459,8 @@ class VCGen:
         return pack(ty, [L.Const(f"{base}@{n}.{suffix}", srt) for suffix, srt in comps])
 
     def param_val(self, name: str, ty: ir.Type) -> Val:
+        if isinstance(ty, ir.TNone):
+            return NONE_V
         if isinstance(ty, ir.TList):
             return ListVal(L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty)
         comps = components(ty)
@@ -1660,7 +1668,7 @@ class VCGen:
     def ev_ListLit(self, e: ir.ListLit, ctx: Ctx) -> Val:
         assert isinstance(e.ty, ir.TList)
         # an empty [] of unknown type is a placeholder until it is stored (see coerce)
-        ty = ir.TList(ir.INT) if e.ty.elem == ir.NONE else e.ty
+        ty = ir.TList(ir.INT) if not e.elems and e.ty.elem == ir.NONE else e.ty
         base = self.fresh("lit", ty, len_=L.ZERO)
         assert isinstance(base, ListVal)
         if e.ty.elem == ir.NONE:

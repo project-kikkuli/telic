@@ -147,6 +147,7 @@ let mk node sort =
 
 let const name sort = mk (Const name) sort
 let int_ n = mk (Num (Q.of_int n)) Int
+let unit = mk (Num (Q.of_int 0)) Unit
 let real q = mk (Num q) Real
 let bool_ b = mk (BoolV b) Bool
 let str s = mk (StrV s) Str

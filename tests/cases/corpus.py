@@ -64,6 +64,20 @@ def index_of(xs: list[int], target: int) -> int:
 
 
 # expect: proved
+def first_none_is_none() -> bool:
+    #@ ensures result
+    values = [None]
+    return values[0] is None
+
+
+# expect: proved
+def empty_none_list_has_zero_length() -> bool:
+    #@ ensures result
+    values: list[None] = []
+    return len(values) == 0
+
+
+# expect: proved
 def count_matching(xs: list[int], v: int) -> int:
     #@ ensures result == xs.count(v)
     n = 0

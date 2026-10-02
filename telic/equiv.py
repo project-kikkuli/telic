@@ -118,11 +118,9 @@ def _has_loops(fn: ir.Function) -> bool:
     return any(isinstance(s, (ir.While, ir.ForRange, ir.ForEach)) for s in ir.walk_stmts(fn.body))
 
 
-def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val], side: str = "a") -> tuple[L.Term, list[L.Term], L.Term]:
-    """The function's result as a symbol over ``inputs`` (loop-free only),
-    the facts that define it and its preconditions, and the condition under
-    which it raises instead of returning. Symbols the two sides create are
-    kept apart by ``side``; only the inputs and the heap are shared."""
+def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val], side: str = "a") -> tuple[L.Term, list[L.Term], L.Term, set[str], list[tuple[ir.Loc, str]]]:
+    """The function's result, defining facts, exits, dependencies and
+    assumptions for a loop-free symbolic run."""
     g = VCGen(program, ref, inputs=inputs)
     g.counter = itertools.count(1 if side == "a" else 1_000_000)
     g.definitional_mode = True
@@ -146,7 +144,7 @@ def result_term(program: Program, ref: FuncRef, inputs: dict[str, Val], side: st
     paths = [L.and_(*ex.facts) for ex in exits]
     raises = L.or_(*[L.and_(*facts) for facts in g.raise_paths])
     defs = [L.or_(*paths, raises)] + [L.implies(p, L.eq(r, ex.value)) for p, ex in zip(paths, exits)]  # type: ignore[arg-type]
-    return r, list(rctx.base) + reqs + defs, raises
+    return r, list(rctx.base) + reqs + defs, raises, g.deps, g.assumptions
 
 
 SCALARS = (ir.TInt, ir.TReal, ir.TBool, ir.TStr)
@@ -391,8 +389,11 @@ def check_pair(program: Program, theory: Theory, a: FuncRef, b: FuncRef, root: s
     symbolic = not rep.reason
     if symbolic and not _has_loops(a.fn) and not _has_loops(b.fn) and not a.fn.unsupported and not b.fn.unsupported:
         try:
-            ra, reqa, xa = result_term(program, a, ina, "a")
-            rb, reqb, xb = result_term(program, b, inb, "b")
+            ra, reqa, xa, depsa, assuma = result_term(program, a, ina, "a")
+            rb, reqb, xb, depsb, assumb = result_term(program, b, inb, "b")
+            unproved = depsa | depsb
+            if assuma or assumb or (proved is None and unproved) or (proved is not None and not unproved <= proved):
+                raise Incomparable("symbolic comparison depends on unchecked assumptions or functions without proved evidence")
             ra, rb = _coerce_pair(ra, rb)
             hyps = reqa + reqb
             for _, v in shown:

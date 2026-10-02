@@ -141,6 +141,8 @@ class Z3Encoder:
     def term(self, t: L.Term) -> z3.ExprRef:
         c = self.ctx
         if isinstance(t, L.Const):
+            if t.sort == L.UNIT:
+                return z3.IntVal(0, c)
             if t not in self.consts:
                 self.consts[t] = z3.Const(t.name, self.sort(t.sort))
             return self.consts[t]

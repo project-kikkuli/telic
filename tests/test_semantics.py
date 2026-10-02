@@ -151,6 +151,23 @@ def test_python_float_rounding_model():
             assert model_value(mod, "f", a, b) == round(a / b), (a, b)
 
 
+def test_python_none_list_values_match_cpython():
+    src = (
+        "def first_is_none() -> bool:\n"
+        "    values = [None]\n"
+        "    return values[0] is None\n\n"
+        "def empty_none_list() -> bool:\n"
+        "    values: list[None] = []\n"
+        "    return len(values) == 0\n"
+    )
+    namespace = {}
+    exec(src, namespace)
+    module = lower_python("none_list.py", src)
+    for name in ("first_is_none", "empty_none_list"):
+        assert not module.functions[name].unsupported, module.functions[name].unsupported
+        assert model_value(module, name, 0, 0) == namespace[name]()
+
+
 VALUE_IDIOMS = [
     "(a or b)",
     "(a and b)",

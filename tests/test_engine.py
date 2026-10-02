@@ -68,6 +68,21 @@ def test_engine_agrees_with_python_core(name):
     assert not diffs, "\n".join(diffs)
 
 
+def test_engine_agrees_on_none_list_literals(tmp_path):
+    path = tmp_path / "none_list.py"
+    path.write_text(
+        "def first_none_is_none() -> bool:\n"
+        "    #@ ensures result\n"
+        "    return [None][0] is None\n\n"
+        "def empty_none_list_has_zero_length() -> bool:\n"
+        "    #@ ensures result\n"
+        "    values: list[None] = []\n"
+        "    return len(values) == 0\n"
+    )
+    compared, diffs = _differential(path)
+    assert compared > 0 and not diffs, "\n".join(diffs)
+
+
 def test_engine_models_everything_in_the_corpora():
     """No fallbacks: every function the Python core checks, the engine checks."""
     for name in DIFF_CASES:

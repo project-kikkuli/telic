@@ -422,6 +422,7 @@ def test_counts_in_names_are_data():
     [
         ("reachable home", "proved", "witness replayed", "tested"),
         ("reachable home", "proved", "source proof", "proved"),
+        ("reachable home", "proved", None, "tested"),
         ("reachable home", "refuted", "learned model", "open"),
         ("always reachable home from overlay", "refuted", "learned model", "open"),
         ('never overlay "Help"', "refuted", "learned model", "refuted"),

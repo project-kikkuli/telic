@@ -140,19 +140,30 @@ class Program:
             )
         }
         pending = list(selected)
-        seen = set(selected)
+        seen: set[str] = set()
         while pending:
             k = pending.pop()
-            if k in self.funcs and self.funcs[k].fn.unsupported:
+            if k in seen or k not in self.funcs:
+                continue
+            seen.add(k)
+            ref = self.funcs[k]
+            if ref.fn.mirrors:
+                from .equiv import resolve_mirror
+
+                for spec, _, _ in ref.fn.mirrors:
+                    target = resolve_mirror(self, ref, spec)
+                    if target is not None and target.key not in seen:
+                        selected.add(target.key)
+                        pending.append(target.key)
+            if ref.fn.unsupported:
                 continue
             for dep in self.callees.get(k, set()) | self.dispatch.get(k, set()) | self.later.get(k, set()):
                 if dep == ANY:
                     continue
                 if dep not in seen:
-                    seen.add(dep)
-                    pending.append(dep)
                     if dep in self.funcs:
                         selected.add(dep)
+                        pending.append(dep)
         return selected
 
     def member(self, cls: str, meth: str) -> "FuncRef | None":
