@@ -540,12 +540,13 @@ class StoredProof:
     id: str
     hash: str
     proof: str  # tactic text after ':= by'
+    proof_bytes: str
 
 
 def read_sidecar(path: str) -> dict[str, StoredProof]:
     if not os.path.exists(path):
         return {}
-    text = Path(path).read_text()
+    text = Path(path).read_bytes().decode()
     out: dict[str, StoredProof] = {}
     matches = list(BLOCK_RE.finditer(text))
     for i, m in enumerate(matches):
@@ -554,9 +555,9 @@ def read_sidecar(path: str) -> dict[str, StoredProof]:
         k = block.find(":= by")
         if k < 0:
             continue
-        proof = block[k + len(":= by"):]
-        proof = "\n".join(l[2:] if l.startswith("  ") else l for l in proof.strip("\n").splitlines()).rstrip()
-        out[m.group("id")] = StoredProof(m.group("id"), m.group("hash"), proof)
+        proof_bytes = block[k + len(":= by"):]
+        proof = "\n".join(l[2:] if l.startswith("  ") else l for l in proof_bytes.strip("\n").splitlines()).rstrip()
+        out[m.group("id")] = StoredProof(m.group("id"), m.group("hash"), proof, proof_bytes)
     return out
 
 
@@ -588,13 +589,13 @@ class LeanOutcome:
     errors: list[str] = field(default_factory=list)
 
 
-def _lean_receipt_key(context: str, statement: str, theorem: str, proof: str | None, identity: Any) -> str:
+def _lean_receipt_key(context: str, statement: str, theorem: str, proof: str | None, proof_bytes: str | None, identity: Any) -> str:
     renderer = hashlib.sha256()
     for path in (Path(__file__), Path(__file__).with_name("toolchain.py")):
         renderer.update(path.name.encode())
         renderer.update(path.read_bytes())
     payload = json.dumps(
-        [PRELUDE.format(heartbeats=HEARTBEATS), context, theorem, statement, proof, identity, renderer.hexdigest()],
+        [PRELUDE.format(heartbeats=HEARTBEATS), context, theorem, statement, proof, proof_bytes, identity, renderer.hexdigest()],
         sort_keys=True,
     )
     return "lean:" + hashlib.sha256(payload.encode()).hexdigest()
@@ -639,7 +640,8 @@ def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto:
                 sp = moved[0]
         has_sidecar_proof = sp is not None and sp.hash == h
         proof = sp.proof if has_sidecar_proof else None
-        k = _lean_receipt_key(rendered_defs, stmt, theorem_name(v.ob), proof, identity)
+        proof_bytes = sp.proof_bytes if has_sidecar_proof else None
+        k = _lean_receipt_key(rendered_defs, stmt, theorem_name(v.ob), proof, proof_bytes, identity)
         hit = cache.get(k)
         valid = hit is not None and hit.get("method") == "lean:auto"
         valid = valid or hit is not None and hit.get("method") == "lean:proof" and has_sidecar_proof and hit.get("proof_hash") == _phash(sp.proof)

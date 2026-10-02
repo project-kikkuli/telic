@@ -151,12 +151,12 @@ def test_unknown_solver_results_are_not_persisted_as_math_receipts(tmp_path, mon
 def test_lean_receipt_key_binds_full_rendered_input_and_identity():
     from telic.lean import _lean_receipt_key
 
-    key = _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", ("Lean 4", "binary-a"))
+    key = _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", "\n  simp\n", ("Lean 4", "binary-a"))
     assert key.startswith("lean:")
-    assert key != _lean_receipt_key("def x := 2", " : True", "vc_f_1", "simp", ("Lean 4", "binary-a"))
-    assert key != _lean_receipt_key("def x := 1", " : False", "vc_f_1", "simp", ("Lean 4", "binary-a"))
-    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "omega", ("Lean 4", "binary-a"))
-    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", ("Lean 4", "binary-b"))
+    assert key != _lean_receipt_key("def x := 2", " : True", "vc_f_1", "simp", "\n  simp\n", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : False", "vc_f_1", "simp", "\n  simp\n", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "omega", "\n  omega\n", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", "\n  simp\n", ("Lean 4", "binary-b"))
 
 
 def test_lean_sidecar_receipts_miss_when_proof_is_changed_removed_or_lean_changes(tmp_path, monkeypatch):
@@ -179,10 +179,10 @@ def test_lean_sidecar_receipts_miss_when_proof_is_changed_removed_or_lean_change
     monkeypatch.setattr(lean, "_def_tactics", lambda *_args: [])
     monkeypatch.setattr("telic.toolchain.lean", lambda: ("Lean 4", "binary-a"))
 
-    def check(proof="simp", identity=None):
+    def check(proof="simp", identity=None, rewrite=True):
         if proof is None:
             sidecar.unlink(missing_ok=True)
-        else:
+        elif rewrite:
             lean.write_sidecar(str(sidecar), "m.py", {"f/1": (stmt_hash, "vc_f_1", statement, proof)})
         if identity is not None:
             monkeypatch.setattr("telic.toolchain.lean", lambda: identity)
@@ -198,12 +198,15 @@ def test_lean_sidecar_receipts_miss_when_proof_is_changed_removed_or_lean_change
     assert len(calls) == 1
     assert check().method == "cache"
     assert len(calls) == 1
-    assert check("omega").status == "proved"
+    sidecar.write_text(sidecar.read_text().replace("  simp\n", "  simp \n", 1))
+    assert check(rewrite=False).status == "proved"
     assert len(calls) == 2
-    assert check(None).status == "proved"
+    assert check("omega").status == "proved"
     assert len(calls) == 3
-    assert check("simp", ("Lean 4", "binary-b")).status == "proved"
+    assert check(None).status == "proved"
     assert len(calls) == 4
+    assert check("simp", ("Lean 4", "binary-b")).status == "proved"
+    assert len(calls) == 5
 
 
 @pytest.mark.parametrize("variable", ["TELIC_Z3", "TELIC_LEAN", "TELIC_CORE"])

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from telic import logic as L
+from telic.checker import CheckOptions, check
 from telic.lean import find_lean, read_sidecar
 from telic.prover import extract_proof
 from telic.prover import resolve as resolve_prover
@@ -90,6 +91,30 @@ def test_sidecar_proof_is_checked_and_used(tmp_path):
     assert f.status == "proved", [(v.ob.id, v.status, v.lean and v.lean.summary) for v in f.verdicts]
     assert any(v.method == "lean:proof" for v in f.verdicts)
     assert oid in read_sidecar(str(tmp_path / "hard.py.proof.lean"))
+
+
+@needs_lean
+def test_cached_sidecar_requires_current_proof_file(tmp_path):
+    _sidecar(tmp_path, PROOF)
+    source = tmp_path / "hard.py"
+    sidecar = Path(str(source) + ".proof.lean")
+    opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), receipts=False, replay=False, infer=False, lean_auto=False)
+
+    first = check([str(source)], opts, root=str(tmp_path))
+    proved = next(f for f in first.functions if f.fn.name == "pow2_add")
+    assert proved.status == "proved" and not proved.from_receipt
+    assert any(v.method == "lean:proof" for v in proved.verdicts)
+
+    second = check([str(source)], opts, root=str(tmp_path))
+    cached = next(f for f in second.functions if f.fn.name == "pow2_add")
+    assert cached.status == "proved" and not cached.from_receipt
+    assert any(v.method == "cache" and v.reason == "lean:proof" for v in cached.verdicts)
+
+    sidecar.unlink()
+    third = check([str(source)], opts, root=str(tmp_path))
+    missing = next(f for f in third.functions if f.fn.name == "pow2_add")
+    assert missing.status == "open" and not missing.from_receipt
+    assert not any(v.status == "proved" and v.reason == "lean:proof" for v in missing.verdicts)
 
 
 @needs_lean
