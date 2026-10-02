@@ -4,6 +4,7 @@ variants driven through a real browser."""
 
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -79,7 +80,7 @@ def test_lemmas_are_found_in_any_comment_style():
     by = {lem.name: lem for lem in got.lemmas}
     assert str(by["escape"].prop) == "always reachable home from overlay" and by["escape"].aims == ("ESC",)
     assert by["nav"].aims == ("ESC", "NAV") and by["nav"].problem is None
-    assert "backs no aim" in by["untagged"].problem
+    assert by["untagged"].aims == () and by["untagged"].problem is None
     assert by["broken"].problem is None and str(by["broken"].prop) == "reachable button"
 
 
@@ -421,7 +422,7 @@ def test_counts_in_names_are_data():
     "property, status, method, want",
     [
         ("reachable home", "proved", "witness replayed", "tested"),
-        ("reachable home", "proved", "source proof", "proved"),
+        ("reachable home", "proved", "source proof", "tested"),
         ("reachable home", "proved", None, "tested"),
         ("reachable home", "refuted", "learned model", "open"),
         ("always reachable home from overlay", "refuted", "learned model", "open"),
@@ -436,11 +437,237 @@ def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
     lemma = scan.lemmas[0]
     old = {"status": status, "method": method, "detail": "old cached result", "viewports": [{"status": status}]}
     got = _result(lemma, "telic.toml", old)
-    assert got.status == want and got.viewports == [{"status": want}]
+    assert got.status == want and [v["status"] for v in got.viewports] == [want]
     if want == "open":
         assert "model-only" in got.detail
     if want == "tested":
         assert "proved" not in got.detail
+
+
+def _static_source_case(tmp_path, app, property):
+    from telic.ui.static import check, extract
+
+    (tmp_path / "App.tsx").write_text(app)
+    (tmp_path / "main.tsx").write_text(
+        'import { createRoot } from "react-dom/client";\n'
+        'import App from "./App";\n'
+        'createRoot(document.getElementById("root")!).render(<App />);\n'
+    )
+    (tmp_path / "index.html").write_text('<body><div id="root"></div><script type="module" src="/main.tsx"></script></body>')
+    scan = Scan()
+    scan_source(f"//@ ui source: {property}", "App.tsx", scan)
+    model, identity, why = extract(str(tmp_path), str(tmp_path))
+    return model, identity, why, (check(model, identity or "", scan.lemmas[0]) if model else None)
+
+
+def test_source_ui_proof_follows_a_mounted_modal_close_handler(tmp_path):
+    model, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return <main>{open ? <div role="dialog" aria-label="Help"><button onClick={() => setOpen(false)}>Close</button></div> : <h1>Home</h1>}</main>;
+}''',
+        'always reachable home from overlay "Help"',
+    )
+    assert why is None and model is not None
+    assert got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_does_not_prove_an_unmounted_export(tmp_path):
+    from telic.ui.static import extract
+
+    (tmp_path / "App.tsx").write_text(
+        'import { useState } from "react";\n'
+        'export default function App() { const [open] = useState(true); return open ? <button>Save</button> : null; }\n'
+    )
+    model, _, why = extract(str(tmp_path), str(tmp_path))
+    assert model is None and why and "not connected to a verified React createRoot" in why
+
+
+def test_source_ui_requires_html_to_load_the_mounted_entry(tmp_path):
+    from telic.ui.static import extract
+
+    _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; export default function App() { const [open] = useState(true); return open ? <button>Save</button> : null; }',
+        'reachable button "Save"',
+    )
+    (tmp_path / "index.html").write_text('<body><div id="root"></div></body>')
+    model, _, why = extract(str(tmp_path), str(tmp_path))
+    assert model is None and why and "does not connect a #root root" in why
+
+
+def test_source_ui_refutes_a_modal_close_handler_that_keeps_it_open(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return open ? <div role="dialog" aria-label="Help"><button onClick={() => setOpen(true)}>Close</button></div> : <h1>Home</h1>;
+}''',
+        'always reachable home from overlay "Help"',
+    )
+    assert why is None and got.status == "refuted"
+
+
+def test_source_ui_rejects_a_shadowed_fake_react_hook(tmp_path):
+    _, _, why, _ = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  function useState(_seed: boolean) { return [false, () => {}] as const; }
+  const [open] = useState(true);
+  return open ? <button>Save</button> : <p>Closed</p>;
+}''',
+        'reachable button "Save"',
+    )
+    assert why and "unshadowed React useState import" in why
+
+
+def test_source_ui_rejects_loose_equality_and_effects(tmp_path):
+    _, _, why, _ = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open] = useState(true);
+  return open == true ? <button>Save</button> : <p>Closed</p>;
+}''',
+        'reachable button "Save"',
+    )
+    assert why and "operator outside the finite UI expression model" in why
+    _, _, why, _ = _static_source_case(
+        tmp_path,
+        '''import { useEffect, useState } from "react";
+export default function App() {
+  const [open] = useState(true);
+  useEffect(() => {}, []);
+  return open ? <button>Save</button> : <p>Closed</p>;
+}''',
+        'reachable button "Save"',
+    )
+    assert why and "outside the source UI model" in why
+
+
+def test_source_ui_rejects_native_controls(tmp_path):
+    _, _, why, _ = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [ready] = useState(true);
+  return ready ? <input aria-label="Search" /> : null;
+}''',
+        'reachable textbox "Search"',
+    )
+    assert why and "native input behavior is outside the source UI model" in why
+
+
+def test_source_ui_treats_aria_hidden_string_as_hidden(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open] = useState(true);
+  return open ? <button aria-hidden="true">Secret</button> : <p>Closed</p>;
+}''',
+        'reachable button "Secret"',
+    )
+    assert why is None and got.status == "refuted"
+
+
+def test_source_ui_uses_native_implicit_roles(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [ready] = useState(true);
+  return ready ? <main><p>Home</p></main> : null;
+}''',
+        'never main',
+    )
+    assert why is None and got.status == "refuted"
+
+
+def test_source_ui_models_child_then_parent_click_updates(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return open ? <div role="dialog" aria-label="Help" onClick={() => setOpen(false)}><button onClick={() => { setOpen(false); setOpen(true); }}>Close</button></div> : <h1>Home</h1>;
+}''',
+        'always reachable home from overlay "Help"',
+    )
+    assert why is None and got.status == "proved"
+
+
+def test_source_ui_bubbles_after_a_child_handler_returns(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return open ? <div role="dialog" aria-label="Help" onClick={() => setOpen(false)}><button onClick={() => { return; setOpen(true); }}>Close</button></div> : <h1>Home</h1>;
+}''',
+        'always reachable home from overlay "Help"',
+    )
+    assert why is None and got.status == "proved"
+
+
+def test_source_ui_models_click_handlers_on_aria_disabled_controls(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return open ? <div role="dialog" aria-label="Help"><button aria-disabled="true" onClick={() => setOpen(false)}>Close</button></div> : <h1>Home</h1>;
+}''',
+        'always reachable home from overlay "Help"',
+    )
+    assert why is None and got.status == "proved"
+
+
+def test_source_ui_tracks_dynamic_jsx_names_and_functional_state_updates(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App() {
+  const [open, setOpen] = useState(true);
+  return <button onClick={() => setOpen((wasOpen) => !wasOpen)}>{open ? "Close" : "Open"}</button>;
+}''',
+        'reachable button "Open"',
+    )
+    assert why is None and got.status == "proved"
+
+
+@pytest.mark.parametrize(
+    "js, expr, expected",
+    [
+        ("true === 1", ["bin", "eq", ["lit", True], ["lit", 1]], False),
+        ('"a" + "b"', ["bin", "add", ["lit", "a"], ["lit", "b"]], "ab"),
+        ('"\\u{10000}" < "\\uE000"', ["bin", "lt", ["lit", "\U00010000"], ["lit", "\uE000"]], True),
+        ('false || "fallback"', ["bin", "or", ["lit", False], ["lit", "fallback"]], "fallback"),
+        ("null === false", ["bin", "eq", ["lit", None], ["lit", False]], False),
+        ("6 % 4", ["bin", "mod", ["lit", 6], ["lit", 4]], 2),
+    ],
+)
+def test_source_expression_model_matches_node_for_accepted_values(js, expr, expected):
+    from telic.frontend import typescript
+    from telic.ui.static import _eval
+
+    typescript.ensure_installed()
+    script = "let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>process.stdout.write(JSON.stringify(Function('return ('+JSON.parse(s)+')')())));"
+    node = subprocess.run([typescript._node(), "-e", script], input=json.dumps(js), capture_output=True, text=True, check=True)
+    assert json.loads(node.stdout) == expected == _eval(expr, {})
+
+
+def test_source_expression_model_rejects_coercion_and_unsafe_intermediates():
+    from telic.ui.static import _eval
+
+    with pytest.raises(ValueError, match="addition coercion"):
+        _eval(["bin", "add", ["lit", None], ["lit", True]], {})
+    with pytest.raises(ValueError, match="exact integer range"):
+        _eval(["bin", "add", ["lit", 2**53 - 1], ["lit", 1]], {})
 
 
 def test_screens_abstraction_keeps_only_what_the_lemmas_see():

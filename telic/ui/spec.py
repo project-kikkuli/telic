@@ -440,6 +440,4 @@ def scan_source(src: str, rel: str, got: Scan, host: bool = False) -> None:
             lem.prop, lem.via = parse_prop(lem.text)
         except SpecError as e:
             lem.problem = f"ui {lem.name}: {e}"
-        if not tags:
-            lem.problem = lem.problem or f"ui {lem.name} backs no aim: tag it, e.g. '//@ [ESCAPE] ui {lem.name}: ...'"
         got.lemmas.append(lem)

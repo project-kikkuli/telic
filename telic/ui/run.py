@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from . import slots, source
+from . import slots, source, static
 from .app import App, AppError, build_digest, torn_down_on_signals
 from .check import Atoms, ModelCheck, Occlusion, Outcome, combine, hit_test
 from .config import ConfigError, UiConfig, find, load
@@ -123,11 +123,13 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
         cache = {}
     entries: dict[str, Any] = cache.get("entries", {})
     used: set[str] = set()
+    static_models: dict[str, tuple[dict[str, Any] | None, str | None, str | None]] = {}
     for cfg_path, lems in groups.items():
         if cfg_path is None:
             for lem in lems:
-                why = f"no telic.toml with a [ui] section at or above {os.path.dirname(lem.path) or '.'}: add one that says how to start the app"
-                rep.results.append(UiResult(lem, "", "open", "", why))
+                top = os.path.dirname(os.path.join(root, lem.path)) or root
+                r = _static_result(lem, "", top, root, entries, used, static_models, configured=False)
+                rep.results.append(r)
             continue
         try:
             cfg = load(cfg_path, root)
@@ -144,6 +146,10 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
         rep.apps.append(app)
         todo = []
         for lem in lems:
+            source_result = _static_result(lem, cfg.path, cfg.dir, root, entries, used, static_models, configured=True)
+            if source_result is not None:
+                rep.results.append(source_result)
+                continue
             hit = entries.get(keys[lem.name])
             if hit is not None:
                 used.add(keys[lem.name])
@@ -183,6 +189,25 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
     return rep
 
 
+def _static_result(lem: UiLemma, app: str, top: str, root: str, entries: dict[str, Any], used: set[str], extracted: dict[str, tuple[dict[str, Any] | None, str | None, str | None]], configured: bool) -> UiResult | None:
+    if top not in extracted:
+        extracted[top] = static.extract(top, root)
+    model, identity, why = extracted[top]
+    if model is None:
+        if configured:
+            return None
+        return UiResult(lem, app, "open", "source model", why or "the app has no statically extractable source model")
+    outcome = static.check(model, identity or "", lem)
+    if configured and outcome.method != "source proof":
+        return None
+    result = UiResult(lem, app, outcome.status, outcome.method, outcome.detail, outcome.trace, {"source": outcome.source, "receipt": outcome.receipt})
+    if outcome.receipt:
+        key = hashlib.sha256(f"{tool_digest()}:{identity}:{lem.name}:{lem.text}".encode()).hexdigest()
+        entries[key] = {"result": result.to_json(), "source_receipt": outcome.receipt}
+        used.add(key)
+    return result
+
+
 def route_patterns(declared: list[str], lems: list[UiLemma]) -> list[str]:
     """The [ui] routes, then the route patterns lemmas name (``screen
     "/groups/:id"``), most specific first: a pattern names the screens it matches."""
@@ -199,8 +224,7 @@ def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
     source_proof = False
     learned_model = False
     if isinstance(raw_method, str):
-        result_method = raw_method
-        source_proof = raw_method in ("source proof", "static proof")
+        result_method = "cached observation" if raw_method in ("source proof", "static proof") else raw_method
         learned_model = raw_method in ("learned model",)
     detail = d.get("detail", "")
     if d["status"] == "proved" and not source_proof:
@@ -220,13 +244,16 @@ def _result(lem: UiLemma, app: str, d: dict[str, Any]) -> UiResult:
         source_proof = False
         learned_model = False
         if isinstance(raw_method, str):
-            source_proof = raw_method in ("source proof", "static proof")
+            source_proof = False
             learned_model = raw_method in ("learned model",)
         if verdict == "proved" and not source_proof:
             verdict = "tested"
         elif (verdict == "vacuous" and not source_proof) or (verdict == "refuted" and learned_model and lem.prop is not None and lem.prop.kind in ("reachable", "always_reachable")):
             verdict = "open"
-        viewports.append({**v, "status": verdict})
+        viewport = {**v, "status": verdict}
+        if raw_method in ("source proof", "static proof"):
+            viewport["method"] = "cached observation"
+        viewports.append(viewport)
     return UiResult(lem, app, status, result_method, detail, d.get("trace"), d.get("replay"), viewports)
 
 

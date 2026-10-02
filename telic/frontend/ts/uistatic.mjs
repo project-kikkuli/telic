@@ -1,0 +1,349 @@
+import { createRequire } from "node:module";
+import fs from "node:fs";
+
+const require = createRequire(import.meta.url);
+const ts = require("typescript");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const files = new Map(input.files.map((f) => [f.path, f]));
+const fail = (sf, node, why) => { throw new Error(`${sf.fileName}:${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1}: ${why}`); };
+const strip = (e) => {
+  while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isTypeAssertionExpression(e))) e = e.expression;
+  return e;
+};
+const modeledAria = new Set(["aria-label", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
+const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6"]);
+const lineOf = (sf, n) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
+
+function literal(e, sf) {
+  e = strip(e);
+  if (!e) return null;
+  if (e.kind === ts.SyntaxKind.TrueKeyword) return ["lit", true];
+  if (e.kind === ts.SyntaxKind.FalseKeyword) return ["lit", false];
+  if (ts.isStringLiteralLike(e)) return ["lit", e.text];
+  if (ts.isNumericLiteral(e)) {
+    const value = Number(e.text);
+    if (!Number.isSafeInteger(value)) fail(sf, e, "numeric UI state and literals must be safe integers");
+    return ["lit", value];
+  }
+  if (e.kind === ts.SyntaxKind.NullKeyword) return ["lit", null];
+  return null;
+}
+
+function expr(e, sf, states, locals = new Set()) {
+  e = strip(e);
+  const lit = literal(e, sf);
+  if (lit) return lit;
+  if (ts.isIdentifier(e)) {
+    if (locals.has(e.text)) return ["local", e.text];
+    if (states.has(e.text)) return ["state", e.text];
+    fail(sf, e, `reads unmodeled value '${e.text}'`);
+  }
+  if (ts.isPrefixUnaryExpression(e) && [ts.SyntaxKind.ExclamationToken, ts.SyntaxKind.MinusToken, ts.SyntaxKind.PlusToken].includes(e.operator)) {
+    const op = e.operator === ts.SyntaxKind.ExclamationToken ? "not" : e.operator === ts.SyntaxKind.MinusToken ? "neg" : "pos";
+    return ["un", op, expr(e.operand, sf, states, locals)];
+  }
+  if (ts.isBinaryExpression(e)) {
+    const ops = new Map([
+      [ts.SyntaxKind.EqualsEqualsEqualsToken, "eq"],
+      [ts.SyntaxKind.ExclamationEqualsEqualsToken, "ne"],
+      [ts.SyntaxKind.AmpersandAmpersandToken, "and"], [ts.SyntaxKind.BarBarToken, "or"],
+      [ts.SyntaxKind.PlusToken, "add"], [ts.SyntaxKind.MinusToken, "sub"], [ts.SyntaxKind.AsteriskToken, "mul"],
+      [ts.SyntaxKind.PercentToken, "mod"], [ts.SyntaxKind.LessThanToken, "lt"], [ts.SyntaxKind.LessThanEqualsToken, "le"],
+      [ts.SyntaxKind.GreaterThanToken, "gt"], [ts.SyntaxKind.GreaterThanEqualsToken, "ge"],
+    ]);
+    const op = ops.get(e.operatorToken.kind);
+    if (!op) fail(sf, e, "uses an operator outside the finite UI expression model");
+    return ["bin", op, expr(e.left, sf, states, locals), expr(e.right, sf, states, locals)];
+  }
+  if (ts.isConditionalExpression(e)) return ["if", expr(e.condition, sf, states, locals), expr(e.whenTrue, sf, states, locals), expr(e.whenFalse, sf, states, locals)];
+  fail(sf, e, "uses an expression outside the finite UI model");
+}
+
+function jsxText(s) {
+  const parts = s.split(/\r?\n/).map((line, i, all) => {
+    let x = line.replace(/\t/g, " ");
+    if (i !== 0) x = x.replace(/^ +/, "");
+    if (i !== all.length - 1) x = x.replace(/ +$/, "");
+    return x;
+  }).filter(Boolean);
+  return parts.join(" ");
+}
+
+function scanComponent(path, text, sf, component) {
+  const owns = (node, target) => {
+    if (node === target) return true;
+    let found = false;
+    const walk = (x) => { if (found) return; if (x === target) found = true; else ts.forEachChild(x, walk); };
+    walk(node);
+    return found;
+  };
+  for (const s of sf.statements) {
+    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) continue;
+    if (s === component) continue;
+    if (ts.isVariableStatement(s) && s.declarationList.declarations.length === 1 && owns(s, component)) continue;
+    fail(sf, s, "module-level executable code outside the mounted component is not modeled");
+  }
+  const namedHooks = new Set();
+  const reactObjects = new Set();
+  for (const s of sf.statements) {
+    if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
+    if (s.moduleSpecifier.text !== "react") fail(sf, s, `import '${s.moduleSpecifier.text}' is outside the source UI dependency model`);
+    const clause = s.importClause;
+    if (!clause) continue;
+    if (clause.name) reactObjects.add(clause.name.text);
+    if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) reactObjects.add(clause.namedBindings.name.text);
+    if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const specifier of clause.namedBindings.elements) {
+        const imported = (specifier.propertyName || specifier.name).text;
+        if (/^use[A-Z]/.test(imported) && imported !== "useState") fail(sf, specifier, `React hook '${imported}' is outside the source UI model`);
+        if (imported === "useState") namedHooks.add(specifier.name.text);
+      }
+    }
+  }
+  const shadows = new Set();
+  const bindingNames = (name) => {
+    if (ts.isIdentifier(name)) shadows.add(name.text);
+    else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) for (const e of name.elements) if (e && ts.isBindingElement(e)) bindingNames(e.name);
+  };
+  for (const p of component.parameters) bindingNames(p.name);
+  for (const s of component.body && ts.isBlock(component.body) ? component.body.statements : []) {
+    if (ts.isVariableStatement(s)) for (const d of s.declarationList.declarations) bindingNames(d.name);
+    else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.name) shadows.add(s.name.text);
+  }
+  const isHook = (call, sf) => {
+    if (ts.isIdentifier(call.expression)) return namedHooks.has(call.expression.text) && !shadows.has(call.expression.text);
+    if (ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "useState" && ts.isIdentifier(call.expression.expression)) {
+      const base = call.expression.expression.text;
+      return reactObjects.has(base) && !shadows.has(base);
+    }
+    return false;
+  };
+  const states = new Map();
+  const setters = new Map();
+  const modeledHooks = new Set();
+  const localFns = new Map();
+  const body = component.body;
+  if (!body || !ts.isBlock(body)) fail(sf, component, "component must use a block body");
+  for (const s of body.statements) {
+    if (ts.isFunctionDeclaration(s) && s.name) localFns.set(s.name.text, s);
+    if (!ts.isVariableStatement(s)) continue;
+    for (const d of s.declarationList.declarations) {
+      const init = d.initializer && strip(d.initializer);
+      if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "useEffect") fail(sf, init, "React effects are outside the source UI model");
+      if (!ts.isArrayBindingPattern(d.name) || !init || !ts.isCallExpression(init)) {
+        if (init && ts.isCallExpression(init)) fail(sf, init, "component initializer calls an unmodeled function");
+        continue;
+      }
+      if (!isHook(init, sf)) fail(sf, init, "state initializer call does not resolve to an unshadowed React useState import");
+      modeledHooks.add(init);
+      const [value, set] = d.name.elements;
+      if (!value || !ts.isIdentifier(value.name) || (set && !ts.isIdentifier(set.name)) || !init.arguments[0]) fail(sf, d, "useState must have a named state and explicit initial value");
+      const initial = literal(init.arguments[0], sf);
+      if (!initial) fail(sf, init.arguments[0], "state initializer is not a finite boolean, number, string, or null literal");
+      const bindings = new Set([...states.keys(), ...setters.keys()]);
+      if (bindings.has(value.name.text) || (set && (bindings.has(set.name.text) || value.name.text === set.name.text))) fail(sf, d, "state and setter bindings must be unique in the component");
+      states.set(value.name.text, { name: value.name.text, setter: set ? set.name.text : null, initial: initial[1], line: lineOf(sf, value) });
+      if (set) setters.set(set.name.text, value.name.text);
+    }
+  }
+  for (const s of body.statements) {
+    if (ts.isExpressionStatement(s)) {
+      const e = strip(s.expression);
+      if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && /^use[A-Z]/.test(e.expression.text)) fail(sf, e, `hook '${e.expression.text}' has effects outside the source UI model`);
+      fail(sf, s, "component has a top-level effect outside the source UI model");
+    }
+  }
+
+  const stateNames = new Set(states.keys());
+  if (!states.size) fail(sf, component, "component has no explicit useState state to model");
+  const inspectHooks = (n) => {
+    if (n !== component && ts.isFunctionLike(n)) return;
+    if (ts.isCallExpression(n)) {
+      const called = ts.isIdentifier(n.expression) ? n.expression.text : ts.isPropertyAccessExpression(n.expression) ? n.expression.name.text : "";
+      if (/^use[A-Z]/.test(called) && !modeledHooks.has(n)) fail(sf, n, `hook '${called}' is outside the source UI model`);
+    }
+    ts.forEachChild(n, inspectHooks);
+  };
+  inspectHooks(component);
+  const enc = (e, locals) => expr(e, sf, stateNames, locals);
+  const containsJsx = (n) => {
+    let found = false;
+    const walk = (x) => { if (found) return; if (ts.isJsxElement(x) || ts.isJsxSelfClosingElement(x) || ts.isJsxFragment(x)) found = true; else ts.forEachChild(x, walk); };
+    walk(n);
+    return found;
+  };
+  const statement = (st, localVars = new Set()) => {
+    if (ts.isBlock(st)) return ["seq", ...st.statements.map((x) => statement(x, localVars))];
+    if (ts.isIfStatement(st)) return ["if", enc(st.expression, localVars), statement(st.thenStatement, localVars), st.elseStatement ? statement(st.elseStatement, localVars) : ["seq"]];
+    if (ts.isEmptyStatement(st)) return ["seq"];
+    if (ts.isReturnStatement(st)) {
+      if (st.expression) fail(sf, st, "event handler returns a value");
+      return ["return"];
+    }
+    if (!ts.isExpressionStatement(st)) fail(sf, st, "event handler contains an unmodeled statement");
+    const e = strip(st.expression);
+    if (!ts.isCallExpression(e) || !ts.isIdentifier(e.expression) || !setters.has(e.expression.text) || e.arguments.length !== 1) fail(sf, e, "event handler performs an effect other than a useState update");
+    const stateName = setters.get(e.expression.text);
+    const arg = strip(e.arguments[0]);
+    let update;
+    if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) {
+      if (arg.parameters.length !== 1 || !ts.isIdentifier(arg.parameters[0].name) || !ts.isExpression(arg.body)) fail(sf, arg, "functional state update must be a single expression");
+      update = ["functional", arg.parameters[0].name.text, enc(arg.body, new Set([arg.parameters[0].name.text]))];
+    } else update = ["value", enc(arg, localVars)];
+    return ["set", stateName, update, lineOf(sf, e)];
+  };
+
+  const handler = (e) => {
+    e = strip(e);
+    if (ts.isArrowFunction(e) || ts.isFunctionExpression(e)) {
+      if (e.parameters.length > 1) fail(sf, e, "event handler parameters are outside the source UI model");
+      if (ts.isBlock(e.body)) return statement(e.body);
+      return statement(ts.factory.createExpressionStatement(e.body));
+    }
+    if (ts.isIdentifier(e) && localFns.has(e.text)) return statement(localFns.get(e.text).body);
+    fail(sf, e, "event handler is not defined in this component");
+  };
+
+  const render = (e) => {
+    e = strip(e);
+    if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
+    if (ts.isJsxElement(e)) return element(e.openingElement, e.children, e);
+    if (ts.isJsxSelfClosingElement(e)) return element(e, [], e);
+    if (ts.isJsxFragment(e)) return { type: "group", children: e.children.map(render) };
+    if (ts.isParenthesizedExpression(e)) return render(e.expression);
+    if (containsJsx(e) && ts.isConditionalExpression(e)) return { type: "branch", test: enc(e.condition, new Set()), yes: render(e.whenTrue), no: render(e.whenFalse) };
+    if (containsJsx(e) && ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) return { type: "branch", test: enc(e.left, new Set()), yes: render(e.right), no: { type: "empty" } };
+    if (ts.isArrayLiteralExpression(e)) return { type: "group", children: e.elements.map(render) };
+    return { type: "text", value: enc(e, new Set()) };
+  };
+
+  function element(open, children, whole) {
+    const tag = open.tagName.getText(sf);
+    if (!/^[a-z][a-z0-9-]*$/.test(tag)) fail(sf, open.tagName, `composed component '${tag}' is not yet modeled`);
+    if (["a", "input", "textarea", "select", "form", "fieldset", "details", "summary", "dialog", "style", "script", "link"].includes(tag)) fail(sf, open.tagName, `native ${tag} behavior is outside the source UI model`);
+    if (!modeledTags.has(tag)) fail(sf, open.tagName, `native ${tag} accessibility semantics are outside the source UI model`);
+    const props = {};
+    const events = {};
+    for (const a of open.attributes.properties) {
+      if (!ts.isJsxAttribute(a)) fail(sf, a, "spread JSX attributes are outside the source UI model");
+      const name = a.name.getText(sf);
+      if (name === "className" || name === "style") fail(sf, a, "CSS class and style effects are outside the source UI model");
+      if (name === "value" || name === "checked") fail(sf, a, `native ${name} semantics are outside the source UI model`);
+      if (name === "role" && !["div", "span"].includes(tag)) fail(sf, a, `role override on native ${tag} is outside the source UI model`);
+      if (["inert", "popover", "popovertarget", "contenteditable"].includes(name.toLowerCase())) fail(sf, a, `native ${name} behavior is outside the source UI model`);
+      if (name.startsWith("aria-") && !modeledAria.has(name.toLowerCase())) fail(sf, a, `ARIA attribute '${name}' changes behavior outside the source UI model`);
+      if (!a.initializer) { props[name] = ["lit", true]; continue; }
+      if (ts.isStringLiteral(a.initializer)) props[name] = ["lit", a.initializer.text];
+      else if (ts.isJsxExpression(a.initializer) && a.initializer.expression) {
+        if (name === "onClick") events.click = handler(a.initializer.expression);
+        else if (/^on[A-Z]/.test(name)) fail(sf, a, `event '${name}' is outside the source UI model`);
+        else props[name] = enc(a.initializer.expression, new Set());
+      } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
+    }
+    return { type: "element", tag, line: lineOf(sf, whole), props, events, children: children.map((c) => ts.isJsxText(c) ? { type: "text", value: jsxText(c.text) } : ts.isJsxExpression(c) ? c.expression ? render(c.expression) : { type: "empty" } : ts.isJsxElement(c) || ts.isJsxSelfClosingElement(c) || ts.isJsxFragment(c) ? render(c) : (fail(sf, c, "JSX child is outside the source UI model"), { type: "empty" })) };
+  }
+
+  const returns = [];
+  const findReturns = (n) => {
+    if (n !== body && (ts.isFunctionLike(n) || ts.isClassLike(n))) return;
+    if (ts.isReturnStatement(n)) returns.push(n);
+    ts.forEachChild(n, findReturns);
+  };
+  findReturns(body);
+  if (returns.length !== 1 || !returns[0].expression) fail(sf, component, "component must have one unconditional return expression");
+  for (const [name, d] of states) {
+    for (const v of body.statements) {
+      if (ts.isExpressionStatement(v) && ts.isCallExpression(strip(v.expression)) && ts.isIdentifier(strip(v.expression).expression) && strip(v.expression).expression.text === d.setter) fail(sf, v, "state update occurs outside an event handler");
+    }
+  }
+  return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values()], render: render(returns[0].expression) };
+}
+
+function componentCandidates(path, text) {
+  const kind = /\.(tsx|jsx)$/.test(path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, kind);
+  const out = [];
+  const find = (n) => {
+    if ((ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n)) && n.body) {
+      let found = false;
+      const jsx = (x) => { if (ts.isJsxElement(x) || ts.isJsxSelfClosingElement(x) || ts.isJsxFragment(x)) found = true; else ts.forEachChild(x, jsx); };
+      jsx(n.body);
+      if (found) out.push({ sf, node: n, name: n.name && n.name.text || (n.parent && ts.isVariableDeclaration(n.parent) && ts.isIdentifier(n.parent.name) ? n.parent.name.text : "default") });
+      return;
+    }
+    ts.forEachChild(n, find);
+  };
+  find(sf);
+  return out;
+}
+
+function mountedComponent(target, files) {
+  const noExt = (p) => p.replace(/\.(tsx?|jsx?|mts|cts|mjs|cjs)$/, "");
+  const rootLookup = (e) => {
+    e = strip(e);
+    if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression) || !ts.isIdentifier(e.expression.expression) || e.expression.expression.text !== "document" || e.arguments.length !== 1 || !ts.isStringLiteralLike(e.arguments[0])) return false;
+    if (e.expression.name.text === "getElementById") return e.arguments[0].text.length > 0 ? e.arguments[0].text : false;
+    const match = e.expression.name.text === "querySelector" && e.arguments[0].text.match(/^#([A-Za-z_][\w-]*)$/);
+    return match ? match[1] : false;
+  };
+  for (const f of files) {
+    const kind = /\.(tsx|jsx)$/.test(f.path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(f.path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+    const sf = ts.createSourceFile(f.path, f.text, ts.ScriptTarget.Latest, true, kind);
+    const roots = new Set();
+    let targetBinding = null;
+    let importsOnlyExpected = true;
+    for (const s of sf.statements) {
+      if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
+      const from = s.moduleSpecifier.text;
+      const clause = s.importClause;
+      if (from === "react-dom/client" && clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
+      } else if (from.startsWith(".")) {
+        const importedPath = noExt(require("node:path").posix.normalize(require("node:path").posix.join(require("node:path").posix.dirname(f.path), from)));
+        if (importedPath === noExt(target.path) && clause) {
+          if (target.defaultExport && clause.name) targetBinding = clause.name.text;
+          if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+            for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === target.name) targetBinding = item.name.text;
+          }
+        } else importsOnlyExpected = false;
+      } else importsOnlyExpected = false;
+    }
+    if (!importsOnlyExpected || !targetBinding || !roots.size) continue;
+    const executable = sf.statements.filter((s) => !ts.isImportDeclaration(s) && !(ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)));
+    if (executable.length !== 1 || !ts.isExpressionStatement(executable[0])) continue;
+    const mount = strip(executable[0].expression);
+    if (!ts.isCallExpression(mount) || !ts.isPropertyAccessExpression(mount.expression) || mount.expression.name.text !== "render" || mount.arguments.length !== 1) continue;
+    const create = strip(mount.expression.expression);
+    if (!ts.isCallExpression(create) || !ts.isIdentifier(create.expression) || !roots.has(create.expression.text) || create.arguments.length !== 1) continue;
+    const root = rootLookup(create.arguments[0]);
+    if (!root) continue;
+    const app = strip(mount.arguments[0]);
+    const tag = ts.isJsxSelfClosingElement(app) ? app.tagName : ts.isJsxElement(app) ? app.openingElement.tagName : null;
+    const attributes = ts.isJsxSelfClosingElement(app) ? app.attributes.properties : ts.isJsxElement(app) ? app.openingElement.attributes.properties : [];
+    const children = ts.isJsxElement(app) ? app.children : [];
+    if (tag && ts.isIdentifier(tag) && tag.text === targetBinding && attributes.length === 0 && children.length === 0) return { root, entry: f.path };
+  }
+  return false;
+}
+
+const models = [];
+const errors = [];
+for (const f of input.files) {
+  for (const c of componentCandidates(f.path, f.text)) {
+    const ownMods = ts.canHaveModifiers(c.node) ? ts.getModifiers(c.node) || [] : [];
+    const parent = c.node.parent;
+    const variableStatement = ts.isVariableDeclaration(parent) && ts.isVariableDeclarationList(parent.parent) && ts.isVariableStatement(parent.parent.parent) ? parent.parent.parent : null;
+    const exportMods = variableStatement && ts.canHaveModifiers(variableStatement) ? ts.getModifiers(variableStatement) || [] : [];
+    const exported = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    if (!exported) continue;
+    const defaultExport = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+    const mountRoot = mountedComponent({ path: f.path, name: c.name, defaultExport }, input.files);
+    if (!mountRoot) {
+      errors.push(`${f.path}:${lineOf(c.sf, c.node)}: exported JSX component is not connected to a verified React createRoot(...).render(<${c.name} />) entry`);
+      continue;
+    }
+    try { models.push({ ...scanComponent(f.path, f.text, c.sf, c.node), mountRoot: mountRoot.root, mountEntry: mountRoot.entry }); }
+    catch (e) { errors.push(String(e && e.message || e).split("\n")[0]); }
+  }
+}
+process.stdout.write(JSON.stringify({ models, errors }));
