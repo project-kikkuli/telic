@@ -52,6 +52,10 @@ def ARRAY(elem: Sort, index: Sort | None = None) -> Sort:
     return Sort("Array", elem=elem, index=None if index == INT else index)
 
 
+def array_lambda(binder: "Const", body: "Term") -> "ArrayLambda":
+    return ArrayLambda(binder, body, ARRAY(body.sort, binder.sort))
+
+
 def index_sort(s: Sort) -> Sort:
     return s.index or INT
 
@@ -173,6 +177,17 @@ class App(Term):
     op: str
     args: tuple[Term, ...]
     sort: Sort
+
+
+@dataclass(frozen=True, repr=False)
+class ArrayLambda(Term):
+    binder: Const
+    body: Term
+    sort: Sort
+
+    def __post_init__(self) -> None:
+        if self.sort.name != "Array" or index_sort(self.sort) != self.binder.sort or self.sort.elem != self.body.sort:
+            raise TypeError(f"array lambda sort {self.sort} does not match {self.binder.sort} -> {self.body.sort}")
 
 
 @dataclass(frozen=True, repr=False)
@@ -479,6 +494,10 @@ def ite(c: Term, a: Term, b: Term) -> Term:
 
 
 def select(arr: Term, idx: Term) -> Term:
+    if isinstance(arr, ArrayLambda):
+        if arr.binder.sort != idx.sort:
+            raise TypeError(f"array lambda index has sort {arr.binder.sort}, got {idx.sort}")
+        return substitute(arr.body, {arr.binder: idx})
     if isinstance(arr, App) and arr.op == "K":
         return arr.args[0]
     if isinstance(arr, App) and arr.op == "store":
@@ -647,6 +666,8 @@ def max_(a: Term, b: Term) -> Term:
 def children(t: Term) -> tuple[Term, ...]:
     if isinstance(t, (App, Fn)):
         return t.args
+    if isinstance(t, ArrayLambda):
+        return (t.body,)
     if isinstance(t, Quant):
         return (t.body,)
     return ()
@@ -682,6 +703,12 @@ def consts(t: Term) -> set[Const]:
             go(x.body)
             bound.clear()
             bound.update(saved)
+        elif isinstance(x, ArrayLambda):
+            saved = set(bound)
+            bound.add(x.binder)
+            go(x.body)
+            bound.clear()
+            bound.update(saved)
         else:
             for c in children(x):
                 go(c)
@@ -705,12 +732,52 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
     if isinstance(t, Fn):
         args = tuple(substitute(a, m) for a in t.args)
         return t if args == t.args else Fn(t.name, args, t.sort)
+    if isinstance(t, ArrayLambda):
+        inner = {k: v for k, v in m.items() if k != t.binder}
+        body, binder = t.body, t.binder
+        replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
+        if binder in replacements:
+            used = consts(body) | replacements | {binder}
+            stem = f"{binder.name}$alpha"
+            name, suffix = stem, 0
+            while any(c.name == name for c in used):
+                suffix += 1
+                name = f"{stem}{suffix}"
+            renamed = Const(name, binder.sort)
+            body = substitute(body, {binder: renamed})
+            binder = renamed
+        new_body = substitute(body, inner)
+        return t if binder == t.binder and new_body is t.body else ArrayLambda(binder, new_body, t.sort)
     if isinstance(t, Quant):
         inner = {k: v for k, v in m.items() if k not in t.vars}
-        body = substitute(t.body, inner)
-        if body is t.body:
+        body, vars_ = t.body, t.vars
+        renaming = {}
+        replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
+        if replacements.intersection(vars_):
+            used = consts(body) | replacements | set(vars_)
+            renamed = []
+            renaming = {}
+            for var in vars_:
+                if var not in replacements:
+                    renamed.append(var)
+                    continue
+                stem, suffix = f"{var.name}$alpha", 0
+                name = stem
+                while any(c.name == name for c in used):
+                    suffix += 1
+                    name = f"{stem}{suffix}"
+                fresh = Const(name, var.sort)
+                used.add(fresh)
+                renaming[var] = fresh
+                renamed.append(fresh)
+            if renaming:
+                body = substitute(body, renaming)
+                vars_ = tuple(renamed)
+        body = substitute(body, inner)
+        if body is t.body and vars_ == t.vars:
             return t
-        return Quant(t.kind, t.vars, body, patterns=tuple(tuple(substitute(p, inner) for p in ps) for ps in t.patterns))
+        patterns = tuple(tuple(substitute(substitute(p, renaming), inner) for p in ps) for ps in t.patterns)
+        return Quant(t.kind, vars_, body, patterns=patterns)
     return t
 
 
@@ -889,7 +956,10 @@ def python_numeric_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
     corrected = ite(and_(ne(field(state, "lo"), zero), is_finite(field(state, "lo"))), add(field(state, "hi"), field(state, "lo")), field(state, "hi"))
     result = ite(field(state, "fast"), corrected, field(state, "ordinary")) if (major, minor) >= (3, 12) else field(state, "ordinary")
     number_sort = REC("PythonNumber", (("is_int", BOOL), ("integer", INT), ("floating", FLOAT64)))
-    tagged_result = mkrec(number_sort, (not_(field(state, "in_float")), field(state, "int_total"), result))
+    index = Const("sum_index", INT)
+    item_is_int = field(select(values, index), "is_int")
+    all_int = Quant("forall", (index,), implies(and_(le(lo, index), lt(index, hi)), item_is_int), patterns=((select(values, index),),))
+    tagged_result = mkrec(number_sort, (all_int, field(state, "int_total"), result))
     sum_def = FunDef(sum_name, (values, lo, hi), number_sort, tagged_result, doc="CPython mixed numeric sum")
     return state_def, sum_def
 
@@ -975,25 +1045,26 @@ def theory_lemmas(elem: Sort) -> list[Axiom]:
 
     out: list[Axiom] = []
     q = lambda vs, body, pats: Quant("forall", tuple(vs), body, patterns=pats)  # noqa: E731
-    out.append(Axiom(f"{ss}_front", q((a, lo, hi), implies(lt(lo, hi), eq(S(a, lo, hi), add(select(a, lo), S(a, add(lo, ONE), hi)))), ((S(a, lo, hi), select(a, lo)),)), "", "sum peels off its first element", ss))
-    inner = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(zero, select(a, i))))
-    out.append(Axiom(f"{ss}_nonneg", q((a, lo, hi), implies(inner, le(zero, S(a, lo, hi))), ((S(a, lo, hi),),)), "", "sum of non-negatives is non-negative", ss))
-    inner_np = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(select(a, i), zero)))
-    out.append(Axiom(f"{ss}_nonpos", q((a, lo, hi), implies(inner_np, le(S(a, lo, hi), zero)), ((S(a, lo, hi),),)), "", "sum of non-positives is non-positive", ss))
-    upd = store(a, k, v)
-    out.append(
-        Axiom(
-            f"{ss}_store",
-            q((a, lo, hi, k, v), eq(S(upd, lo, hi), add(S(a, lo, hi), ite(and_(le(lo, k), lt(k, hi)), sub(v, select(a, k)), zero))), ((S(upd, lo, hi),),)),
-            "",
-            "updating one element changes the sum by the difference",
-            ss,
+    if elem in (INT, REAL):
+        out.append(Axiom(f"{ss}_front", q((a, lo, hi), implies(lt(lo, hi), eq(S(a, lo, hi), add(select(a, lo), S(a, add(lo, ONE), hi)))), ((S(a, lo, hi), select(a, lo)),)), "", "sum peels off its first element", ss))
+        inner = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(zero, select(a, i))))
+        out.append(Axiom(f"{ss}_nonneg", q((a, lo, hi), implies(inner, le(zero, S(a, lo, hi))), ((S(a, lo, hi),),)), "", "sum of non-negatives is non-negative", ss))
+        inner_np = Quant("forall", (i,), implies(and_(le(lo, i), lt(i, hi)), le(select(a, i), zero)))
+        out.append(Axiom(f"{ss}_nonpos", q((a, lo, hi), implies(inner_np, le(S(a, lo, hi), zero)), ((S(a, lo, hi),),)), "", "sum of non-positives is non-positive", ss))
+        upd = store(a, k, v)
+        out.append(
+            Axiom(
+                f"{ss}_store",
+                q((a, lo, hi, k, v), eq(S(upd, lo, hi), add(S(a, lo, hi), ite(and_(le(lo, k), lt(k, hi)), sub(v, select(a, k)), zero))), ((S(upd, lo, hi),),)),
+                "",
+                "updating one element changes the sum by the difference",
+                ss,
+            )
         )
-    )
-    out.append(Axiom(f"{ss}_split", q((a, lo, mid, hi), implies(and_(le(lo, mid), le(mid, hi)), eq(S(a, lo, hi), add(S(a, lo, mid), S(a, mid, hi)))), ((S(a, lo, mid), S(a, mid, hi)),)), "", "sum splits at any midpoint", ss))
-    at_k = and_(le(lo, k), lt(k, hi))
-    out.append(Axiom(f"{ss}_elem_le", q((a, lo, hi, k), implies(and_(inner, at_k), le(select(a, k), S(a, lo, hi))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-negatives is at most their sum", ss))
-    out.append(Axiom(f"{ss}_elem_ge", q((a, lo, hi, k), implies(and_(inner_np, at_k), le(S(a, lo, hi), select(a, k))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-positives is at least their sum", ss))
+        out.append(Axiom(f"{ss}_split", q((a, lo, mid, hi), implies(and_(le(lo, mid), le(mid, hi)), eq(S(a, lo, hi), add(S(a, lo, mid), S(a, mid, hi)))), ((S(a, lo, mid), S(a, mid, hi)),)), "", "sum splits at any midpoint", ss))
+        at_k = and_(le(lo, k), lt(k, hi))
+        out.append(Axiom(f"{ss}_elem_le", q((a, lo, hi, k), implies(and_(inner, at_k), le(select(a, k), S(a, lo, hi))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-negatives is at most their sum", ss))
+        out.append(Axiom(f"{ss}_elem_ge", q((a, lo, hi, k), implies(and_(inner_np, at_k), le(S(a, lo, hi), select(a, k))), ((S(a, lo, hi), select(a, k)),)), "", "each of non-positives is at least their sum", ss))
     out.append(Axiom(f"{sc}_bounds", q((a, lo, hi, v), and_(le(ZERO, C(a, lo, hi, v)), le(C(a, lo, hi, v), max_(sub(hi, lo), ZERO))), ((C(a, lo, hi, v),),)), "", "a count lies between 0 and the length", sc))
     out.append(Axiom(f"{sc}_front", q((a, lo, hi, v), implies(lt(lo, hi), eq(C(a, lo, hi, v), add(ite(eq(select(a, lo), v), ONE, ZERO), C(a, add(lo, ONE), hi, v)))), ((C(a, lo, hi, v), select(a, lo)),)), "", "count peels off its first element", sc))
     del mid
@@ -1084,6 +1155,9 @@ def show(t: Term, prec: int = -1) -> str:
         vs = ", ".join(v.name for v in t.vars)
         s = f"{t.kind} {vs}. {show(t.body, 0)}"
         return f"({s})" if prec >= 0 else s
+    if isinstance(t, ArrayLambda):
+        s = f"fun {t.binder.name} => {show(t.body)}"
+        return f"({s})" if prec >= 0 else s
     if isinstance(t, Fn):
         return f"{t.name}({', '.join(show(a) for a in t.args)})"
     assert isinstance(t, App)
@@ -1132,6 +1206,8 @@ def canonical(t: Term) -> str:
         return f"f{t.bits:x}:{t.sort}"
     if isinstance(t, Quant):
         return f"({t.kind} ({' '.join(canonical(v) for v in t.vars)}) {canonical(t.body)})"
+    if isinstance(t, ArrayLambda):
+        return f"(array_lambda {canonical(t.binder)} {canonical(t.body)} : {t.sort})"
     if isinstance(t, Fn):
         return f"({t.name} {' '.join(canonical(a) for a in t.args)})"
     assert isinstance(t, App)

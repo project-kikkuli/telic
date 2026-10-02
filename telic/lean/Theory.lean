@@ -33,6 +33,30 @@ decreasing_by omega
 
 def upd {α : Type} (a : Int → α) (i : Int) (v : α) : Int → α := fun j => if j = i then v else a j
 
+/-- A left fold over an integer-indexed array, used by checked state induction. -/
+def seqfold {α β : Type} (step : α → β → α) (a : Int → β) (init : α) (lo hi : Int) : α :=
+  if hi ≤ lo then init else step (seqfold step a init lo (hi - 1)) (a (hi - 1))
+termination_by (hi - lo).toNat
+decreasing_by omega
+
+/-- Induction over the exact decreasing measure used by recursive array folds. -/
+theorem seqfold_invariant {α β : Type} (step : α → β → α) (a : Int → β) (init : α)
+    (P : α → Prop) (A : β → Prop) (lo hi : Int)
+    (hbase : P init)
+    (hstep : ∀ s x, P s → A x → P (step s x))
+    (hitems : ∀ i, lo ≤ i → i < hi → A (a i)) :
+    P (seqfold step a init lo hi) := by
+  by_cases h : hi ≤ lo
+  · simp [seqfold, h, hbase]
+  · have hlo : lo < hi := by omega
+    rw [seqfold, if_neg h]
+    apply hstep
+    · exact seqfold_invariant step a init P A lo (hi - 1) hbase hstep
+        (fun i h1 h2 => hitems i h1 (by omega))
+    · exact hitems (hi - 1) (by omega) (by omega)
+termination_by (hi - lo).toNat
+decreasing_by omega
+
 -- ---------------------------------------------------------------------------
 -- Integer sums
 

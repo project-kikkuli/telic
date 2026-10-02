@@ -168,6 +168,8 @@ class Z3Encoder:
                 pats = [z3.MultiPattern(*[self.term(x) for x in p]) if len(p) > 1 else self.term(p[0]) for p in t.patterns]
                 return z3.ForAll(vs, body, patterns=pats)
             return z3.ForAll(vs, body) if t.kind == "forall" else z3.Exists(vs, body)
+        if isinstance(t, L.ArrayLambda):
+            return z3.Lambda(self.term(t.binder), self.term(t.body))
         if isinstance(t, L.Fn):
             f = self.funcs.get(t.name)  # a defined function
             if f is None:

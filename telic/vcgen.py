@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sys
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Union
@@ -890,6 +891,8 @@ class VCGen:
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
             if isinstance(v, ListVal):
                 facts.append(L.le(L.ZERO, v.len))
+                if self.module.language == "python":
+                    facts.append(L.le(v.len, L.IntV(sys.maxsize)))
                 if self.module.language == "python" and isinstance(p.ty, ir.TList) and isinstance(p.ty.elem, ir.TReal) and p.ty.elem.bits == 64:
                     numeric = py_numeric_state(v)
                     i = L.Const(f"{p.name}.numeric_index", L.INT)
@@ -1784,8 +1787,9 @@ class VCGen:
             if op == "mul":
                 return PyNumber(both_int, L.mul(x.integer, y.integer), L.mul(x.as_float(), y.as_float()))
             if op in ("rdiv", "py_rdiv"):
+                quotient_fits = L.lt(L.abs_(x.integer), L.mul(conversion_limit, L.abs_(y.integer)))
+                self.oblige("overflow", ctx, L.implies(L.and_(both_int, L.ne(y.integer, L.ZERO)), quotient_fits), e.loc, "integer division result fits in a float")
                 exact_quotient = L.to_float(L.rdiv(L.to_real(x.integer), L.to_real(y.integer)), L.FLOAT64)
-                self.oblige("overflow", ctx, L.implies(both_int, L.is_finite(exact_quotient)), e.loc, "integer division result fits in a float")
                 negative_zero = L.and_(both_int, L.eq(x.integer, L.ZERO), L.lt(y.integer, L.ZERO))
                 exact_quotient = L.ite(negative_zero, L.fneg(L.fval(0.0, L.FLOAT64)), exact_quotient)
                 quotient = L.ite(both_int, exact_quotient, L.rdiv(x.as_float(), y.as_float()))
@@ -1997,7 +2001,16 @@ class VCGen:
         body = self.ev(e.body, sub)
         assert not isinstance(body, ListVal)
         if e.kind == "forall":
-            return L.forall([i], L.implies(rng, body))
+            patterns = ((seq.at(i),),) if e.seq is not None and isinstance(seq, ListVal) else ()
+            quantified = L.Quant("forall", (i,), L.implies(rng, body), patterns=patterns)
+            first = ctx.sub(None, spec=True, quiet=True, binders=ctx.binders)
+            first.bound[e.idx] = lo
+            if e.seq is not None and e.elem is not None:
+                assert isinstance(seq, ListVal)
+                first.bound[e.elem] = self.python_list_value(seq, lo)
+            first_body = self.ev(e.body, first)
+            assert not isinstance(first_body, ListVal)
+            return L.and_(quantified, L.implies(L.lt(lo, hi), first_body))
         return L.exists([i], L.and_(rng, body))
 
     def ev_Builtin(self, e: ir.Builtin, ctx: Ctx) -> Val:
@@ -2403,10 +2416,9 @@ class VCGen:
                 sum_name = f"seqsum_py_numeric_cpython_{major}_{minor}"
                 values = xs.arr
                 if not isinstance(xs.ty.elem, ir.TPythonNumber):
-                    values, assume_values = self.defined_symbol(ctx, f"sum@{next(self.counter)}.tagged", L.ARRAY(sort_of(ir.TPythonNumber())))
                     j = L.Const(f"sum_value_index!{next(self.counter)}", L.INT)
                     value = L.mkrec(sort_of(ir.TPythonNumber()), (L.FALSE, L.ZERO, L.select(xs.arr, j)))
-                    assume_values(L.Quant("forall", (j,), L.eq(L.select(values, j), value), patterns=((L.select(values, j),),)))
+                    values = L.array_lambda(j, value)
                 state_sort = L.REC(
                     f"PyNumericSumState_cpython_{major}_{minor}",
                     (("in_float", L.BOOL), ("int_total", L.INT), ("fast", L.BOOL), ("ordinary", L.FLOAT64), ("hi", L.FLOAT64), ("lo", L.FLOAT64)),
@@ -2452,6 +2464,12 @@ class VCGen:
                 self.theory_fns.add(state_name)
                 self.theory_fns.add(sum_name)
                 result = L.Fn(sum_name, (values, start, end), sort_of(ir.TPythonNumber()))
+                item = L.select(values, start)
+                is_int = L.field(item, "is_int")
+                integer = L.field(item, "integer")
+                floating = L.add(L.fval(0.0, L.FLOAT64), L.field(item, "floating"))
+                single = L.mkrec(sort_of(ir.TPythonNumber()), (is_int, integer, floating))
+                result = L.ite(L.eq(xs.len, L.ONE), single, result)
                 return result if isinstance(xs.ty.elem, ir.TPythonNumber) else L.field(result, "floating")
             if name.startswith("py_sum_cpython_") and es == L.FLOAT64:
                 major, minor = (int(x) for x in name.removeprefix("py_sum_cpython_").split("_", 1))
@@ -2671,20 +2689,16 @@ class VCGen:
         if cond is None:
             ln: L.Term = seq.len
         elif pure:
-            prefix, assume_prefix = self.defined_symbol(ctx, f"comp@{n}.prefix", L.ARRAY(L.INT), pure)
+            selected, assume_selected = self.defined_symbol(ctx, f"comp@{n}.selected", L.ARRAY(L.BOOL), pure)
             j = L.Const(f"j!{n}", L.INT)
             sub_j = ctx.sub(None, spec=True, quiet=True)
             sub_j.bound[elem] = self.python_list_value(seq, j)
             cj = self.ev(cond, sub_j)
             assert isinstance(cj, L.Term)
-            assume_prefix(L.eq(L.select(prefix, L.ZERO), L.ZERO))
-            step = L.eq(
-                L.select(prefix, L.add(j, L.ONE)),
-                L.add(L.select(prefix, j), L.ite(cj, L.ONE, L.ZERO)),
-            )
-            assume_prefix(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, seq.len)), step), patterns=((L.select(prefix, L.add(j, L.ONE)),),)))
-            ln = L.select(prefix, seq.len)
-            filtered_state = (prefix, j, sub_j, cj)
+            selected_at_j = L.select(selected, j)
+            assume_selected(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, seq.len)), L.eq(selected_at_j, cj)), patterns=((selected_at_j,),)))
+            ln = L.Fn("seqcount_bool", (selected, L.ZERO, seq.len, L.TRUE), L.INT)
+            filtered_state = (selected, j, sub_j, cj)
         else:
             ln, _ = self.defined_symbol(ctx, f"comp@{n}.len", L.INT, pure)
             assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
@@ -2726,12 +2740,21 @@ class VCGen:
             c = self.ev(cond, sub)
             self.ev(body, sub.sub(c))  # type: ignore[arg-type]
             assert filtered_state is not None
-            prefix, j, sub_j, cj = filtered_state
+            selected, j, sub_j, cj = filtered_state
             bj = self.ev(body, sub_j)
             bj_value = L.mkrec(sort_of(ir.TPythonNumber()), bj.parts()) if isinstance(bj, PyNumber) and isinstance(e.ty.elem, ir.TPythonNumber) else bj.as_float() if isinstance(bj, PyNumber) else bj
-            rank = L.select(prefix, j)
+            rank = L.Fn("seqcount_bool", (selected, L.ZERO, j, L.TRUE), L.INT)
             selected = L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj)
             assume(L.Quant("forall", (j,), L.implies(selected, L.eq(L.select(arr, rank), bj_value)), patterns=((L.select(arr, rank),),)))  # type: ignore[arg-type]
+            zero_sub = ctx.sub(None, spec=True, quiet=True)
+            zero_sub.bound[elem] = self.python_list_value(seq, L.ZERO)
+            zero_cond = self.ev(cond, zero_sub)
+            zero_body = self.ev(body, zero_sub)
+            if isinstance(zero_body, PyNumber) and isinstance(e.ty.elem, ir.TPythonNumber):
+                zero_body = L.mkrec(sort_of(ir.TPythonNumber()), zero_body.parts())
+            elif isinstance(zero_body, PyNumber):
+                zero_body = zero_body.as_float()
+            assume(L.implies(L.and_(L.lt(L.ZERO, seq.len), zero_cond), L.eq(L.select(arr, L.ZERO), zero_body)))  # type: ignore[arg-type]
         return ListVal(arr, L.ZERO, ln, e.ty, numeric_output)
 
     def same_comp(self, arr: L.Term, b: L.Term, seq: ListVal, i: L.Const, ctx: Ctx) -> L.Term:

@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,7 +19,7 @@ from .jobs import take as take_jobs
 from .program import ANY, FuncRef, Program
 from .render_expr import render
 from .smt import RLIMIT, SmtResult, Theory, solve
-from .vcgen import Obligation, VCError, VCGen, build_axioms, build_fundef
+from .vcgen import ListVal, Obligation, VCError, VCGen, build_axioms, build_fundef
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -456,6 +456,201 @@ def function_key(program: Program, key: str, root: str | None, rlimit: int) -> s
     return "fn:" + h.hexdigest()[:24]
 
 
+_SINGLE_INT_DIVISION = "python-singleton-int-division-v1"
+
+
+def _singleton_int_division_input(ref: FuncRef) -> dict[str, Any] | None:
+    fn = ref.fn
+    if ref.module.language != "python" or len(fn.params) != 1 or len(fn.body) != 1 or not isinstance(fn.body[0], ir.Return):
+        return None
+    param = fn.params[0]
+    if not isinstance(param.ty, ir.TList) or not isinstance(param.ty.elem, ir.TPythonNumber):
+        return None
+    value = fn.body[0].value
+    if not isinstance(value, ir.Binary) or value.op != "py_rdiv" or not isinstance(value.left, ir.Builtin) or not value.left.name.startswith("py_sum_cpython_"):
+        return None
+    if len(value.left.args) != 1 or not isinstance(value.left.args[0], ir.Var) or value.left.args[0].name != param.name:
+        return None
+    if not isinstance(value.right, ir.Builtin) or value.right.name != "py_number" or len(value.right.args) != 1:
+        return None
+    length = value.right.args[0]
+    if not isinstance(length, ir.Builtin) or length.name != "len" or len(length.args) != 1 or not isinstance(length.args[0], ir.Var) or length.args[0].name != param.name:
+        return None
+
+    number_sort = L.REC("PythonNumber", (("is_int", L.BOOL), ("integer", L.INT), ("floating", L.FLOAT64)))
+    arr = L.Const(f"{param.name}.singleton_candidate", L.ARRAY(number_sort))
+    tag = L.Const(f"{param.name}.singleton_candidate.is_int", L.BOOL)
+    integer = L.Const(f"{param.name}.singleton_candidate.integer", L.INT)
+    floating = L.Const(f"{param.name}.singleton_candidate.floating", L.FLOAT64)
+    item = L.mkrec(number_sort, (tag, integer, floating))
+    return {param.name: ListVal(L.store(arr, L.ZERO, item), L.ZERO, L.ONE, param.ty)}
+
+
+def _project_record(term: L.Term, name: str) -> L.Term:
+    if isinstance(term, L.App) and term.op == "ite":
+        return L.ite(term.args[0], _project_record(term.args[1], name), _project_record(term.args[2], name))
+    return L.field(term, name)
+
+
+def _checked_python_sum_invariant(program: Program, theory: Theory, timeout_ms: int, rlimit: int, jobs: int | None, cache: ProofCache | None = None) -> tuple[L.Axiom | None, str | None]:
+    """Check an induction certificate for the live CPython numeric sum state.
+
+    The Lean seqfold theorem supplies only the generic decreasing-measure rule.
+    Base, exact source transition, and final-state obligations are discharged
+    separately against the version-selected FunDef using IEEE SMT semantics.
+    """
+    major, minor = sys.version_info.major, sys.version_info.minor
+    state_name = f"py_numeric_sum_state_cpython_{major}_{minor}"
+    sum_name = f"seqsum_py_numeric_cpython_{major}_{minor}"
+    state_def, sum_def = L.python_numeric_sum_defs(major, minor)
+    if not state_def.recursive or state_def.body is None or state_def.measure is None:
+        return None, None
+    if theory.fundefs.get(state_name) != state_def or theory.fundefs.get(sum_name) != sum_def:
+        return None, None
+    values = L.Const("sum_induction.values", L.ARRAY(L.REC("PythonNumber", (("is_int", L.BOOL), ("integer", L.INT), ("floating", L.FLOAT64)))))
+    lo, hi, i = L.Const("sum_induction.lo", L.INT), L.Const("sum_induction.hi", L.INT), L.Const("sum_induction.i", L.INT)
+    zero = L.fval(0.0, L.FLOAT64)
+
+    def invariant(st: L.Term, end: L.Term) -> L.Term:
+        fields = [
+            _project_record(st, "fast"),
+            L.eq(_project_record(st, "int_total"), L.ZERO),
+            L.eq(_project_record(st, "in_float"), L.lt(lo, end)),
+            L.le(zero, _project_record(st, "ordinary")),
+        ]
+        if (major, minor) >= (3, 12):
+            high, correction = _project_record(st, "hi"), _project_record(st, "lo")
+            fields.extend((L.le(zero, high), L.implies(L.is_finite(high), L.le(L.fneg(high), correction))))
+        return L.and_(*fields)
+
+    prev = L.Fn(state_name, (values, lo, i), state_def.sort)
+    item = L.select(values, i)
+    item_ok = L.and_(L.not_(L.field(item, "is_int")), L.le(zero, L.field(item, "floating")))
+    next_state = L.substitute(state_def.body, {
+        state_def.params[0]: values,
+        state_def.params[1]: lo,
+        state_def.params[2]: L.add(i, L.ONE),
+    })
+    base = L.Fn(state_name, (values, lo, lo), state_def.sort)
+    step = Obligation(
+        id=f"{state_name}/invariant.step",
+        func="@python-numeric-sum",
+        kind="induction.step",
+        loc=ir.NOLOC,
+        site=None,
+        message="the CPython numeric sum transition preserves its state invariant",
+        hyps=[L.le(lo, i), invariant(prev, i), item_ok],
+        goal=invariant(next_state, L.add(i, L.ONE)),
+    )
+    base_ob = replace(step, id=f"{state_name}/invariant.base", kind="induction.base", message="the CPython numeric sum initial state satisfies its invariant", hyps=[], goal=invariant(base, lo))
+
+    index = L.Const("sum_induction.j", L.INT)
+    elem = L.select(values, index)
+    all_nonnegative_floats = L.Quant(
+        "forall",
+        (index,),
+        L.implies(
+            L.and_(L.le(lo, index), L.lt(index, hi)),
+            L.and_(L.not_(L.field(elem, "is_int")), L.le(zero, L.field(elem, "floating"))),
+        ),
+        patterns=((L.select(values, index),),),
+    )
+    final_state = L.Fn(state_name, (values, lo, hi), state_def.sort)
+    result = L.Fn(sum_name, (values, lo, hi), sum_def.sort)
+    final_ob = replace(
+        step,
+        id=f"{state_name}/invariant.result",
+        kind="induction.result",
+        message="the version-selected CPython sum result is a nonnegative float",
+        hyps=[L.lt(lo, hi), all_nonnegative_floats, invariant(final_state, hi)],
+        goal=L.and_(L.not_(L.field(result, "is_int")), L.le(zero, L.field(result, "floating"))),
+    )
+    obligations = [base_ob, step, final_ob]
+    proof_theory = theory
+    prerequisite: Obligation | None = None
+    prerequisite_result: SmtResult | None = None
+    prerequisite_formula: L.Term | None = None
+    if (major, minor) >= (3, 12):
+        d, m = L.Const("sum_induction.p3.d", L.FLOAT64), L.Const("sum_induction.p3.m", L.FLOAT64)
+        prerequisite = Obligation(
+            id=f"{state_name}/ieee.add-nonnegative-monotone",
+            func="@python-numeric-sum",
+            kind="induction.lemma",
+            loc=ir.NOLOC,
+            site=None,
+            message="round-to-nearest addition of a nonnegative finite value does not decrease a finite value",
+            hyps=[L.is_finite(d), L.is_finite(m), L.le(zero, m)],
+            goal=L.le(d, L.add(d, m)),
+        )
+        prerequisite_result = solve_all([prerequisite], theory, timeout_ms, rlimit, jobs)[0]
+        p3_formula = L.Quant(
+            "forall",
+            (d, m),
+            L.implies(
+                L.and_(L.is_finite(d), L.is_finite(m), L.le(zero, m)),
+                L.le(d, L.add(d, m)),
+            ),
+            patterns=((L.add(d, m),),),
+        )
+        if prerequisite_result.status == "proved":
+            prerequisite_formula = p3_formula
+            p3 = L.Axiom(
+                f"{state_name}_ieee_add_nonnegative_monotone",
+                p3_formula,
+                "",
+                "checked IEEE addition monotonicity prerequisite",
+                state_name,
+            )
+            proof_theory = Theory(dict(theory.fundefs), [*theory.axioms, p3])
+    results = solve_all(obligations, proof_theory, timeout_ms, rlimit, jobs)
+    if cache is not None:
+        if prerequisite is not None and prerequisite_result is not None and prerequisite_result.status == "proved":
+            cache.put(obligation_key(prerequisite, theory, rlimit), {"method": "z3"})
+        for obligation, result in zip(obligations, results):
+            if result.status == "proved":
+                cache.put(obligation_key(obligation, proof_theory, rlimit), {"method": "z3"})
+    if any(result.status != "proved" for result in results):
+        return None, None
+
+    # The checked Lean theorem seqfold_invariant is applied only after the
+    # recursive body matches its exact fold shape and all three VCs are proved.
+    body = state_def.body
+    if not (isinstance(body, L.App) and body.op == "ite" and body.args[0] == L.le(state_def.params[2], state_def.params[1])):
+        return None, None
+    expected_measure = L.sub(state_def.params[2], state_def.params[1])
+    if state_def.measure != (expected_measure,) or sum_def.body is None:
+        return None, None
+    recursive_calls = [t for t in L.iter_terms(body) if isinstance(t, L.Fn) and t.name == state_name]
+    if not any(call.args == (state_def.params[0], state_def.params[1], L.sub(state_def.params[2], L.ONE)) for call in recursive_calls):
+        return None, None
+    formula = L.Quant(
+        "forall",
+        (values, lo, hi),
+        L.implies(
+            L.and_(L.lt(lo, hi), all_nonnegative_floats),
+            L.and_(L.not_(L.field(L.Fn(sum_name, (values, lo, hi), sum_def.sort), "is_int")), L.le(zero, L.field(L.Fn(sum_name, (values, lo, hi), sum_def.sort), "floating"))),
+        ),
+        patterns=((L.Fn(sum_name, (values, lo, hi), sum_def.sort),),),
+    )
+    certificate_inputs = {
+        "python": f"{major}.{minor}",
+        "rounding": "IEEE-754 binary64 roundTiesToEven",
+        "state_name": state_name,
+        "state_sort": str(state_def.sort),
+        "state_body": L.canonical(state_def.body),
+        "state_measure": L.canonical(state_def.measure[0]),
+        "sum_name": sum_name,
+        "sum_sort": str(sum_def.sort),
+        "sum_body": L.canonical(sum_def.body),
+        "invariant": L.canonical(formula),
+        "rule": "seqfold_invariant",
+    }
+    if prerequisite_formula is not None:
+        certificate_inputs["ieee_prerequisite"] = L.canonical(prerequisite_formula)
+    digest = hashlib.sha256(json.dumps(certificate_inputs, sort_keys=True).encode()).hexdigest()[:24]
+    return L.Axiom(f"{state_name}_nonnegative", formula, "", "checked induction over the source-faithful CPython sum state", sum_name), digest
+
+
 def code_value_calls(program: Program, rep: "FunctionReport") -> None:
     """A call through a function value runs code no ``Call`` names: the
     proof rests on the functions it reaches, and recursion through it needs
@@ -675,7 +870,7 @@ def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory
             theory.fundefs[d.name] = d
     for d in L.python_numeric_sum_defs(sys.version_info.major, sys.version_info.minor):
         theory.fundefs[d.name] = d
-    for elem in (L.INT, L.REAL):
+    for elem in (L.INT, L.REAL, L.BOOL):
         theory.axioms.extend(L.theory_lemmas(elem))
     for key in sorted(program.definitional):
         ref = program.ref(key)
@@ -722,6 +917,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)
     theory, theory_problems = build_theory(program, {})
+    has_python_sum = any(isinstance(e, ir.Builtin) and e.name.startswith("py_sum_cpython_") for m in program.modules for fn in m.functions.values() for s in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(s) for e in ir.walk_expr(e))
     reports: list[FunctionReport] = []
     hits = solved = 0
 
@@ -801,6 +997,12 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         measures.update(res.options.measures)
     if measures:
         theory, theory_problems = build_theory(program, measures)
+    if has_python_sum:
+        sum_invariant, sum_invariant_digest = _checked_python_sum_invariant(program, theory, opts.timeout_ms, opts.rlimit, opts.jobs, cache)
+        if sum_invariant is not None:
+            theory.axioms.append(sum_invariant)
+            cert_key = f"induction:python-sum:{sys.version_info.major}.{sys.version_info.minor}:{sum_invariant_digest}"
+            cache.put(cert_key, {"method": "z3+lean-seqfold", "status": "proved", "fundef": sum_invariant_digest, "rule": "seqfold_invariant"})
 
     pending: list[tuple[Verdict, str]] = []
     staged: list[tuple[FunctionReport, str | None, float]] = []
@@ -967,6 +1169,35 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             elif res.status == "unknown" and not res.reason.startswith("timeout"):
                 cache.put(key_, {"method": "unknown", "reason": res.reason})
 
+    # Search a source-faithful singleton shape when an exact Python sum/length
+    # division remains open. These VCs retain the original clauses; the shape
+    # can only supply a refutation after replay against the original source.
+    candidate_verdicts: list[tuple[FunctionReport, Verdict, str]] = []
+    for rep, _, _ in staged:
+        if all(v.status == "proved" for v in rep.verdicts):
+            continue
+        overrides = _singleton_int_division_input(rep.ref)
+        if overrides is None:
+            continue
+        try:
+            candidate_gen = VCGen(program, rep.ref, (inferred.get(rep.ref.key) or Inferred()).options, inputs=overrides)
+            candidate_obs = candidate_gen.run()
+        except VCError:
+            continue
+        target_obs = [o for o in candidate_obs if o.kind == "overflow" and o.message == "integer division result fits in a float"]
+        if not target_obs:
+            continue
+        target_results = solve_all(target_obs, theory, opts.timeout_ms, opts.rlimit, opts.jobs)
+        for ob, result in zip(target_obs, target_results):
+            if result.status != "refuted":
+                continue
+            candidate_id = f"{ob.id}/{_SINGLE_INT_DIVISION}"
+            candidate_ob = replace(ob, id=candidate_id, candidate=_SINGLE_INT_DIVISION)
+            verdict = Verdict(candidate_ob, "refuted", "z3-candidate", result.seconds, result.model, result.state, _SINGLE_INT_DIVISION)
+            rep.verdicts.append(verdict)
+            source_digest = function_key(program, rep.ref.key, root, opts.rlimit)
+            candidate_verdicts.append((rep, verdict, source_digest))
+
     # Escalate: counterexamples get executed (each replay is a subprocess,
     # so they run side by side), unknowns go to Lean.
     if opts.replay:
@@ -978,6 +1209,40 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if to_replay:
             with take_jobs(opts.jobs, len(to_replay)) as workers, ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(lambda r: replay_verdicts(program, r), to_replay))
+    for _, verdict, source_digest in candidate_verdicts:
+        if verdict.status == "refuted" and verdict.replay is not None and verdict.replay.confirmed:
+            replay_identity = json.dumps(
+                {
+                    "runtime": verdict.replay.runtime,
+                    "violation": verdict.replay.violation,
+                    "summary": verdict.replay.summary,
+                    "model": verdict.model,
+                    "state": verdict.state,
+                },
+                sort_keys=True,
+                default=str,
+            )
+            receipt = hashlib.sha256(
+                f"{toolchain_id()}:{_SINGLE_INT_DIVISION}:{source_digest}:"
+                f"{L.canonical(verdict.ob.formula())}:{replay_identity}".encode()
+            ).hexdigest()[:24]
+            cache.put(
+                f"counterexample:{receipt}",
+                {
+                    "method": "z3+replay",
+                    "source": source_digest,
+                    "specializer": _SINGLE_INT_DIVISION,
+                    "candidate": L.canonical(verdict.ob.formula()),
+                    "replay": replay_identity,
+                    "status": "refuted",
+                },
+            )
+        elif verdict.status in ("refuted", "unconfirmed"):
+            # A restricted SMT model is only a search candidate. Without a
+            # source replay it cannot change the function's verdict.
+            verdict.status = "unknown"
+            verdict.method = "z3-candidate"
+            verdict.reason = "candidate requires confirmed source replay"
     vacuous = vacuity.explain(theory, opts, cache)
     for rep, fkey, ft in staged:
         ref = rep.ref

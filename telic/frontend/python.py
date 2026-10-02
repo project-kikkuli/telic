@@ -2252,15 +2252,25 @@ class ExprLowerer:
                 return ir.Builtin(ir.STR, loc, "str_fn", (ir.Lit(ir.STR, loc, "percent_format"), a, self.fl.coerce(b, ir.TOpaque("")) if not isinstance(b.ty, ir.TOpaque) else b))
             raise self.err(f"unsupported operation on {a.ty} and {b.ty}", n)
         if isinstance(op, ast.Pow):
-            if isinstance(n.right, ast.Constant) and isinstance(n.right.value, int) and 0 <= n.right.value <= 4 and ir.is_numeric(a.ty):
-                k = n.right.value
-                if k == 0:
-                    return ir.Lit(a.ty, loc, 1 if isinstance(a.ty, ir.TInt) else Fraction(1))
-                out = a
-                for _ in range(k - 1):
-                    out = ir.Binary(a.ty, loc, "mul", out, a)
-                return out
-            return self.opaque("pow", [a, b], ir.TOpaque("") if not (isinstance(a.ty, ir.TReal) or isinstance(b.ty, ir.TReal)) else ir.REAL, loc)
+            if isinstance(b, ir.Lit) and type(b.value) is int:
+                k = b.value
+                if k < 0:
+                    raise self.err("negative exponent power is not modelled", n)
+                if isinstance(a, ir.Lit) and type(a.value) is int and k <= 4096:
+                    return ir.Lit(ir.INT, loc, a.value**k)
+                if isinstance(a.ty, ir.TInt):
+                    if k > 4:
+                        return self.opaque("pow", [a, b], ir.INT, loc)
+                elif not ir.is_numeric(a.ty):
+                    raise self.err(f"power on {a.ty} is not modelled", n)
+                if k <= 4 and ir.is_numeric(a.ty):
+                    if k == 0:
+                        return ir.Lit(a.ty, loc, 1 if isinstance(a.ty, ir.TInt) else Fraction(1))
+                    out = a
+                    for _ in range(k - 1):
+                        out = ir.Binary(a.ty, loc, "mul", out, a)
+                    return out
+            raise self.err("power with a non-literal or non-integer exponent is not modelled", n)
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TList):
             if isinstance(b, ir.ListLit) and not b.elems:
                 b = ir.ListLit(a.ty, b.loc, ())

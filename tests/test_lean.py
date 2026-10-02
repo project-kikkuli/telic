@@ -62,10 +62,10 @@ def test_theory_lemmas_are_proved_in_lean():
     assert "sorry" not in out.stdout
     text = THEORY.read_text()
     # every lemma handed to Z3 has a Lean proof of the same name
-    for elem, prefix in ((L.INT, "seqsum"), (L.REAL, "seqsumR")):
+    for elem, prefix in ((L.INT, "seqsum"), (L.REAL, "seqsumR"), (L.BOOL, "seqcount")):
         for ax in L.theory_lemmas(elem):
             name = ax.name
-            name = name.replace("seqsum_r_", "seqsumR_").replace("seqcount_int_", "seqcount_").replace("seqcount_real_", "seqcount_")
+            name = name.replace("seqsum_r_", "seqsumR_").replace("seqcount_bool_", "seqcount_").replace("seqcount_int_", "seqcount_").replace("seqcount_real_", "seqcount_")
             assert re.search(rf"theorem {re.escape(name)}\b", text), f"no Lean proof for {ax.name}"
 
 

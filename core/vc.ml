@@ -655,7 +655,7 @@ let rec ev g ctx (e : Ir.expr) : value =
       (match op with
        | "lt" | "le" | "gt" | "ge" -> T (compare op (op = "gt" || op = "ge"))
        | "add" | "sub" | "mul" ->
-         let conversion_limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+         let conversion_limit = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") Int in
          let xfits = lt (abs_ xi) conversion_limit and yfits = lt (abs_ yi) conversion_limit in
          let mixed = not_ both_int in
          let conversions = and_ [ implies (and_ [ xt; not_ yt ]) xfits; implies (and_ [ yt; not_ xt ]) yfits ] in
@@ -667,11 +667,13 @@ let rec ev g ctx (e : Ir.expr) : value =
        | "py_rdiv" ->
          let divisor_nonzero = or_ [ and_ [ yt; ne yi zero ]; and_ [ not_ yt; not_ (fpred "fp.isZero" yf) ] ] in
          oblige g "div" ctx divisor_nonzero loc "divisor of '/' is non-zero";
-         let conversion_limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+         let conversion_limit = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") Int in
          let conversions = and_ [ implies (and_ [ xt; not_ yt ]) (lt (abs_ xi) conversion_limit); implies (and_ [ yt; not_ xt ]) (lt (abs_ yi) conversion_limit) ] in
          oblige g "overflow" ctx (implies (not_ both_int) conversions) loc "integer converted to float does not overflow";
          let exact_q = as_float (rdiv (to_real xi) (to_real yi)) in
-         oblige g "overflow" ctx (implies both_int (is_finite exact_q)) loc "integer division result fits in a float";
+         let limit = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") Int in
+         let quotient_fits = lt (abs_ xi) (mul limit (abs_ yi)) in
+         oblige g "overflow" ctx (implies (and_ [ both_int; not_ (eq yi zero) ]) quotient_fits) loc "integer division result fits in a float";
          let negative_zero = and_ [ both_int; eq xi zero; lt yi zero ] in
          let exact_q = ite negative_zero (fneg (fval 0.0)) exact_q in
          let q = ite both_int exact_q (rdiv (py_as_float x) (py_as_float y)) in
@@ -800,14 +802,25 @@ let rec ev g ctx (e : Ir.expr) : value =
     let i = const (Printf.sprintf "%s!%d" base (next g)) Int in
     let rng = and_ [ le lo i; lt i hi ] in
     let sub = sub_ctx ~cond:rng ctx in
+    let seq_value = match q.seq with Some s -> Some (ev g ctx s) | None -> None in
     let bound = SM.add q.idx (T i) sub.bound in
     let bound =
       match (q.seq, q.elem) with
-      | Some s, Some el -> ( match ev g ctx s with L l -> SM.add el (T (at (l.arr, l.off) i)) bound | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
+      | Some _, Some el -> (match seq_value with Some (L l) -> SM.add el (T (at (l.arr, l.off) i)) bound | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
       | _ -> bound
     in
     let body = tm (ev g { sub with bound; binders = ctx.binders @ [ i ] } q.body) in
-    if q.kind = "forall" then T (forall [ i ] (implies rng body)) else T (exists [ i ] (and_ [ rng; body ]))
+    if q.kind = "forall" then begin
+      let first_bound = SM.add q.idx (T lo) ctx.bound in
+      let first_bound =
+        match (q.seq, q.elem) with
+        | Some _, Some el -> (match seq_value with Some (L l) -> SM.add el (T (at (l.arr, l.off) lo)) first_bound | _ -> raise (Vc_error ("quantifier over a non-list", loc)))
+        | _ -> first_bound
+      in
+      let first_body = tm (ev g { ctx with spec = true; quiet = true; bound = first_bound } q.body) in
+      let patterns = match seq_value with Some (L l) -> [ [| at (l.arr, l.off) i |] ] | _ -> [] in
+      T (and_ [ quant "forall" [ i ] (implies rng body) patterns; implies (lt lo hi) first_body ])
+    end else T (exists [ i ] (and_ [ rng; body ]))
   | Builtin (name, args) -> builtin g ctx e name args
   | Call (f, args) ->
     let callee = match resolve g ctx.modpath f with Some c -> c | None -> raise (Vc_error (Printf.sprintf "unknown function '%s'" f, loc)) in
@@ -1213,14 +1226,17 @@ and builtin g ctx (e : Ir.expr) name args =
         let prefix = fn state_name [| l.arr; l.off; i |] state_sort in
         let item = select l.arr i in
         let is_int = field item "is_int" and integer = field item "integer" in
-        let limit = int_ ((1 lsl 1024) - (1 lsl 970)) in
+        let limit = mk (Big "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") Int in
         let safe = and_ [
           implies (and_ [ not_ (field prefix "in_float"); not_ is_int ]) (lt (abs_ (field prefix "int_total")) limit);
           implies (and_ [ field prefix "in_float"; is_int ]) (lt (abs_ integer) limit);
         ] in
         let range = and_ [ le l.off i; lt i (add l.off l.len) ] in
         oblige g "overflow" ctx (quant "forall" [ i ] (implies range safe) [ [| field prefix "int_total" |] ]) loc "integer values converted by sum fit in a float";
-        T (fn sum_name [| l.arr; l.off; add l.off l.len |] py_num_sort)
+        let result = fn sum_name [| l.arr; l.off; add l.off l.len |] py_num_sort in
+        let item = select l.arr l.off in
+        let single = mkrec py_num_sort [ field item "is_int"; field item "integer"; add (fval 0.0) (field item "floating") ] in
+        T (ite (eq l.len one) single result)
       end else if cpython then begin
         match (num l.off, num l.len) with
         | Some off, Some len when off.d = 1 && len.d = 1 && len.n >= 0 ->
@@ -1622,18 +1638,17 @@ and comprehension g ctx (e : Ir.expr) seq =
     match cond with
     | None -> seq.len
     | Some _ when is_pure ->
-      let prefix = sym (Printf.sprintf "comp@%d.prefix" n) (Array (Int, Int)) in
+      let selected = sym (Printf.sprintf "comp@%d.selected" n) (Array (Int, Bool)) in
       let j = const (Printf.sprintf "j!%d" n) Int in
       let sub_j = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) j)) ctx.bound } in
       let cj = term_of loc (ev g sub_j (Option.get cond)) in
-      assume ctx (eq (select prefix zero) zero);
+      let selected_at_j = select selected j in
       assume ctx
         (quant "forall" [ j ]
-           (implies (and_ [ le zero j; lt j seq.len ])
-              (eq (select prefix (add j one)) (add (select prefix j) (ite cj one zero))))
-           [ [| select prefix (add j one) |] ]);
-      filtered_state := Some (prefix, j, sub_j, cj);
-      select prefix seq.len
+           (implies (and_ [ le zero j; lt j seq.len ]) (eq selected_at_j cj))
+           [ [| selected_at_j |] ]);
+      filtered_state := Some (selected, j, sub_j, cj);
+      fn "seqcount_bool" [| selected; zero; seq.len; tt |] Int
     | Some _ ->
       let ln = sym (Printf.sprintf "comp@%d.len" n) Int in
       assume ctx (and_ [ le zero ln; le ln seq.len ]);
@@ -1662,13 +1677,17 @@ and comprehension g ctx (e : Ir.expr) seq =
        let cv = term_of loc (ev g sub c) in
        ignore (ev g (sub_ctx ~cond:cv sub) body);
        (match !filtered_state with
-        | Some (prefix, j, sub_j, cj) ->
+        | Some (selected, j, sub_j, cj) ->
           let bj = term_of loc (ev g sub_j body) in
-          let rank = select prefix j in
+          let rank = fn "seqcount_bool" [| selected; zero; j; tt |] Int in
           assume ctx
             (quant "forall" [ j ]
                (implies (and_ [ le zero j; lt j seq.len; cj ]) (eq (select arr rank) bj))
-               [ [| select arr rank |] ])
+               [ [| select arr rank |] ]);
+          let sub_zero = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) zero)) ctx.bound } in
+          let zero_cond = term_of loc (ev g sub_zero c) in
+          let zero_body = term_of loc (ev g sub_zero body) in
+          assume ctx (implies (and_ [ lt zero seq.len; zero_cond ]) (eq (select arr zero) zero_body))
         | None -> raise (Fallback "filtered comprehension rank")));
     L (list_value !comp_arr zero ln e.ty)
   end
@@ -2679,6 +2698,9 @@ let run g =
       st.env <- SM.add p v st.env;
       g.inputs <- (p, v) :: g.inputs;
       (match v with L l -> Dynarray.add_last st.facts (le zero l.len) | _ -> ());
+      (match (g.info.language, v) with
+       | "python", L l -> Dynarray.add_last st.facts (le l.len (mk (Big "9223372036854775807") Int))
+       | _ -> ());
       (match (ty, v) with
        | TList TReal, L l ->
          let i = const (p ^ ".numeric_index") Int in
