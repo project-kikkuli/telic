@@ -56,7 +56,8 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
     projection = L.array_lambda(binder, L.add(binder, outer))
     assert L.consts(projection) == {outer}
 
-    substituted = L.substitute(projection, {outer: binder})
+    alpha_name = L.Const("index$alpha", L.INT)
+    substituted = L.substitute(projection, {outer: binder, alpha_name: L.IntV(7)})
     assert isinstance(substituted, L.ArrayLambda)
     assert substituted.binder != binder
     assert L.consts(substituted) == {binder}
@@ -68,7 +69,7 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
     assert solver.check() == z3.unsat
 
     quantified = L.Quant("forall", (binder,), L.gt(binder, outer), patterns=((binder,),))
-    renamed = L.substitute(quantified, {outer: binder})
+    renamed = L.substitute(quantified, {outer: binder, alpha_name: L.IntV(7)})
     assert isinstance(renamed, L.Quant)
     assert renamed.vars[0] != binder
     assert renamed.patterns == ((renamed.vars[0],),)
@@ -77,6 +78,13 @@ def test_array_lambda_projection_is_capture_safe_and_matches_python():
 
     rendered = LeanPrinter(Namer(), {}).t(projection)
     assert "fun" in rendered and "index" in rendered
+    free_bool = L.Const("shadow", L.BOOL)
+    shadowed = L.array_lambda(L.Const("shadow", L.INT), L.ite(free_bool, L.ONE, L.ZERO))
+    namer = Namer()
+    free_name = namer(free_bool.name)
+    shadowed_text = LeanPrinter(namer, {}).t(shadowed)
+    assert f"{free_name} : Prop" not in shadowed_text
+    assert f"{free_name}" in shadowed_text and "fun (shadow_2 : Int)" in shadowed_text
 
 
 def py_expr(rnd, depth=0):

@@ -722,6 +722,28 @@ def fns(t: Term) -> set[str]:
     return {x.name for x in iter_terms(t) if isinstance(x, Fn)}
 
 
+def _term_names(t: Term) -> set[str]:
+    names: set[str] = set()
+    for x in iter_terms(t):
+        if isinstance(x, Const):
+            names.add(x.name)
+        elif isinstance(x, Quant):
+            names.update(v.name for v in x.vars)
+        elif isinstance(x, ArrayLambda):
+            names.add(x.binder.name)
+    return names
+
+
+def _fresh_binder(binder: Const, used: set[str]) -> Const:
+    stem = f"{binder.name}$alpha"
+    name, suffix = stem, 0
+    while name in used:
+        suffix += 1
+        name = f"{stem}{suffix}"
+    used.add(name)
+    return Const(name, binder.sort)
+
+
 def substitute(t: Term, m: dict[Term, Term]) -> Term:
     if t in m:
         return m[t]
@@ -738,15 +760,14 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
         body, binder = t.body, t.binder
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if binder in replacements:
-            used = consts(body) | replacements | {binder}
-            stem = f"{binder.name}$alpha"
-            name, suffix = stem, 0
-            while any(c.name == name for c in used):
-                suffix += 1
-                name = f"{stem}{suffix}"
-            renamed = Const(name, binder.sort)
+            used = _term_names(body) | {binder.name}
+            for key, value in inner.items():
+                used.update(_term_names(key))
+                used.update(_term_names(value))
+            renamed = _fresh_binder(binder, used)
             body = substitute(body, {binder: renamed})
             binder = renamed
+            inner.pop(binder, None)
         new_body = substitute(body, inner)
         return t if binder == t.binder and new_body is t.body else ArrayLambda(binder, new_body, t.sort)
     if isinstance(t, Quant):
@@ -755,20 +776,16 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
         renaming = {}
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if replacements.intersection(vars_):
-            used = consts(body) | replacements | set(vars_)
+            used = _term_names(body) | {var.name for var in vars_}
+            for key, value in inner.items():
+                used.update(_term_names(key))
+                used.update(_term_names(value))
             renamed = []
-            renaming = {}
             for var in vars_:
                 if var not in replacements:
                     renamed.append(var)
                     continue
-                stem, suffix = f"{var.name}$alpha", 0
-                name = stem
-                while any(c.name == name for c in used):
-                    suffix += 1
-                    name = f"{stem}{suffix}"
-                fresh = Const(name, var.sort)
-                used.add(fresh)
+                fresh = _fresh_binder(var, used)
                 renaming[var] = fresh
                 renamed.append(fresh)
             if renaming:
