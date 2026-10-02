@@ -806,6 +806,15 @@ def test_source_ui_keeps_effectful_imported_hooks_open(tmp_path):
     assert got.status == "open" and got.method != "source proof"
 
 
+def test_source_ui_models_immutable_values_and_named_arrow_handlers(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; export default function App(){const [open,setOpen]=useState(true);const title=open?"Help":"Home";const close=()=>setOpen(false);return open?<div role="dialog" aria-label={title}><button onClick={close}>Close</button></div>:<h1>{title}</h1>}',
+        'always reachable heading "Home" from overlay "Help"',
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
 def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,

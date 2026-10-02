@@ -167,6 +167,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (!ts.isVariableStatement(s)) continue;
     for (const d of s.declarationList.declarations) {
       const init = d.initializer && strip(d.initializer);
+      if (ts.isIdentifier(d.name) && (s.declarationList.flags & ts.NodeFlags.Const) && init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) localFns.set(d.name.text, init);
       if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "useEffect") fail(sf, init, "React effects are outside the source UI model");
       if (!ts.isArrayBindingPattern(d.name) || !init || !ts.isCallExpression(init)) {
         if (init && ts.isCallExpression(init)) fail(sf, init, "component initializer calls an unmodeled function");
@@ -219,7 +220,8 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     for (const d of s.declarationList.declarations) {
       const init = d.initializer && strip(d.initializer);
       if (!init || modeledHooks.has(init) || ts.isArrowFunction(init) || ts.isFunctionExpression(init)) continue;
-      enc(init, new Set());
+      const value = enc(init, new Set());
+      if (ts.isIdentifier(d.name) && (s.declarationList.flags & ts.NodeFlags.Const)) substitutions.set(d.name.text, value);
     }
   }
   const containsJsx = (n) => {
@@ -267,8 +269,18 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (ts.isIdentifier(e) && componentProps.handlers.has(e.text)) return componentProps.handlers.get(e.text);
     if (ts.isIdentifier(e) && localFns.has(e.text)) {
       const fn = localFns.get(e.text);
-      if (fn.parameters.length) fail(sf, fn, "event handler parameters are outside the source UI model");
-      return statement(fn.body);
+      if (fn.parameters.length > 1 || fn.parameters.some((p) => !ts.isIdentifier(p.name))) fail(sf, fn, "event handler parameters are outside the source UI model");
+      if (fn.parameters.length) {
+        const param = fn.parameters[0].name.text;
+        const uses = (node) => {
+          if (ts.isIdentifier(node) && node.text === param) return true;
+          let found = false;
+          ts.forEachChild(node, (child) => { if (uses(child)) found = true; });
+          return found;
+        };
+        if (uses(fn.body)) fail(sf, fn, "event handler reads its browser event parameter; event values are outside the source UI model");
+      }
+      return ts.isBlock(fn.body) ? statement(fn.body) : statement(ts.factory.createExpressionStatement(fn.body));
     }
     fail(sf, e, "event handler is not defined in this component");
   };
