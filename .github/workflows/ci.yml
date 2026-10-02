@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      record:
+        description: Construct a proof baseline artifact
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      RECORD: ${{ inputs.record }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +38,12 @@ jobs:
           restore-keys: evidence-v1-${{ runner.os }}-
       - name: Select changed evidence
         id: plan
-        run: python3 scripts/ci.py --plan
+        run: |
+          if [ "$RECORD" = true ]; then
+            python3 scripts/ci.py --plan --group proof
+          else
+            python3 scripts/ci.py --plan
+          fi
       - if: steps.plan.outputs.needed == 'true'
         uses: actions/setup-python@v5
         with:
@@ -81,7 +93,17 @@ jobs:
           TELIC_JOBS=$(nproc)
           TELIC_MAX_JOBS=$TELIC_JOBS
           export TELIC_JOBS TELIC_MAX_JOBS
-          .venv/bin/python scripts/ci.py --since "$BASE"
+          if [ "$RECORD" = true ]; then
+            .venv/bin/python scripts/ci.py --record
+          else
+            .venv/bin/python scripts/ci.py --since "$BASE"
+          fi
+      - name: Export constructed baseline
+        if: inputs.record
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-baseline
+          path: telic.ledger.json
       - name: Preserve evidence
         if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4

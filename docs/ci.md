@@ -94,7 +94,9 @@ uv run python scripts/ci.py --group proof --since origin/main
 ```
 
 `scripts/ci.py --record` explicitly establishes the initial baseline. Later
-ledger changes remain reviewable against the base commit. The full historical
+ledger changes remain reviewable against the base commit. Dispatching `ci`
+with `record=true` constructs the same baseline as an artifact for review;
+it does not write the repository. The full historical
 test battery, including browser exploration, runs only when the manual
 `validation` workflow is dispatched.
 
