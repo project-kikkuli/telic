@@ -132,7 +132,7 @@ class Program:
         selected = {
             k for k, r in self.funcs.items()
             if not r.module.context and (
-                r.fn.has_contract or r.fn.decreases or r.fn.aims or r.fn.mirrors
+                r.fn.declared_claims or r.fn.aims or r.fn.mirrors
                 or any(r.fn.name.startswith(c + ".") for c in classes)
                 or any(isinstance(s, ir.FieldAssign) and s.cls in classes for s in ir.walk_stmts(r.fn.body))
                 or any(isinstance(e, ir.New) and e.cls in classes for s in ir.walk_stmts(r.fn.body) for value in ir.stmt_exprs(s) for e in ir.walk_expr(value))
@@ -348,7 +348,7 @@ class Program:
                 exprs.extend(c.expr for c in s.invariants)
             if isinstance(s, (ir.AssertStmt, ir.AssumeStmt)):
                 exprs.append(s.clause.expr)
-        for c in ref.fn.requires + ref.fn.ensures + ref.fn.raises:
+        for c in ref.fn.declared_claims:
             exprs.append(c.expr)
         for e in exprs:
             for sub in ir.walk_expr(e):

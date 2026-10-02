@@ -542,6 +542,18 @@ class Function:
     def has_contract(self) -> bool:
         return bool(self.requires or self.ensures or self.raises)
 
+    @property
+    def declared_claims(self) -> list[Clause]:
+        clauses = self.requires + self.ensures + self.raises + ([self.decreases] if self.decreases else [])
+        for stmt in walk_stmts(self.body):
+            if isinstance(stmt, AssertStmt) and not stmt.native:
+                clauses.append(stmt.clause)
+            if isinstance(stmt, (While, ForRange, ForEach)):
+                clauses.extend(stmt.invariants)
+            if isinstance(stmt, While) and stmt.decreases:
+                clauses.append(stmt.decreases)
+        return clauses
+
 
 @dataclass(frozen=True)
 class AimDecl:
