@@ -230,13 +230,15 @@ def uses_down(x: int) -> int:
 
 
 @pytest.mark.parametrize("engine", ["python", "ox"])
-def test_the_timeout_bounds_unfolding_a_diverging_definition(tmp_path, engine):
+@pytest.mark.parametrize("cache", [False, True])
+def test_the_timeout_bounds_unfolding_a_diverging_definition(tmp_path, engine, cache):
     from telic.engine import binary
 
     if engine == "ox" and binary() is None:
         pytest.skip("telic-core not built")
     (tmp_path / "m.py").write_text(DIVERGES)
-    opts = CheckOptions(cache_path=None, lean=False, replay=False, timeout_ms=1000, engine=engine, only={"uses_down"})
+    cache_path = str(tmp_path / ".telic/cache.json") if cache else None
+    opts = CheckOptions(cache_path=cache_path, lean=False, replay=False, timeout_ms=1000, engine=engine, only={"uses_down"})
     rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
     (f,) = rep.functions
     assert f.status == "open" and [v.reason for v in f.verdicts] == ["timeout"]

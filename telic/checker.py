@@ -711,11 +711,14 @@ def _math_schema(program: Program, ref: FuncRef) -> str:
     return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
-def obligation_key(ob: Obligation, theory: Theory, rlimit: int, timeout_ms: int = 60000, schema: str = "") -> str:
+def obligation_key(ob: Obligation, theory: Theory, rlimit: int, timeout_ms: int = 60000, schema: str = "") -> str | None:
     """Key mathematical evidence by the complete encoded query and solver."""
     from .smt import query_fingerprint
 
-    h = hashlib.sha256(f"{query_fingerprint(ob, theory, timeout_ms, rlimit)}\0{schema}".encode()).hexdigest()[:24]
+    fingerprint = query_fingerprint(ob, theory, timeout_ms, rlimit)
+    if fingerprint is None:
+        return None
+    h = hashlib.sha256(f"{fingerprint}\0{schema}".encode()).hexdigest()[:24]
     return "py:" + h
 
 
@@ -806,14 +809,15 @@ class Vacuity:
     An undecided check leaves the verdict alone."""
 
     def __init__(self) -> None:
-        self.todo: list[tuple[tuple[FunctionReport, VCGen], Obligation, str]] = []
+        self.todo: list[tuple[tuple[FunctionReport, VCGen], Obligation, str | None]] = []
         self.unsat: list[tuple[FunctionReport, VCGen]] = []
 
     def record(self, results: list[SmtResult], cache: "ProofCache") -> None:
         for (item, _, key), res in zip(self.todo, results):
             if res.status == "proved":
                 self.unsat.append(item)
-                cache.put(key, {"method": "unsat"})
+                if key is not None:
+                    cache.put(key, {"method": "unsat"})
 
     def explain(self, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> dict[str, str]:
         out: dict[str, str] = {}
@@ -844,12 +848,13 @@ class Vacuity:
 
 
 def _unsat(ob: Obligation, theory: Theory, opts: "CheckOptions", cache: "ProofCache", schema: str = "") -> bool:
-    key = "sat:" + obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, schema)
-    hit = cache.get(key)
+    raw_key = obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, schema)
+    key = "sat:" + raw_key if raw_key is not None else None
+    hit = cache.get(key) if key is not None else None
     if hit is None or hit.get("method") != "unsat":
         res = solve(ob, theory, opts.timeout_ms, opts.rlimit)
         hit = {"method": "unsat" if res.status == "proved" else "sat"}
-        if hit["method"] == "unsat":
+        if hit["method"] == "unsat" and key is not None:
             cache.put(key, hit)
     return hit.get("method") == "unsat"
 
@@ -877,8 +882,9 @@ def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, 
         if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract or lemmas):
             continue
         ob = _unsat_probe(gen, gen.entry_facts + lemmas)
-        key = "sat:" + obligation_key(ob, theory, rlimit, timeout_ms, _math_schema(gen.program, gen.ref))
-        hit = cache.get(key)
+        raw_key = obligation_key(ob, theory, rlimit, timeout_ms, _math_schema(gen.program, gen.ref))
+        key = "sat:" + raw_key if raw_key is not None else None
+        hit = cache.get(key) if key is not None else None
         if hit is None or hit.get("method") != "unsat":
             v.todo.append(((rep, gen), ob, key))
         elif hit.get("method") == "unsat":
@@ -1018,7 +1024,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if measures:
         theory, theory_problems = build_theory(program, measures)
 
-    pending: list[tuple[Verdict, str]] = []
+    pending: list[tuple[Verdict, str | None]] = []
     staged: list[tuple[FunctionReport, str | None, float]] = []
     engine_tasks: list[tuple[FunctionReport, FuncRef, Inferred, str | None, float]] = []
     entry_checks: list[tuple[FunctionReport, VCGen]] = []
@@ -1056,7 +1062,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
         for ob in obs:
             key_ = obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, _math_schema(program, rep.ref))
-            hit = cache.get(key_)
+            hit = cache.get(key_) if key_ is not None else None
             if hit is not None and hit.get("method") == "z3":
                 if cache.fresh(key_):
                     solved += 1  # a duplicate obligation proved earlier in this run
@@ -1170,7 +1176,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         results = results[: len(pending)]
         for (v, key_), res in zip(pending, results):
             v.status, v.seconds, v.model, v.state, v.reason = res.status, res.seconds, res.model, res.state, res.reason
-            if res.status == "proved":
+            if res.status == "proved" and key_ is not None:
                 cache.put(key_, {"method": "z3"})
 
     # Escalate: counterexamples get executed (each replay is a subprocess,

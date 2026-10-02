@@ -166,12 +166,13 @@ def check(program: Program, functions: list[Any], gens: dict[str, VCGen], solve,
                     probes.append((ob, f.fn.name, r, i))
 
     obs = [o for o, _ in todo] + [o for o, _, _, _ in probes]
-    keys = ["lc:" + key(o) for o in obs]
-    answers: list[str | None] = [(cache.get(k) or {}).get("method") for k in keys]
+    raw_keys = [key(o) for o in obs]
+    keys = ["lc:" + k if k is not None else None for k in raw_keys]
+    answers: list[str | None] = [(cache.get(k) or {}).get("method") if k is not None else None for k in keys]
     ask = [i for i, a in enumerate(answers) if a is None]
     for i, res in zip(ask, solve([obs[i] for i in ask])):
         answers[i] = res.status
-        if res.status in ("proved", "refuted"):
+        if res.status in ("proved", "refuted") and keys[i] is not None:
             cache.put(keys[i], {"method": res.status})
     for (ob, (rep, why)), a in zip(todo, answers[: len(todo)]):
         if a == "refuted":

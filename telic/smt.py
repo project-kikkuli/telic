@@ -58,10 +58,11 @@ class SmtResult:
 
 
 class Z3Encoder:
-    def __init__(self, theory_defs: list[L.FunDef], rlimit: int = 0):
-        self.ctx = z3.Context(rlimit=rlimit)
+    def __init__(self, theory_defs: list[L.FunDef], rlimit: int = 0, ctx: z3.Context | None = None):
+        self.ctx = ctx or z3.Context(rlimit=rlimit)
         self.consts: dict[L.Const, z3.ExprRef] = {}
         self.funcs: dict[str, z3.FuncDeclRef] = {}
+        self.encoded_constants: list[str] = []
         self.datatypes: dict[str, Any] = {}
         self.key_candidates: dict[str, list[Any]] = {}
         # keys an unchecked value rebuilt as JSON may have: those the obligation names
@@ -73,6 +74,8 @@ class Z3Encoder:
         self.json_containers: set[L.Term] = set()  # values the obligation looks inside
         self.json_lits: list[str] = []
         self.json_model: z3.ModelRef | None = None
+        self.encoded_signatures: list[str] = []
+        self.encoded_definitions: list[str] = []
         self.defs = {d.name: d for d in theory_defs}
         for d in theory_defs:
             self.declare(d)
@@ -130,11 +133,19 @@ class Z3Encoder:
         else:
             f = z3.Function(d.name, *doms, self.sort(d.sort))
         self.funcs[d.name] = f
+        self._record_signature(f)
+
+    def _record_signature(self, f: z3.FuncDeclRef) -> None:
+        self.encoded_signatures.append(f.sexpr())
 
     def define(self, d: L.FunDef) -> None:
         args = [self.term(p) for p in d.params]
         assert d.body is not None
-        z3.RecAddDefinition(self.funcs[d.name], args, self.term(d.body))
+        body = self.term(d.body)
+        z3.RecAddDefinition(self.funcs[d.name], args, body)
+        self.encoded_definitions.append(
+            f"{d.name} ({' '.join(arg.sexpr() for arg in args)}) := {body.sexpr()}"
+        )
 
     # -- terms ------------------------------------------------------------
 
@@ -143,6 +154,7 @@ class Z3Encoder:
         if isinstance(t, L.Const):
             if t not in self.consts:
                 self.consts[t] = z3.Const(t.name, self.sort(t.sort))
+                self.encoded_constants.append(f"{self.consts[t].sexpr()} : {self.consts[t].sort().sexpr()}")
             return self.consts[t]
         if isinstance(t, L.IntV):
             return z3.IntVal(t.value, c)
@@ -169,6 +181,7 @@ class Z3Encoder:
                 if f is None:
                     f = z3.Function(t.name, *[self.sort(a.sort) for a in t.args], self.sort(t.sort))
                     self.funcs[key] = f  # type: ignore[index]
+                    self._record_signature(f)
             return f(*[self.term(a) for a in t.args])
         assert isinstance(t, L.App)
         a = [self.term(x) for x in t.args]
@@ -533,31 +546,50 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int =
     return res
 
 
-def query_fingerprint(ob: Obligation, theory: Theory, timeout_ms: int, rlimit: int) -> str:
-    """Identify the exact encoded queries whose UNSAT result can prove ob."""
-    import hashlib
-
+def _query_stages(ob: Obligation, theory: Theory, rlimit: int):
     terms = list(ob.hyps) + [ob.goal]
     with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
     without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
     stages = [(with_lemmas, rlimit)] if len(with_lemmas[1]) == len(without[1]) else [(without, rlimit // 10), (with_lemmas, rlimit)]
-    material = [f"timeout={timeout_ms};rlimit={rlimit};seed={SEED}", repr(ob.inputs)]
+    return stages
+
+
+def _query_variants(stages):
     for (defs, axioms), budget in stages:
-        variants = [(defs, axioms, budget)]
+        yield defs, axioms, budget
         if any(d.recursive for d in defs):
             opaque = [dataclasses.replace(d, body=None) if d.recursive else d for d in defs]
-            variants.append((opaque, axioms, budget))
-        for stage_defs, stage_axioms, stage_budget in variants:
-            material.append(f"stage-rlimit={stage_budget}")
-            enc = Z3Encoder(stage_defs, stage_budget)
-            solver = z3.Solver(ctx=enc.ctx)
-            solver.set("random_seed", SEED)
-            for ax in stage_axioms:
-                solver.add(enc.term(ax.formula))
-            for hyp in ob.hyps:
-                solver.add(enc.term(hyp))
-            solver.add(z3.Not(enc.term(ob.goal)))
-            material.append(solver.sexpr())
+            yield opaque, axioms, budget
+
+
+def _prepare_query(ob: Obligation, defs, axioms, rlimit: int, timeout_ms: int):
+    """Encode definitions and assertions without asking Z3 to assert or solve them."""
+    ctx = z3.Context(rlimit=rlimit)
+    with _Deadline(ctx, timeout_ms) as deadline:
+        enc = Z3Encoder(defs, rlimit, ctx)
+        assertions = [enc.term(ax.formula) for ax in axioms]
+        assertions.extend(enc.term(hyp) for hyp in ob.hyps)
+        assertions.append(z3.Not(enc.term(ob.goal)))
+    if deadline.fired:
+        return None
+    return enc, assertions
+
+
+def query_fingerprint(ob: Obligation, theory: Theory, timeout_ms: int, rlimit: int) -> str | None:
+    """Identify encoded queries without triggering unbounded solver assertion rewriting."""
+    import hashlib
+
+    material = [f"timeout={timeout_ms};rlimit={rlimit};seed={SEED}", repr(ob.inputs)]
+    for stage_defs, stage_axioms, stage_budget in _query_variants(_query_stages(ob, theory, rlimit)):
+        prepared = _prepare_query(ob, stage_defs, stage_axioms, stage_budget, timeout_ms)
+        if prepared is None:
+            return None
+        enc, assertions = prepared
+        material.append(f"stage-rlimit={stage_budget}")
+        material.extend(f"constant={constant}" for constant in enc.encoded_constants)
+        material.extend(f"signature={signature}" for signature in enc.encoded_signatures)
+        material.extend(f"definition={definition}" for definition in enc.encoded_definitions)
+        material.extend(f"assertion={assertion.sexpr()}" for assertion in assertions)
     global _PYTHON_SOLVER_ID
     if _PYTHON_SOLVER_ID is None:
         from .toolchain import python_z3
@@ -593,19 +625,16 @@ class _Deadline:
 
 
 def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> SmtResult:
-    terms = list(ob.hyps) + [ob.goal]
     defs, axioms = closure
-    enc = Z3Encoder(defs, rlimit)
+    prepared = _prepare_query(ob, defs, axioms, rlimit, timeout_ms)
+    if prepared is None:
+        return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
+    enc, assertions = prepared
     s = z3.Solver(ctx=enc.ctx)
     s.set("random_seed", SEED)
-    # Each stage gets the whole net, so a slow statement never eats into solving.
     try:
         with _Deadline(enc.ctx, timeout_ms) as d:
-            for ax in axioms:
-                s.add(enc.term(ax.formula))
-            for h in ob.hyps:
-                s.add(enc.term(h))
-            s.add(z3.Not(enc.term(ob.goal)))
+            s.add(*assertions)
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout")
         with _Deadline(enc.ctx, timeout_ms) as d:
@@ -621,7 +650,7 @@ def _solve(ob: Obligation, closure, timeout_ms: int, rlimit: int, t0: float) -> 
     if r == z3.sat:
         with _Deadline(enc.ctx, timeout_ms) as d:
             _small_lists(ob, enc, s)
-            res = _refutation(ob, enc, s, terms, dt)
+            res = _refutation(ob, enc, s, list(ob.hyps) + [ob.goal], dt)
         if d.fired:
             return SmtResult("unknown", time.perf_counter() - t0, reason="timeout reading the model")
         return res
