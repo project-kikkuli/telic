@@ -2518,7 +2518,7 @@ class ExprLowerer:
                 (x,) = self._args(n, 1)
                 if isinstance(x.ty, ir.TInt):
                     return x
-                if not isinstance(x.ty, ir.TReal):
+                if not isinstance(x.ty, (ir.TReal, ir.TPythonNumber)):
                     raise self.err(f"math.{f.attr} needs a number", n)
                 return ir.Builtin(ir.INT, loc, f.attr, (x,))
             if f.attr == "count":
@@ -2611,7 +2611,7 @@ class ExprLowerer:
             (x,) = self._args(n, 1)
             if isinstance(x.ty, ir.TInt):
                 return x
-            if isinstance(x.ty, ir.TReal):
+            if isinstance(x.ty, (ir.TReal, ir.TPythonNumber)):
                 return ir.Builtin(ir.INT, loc, "round_even", (x,))
             raise self.err("round() needs a number", n)
         if name == "bool":

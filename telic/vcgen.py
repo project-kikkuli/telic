@@ -2029,10 +2029,13 @@ class VCGen:
         if name == "py_is_kind":
             value, kind = args
             assert isinstance(e.args[1], ir.Lit)
-            wants_int = e.args[1].value == "int"
+            kind_name = str(e.args[1].value)
+            wants_int = kind_name == "int"
             if isinstance(value, PyNumber):
                 return value.is_int if wants_int else L.not_(value.is_int)
             if isinstance(value, L.Term):
+                if value.sort == L.OPAQUE:
+                    return L.Fn("opaque.isinstance.Bool", (value, L.StrV(kind_name)), L.BOOL)
                 return L.BoolV(value.sort == L.INT if wants_int else value.sort in (L.FLOAT32, L.FLOAT64))
             return L.FALSE
         if name == "py_mixed_list":
@@ -2505,6 +2508,11 @@ class VCGen:
                 self.oblige("finite", ctx, L.is_finite(xf), e.loc, "number is finite where it is rounded to an integer")
                 exact = L.App("fp.to_real", (xf,), L.REAL)
                 return L.ite(x.is_int, x.integer, L.floor(exact))
+            if name == "round_even":
+                xf = x.as_float()
+                self.oblige("finite", ctx, L.is_finite(xf), e.loc, "number is finite where it is rounded to an integer")
+                exact = L.App("fp.to_real", (xf,), L.REAL)
+                return L.ite(x.is_int, x.integer, round_even(exact))
             x = x.as_float()
         assert not isinstance(x, ListVal)
         if name in ("js_floor", "js_ceil", "js_trunc", "js_round"):

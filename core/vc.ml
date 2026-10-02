@@ -675,7 +675,7 @@ let rec ev g ctx (e : Ir.expr) : value =
          let negative_zero = and_ [ both_int; eq xi zero; lt yi zero ] in
          let exact_q = ite negative_zero (fneg (fval 0.0)) exact_q in
          let q = ite both_int exact_q (rdiv (py_as_float x) (py_as_float y)) in
-         T q
+         T (mkrec py_num_sort [ ff; zero; q ])
        | _ -> raise (Vc_error ("unsupported tagged Python numeric operator " ^ op, loc)))
     | _ -> (
       let x = tm x and y = tm y in
@@ -889,7 +889,9 @@ and builtin g ctx (e : Ir.expr) name args =
      | _ -> raise (Vc_error ("Python numeric tag requires a number", loc)))
   | "py_is_kind" ->
     let x, kind = match args with [ x; k ] -> (tm (ev g ctx x), lit_str k) | _ -> raise (Vc_error ("py_is_kind takes a number and kind", loc)) in
-    if kind = "int" then T (field x "is_int") else T (not_ (field x "is_int"))
+    if x.sort = py_num_sort then T (if kind = "int" then field x "is_int" else not_ (field x "is_int"))
+    else if x.sort = Opaque then T (fn "opaque.isinstance.Bool" [| x; str kind |] Bool)
+    else T (if kind = "int" then (if x.sort = Int then tt else ff) else (if List.mem x.sort [ Float32; Float64; Real ] then tt else ff))
   | "py_int_parse" | "py_float_parse" | "js_parse_int" | "js_parse_float" -> parse_number g ctx e name (tm (ev g ctx (List.hd args)))
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
   | "each" ->
@@ -1057,24 +1059,9 @@ and builtin g ctx (e : Ir.expr) name args =
       for i = n - 2 downto 0 do out := ite (eq x (int_ i)) arr.(i) !out done;
       T !out
     | "py_mixed_list", items ->
-      let n = next g in
-      let arr = ref (const_array (Array (Int, Float64)) (fval 0.0)) in
-      let tags = ref (const_array (Array (Int, Bool)) ff) in
-      let ints = ref (const_array (Array (Int, Int)) zero) in
-      let floats = ref (const_array (Array (Int, Float64)) (fval 0.0)) in
-      List.iteri (fun i item ->
-        let x = tm item and index = int_ i in
-        if x.sort = Int then begin
-          arr := store !arr index (as_float_to Float64 x);
-          tags := store !tags index tt;
-          ints := store !ints index x
-        end else begin
-          let x = as_float_to Float64 x in
-          arr := store !arr index x;
-          floats := store !floats index x
-        end
-      ) items;
-      L { arr = !arr; off = zero; len = int_ (List.length items); py_tags = !tags; py_ints = !ints; py_floats = !floats; lty = e.ty }
+      let arr = ref (const_array (Array (Int, py_num_sort)) (default_term py_num_sort)) in
+      List.iteri (fun i item -> arr := store !arr (int_ i) (tm item)) items;
+      L (list_value !arr zero (int_ (List.length items)) e.ty)
     | ("dict_keys" | "dict_values"), [ d ] ->
       let d = dct d in
       let n = next g in
@@ -1246,8 +1233,9 @@ and builtin g ctx (e : Ir.expr) name args =
           let safe_prefix = ref tt and safe_items = ref tt in
           for i = 0 to len.n - 1 do
             let index = add l.off (int_ i) in
-            let is_int = select l.py_tags index in
-            let int_value = select l.py_ints index and float_value = select l.py_floats index in
+            let item = select l.arr index in
+            let is_int = field item "is_int" in
+            let int_value = field item "integer" and float_value = field item "floating" in
             let was_in_float = !in_float and previous_int_total = !int_total in
             safe_prefix := and_ [ !safe_prefix; implies (not_ was_in_float) (floatable previous_int_total) ];
             safe_items := and_ [ !safe_items; implies is_int (floatable int_value) ];
@@ -1349,10 +1337,18 @@ and builtin g ctx (e : Ir.expr) name args =
       oblige g "overflow" ctx (implies tag (is_finite converted)) loc "integer converted to float does not overflow";
       T converted
     | "to_real", [ x ] -> T (as_float_to (sort_of e.ty) (tm x))
+    | "floor", [ T x ] when x.sort = py_num_sort ->
+      let tag, integer, floating = py_parts x in
+      oblige g "finite" ctx (implies (not_ tag) (is_finite floating)) loc "number is finite where it is rounded to an integer";
+      T (ite tag integer (floor (fto_real floating)))
     | "floor", [ x ] ->
       let x = tm x in
       if List.mem x.sort [ Float32; Float64 ] then oblige g "finite" ctx (is_finite x) loc "number is finite where it is rounded to an integer";
       T (floor x)
+    | "ceil", [ T x ] when x.sort = py_num_sort ->
+      let tag, integer, floating = py_parts x in
+      oblige g "finite" ctx (implies (not_ tag) (is_finite floating)) loc "number is finite where it is rounded to an integer";
+      T (ite tag integer (neg (floor (neg (fto_real floating)))))
     | "ceil", [ x ] -> T (neg (floor (neg (tm x))))
     | "trunc", [ T v ] when v.sort = py_num_sort ->
       let tag, integer, floating = py_parts v in
@@ -1366,6 +1362,10 @@ and builtin g ctx (e : Ir.expr) name args =
       let exact = fto_real x in
       let truncated = ite (le (real (Q.of_int 0)) exact) (floor exact) (neg (floor (neg exact))) in
       T (ite (fpred "fp.isNaN" x) zero (ite (le x (as_float_to x.sort lo)) lo (ite (le (as_float_to x.sort hi) x) hi truncated)))
+    | "round_even", [ T x ] when x.sort = py_num_sort ->
+      let tag, integer, floating = py_parts x in
+      oblige g "finite" ctx (implies (not_ tag) (is_finite floating)) loc "number is finite where it is rounded to an integer";
+      T (ite tag integer (round_even (fto_real floating)))
     | "round_even", [ x ] -> T (round_even (tm x))
     | "round_up", [ x ] -> T (floor (add (tm x) (real (Q.make 1 2))))
     | ("js_floor" | "js_ceil" | "js_trunc" | "js_round" as rounding), [ x ] ->
