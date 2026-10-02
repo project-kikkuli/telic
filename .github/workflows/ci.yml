@@ -61,7 +61,7 @@ jobs:
           uv pip install -e '.[test]' -c .github/constraints.txt
           npm ci --prefix telic/frontend/ts
       - if: steps.plan.outputs.native == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         id: native
         with:
           path: core/telic-core
@@ -76,6 +76,12 @@ jobs:
       - name: Build native engine
         if: steps.plan.outputs.native == 'true' && steps.native.outputs.cache-hit != 'true'
         run: opam exec -- make -C core
+      - name: Preserve native build
+        if: steps.plan.outputs.native == 'true' && steps.native.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: core/telic-core
+          key: ${{ steps.native.outputs.cache-primary-key }}
       - if: steps.plan.outputs.lean == 'true'
         uses: actions/cache@v4
         with:
