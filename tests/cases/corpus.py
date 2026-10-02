@@ -22,6 +22,142 @@ def abs_val(x: int) -> int:
     return x
 
 
+# expect: proved
+def shortcircuit_and_skips_rhs(x: bool) -> bool:
+    #@ requires not x
+    #@ ensures cost("work") == 3
+    return x and True
+
+
+# expect: proved
+def shortcircuit_and_runs_rhs(x: bool) -> bool:
+    #@ requires x
+    #@ ensures cost("work") == 4
+    return x and True
+
+
+# expect: proved
+def shortcircuit_or_skips_rhs(x: bool) -> bool:
+    #@ requires x
+    #@ ensures cost("work") == 3
+    return x or True
+
+
+# expect: proved
+def shortcircuit_or_runs_rhs(x: bool) -> bool:
+    #@ requires not x
+    #@ ensures cost("work") == 4
+    return x or True
+
+
+# expect: proved
+def conditional_counts_selected_branch(x: bool) -> bool:
+    #@ ensures cost("work") == 4
+    return True if x else False
+
+
+# expect: proved
+def string_concat_cost(left: str, right: str) -> str:
+    #@ requires len(left) == 2 and len(right) == 3
+    #@ ensures cost("work") == 9
+    #@ ensures cost("alloc") == 5
+    return left + right
+
+
+# expect: proved
+def string_slice_cost(text: str) -> str:
+    #@ requires len(text) == 4
+    #@ ensures cost("work") == 7
+    #@ ensures cost("alloc") == 2
+    return text[1:3]
+
+
+# expect: proved
+def resource_helper(x: bool) -> bool:
+    #@ requires x
+    #@ ensures cost("work") == 4
+    return x and True
+
+
+# expect: proved
+def resource_call_composes(x: bool) -> bool:
+    #@ requires x
+    #@ ensures cost("work") == 7
+    return resource_helper(x)
+
+
+# expect: proved
+def resource_checked_callback(x: bool) -> bool:
+    #@ requires x
+    #@ ensures cost("work") <= 20
+    return x and True
+
+
+# expect: proved
+def resource_symbolic_comprehension(xs: list[bool]) -> list[bool]:
+    #@ requires all(x for x in xs)
+    #@ ensures cost("work") <= 30 * len(xs) + 100
+    return [resource_checked_callback(x) for x in xs]
+
+
+# expect: proved
+def resource_any_upper_bound(xs: list[int]) -> bool:
+    #@ ensures cost("work") <= 10 * len(xs) + 100
+    return any(x > 0 for x in xs)
+
+
+# expect: proved
+def resource_recursion(n: int) -> int:
+    #@ requires n >= 0
+    #@ ensures cost("work") == 9 * n + 6
+    #@ decreases n
+    if n == 0:
+        return 0
+    return resource_recursion(n - 1)
+
+
+# expect: proved
+def resource_loop(n: int) -> int:
+    #@ requires n >= 0
+    #@ ensures cost("work") == 7 + 4 * n
+    total = 0
+    for i in range(n):
+        #@ invariant cost("work") == 5 + 4 * i
+        total = total + 1
+    return total
+
+
+# expect: proved
+def resource_comprehension_alloc() -> list[str]:
+    #@ ensures cost("alloc") == 15
+    return [x + "!" for x in ["aa", "bb", "cc"]]
+
+
+# expect: proved
+def resource_full_slice_alloc(xs: list[int]) -> list[int]:
+    #@ ensures cost("alloc") == len(xs)
+    return xs[:]
+
+
+# expect: proved
+def resource_filtered_comprehension_alloc(xs: list[int]) -> list[int]:
+    #@ ensures cost("alloc") == len(result)
+    return [x for x in xs if x > 0]
+
+
+# expect: proved
+def resource_dict_duplicate_alloc() -> dict[str, int]:
+    #@ ensures cost("alloc") == 1
+    return {"key": 1, "key": 2}
+
+
+# expect: proved
+def resource_raise() -> None:
+    #@ ensures cost("work") == 1
+    #@ raises True
+    raise ValueError()
+
+
 # expect: refuted
 def abs_bad(x: int) -> int:
     #@ ensures result >= 0

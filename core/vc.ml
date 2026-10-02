@@ -277,6 +277,7 @@ type gen = {
   opts : options;
   mutable obligations : obligation list;  (** reversed *)
   mutable exits : exit list;  (** reversed *)
+  mutable raise_exits : exit list;
   mutable loops : frame list;
   mutable counter : int;
   ids : (string, int) Hashtbl.t;
@@ -286,6 +287,7 @@ type gen = {
   mutable assumptions : (int * string) list;
   mutable loop_notes : (int * string) list;
   mutable definitional_mode : bool;
+  resource_tracking : bool;
   mutable written : (string * int) list;  (** (class, line) of each field write to a class with an invariant, reversed *)
   mutable created : term list;  (** objects this call allocated *)
   mutable lc_written : string list;  (** classes of the non-parameter objects it writes a field of *)
@@ -334,7 +336,7 @@ let fresh_self g = is_init g || (let n = g.info.fn.name in String.length n >= 14
 
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
 let ends_with x s = String.length s >= String.length x && String.sub s (String.length s - String.length x) (String.length x) = x
-let is_heap k = String.length k > 0 && k.[0] = '@'
+let is_heap k = String.length k > 0 && k.[0] = '@' && not (starts_with "@telic.cost." k)
 let heap_env env = SM.filter (fun k _ -> is_heap k) env
 
 (* -- the heap: one map per class field (per component), keyed by reference *)
@@ -413,6 +415,52 @@ let lookup ctx name (loc : Ir.loc) =
     | None -> raise (Vc_error (Printf.sprintf "'%s' may be used before it is assigned" name, loc)))
 
 let expr_name (e : Ir.expr) = match e.e with Var n -> n | Field (_, f) -> f | Call (f, _) -> f ^ "(...)" | _ -> "value"
+
+let resource_models = [ "work"; "alloc"; "external_calls" ]
+let resource_key model = "@telic.cost." ^ model
+let resource_env ctx =
+  match ctx.state with
+  | None -> SM.empty
+  | Some st -> List.filter_map (fun model -> Option.map (fun v -> (resource_key model, v)) (SM.find_opt (resource_key model) st.env)) resource_models |> List.to_seq |> SM.of_seq
+let set_resource_env ctx values = match ctx.state with Some st -> st.env <- SM.union (fun _ _ next -> Some next) st.env values | None -> ()
+let charge_resource ctx model amount =
+  if not ctx.spec then match ctx.state with
+  | Some st ->
+    let key = resource_key model in
+    (match SM.find_opt key st.env with Some (T old) -> st.env <- SM.add key (T (add old amount)) st.env | _ -> ())
+  | None -> ()
+let merge_resource_env ctx yes no cond =
+  let merged = List.filter_map (fun model ->
+    let key = resource_key model in
+    match SM.find_opt key yes, SM.find_opt key no with
+    | Some y, Some n -> Some (key, ite_val cond y n)
+    | _ -> None) resource_models in
+  set_resource_env ctx (List.to_seq merged |> SM.of_seq)
+let unknown_resource g ctx model where =
+  if g.resource_tracking && not ctx.spec then begin
+    let amount = const (Printf.sprintf "%s_%s@%d" model where (next g)) Int in
+    assume ctx (le zero amount);
+    charge_resource ctx model amount
+  end
+let bounded_resource g ctx model where upper =
+  if g.resource_tracking && not ctx.spec then begin
+    let name = Printf.sprintf "%s_%s@%d" model where (next g) in
+    let amount = if ctx.binders = [] then const name Int else fn name (Array.of_list ctx.binders) Int in
+    let fact = and_ [ le zero amount; le amount upper ] in
+    if ctx.binders = [] then assume ctx fact else assume_for_all_binders ctx fact;
+    charge_resource ctx model amount
+  end
+let expr_steps (e : Ir.expr) =
+  let n = ref 0 in
+  Ir.walk_expr (fun _ -> incr n) e;
+  int_ !n
+let rec resource_parts (e : Ir.expr) =
+  match e.e with
+  | Binary ("and", a, b) -> resource_parts a @ resource_parts b
+  | _ ->
+    let found = ref false in
+    Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Builtin ("cost", _) -> found := true | _ -> ()) e;
+    if !found then [ e ] else []
 
 (* min of two lengths, without a case split when one is the other plus a
    non-negative constant (a list and the same list appended to) *)
@@ -573,6 +621,7 @@ let rec first_select_on r (t : term) =
   | _ -> None
 
 let rec ev g ctx (e : Ir.expr) : value =
+  charge_resource ctx "work" one;
   let loc = e.loc in
   let tm x = term_of loc x in
   match e.e with
@@ -588,7 +637,11 @@ let rec ev g ctx (e : Ir.expr) : value =
   | Unary (op, _) -> raise (Vc_error ("unknown unary operator " ^ op, loc))
   | Binary (("and" | "or" | "implies") as op, a, b) ->
     let x = tm (ev g ctx a) in
-    let y = tm (ev g (sub_ctx ~cond:(if op = "or" then not_ x else x) ctx) b) in
+    let guard = if op = "or" then not_ x else x in
+    let before = resource_env ctx in
+    let y = tm (ev g (sub_ctx ~cond:guard ctx) b) in
+    let after = resource_env ctx in
+    merge_resource_env ctx after before guard;
     T (match op with "and" -> and_ [ x; y ] | "or" -> or_ [ x; y ] | _ -> implies x y)
   | Binary (op, a, b) -> (
     let x = ev g ctx a and y = ev g ctx b in
@@ -623,8 +676,13 @@ let rec ev g ctx (e : Ir.expr) : value =
       | _ -> raise (Vc_error ("unknown operator " ^ op, loc))))
   | Ite (c, a, b) ->
     let c = tm (ev g ctx c) in
+    let before = resource_env ctx in
     let x = ev g (sub_ctx ~cond:c ctx) a in
+    let then_env = resource_env ctx in
+    set_resource_env ctx before;
     let y = ev g (sub_ctx ~cond:(not_ c) ctx) b in
+    let else_env = resource_env ctx in
+    merge_resource_env ctx then_env else_env c;
     ite_val c x y
   | Index (s, i, wrap) -> (
     match ev g ctx s with
@@ -672,9 +730,11 @@ let rec ev g ctx (e : Ir.expr) : value =
     let base = match fresh g "lit" ty ~len:zero () with L l -> l | _ -> assert false in
     let arr = ref base.arr in
     List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) elems;
+    charge_resource ctx "alloc" (int_ (List.length elems));
     L { arr = !arr; off = zero; len = int_ (List.length elems); lty = e.ty }
   | Quant q when (not ctx.spec) && effectful g q.body ->
     (* an unknown truth value; the body's obligations and effects for every element *)
+    List.iter (fun model -> unknown_resource g ctx model "short_circuit_quantifier") resource_models;
     let n = next g in
     (match q.seq with
      | Some ({ ty = TDict (kty, _); _ } as s) -> (
@@ -712,7 +772,14 @@ let rec ev g ctx (e : Ir.expr) : value =
     let base = match String.index_opt q.idx '$' with Some k -> String.sub q.idx 0 k | None -> q.idx in
     let i = const (Printf.sprintf "%s!%d" base (next g)) Int in
     let rng = and_ [ le lo i; lt i hi ] in
-    let sub = sub_ctx ~cond:rng ctx in
+    let local = match ctx.state with
+      | Some outer when not ctx.spec && g.resource_tracking ->
+        let local = { env = outer.env; facts = Dynarray.of_list (Dynarray.to_list outer.facts); alive = outer.alive } in
+        List.iter (fun model -> local.env <- SM.add (resource_key model) (T zero) local.env) resource_models;
+        Some local
+      | _ -> None
+    in
+    let sub = { (sub_ctx ~cond:rng ctx) with state = local } in
     let bound = SM.add q.idx (T i) sub.bound in
     let bound =
       match (q.seq, q.elem) with
@@ -720,6 +787,23 @@ let rec ev g ctx (e : Ir.expr) : value =
       | _ -> bound
     in
     let body = tm (ev g { sub with bound; binders = ctx.binders @ [ i ] } q.body) in
+    (match local with
+     | Some local ->
+       let size = max_ (Term.sub hi lo) zero in
+       List.iter (fun model ->
+         let key = resource_key model in
+         let used = match SM.find_opt key local.env with Some (T v) -> v | _ -> zero in
+         match resource_callback_bound g model q.body None with
+         | Some bound when bound != zero ->
+           let name = Printf.sprintf "quant_%s@%d" model (next g) in
+           let amount = if ctx.binders = [] then const name Int else fn name (Array.of_list ctx.binders) Int in
+           let fact = and_ [ le zero amount; le amount (mul size bound) ] in
+           if ctx.binders = [] then assume ctx fact else assume_for_all_binders ctx fact;
+           charge_resource ctx model amount
+         | Some _ when used == zero -> ()
+         | _ when used == zero -> ()
+         | _ -> unknown_resource g ctx model "quantifier_callback_without_checked_cost_bound") resource_models
+     | None -> ());
     if q.kind = "forall" then T (forall [ i ] (implies rng body)) else T (exists [ i ] (and_ [ rng; body ]))
   | Builtin (name, args) -> builtin g ctx e name args
   | Call (f, args) ->
@@ -788,6 +872,12 @@ and builtin g ctx (e : Ir.expr) name args =
   let lit_str (a : Ir.expr) = match a.e with Lit (LStr s) -> s | Lit (LInt s) -> s | _ -> raise (Vc_error ("expected a literal", loc)) in
   let assume_ t = assume ctx t in
   match name with
+  | "cost" ->
+    if not ctx.spec then raise (Vc_error ("cost() is only available in a specification", loc));
+    let model = match args with [ a ] -> lit_str a | _ -> raise (Vc_error ("cost() takes one literal model name", loc)) in
+    let key = resource_key (if model = "peak" then "alloc" else model) in
+    if not (List.mem model [ "work"; "alloc"; "peak"; "external_calls" ]) then raise (Vc_error ("unknown cost model '" ^ model ^ "'", loc));
+    (match SM.find_opt key (cur_env ctx) with Some v -> v | None -> raise (Vc_error ("cost('" ^ model ^ "') is not available in this specification", loc)))
   | "py_int_parse" | "py_float_parse" | "js_parse_int" | "js_parse_float" -> parse_number g ctx e name (tm (ev g ctx (List.hd args)))
   | "comp" -> comprehension g ctx e (ev g ctx (List.hd args))
   | "each" ->
@@ -797,7 +887,7 @@ and builtin g ctx (e : Ir.expr) name args =
      | TNone -> NoneV
      | t ->
        let r = fresh g "comprehension" t () in
-       (match r with L l -> assume ctx (le zero l.len) | _ -> ());
+       (match r with L l -> assume ctx (le zero l.len); charge_resource ctx "alloc" l.len | _ -> ());
        r)
   | "range_list" ->
     let lo, hi = match args with [ a; b ] -> (tm (ev g ctx a), tm (ev g ctx b)) | _ -> raise (Vc_error ("range_list takes two bounds", loc)) in
@@ -805,6 +895,8 @@ and builtin g ctx (e : Ir.expr) name args =
     let arr, assume = defined_symbol ctx (Printf.sprintf "range@%d.arr" n) (sort_of e.ty) in
     let k = const (Printf.sprintf "i!%d" n) Int in
     let ln = max_ (Term.sub hi lo) zero in
+    charge_resource ctx "work" ln;
+    charge_resource ctx "alloc" ln;
     assume ctx (quant "forall" [ k ] (implies (and_ [ le zero k; lt k ln ]) (eq (select arr k) (add lo k))) [ [| select arr k |] ]);
     L { arr; off = zero; len = ln; lty = e.ty }
   | "list_repeat" ->
@@ -815,6 +907,8 @@ and builtin g ctx (e : Ir.expr) name args =
     let arr, assume = defined_symbol ctx (Printf.sprintf "rep@%d.arr" n) (sort_of xs.lty) in
     let i = const (Printf.sprintf "i!%d" n) Int in
     let ln = mul (int_ width) (max_ k zero) in
+    charge_resource ctx "work" ln;
+    charge_resource ctx "alloc" ln;
     assume ctx (quant "forall" [ i ] (implies (and_ [ le zero i; lt i ln ]) (eq (select arr i) (at (xs.arr, xs.off) (emod i (int_ width))))) [ [| select arr i |] ]);
     L { arr; off = zero; len = ln; lty = xs.lty }
   | "threw" -> threw g ctx (List.hd args)
@@ -824,16 +918,22 @@ and builtin g ctx (e : Ir.expr) name args =
     let kt, vt = match e.ty with TDict (k, v) -> (k, v) | _ -> raise (Vc_error ("dict literal of a non-dict type", loc)) in
     let ks = sort_of kt and vs = sort_of vt in
     let vals = ref (const_array (Array (ks, vs)) (default_term vs)) and has = ref (const_array (Array (ks, Bool)) ff) in
+    let seen = ref [] and allocated = ref zero in
     let rec pairs = function
       | k :: v :: rest ->
         let k = tm (ev g ctx k) in
         let v = tm (coerce (ev g ctx v) (Some vt)) in
+        let duplicate = or_ (List.map (fun previous -> eq k previous) !seen) in
+        allocated := add !allocated (ite duplicate zero one);
+        seen := k :: !seen;
         vals := store !vals k v;
         has := store !has k tt;
         pairs rest
       | _ -> ()
     in
     pairs args;
+    charge_resource ctx "work" (int_ (List.length args / 2));
+    charge_resource ctx "alloc" !allocated;
     D { vals = !vals; has = !has; dty = e.ty }
   | _ -> (
     (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the await" | _ -> ());
@@ -935,6 +1035,8 @@ and builtin g ctx (e : Ir.expr) name args =
       T !out
     | ("dict_keys" | "dict_values"), [ d ] ->
       let d = dct d in
+      unknown_resource g ctx "work" ("dict_" ^ name);
+      unknown_resource g ctx "alloc" ("dict_" ^ name);
       let n = next g in
       let keys = const (Printf.sprintf "keys@%d" n) (Array (Int, sort_of (dkey d))) in
       let ln = const (Printf.sprintf "keys@%d.len" n) Int in
@@ -966,14 +1068,17 @@ and builtin g ctx (e : Ir.expr) name args =
       let n = next g in
       let arr = const (Printf.sprintf "cat@%d.arr" n) a.arr.sort in
       let ln = add a.len b.len in
+      charge_resource ctx "work" ln;
+      charge_resource ctx "alloc" ln;
       let i = const (Printf.sprintf "i!%d" n) Int and k = const (Printf.sprintf "k!%d" n) Int in
       assume_ (quant "forall" [ i ] (implies (and_ [ le zero i; lt i a.len ]) (eq (select arr i) (at (a.arr, a.off) i))) [ [| select arr i |] ]);
       assume_ (quant "forall" [ k ] (implies (and_ [ le a.len k; lt k ln ]) (eq (select arr k) (at (b.arr, b.off) (sub k a.len)))) [ [| select arr k |] ]);
       L { arr; off = zero; len = ln; lty = a.lty }
-    | "dict_copy", [ d ] -> d
+    | "dict_copy", [ d ] -> unknown_resource g ctx "work" "dict_copy"; unknown_resource g ctx "alloc" "dict_copy"; d
     | "dict_set", [ d; k; v ] ->
       let d = dct d in
       let v = tm (coerce v (Some (dval d))) in
+      charge_resource ctx "alloc" (ite (select d.has (tm k)) zero one);
       D { d with vals = store d.vals (tm k) v; has = store d.has (tm k) tt }
     | "dict_remove", [ d; k ] -> let d = dct d in D { d with has = store d.has (tm k) ff }
     | "dict_del", [ d; k ] ->
@@ -995,6 +1100,7 @@ and builtin g ctx (e : Ir.expr) name args =
       T (List.fold_left (fun acc y -> f acc (tm y)) (tm x) rest)
     | "sum", [ xs ] ->
       let l = lst xs in
+      charge_resource ctx "work" l.len;
       let elem = match l.lty with TList t -> t | _ -> TInt in
       let fd = if elem = TInt then "seqsum" else "seqsum_r" in
       let total = fn fd [| l.arr; l.off; add l.off l.len |] (sort_of elem) in
@@ -1002,36 +1108,46 @@ and builtin g ctx (e : Ir.expr) name args =
       T total
     | "count", [ xs; v ] ->
       let l = lst xs in
+      charge_resource ctx "work" l.len;
       let elem = match l.lty with TList t -> t | _ -> TInt in
       let fd = "seqcount_" ^ String.lowercase_ascii (sort_name (sort_of elem)) in
       T (fn fd [| l.arr; l.off; add l.off l.len; tm v |] Int)
     | "contains", [ xs; v ] ->
       let l = lst xs in
+      bounded_resource g ctx "work" "list_contains" l.len;
       let i = const (Printf.sprintf "in!%d" (next g)) Int in
       T (exists [ i ] (and_ [ le zero i; lt i l.len; eq (at (l.arr, l.off) i) (tm v) ]))
-    | "slice", [ xs; lo; hi ] ->
+    | ("slice" | "slice_view" as name), [ xs; lo; hi ] ->
       let l = lst xs in
       let n = l.len in
       let norm b default = match b with NoneV -> default | b -> let b = tm b in ite (lt b zero) (max_ (add b n) zero) (min_ b n) in
       let lo2 = norm lo zero and hi2 = norm hi n in
-      if (match (lo, hi) with NoneV, NoneV -> true | _ -> false) then L l else L { l with off = add l.off lo2; len = max_ (sub hi2 lo2) zero }
-    | "list_append", [ xs; v ] -> let l = lst xs in L { l with arr = store l.arr (add l.off l.len) (tm v); len = add l.len one }
+      let len = max_ (sub hi2 lo2) zero in
+      if name = "slice" then (charge_resource ctx "work" len; charge_resource ctx "alloc" len);
+      L { l with off = add l.off lo2; len }
+    | "list_append", [ xs; v ] -> let l = lst xs in charge_resource ctx "alloc" one; L { l with arr = store l.arr (add l.off l.len) (tm v); len = add l.len one }
     | "list_set", [ xs; i; v ] ->
       let l = lst xs in
       let j = index_of g (l.arr, l.off, l.len) (tm i) true ctx loc (expr_name (List.hd args)) in
       L { l with arr = store l.arr (add l.off j) (tm v) }
-    | "str_concat", _ -> T (app "str.++" (Array.of_list (List.map tm vals)) Str)
+    | "str_concat", _ ->
+      let strings = List.map tm vals in
+      let size = List.fold_left (fun n s -> add n (app "str.len" [| s |] Int)) zero strings in
+      charge_resource ctx "work" size;
+      charge_resource ctx "alloc" size;
+      T (app "str.++" (Array.of_list strings) Str)
     | "str_len", [ s ] -> T (app "str.len" [| tm s |] Int)
-    | "str_contains", [ a; b ] -> T (app "str.contains" [| tm a; tm b |] Bool)
-    | "str_startswith", [ a; b ] -> T (app "str.prefixof" [| tm b; tm a |] Bool)
-    | "str_endswith", [ a; b ] -> T (app "str.suffixof" [| tm b; tm a |] Bool)
-    | "str_of_int", [ a ] -> T (app "str.from_int" [| tm a |] Str)
+    | "str_contains", [ a; b ] -> bounded_resource g ctx "work" "str_contains" (mul (app "str.len" [| tm a |] Int) (app "str.len" [| tm b |] Int)); T (app "str.contains" [| tm a; tm b |] Bool)
+    | "str_startswith", [ a; b ] -> bounded_resource g ctx "work" "str_startswith" (app "str.len" [| tm b |] Int); T (app "str.prefixof" [| tm b; tm a |] Bool)
+    | "str_endswith", [ a; b ] -> bounded_resource g ctx "work" "str_endswith" (app "str.len" [| tm b |] Int); T (app "str.suffixof" [| tm b; tm a |] Bool)
+    | "str_of_int", [ a ] -> unknown_resource g ctx "work" "str_of_int"; unknown_resource g ctx "alloc" "str_of_int"; T (app "str.from_int" [| tm a |] Str)
     | "str_lt", [ a; b ] -> T (app "str.lt" [| tm a; tm b |] Bool)
     | "str_le", [ a; b ] -> T (app "str.le" [| tm a; tm b |] Bool)
-    | "str_find", [ a; b ] -> T (app "str.indexof" [| tm a; tm b; zero |] Int)
+    | "str_find", [ a; b ] -> bounded_resource g ctx "work" "str_find" (mul (app "str.len" [| tm a |] Int) (app "str.len" [| tm b |] Int)); T (app "str.indexof" [| tm a; tm b; zero |] Int)
     | "str_index", [ s; i ] ->
       let s = tm s and i = tm i in
       let n = app "str.len" [| s |] Int in
+      charge_resource ctx "work" one;
       oblige g "index" ctx (and_ [ le (neg n) i; lt i n ]) loc (Printf.sprintf "index into '%s' is within -len..len-1" (expr_name (List.hd args)));
       T (app "str.at" [| s; ite (lt i zero) (add i n) i |] Str)
     | "str_slice", [ s; lo; hi ] ->
@@ -1039,8 +1155,11 @@ and builtin g ctx (e : Ir.expr) name args =
       let n = app "str.len" [| s |] Int in
       let norm b default = match b with NoneV -> default | b -> let b = tm b in ite (lt b zero) (max_ (add b n) zero) (min_ b n) in
       let lo2 = norm lo zero and hi2 = norm hi n in
-      T (app "str.substr" [| s; lo2; max_ (sub hi2 lo2) zero |] Str)
-    | "str_fn", _ -> T (fn ("str." ^ lit_str (List.hd args)) (Array.of_list flat_rest) (sort_of e.ty))
+      let size = max_ (sub hi2 lo2) zero in
+      charge_resource ctx "work" size;
+      charge_resource ctx "alloc" size;
+      T (app "str.substr" [| s; lo2; size |] Str)
+    | "str_fn", _ -> unknown_resource g ctx "work" ("str_" ^ lit_str (List.hd args)); unknown_resource g ctx "alloc" ("str_" ^ lit_str (List.hd args)); T (fn ("str." ^ lit_str (List.hd args)) (Array.of_list flat_rest) (sort_of e.ty))
     | "to_real", [ x ] -> T (to_real (tm x))
     | "floor", [ x ] -> T (floor (tm x))
     | "ceil", [ x ] -> T (neg (floor (neg (tm x))))
@@ -1057,12 +1176,52 @@ and pure g (e : Ir.expr) =
       match x.e with
       | Extern _ | New _ -> ok := false
       | Builtin (("await" | "from_opaque" | "comp" | "dict_keys" | "dict_values"), _) -> ok := false
-      | Call (f, _) -> ( match resolve g g.info.modpath f with Some t when t.definitional -> () | _ -> ok := false)
+      | Call (f, _) -> ( match resolve g g.info.modpath f with Some t when t.definitional || resource_only_call g t -> () | _ -> ok := false)
       | _ -> ())
     e;
   !ok
 
+and resource_only_call g (callee : finfo) =
+  let fn = callee.fn in
+  let has_cost = List.exists (fun (en : Ir.clause) ->
+    let found = ref false in
+    Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Builtin ("cost", _) -> found := true | _ -> ()) en.cexpr;
+    !found) fn.ensures in
+  let safe = ref (has_cost && fn.raises = [] && callee.mutated = [] && fn.unsupported = []) in
+  Ir.walk_stmts (fun s ->
+    (match s with
+     | While _ | ForRange _ | ForEach _ | IndexAssign _ | Append _ | FieldAssign _ | DictDel _ | Raise _ | Unsupported _ | ExprStmt _ -> safe := false
+     | _ -> ());
+    List.iter (Ir.walk_expr (fun (x : Ir.expr) -> match x.e with
+      | Extern _ | New _ -> safe := false
+      | Call (f, _) -> (match resolve g callee.modpath f with Some t when t.definitional -> () | _ -> safe := false)
+      | _ -> ())) (Ir.stmt_exprs s)) fn.body;
+  !safe
+
+and resource_callback_bound g model body cond =
+  let exprs = body :: (match cond with Some c -> [ c ] | None -> []) in
+  let calls = ref [] in
+  List.iter (Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Call (f, _) -> calls := f :: !calls | Extern _ | New _ -> calls := "!unknown" :: !calls | _ -> ())) exprs;
+  if List.mem "!unknown" !calls then None
+  else
+    let limit f = match resolve g g.info.modpath f with
+      | None -> None
+      | Some callee ->
+        let limits = List.concat_map (fun (en : Ir.clause) -> List.filter_map (fun (part : Ir.expr) -> match part.e with
+          | Binary (("<=" | "le"), { e = Builtin ("cost", { e = Lit (LStr m); _ } :: _); _ }, { e = Lit (LInt n); _ }) when m = model -> Option.bind (int_of_string_opt n) (fun n -> if n >= 0 then Some n else None)
+          | _ -> None) (resource_parts en.cexpr)) callee.fn.ensures in
+        if limits = [] then None else Some (List.fold_left max 0 limits)
+    in
+    let limits = List.map limit !calls in
+    if List.exists Option.is_none limits then None
+    else
+      let call_cost = List.fold_left (fun n x -> n + Option.get x) 0 limits in
+      let steps = if model = "work" then List.fold_left (fun n e -> match (expr_steps e).node with Num q when q.d = 1 -> n + q.n | _ -> n) 0 exprs else 0 in
+      Some (int_ (steps + call_cost))
+
 and each_element g ctx (e : Ir.expr) seq =
+  unknown_resource g ctx "work" "effectful_comprehension_callback";
+  unknown_resource g ctx "alloc" "effectful_comprehension_callback";
   let src, names, body, cond =
     match e.e with
     | Builtin (_, [ src; { e = Lit (LStr el); _ }; body ]) -> (src, el, body, None)
@@ -1071,6 +1230,8 @@ and each_element g ctx (e : Ir.expr) seq =
   in
   (* "x" or "x,i": the element and its index *)
   let elem, idx = match String.index_opt names ',' with Some k -> (String.sub names 0 k, Some (String.sub names (k + 1) (String.length names - k - 1))) | None -> (names, None) in
+  let steps = add (expr_steps body) (Option.fold ~none:zero ~some:expr_steps cond) in
+  charge_resource ctx "work" (add seq.len (mul seq.len steps));
   let i = const (Printf.sprintf "%s!%d" elem (next g)) Int in
   let binds = (elem, T (at (seq.arr, seq.off) i)) :: (match idx with Some x -> [ (x, T i) ] | None -> []) in
   run_each g ctx e.loc (Some src) (and_ [ le zero i; lt i seq.len ]) binds body cond
@@ -1113,7 +1274,7 @@ and modified ?(extern_heap = true) g body =
   (* sets kept as lists (their order names the havocked constants) plus a
      table for membership: a program with many classes has thousands of heap
      keys, and list membership made this quadratic *)
-  let names = ref (Ir.assigned_names body) and appends = ref [] in
+  let names = ref (List.fold_left (fun xs model -> resource_key model :: xs) (Ir.assigned_names body) resource_models) and appends = ref [] in
   let seen_n = Hashtbl.create 64 and seen_a = Hashtbl.create 16 in
   List.iter (fun n -> Hashtbl.replace seen_n n ()) !names;
   let addn n = if not (Hashtbl.mem seen_n n) then (Hashtbl.add seen_n n (); names := n :: !names) in
@@ -1200,6 +1361,7 @@ and havoc ?(framed = []) g (st : state) names appends : state =
         | T o ->
           let nw = const (Printf.sprintf "%s@%d" (String.sub name 1 (String.length name - 1)) (next g)) o.sort in
           h.env <- SM.add name (T nw) h.env;
+          if starts_with "@telic.cost." name then Dynarray.add_last h.facts (le zero nw);
           if name = "@alloc" then begin
             let r = const (Printf.sprintf "r!%d" (next g)) Int in
             Dynarray.add_last h.facts (monotone_alloc o nw r)
@@ -1266,6 +1428,44 @@ and effectful g (e : Ir.expr) =
     e;
   !hit
 
+and comprehension_costs g ctx seq elem body cond models =
+  match ctx.state with
+  | None -> List.map (fun model -> (model, zero)) models
+  | Some outer ->
+    let n = next g in
+    let i = const (Printf.sprintf "cost!%d" n) Int in
+    let rng = and_ [ le zero i; lt i seq.len ] in
+    let local = { env = outer.env; facts = Dynarray.of_list (Dynarray.to_list outer.facts); alive = outer.alive } in
+    List.iter (fun model -> local.env <- SM.add (resource_key model) (T zero) local.env) resource_models;
+    let sub = { (sub_ctx ~cond:rng ctx) with base = local.facts; bound = SM.add elem (T (at (seq.arr, seq.off) i)) ctx.bound; state = Some local; quiet = true; binders = ctx.binders @ [ i ] } in
+    let accepted = Option.map (fun (c : Ir.expr) -> term_of c.loc (ev g sub c)) cond in
+    let condition_costs = resource_env sub in
+    List.iter (fun model -> local.env <- SM.add (resource_key model) (T zero) local.env) resource_models;
+    ignore (ev g sub body);
+    let body_costs = resource_env sub in
+    List.map (fun model ->
+      let key = resource_key model in
+      let body_cost = match SM.find_opt key body_costs with Some (T v) -> v | _ -> zero in
+      let body_cost = match accepted with Some c -> ite c body_cost zero | None -> body_cost in
+      let cond_cost = match SM.find_opt key condition_costs with Some (T v) -> v | _ -> zero in
+      let cost = add cond_cost body_cost in
+      if cost == zero then (model, zero)
+      else if model = "work" && (match seq.len.node with Num q -> q.d <> 1 || q.n < 0 | _ -> true) && Option.is_some (resource_callback_bound g model body cond) then begin
+        let bound = Option.get (resource_callback_bound g model body cond) in
+        let name = Printf.sprintf "comp_%s@%d" model (next g) in
+        let amount = if ctx.binders = [] then const name Int else fn name (Array.of_list ctx.binders) Int in
+        let fact = and_ [ le zero amount; le amount (mul seq.len bound) ] in
+        if ctx.binders = [] then assume ctx fact else assume_for_all_binders ctx fact;
+        (model, amount)
+      end
+      else match seq.len.node with
+      | Num q when q.d = 1 && q.n >= 0 -> (model, List.fold_left (fun total k -> add total (subst [ (i, int_ k) ] cost)) zero (List.init q.n Fun.id))
+      | _ -> begin
+        let arr, assume = defined_symbol ctx (Printf.sprintf "comp_cost_%s@%d" model n) (Array (Int, Int)) in
+        assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) cost)) [ [| select arr i |] ]);
+        (model, fn "seqsum" [| arr; zero; seq.len |] Int)
+      end) models
+
 and comprehension g ctx (e : Ir.expr) seq =
   let loc = e.loc in
   let seq = match seq with L l -> l | _ -> raise (Vc_error ("comprehension over a non-list", loc)) in
@@ -1299,9 +1499,27 @@ and comprehension g ctx (e : Ir.expr) seq =
   if not is_pure then begin
     (* values unknown; obligations and effects as for any element *)
     each_element g ctx e seq;
+    charge_resource ctx "alloc" ln;
     result
   end
   else begin
+    let resource_models = List.concat_map (fun (en : Ir.clause) ->
+      List.concat_map (fun part ->
+        let found = ref [] in
+        Ir.walk_expr (fun (x : Ir.expr) -> match x.e with Builtin ("cost", [ { e = Lit (LStr model); _ } ]) -> found := model :: !found | _ -> ()) part;
+        !found) (resource_parts en.cexpr)) g.info.fn.ensures |> List.sort_uniq compare in
+    if resource_models <> [] then begin
+      let resource_models = List.map (fun model -> if model = "peak" then "alloc" else model) resource_models |> List.sort_uniq compare in
+      let callback_costs = comprehension_costs g ctx seq elem body cond resource_models in
+      if List.mem_assoc "work" callback_costs then charge_resource ctx "work" (add seq.len (List.assoc "work" callback_costs));
+      if List.mem_assoc "alloc" callback_costs then charge_resource ctx "alloc" (List.assoc "alloc" callback_costs)
+    end
+    else begin
+      let body_steps = expr_steps body in
+      let cond_steps = Option.fold ~none:zero ~some:expr_steps cond in
+      charge_resource ctx "work" (add seq.len (add (mul seq.len cond_steps) (mul ln body_steps)))
+    end;
+    charge_resource ctx "alloc" ln;
     (match cond with
      | None ->
        let b = term_of loc (ev g sub body) in
@@ -1315,6 +1533,9 @@ and comprehension g ctx (e : Ir.expr) seq =
        let k = const (Printf.sprintf "k!%d" n) Int and j = const (Printf.sprintf "j!%d" n) Int in
        let sub_j = { ctx with spec = true; quiet = true; bound = SM.add elem (T (at (seq.arr, seq.off) j)) ctx.bound } in
        let bj = term_of loc (ev g sub_j body) and cj = term_of loc (ev g sub_j c) in
+       let matches, assume_matches = defined_symbol ctx (Printf.sprintf "comp@%d.matches" n) (Array (Int, Bool)) in
+       assume_matches ctx (quant "forall" [ j ] (implies (and_ [ le zero j; lt j seq.len ]) (eq (select matches j) cj)) [ [| select matches j |] ]);
+       assume ctx (eq ln (fn "seqcount_bool" [| matches; zero; seq.len; tt |] Int));
        assume ctx
          (quant "forall" [ k ]
             (implies (and_ [ le zero k; lt k ln ]) (exists [ j ] (and_ [ le zero j; lt j seq.len; cj; eq (select arr k) bj ])))
@@ -1495,6 +1716,9 @@ and extern g ctx (e : Ir.expr) name args =
   let loc = e.loc in
   let vals = List.map (ev g ctx) args in
   if ctx.spec then raise (Vc_error (Printf.sprintf "specifications cannot call unchecked code ('%s')" name, loc));
+  charge_resource ctx "external_calls" one;
+  unknown_resource g ctx "work" name;
+  unknown_resource g ctx "alloc" name;
   (* '@wrapper f' runs checked f with these arguments (a generator, a library decorator) *)
   (match if starts_with "@" name then resolve g ctx.modpath name else None with
    | Some callee when same_scc g g.info.key callee.key && g.info.termination ->
@@ -1558,6 +1782,7 @@ and new_object g ctx loc cls args =
   let alloc = alloc_of st.env in
   let r = const (Printf.sprintf "%s@new%d" cls (next g)) Int in
   g.created <- r :: g.created;
+  charge_resource ctx "alloc" one;
   assume ctx (not_ (select alloc r));
   st.env <- SM.add "@alloc" (T (store alloc r tt)) st.env;
   let check_invariants () =
@@ -1585,6 +1810,7 @@ and new_object g ctx loc cls args =
       T r)
 
 and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs : Ir.expr option list) ctx loc : value =
+  let mk_fn = fn in
   let fn = callee.fn in
   (* a comprehension's element is no variable of the state, whatever it shadows *)
   let arg_exprs = List.map (function Some { Ir.e = Var n; _ } when SM.mem n ctx.bound -> None | a -> a) arg_exprs in
@@ -1608,8 +1834,10 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
   let heap_pre = heap_env (match ctx.state with Some st -> st.env | None -> ctx.env) in
   let with_pmap h = SM.union (fun _ _ b -> Some b) h pmap in
   let definitional = callee.definitional in
-  if ctx.spec && not definitional then raise (Vc_error (Printf.sprintf "specs may only call pure (loop-free, mutation-free) functions; '%s' is not" fn.name, loc));
-  let cctx = { ctx with env = with_pmap heap_pre; modpath = callee.modpath; live = None; bound = SM.empty; old_env = None; result = None; spec = true; quiet = true; state = None; binders = [] } in
+  let contractual = resource_only_call g callee in
+  if ctx.spec && not (definitional || contractual) then raise (Vc_error (Printf.sprintf "specs may only call pure (loop-free, mutation-free) functions; '%s' is not" fn.name, loc));
+  let zero_resources = List.fold_left (fun m model -> SM.add (resource_key model) (T zero) m) SM.empty resource_models in
+  let cctx = { ctx with env = SM.union (fun _ _ next -> Some next) (with_pmap heap_pre) zero_resources; modpath = callee.modpath; live = None; bound = SM.empty; old_env = None; result = None; spec = true; quiet = true; state = None; binders = [] } in
   List.iter
     (fun (rq : Ir.clause) ->
       let gl = term_of loc (ev g cctx rq.cexpr) in
@@ -1646,10 +1874,31 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
     end
   in
   let post = ref pmap in
-  (match ctx.state with Some st when not ctx.spec -> post := SM.union (fun _ _ b -> Some b) !post (call_effects g callee args arg_exprs ctx st loc) | _ -> ());
-  if (not ctx.spec) && fn.ensures <> [] && not g.definitional_mode then begin
-    let ectx = { cctx with env = !post; old_env = Some (with_pmap heap_pre); result = (match r with NoneV -> None | r -> Some r) } in
-    List.iter (fun (en : Ir.clause) -> assume ctx (term_of loc (ev g ectx en.cexpr))) fn.ensures
+  (match ctx.state with Some st when not ctx.spec ->
+    post := SM.union (fun _ _ b -> Some b) !post (call_effects g callee args arg_exprs ctx st loc);
+   | _ -> ());
+  (match ctx.state with
+   | Some _ when not ctx.spec && g.resource_tracking ->
+     List.iter
+       (fun model ->
+         let key = resource_key model in
+         let name = Printf.sprintf "%s_%s@%d" model fn.name (next g) in
+         let delta = if ctx.binders = [] then const name Int else mk_fn name (Array.of_list ctx.binders) Int in
+         let add_fact = if ctx.binders = [] then assume ctx else assume_for_all_binders ctx in
+         add_fact (le zero delta);
+         post := SM.add key (T delta) !post;
+         charge_resource ctx model delta)
+       resource_models
+   | _ -> ());
+  if ((not ctx.spec) || contractual) && fn.ensures <> [] && not g.definitional_mode then begin
+    let old_env = List.fold_left (fun env model -> SM.add (resource_key model) (T zero) env) (with_pmap heap_pre) resource_models in
+    let ectx = { cctx with env = !post; old_env = Some old_env; result = (match r with NoneV -> None | r -> Some r) } in
+    List.iter (fun (en : Ir.clause) ->
+      let has_cost = List.exists (fun (x : Ir.expr) -> match x.e with Builtin ("cost", _) -> true | _ -> false) (let xs = ref [] in Ir.walk_expr (fun x -> xs := x :: !xs) en.cexpr; !xs) in
+      if not (has_cost && not g.resource_tracking) && not (ctx.spec && contractual && has_cost) then begin
+        let fact = term_of loc (ev g ectx en.cexpr) in
+        if ctx.binders = [] then assume ctx fact else assume_for_all_binders ctx fact
+      end) fn.ensures
   end;
   r
 
@@ -1707,6 +1956,16 @@ and threw g ctx (e : Ir.expr) =
     if not (List.mem callee.key g.deps) then g.deps <- g.deps @ [ callee.key ];
     let ends s suffix = String.length s >= String.length suffix && String.sub s (String.length s - String.length suffix) (String.length suffix) = suffix in
     ignore (call_effects g ~new_self:(ends callee.fn.name ".__init__") ~returned:false callee vals (List.map Option.some args) ctx st e.loc);
+    let pmap = List.fold_left (fun m ((p, _), a) -> SM.add p a m) SM.empty (zip callee.fn.params vals) in
+    let post = if not g.resource_tracking then pmap else List.fold_left (fun m model ->
+      let key = resource_key model in
+      let delta = const (Printf.sprintf "raised_%s_%s@%d" model callee.fn.name (next g)) Int in
+      assume ctx (le zero delta);
+      charge_resource ctx model delta;
+      SM.add key (T delta) m) pmap resource_models in
+    let old_env = List.fold_left (fun m model -> SM.add (resource_key model) (T zero) m) pmap resource_models in
+    let ectx = { ctx with env = post; modpath = callee.modpath; live = None; bound = SM.empty; old_env = Some old_env; result = None; spec = true; quiet = true; state = None; binders = [] } in
+    if g.resource_tracking then List.iter (fun (en : Ir.clause) -> List.iter (fun part -> assume ctx (term_of en.cloc (ev g ectx part))) (resource_parts en.cexpr)) callee.fn.ensures;
     NoneV
   | Call _, _ -> NoneV
   | _ -> raise (Vc_error ("'threw' takes a call", e.loc))
@@ -1885,6 +2144,7 @@ let state_ctx g ?(spec = false) (st : state) =
 let rec block g stmts (st : state) : state = List.fold_left (fun st s -> if st.alive then stmt g s st else st) st stmts
 
 and stmt g (s : Ir.stmt) (st : state) : state =
+  (match s with AssumeStmt _ | AssertStmt (_, _, false) -> () | _ -> charge_resource (state_ctx g st) "work" one);
   match s with
   | Assign (_, name, v) ->
     let x = coerce (ev g (state_ctx g st) v) (Hashtbl.find_opt g.info.fn.locals name) in
@@ -1919,6 +2179,7 @@ and stmt g (s : Ir.stmt) (st : state) : state =
       let k = term_of loc (ev g ctx i) in
       let vt = match d.dty with TDict (_, vt) -> vt | _ -> assert false in
       let x = term_of loc (coerce (ev g ctx v) (Some vt)) in
+      charge_resource ctx "alloc" (ite (select d.has k) zero one);
       st.env <- SM.add name (D { d with vals = store d.vals k x; has = store d.has k tt }) st.env;
       st
     | Some (L l) ->
@@ -1931,9 +2192,10 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     | _ -> raise (Vc_error ("index assignment to a non-list", loc)))
   | Append (loc, name, v) -> (
     match SM.find_opt name st.env with
-    | Some (L _) ->
+  | Some (L _) ->
       let x = term_of loc (ev g (state_ctx g st) v) in
       let l = match SM.find_opt name st.env with Some (L l) -> l | _ -> assert false in
+      charge_resource (state_ctx g st) "alloc" one;
       st.env <- SM.add name (L { l with arr = store l.arr (add l.off l.len) x; len = add l.len one }) st.env;
       st
     | _ -> raise (Vc_error ("append to a non-list", loc)))
@@ -2001,6 +2263,7 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     if caught then (st.alive <- false; st)
     else begin
       let ctx = state_ctx g st in
+      g.raise_exits <- { efacts = Dynarray.to_list st.facts; value = None; eenv = st.env; eloc = loc } :: g.raise_exits;
       (if g.info.fn.raises <> [] then begin
          let ectx = { ctx with env = g.entry; live = None; spec = true; quiet = true } in
          let cond = or_ (List.map (fun (r : Ir.clause) -> term_of loc (ev g ectx r.cexpr)) g.info.fn.raises) in
@@ -2277,9 +2540,11 @@ and loop_each g (r : Ir.stmt) (st : state) : state =
 (* what a caller can observe: scalar parameters keep their entry values; list
    and dict parameters show their final contents; fields come from the final heap *)
 let post_env g exit_env =
-  List.fold_left
+  let env = List.fold_left
     (fun m (p, ty) -> SM.add p (match (ty : Ir.ty) with TList _ | TDict _ -> SM.find p exit_env | _ -> SM.find p g.entry) m)
     (heap_env exit_env) g.info.fn.params
+  in
+  List.fold_left (fun m model -> match SM.find_opt (resource_key model) exit_env with Some v -> SM.add (resource_key model) v m | None -> m) env resource_models
 
 let check_exits g =
   let fn = g.info.fn in
@@ -2305,12 +2570,26 @@ let check_exits g =
           oblige g ~site:ex.eloc ~clause:r0 "raises" { ctx with quiet = false } (not_ cond) r0.cloc (Printf.sprintf "returns normally although '@raises %s' holds" r0.text)
         end
       end)
-    (List.rev g.exits)
+    (List.rev g.exits);
+  List.iter
+    (fun ex ->
+      let facts = Dynarray.of_list ex.efacts in
+      let env = List.fold_left (fun m model -> match SM.find_opt (resource_key model) ex.eenv with Some v -> SM.add (resource_key model) v m | None -> m) (heap_env ex.eenv) resource_models in
+      List.iter
+        (fun (en : Ir.clause) ->
+          List.iter
+            (fun part ->
+              let ctx = spec_ctx g ~old_env:g.entry ~quiet:false ~base:facts ~env () in
+              let gl = term_of en.cloc (ev g ctx part) in
+              oblige g ~site:ex.eloc ~clause:en "resource" ctx gl en.cloc (Printf.sprintf "resource bound '%s' holds when the function raises" en.text))
+            (resource_parts en.cexpr))
+        fn.ensures)
+    (List.rev g.raise_exits)
 
 let make prog info opts =
   {
-    prog; info; opts; obligations = []; exits = []; loops = []; counter = 0; ids = Hashtbl.create 32; deps = []; entry = SM.empty;
-    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; written = []; created = []; lc_written = []; comp_memo = Hashtbl.create 8; comp_bodies = Hashtbl.create 8; comp_sums = Hashtbl.create 8;
+    prog; info; opts; obligations = []; exits = []; raise_exits = []; loops = []; counter = 0; ids = Hashtbl.create 32; deps = []; entry = SM.empty;
+    inputs = []; assumptions = []; loop_notes = []; definitional_mode = false; resource_tracking = List.exists (fun (en : Ir.clause) -> resource_parts en.cexpr <> []) info.fn.ensures; written = []; created = []; lc_written = []; comp_memo = Hashtbl.create 8; comp_bodies = Hashtbl.create 8; comp_sums = Hashtbl.create 8;
   }
 
 let run g =
@@ -2321,6 +2600,7 @@ let run g =
     (fun c -> List.iter (fun (f, _) -> List.iter (fun (k, srt) -> if not (SM.mem k st.env) then st.env <- SM.add k (T (const (String.sub k 1 (String.length k - 1)) srt)) st.env) (heap_keys g c.cname f)) c.cfields)
     g.prog.classes;
   st.env <- SM.add "@alloc" (T (const "alloc" (Array (Int, Bool)))) st.env;
+  if g.resource_tracking then List.iter (fun model -> st.env <- SM.add (resource_key model) (T zero) st.env) resource_models;
   List.iter (fun c -> if has_invariants g c.cname then st.env <- SM.add (written_key c.cname) (T no_writes) st.env) g.prog.classes;
   List.iter
     (fun (p, ty) ->

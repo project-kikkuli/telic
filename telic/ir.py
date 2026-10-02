@@ -163,6 +163,16 @@ def reaches_object(t: Type) -> bool:
 
 INT, REAL, BOOL, STR, NONE = TInt(), TReal(), TBool(), TStr(), TNone()
 
+RESOURCE_MODELS = {
+    "work": "executed source-lowered IR operations",
+    "alloc": "abstract materialized cells (list elements, string units, dict entries, and objects)",
+    "peak": "upper bound on incremental live abstract cells allocated during this invocation (all allocations remain live; input and caller heap excluded)",
+    "external_calls": "unchecked call sites executed",
+}
+RESOURCE_KEYS = {name: f"@telic.cost.{name}" for name in RESOURCE_MODELS}
+RESOURCE_KEYS["peak"] = RESOURCE_KEYS["alloc"]
+RESOURCE_STATE_MODELS = ("work", "alloc", "external_calls")
+
 
 def is_numeric(t: Type) -> bool:
     return isinstance(t, (TInt, TReal))

@@ -770,3 +770,17 @@ func sameCents(_ a: Money, _ b: Money) -> Bool {
     //@ ensures result
     return a == b
 }
+
+// expect: proved
+func shortCircuitAndSkipped(_ x: Bool) -> Bool {
+    //@ requires !x
+    //@ ensures cost("work") == 3
+    return x && true
+}
+
+// expect: proved
+func shortCircuitAndExecuted(_ x: Bool) -> Bool {
+    //@ requires x
+    //@ ensures cost("work") == 4
+    return x && true
+}

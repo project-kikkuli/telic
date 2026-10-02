@@ -796,6 +796,8 @@ class Program:
             fn = ref.fn
             if fn.unsupported or fn.trusted or fn.ret == ir.NONE or isinstance(fn.ret, (ir.TList, ir.TOption, ir.TDict)):
                 continue
+            if any(isinstance(x, ir.Builtin) and x.name == "cost" for c in fn.requires + fn.ensures for x in ir.walk_expr(c.expr)):
+                continue
             if key in self.allocates or fn.name.endswith(".__init__") or key in self.dispatch:
                 continue  # an overridden method's body is not what every call runs
             if self.ambiguity(ref) is not None:

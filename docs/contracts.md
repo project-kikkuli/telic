@@ -37,6 +37,25 @@ ones.
 - a list parameter means its contents **at exit**, which is what the caller sees;
 - `old(e)` evaluates `e` at entry.
 
+Resource postconditions can refer to `cost("work")`, `cost("alloc")`,
+`cost("peak")`, or `cost("external_calls")`. These are mathematical
+nonnegative upper-bound counters over source-lowered IR: `work` counts lowered
+expression and statement operations, `alloc` counts abstract materialized
+cells, `peak` bounds incremental live abstract cells allocated during this
+invocation, treating all its allocated cells as live and excluding the input and
+caller heap. `external_calls` counts unchecked call sites. Bulk list and string
+operations are charged by their modeled size. Comprehension callbacks with
+checked constant cost bounds use an abstract aggregate between zero and the
+worst-case cost of running the callback for every input element; `all` and
+`any` use the same worst-case count even when runtime short-circuiting stops
+early. Membership and string-search operations use bounded abstract work
+between zero and their worst-case scan size, since a match or mismatch can stop
+the scan early. Dictionary literals count each evaluated pair as work and
+count distinct keys as allocated cells. Checked callees compose their declared resource postconditions;
+unchecked calls have an unbounded cost, so a finite bound cannot be proved
+through them. These units describe the verifier's model and do not guarantee
+wall-clock time or platform memory use.
+
 **`invariant I`** is a loop invariant. It must hold before the loop and be
 preserved by every iteration, including iterations that `continue`. After the
 loop it is assumed, together with the negated condition. For `for i in

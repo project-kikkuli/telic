@@ -548,3 +548,23 @@ export function reduceUnguarded(xs: number[]): number {
   const t = xs.reduce((acc, x) => acc + posNum(x), 0);
   return 0;
 }
+
+// expect: proved
+export function shortCircuitAndSkipped(x: boolean): boolean {
+  //@ requires !x
+  //@ ensures cost("work") === 3
+  return x && true;
+}
+
+// expect: proved
+export function shortCircuitAndExecuted(x: boolean): boolean {
+  //@ requires x
+  //@ ensures cost("work") === 4
+  return x && true;
+}
+
+// expect: proved
+export function fullSliceAlloc(xs: number[]): number[] {
+  //@ ensures cost("alloc") === xs.length
+  return xs.slice();
+}

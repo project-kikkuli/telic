@@ -2237,7 +2237,7 @@ class ExprLowerer:
         if not self.spec:  # Rust panics instead of clamping
             ok = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), lo_e), ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", lo_e, hi_e), ir.Binary(ir.BOOL, loc, "le", hi_e, n)))
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, "slice range is within bounds"), native=True))
-        return self.elems_kinded(ir.Builtin(seq.ty, loc, "slice", (seq, lo_e, hi_e)), self.kind_of_elems(seq))
+        return self.elems_kinded(ir.Builtin(seq.ty, loc, "slice_view", (seq, lo_e, hi_e)), self.kind_of_elems(seq))
 
     def x_array_expression(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         loc = self.loc(n)
@@ -2781,6 +2781,13 @@ class ExprLowerer:
         if self.spec and name == "implies":
             a, b = self.expr(argn[0], ir.BOOL), self.expr(argn[1], ir.BOOL)
             return ir.Binary(ir.BOOL, loc, "implies", a, b)
+        if self.spec and name == "cost":
+            if len(argn) != 1:
+                raise self.err("cost() takes one literal model name", n)
+            model = self.expr(argn[0], ir.STR)
+            if not isinstance(model, ir.Lit) or not isinstance(model.value, str):
+                raise self.err("cost() takes one literal model name", n)
+            return ir.Builtin(ir.INT, loc, "cost", (model,))
         if hit is not None and hit[0] == "fn":
             return self.call(self.fe.fns[hit[1]], None, argn, n, expect)
         if hit is not None and hit[0] == "type" and hit[1] in self.fe.structs and self.fe.structs[hit[1]].tuple:
@@ -3252,7 +3259,7 @@ class ExprLowerer:
             ot = ir.TOption(t.elem)
             tv = self.fl.fresh("pop", ot)
             last = ir.Binary(ir.INT, loc, "sub", length, ir.Lit(ir.INT, loc, 1))
-            self.pre.append(ir.If(loc, ir.Binary(ir.BOOL, loc, "gt", length, ir.Lit(ir.INT, loc, 0)), (ir.Assign(loc, tv, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, recv, last, wrap=False),))), ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice", (recv, ir.Lit(ir.INT, loc, 0), last)))), (ir.Assign(loc, tv, ir.Lit(ot, loc, None)),)))
+            self.pre.append(ir.If(loc, ir.Binary(ir.BOOL, loc, "gt", length, ir.Lit(ir.INT, loc, 0)), (ir.Assign(loc, tv, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, recv, last, wrap=False),))), ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice_view", (recv, ir.Lit(ir.INT, loc, 0), last)))), (ir.Assign(loc, tv, ir.Lit(ot, loc, None)),)))
             if ek:
                 self.fl.kinds[tv] = ek
             return ir.Var(ot, loc, tv)
@@ -3273,7 +3280,7 @@ class ExprLowerer:
             return ir.Lit(ir.NONE, loc, None)
         if m == "truncate" and isinstance(recv, ir.Var):
             k = self.expr(argn[0], ir.INT, "usize")
-            self.pre.append(ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice", (recv, ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "min", (k, length))))))
+            self.pre.append(ir.Assign(loc, recv.name, ir.Builtin(t, loc, "slice_view", (recv, ir.Lit(ir.INT, loc, 0), ir.Builtin(ir.INT, loc, "min", (k, length))))))
             return ir.Lit(ir.NONE, loc, None)
         args, writes = self.extern_args(argn)
         if m in ("remove", "swap_remove", "insert") and len(args) == (2 if m == "insert" else 1):

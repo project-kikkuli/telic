@@ -395,6 +395,11 @@ class VCGen:
         self.program = program
         self.ref = ref
         self.fn = ref.fn
+        self.resource_tracking = any(
+            isinstance(node, ir.Builtin) and node.name == "cost"
+            for clause in self.fn.ensures
+            for node in ir.walk_expr(clause.expr)
+        )
         self.module = ref.module
         self.opts = opts or Options()
         self.obligations: list[Obligation] = []
@@ -409,6 +414,7 @@ class VCGen:
         self.assumptions: list[tuple[ir.Loc, str]] = []
         self.definitional_mode = False
         self.raise_paths: list[list[L.Term]] = []
+        self.raise_exits: list[Exit] = []
         # lines of the field writes to each class with an invariant
         self.written: dict[str, list[int]] = {}
         self._self_escapes: bool | None = None
@@ -609,7 +615,7 @@ class VCGen:
             env[k] = L.store(env[k], ref, comp)  # type: ignore[arg-type]
 
     def heap_env(self, env: dict[str, Val]) -> dict[str, Val]:
-        return {k: v for k, v in env.items() if k.startswith("@")}
+        return {k: v for k, v in env.items() if k.startswith("@") and k not in ir.RESOURCE_KEYS.values()}
 
     def class_invariants(self, cls: str, ref: L.Term, env: dict[str, Val], ctx_base: list[L.Term], skip: set[tuple[str, int]] = set()) -> list[tuple[ir.Clause, L.Term]]:  # noqa: B006
         e = dict(self.heap_env(env))
@@ -718,6 +724,8 @@ class VCGen:
         env: dict[str, Val] = {}
         facts: list[L.Term] = []
         self.heap_init(env)
+        if self.resource_tracking:
+            env.update({key: L.ZERO for key in ir.RESOURCE_KEYS.values()})
         for cname in self.program.classes:
             if self.has_invariants(cname):
                 env[WRITTEN + cname] = NO_WRITES
@@ -835,6 +843,7 @@ class VCGen:
         values; list parameters show their final contents; object fields are
         read from the final heap."""
         out: dict[str, Val] = self.heap_env(exit_env)
+        out.update({key: exit_env[key] for key in ir.RESOURCE_KEYS.values() if key in exit_env})
         for p in self.fn.params:
             if isinstance(p.ty, (ir.TList, ir.TDict)):
                 out[p.name] = exit_env[p.name]
@@ -881,6 +890,12 @@ class VCGen:
                     site=ex.loc,
                     clause=fn.raises[0],
                 )
+        for ex in self.raise_exits:
+            st = State(dict(ex.env), list(ex.facts))
+            for en in fn.ensures:
+                ctx = Ctx(base=st.facts, env=ex.env, module=self.module, old_env=self.entry, spec=True)
+                for part in self.resource_parts(en.expr):
+                    self.oblige("resource", ctx, self.ev(part, ctx.sub(label="raises")), en.loc, f"resource bound '{en.text}' holds when the function raises", site=ex.loc, clause=en)
 
     def check_lifecycles(self, env: dict[str, Val], facts: list[L.Term], site: ir.Loc, probe: bool = True, guard: tuple[L.Term, ...] = ()) -> None:
         """Objects that existed at entry changed only as their lifecycles
@@ -937,6 +952,8 @@ class VCGen:
         return st
 
     def stmt(self, s: ir.Stmt, st: State) -> State:
+        if not isinstance(s, (ir.AssumeStmt,)) and not (isinstance(s, ir.AssertStmt) and not s.native):
+            self.charge_resource(self.ctx(st), "work", L.ONE)
         if isinstance(s, ir.Assign):
             ctx = self.ctx(st)
             st.env[s.name] = coerce(self.ev(s.value, ctx), self.fn.locals.get(s.name))
@@ -971,6 +988,7 @@ class VCGen:
             ctx = self.ctx(st)
             k = self.ev(s.idx, ctx)
             v = coerce(self.ev(s.value, ctx), d.ty.val)
+            self.charge_resource(ctx, "alloc", L.ite(L.select(d.has, k), L.ZERO, L.ONE))  # type: ignore[arg-type]
             st.env[s.name] = DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
             self.wrote_view(s.name, ctx)
             return st
@@ -988,6 +1006,7 @@ class VCGen:
             assert isinstance(lst, ListVal)
             ctx = self.ctx(st)
             v = self.ev(s.value, ctx)
+            self.charge_resource(ctx, "alloc", L.ONE)
             st.env[s.name] = ListVal(L.store(lst.arr, L.add(lst.off, lst.len), v), lst.off, L.add(lst.len, L.ONE), lst.ty)
             self.wrote_view(s.name, ctx)
             return st
@@ -1062,6 +1081,7 @@ class VCGen:
             return st
         if isinstance(s, ir.Raise):
             self.raise_paths.append(list(st.facts))
+            self.raise_exits.append(Exit(list(st.facts), None, dict(st.env), s.loc))
             ctx = self.ctx(st)
             if self.fn.raises:
                 ectx = Ctx(base=st.facts, env=self.entry, module=self.module, spec=True, quiet=True)
@@ -1124,7 +1144,7 @@ class VCGen:
         without ``unchecked_writes``, not counting what unchecked code may
         change through the values it is handed, and without ``extern_heap``
         the objects it may reach."""
-        names = ir.assigned_names(stmts)
+        names = ir.assigned_names(stmts) | set(ir.RESOURCE_KEYS.values())
         appends: set[str] = set()
         for s in ir.walk_stmts(stmts):
             if isinstance(s, ir.Append):
@@ -1213,6 +1233,8 @@ class VCGen:
                 assert not isinstance(old, (ListVal, OptVal, DictVal))
                 new = L.Const(f"{name[1:]}@{next(self.counter)}", old.sort)
                 h.env[name] = new
+                if name in ir.RESOURCE_KEYS.values():
+                    h.facts.append(L.le(L.ZERO, new))
                 alloc0 = self.entry.get("@alloc")
                 if name in framed and isinstance(alloc0, L.Term) and old.sort.name == "Array" and (old.sort.index or L.INT) == L.INT:
                     r = L.Const(f"r!{next(self.counter)}", L.INT)
@@ -1496,8 +1518,46 @@ class VCGen:
         return i
 
     def ev(self, e: ir.Expr, ctx: Ctx) -> Val:
+        self.charge_resource(ctx, "work", L.ONE)
         m = getattr(self, "ev_" + type(e).__name__)
         return m(e, ctx)
+
+    def charge_resource(self, ctx: Ctx, model: str, amount: L.Term) -> None:
+        if ctx.spec or self.definitional_mode or ctx.state is None or not self.resource_tracking:
+            return
+        key = ir.RESOURCE_KEYS[model]
+        old = ctx.state.env.get(key)
+        if not isinstance(old, L.Term):
+            raise VCError(f"resource model '{model}' has no execution state")
+        ctx.state.env[key] = L.add(old, amount)
+
+    def resource_state(self, ctx: Ctx) -> dict[str, L.Term]:
+        if ctx.state is None:
+            return {}
+        return {key: value for key in set(ir.RESOURCE_KEYS.values()) if isinstance((value := ctx.state.env.get(key)), L.Term)}
+
+    def set_resource_state(self, ctx: Ctx, values: dict[str, L.Term]) -> None:
+        if ctx.state is not None:
+            ctx.state.env.update(values)
+
+    def merge_resource_state(self, ctx: Ctx, yes: dict[str, L.Term], no: dict[str, L.Term], cond: L.Term) -> None:
+        self.set_resource_state(ctx, {key: L.ite(cond, yes[key], no[key]) for key in yes.keys() & no.keys()})
+
+    def unknown_resource(self, ctx: Ctx, model: str, where: str, loc: ir.Loc) -> L.Term:
+        if ctx.spec or ctx.state is None or not self.resource_tracking:
+            return L.ZERO
+        amount = self.fresh(f"{model}_{where}", ir.INT)
+        assert isinstance(amount, L.Term)
+        ctx.assume(L.le(L.ZERO, amount))
+        self.charge_resource(ctx, model, amount)
+        return amount
+
+    def bounded_resource(self, ctx: Ctx, model: str, where: str, upper: L.Term) -> L.Term:
+        if ctx.spec or ctx.state is None or not self.resource_tracking:
+            return L.ZERO
+        amount = self.bounded_resource_delta(ctx, f"{model}_{where}", upper)
+        self.charge_resource(ctx, model, amount)
+        return amount
 
     def ev_Lit(self, e: ir.Lit, ctx: Ctx) -> Val:
         v = e.value
@@ -1542,7 +1602,10 @@ class VCGen:
         if op in ("and", "or", "implies"):
             a = self.ev(e.left, ctx)
             assert not isinstance(a, ListVal)
-            b = self.ev(e.right, ctx.sub(a if op in ("and", "implies") else L.not_(a)))
+            guard = a if op in ("and", "implies") else L.not_(a)
+            before = self.resource_state(ctx)
+            b = self.ev(e.right, ctx.sub(guard))
+            self.merge_resource_state(ctx, self.resource_state(ctx), before, guard)
             assert not isinstance(b, ListVal)
             return {"and": L.and_, "or": L.or_}[op](a, b) if op != "implies" else L.implies(a, b)
         a = self.ev(e.left, ctx)
@@ -1611,8 +1674,13 @@ class VCGen:
     def ev_Ite(self, e: ir.Ite, ctx: Ctx) -> Val:
         c = self.ev(e.cond, ctx)
         assert not isinstance(c, ListVal)
+        before = self.resource_state(ctx)
         a = self.ev(e.then, ctx.sub(c))
+        then_state = self.resource_state(ctx)
+        self.set_resource_state(ctx, before)
         b = self.ev(e.orelse, ctx.sub(L.not_(c)))
+        else_state = self.resource_state(ctx)
+        self.merge_resource_state(ctx, then_state, else_state, c)
         return ite_val(c, a, b)
 
     def ev_Index(self, e: ir.Index, ctx: Ctx) -> Val:
@@ -1670,6 +1738,7 @@ class VCGen:
             v = self.ev(x, ctx)
             assert not isinstance(v, ListVal)
             arr = L.store(arr, L.IntV(i), v)
+        self.charge_resource(ctx, "alloc", L.IntV(len(e.elems)))
         return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
@@ -1677,6 +1746,8 @@ class VCGen:
             return self.quant_each(e, ctx)
         if e.seq is not None and isinstance(e.seq.ty, ir.TDict):
             # over a dict's keys: every k it holds
+            if not ctx.spec:
+                self.unknown_resource(ctx, "work", "quantifier over dictionary keys", e.loc)
             d = self.ev(e.seq, ctx)
             assert isinstance(d, DictVal) and e.elem is not None
             k = L.Const(f"{e.elem}!{next(self.counter)}", sort_of(e.seq.ty.key))
@@ -1693,7 +1764,12 @@ class VCGen:
         assert not isinstance(lo, ListVal) and not isinstance(hi, ListVal)
         i = L.Const(f"{e.idx.split('$')[0]}!{next(self.counter)}", L.INT)
         rng = L.and_(L.le(lo, i), L.lt(i, hi))
+        local = ctx.state.copy() if ctx.state is not None and not ctx.spec and self.resource_tracking else None
+        if local is not None:
+            for key in ir.RESOURCE_KEYS.values():
+                local.env[key] = L.ZERO
         sub = ctx.sub(rng, binders=ctx.binders + (i,))
+        sub.state = local
         sub.bound[e.idx] = i
         if e.seq is not None and e.elem is not None:
             seq = self.ev(e.seq, ctx)
@@ -1701,12 +1777,36 @@ class VCGen:
             sub.bound[e.elem] = seq.at(i)
         body = self.ev(e.body, sub)
         assert not isinstance(body, ListVal)
+        if local is not None:
+            size = L.max_(L.sub(hi, lo), L.ZERO)
+            for model in ir.RESOURCE_STATE_MODELS:
+                bound = self.comprehension_resource_bound(e.body, None, model)
+                key = ir.RESOURCE_KEYS[model]
+                if bound is not None and (bound != L.ZERO or local.env[key] == L.ZERO):
+                    if bound != L.ZERO:
+                        amount = self.bounded_resource_delta(ctx, f"quant_{model}", L.mul(size, bound))
+                        self.charge_resource(ctx, model, amount)
+                elif local.env[key] != L.ZERO:
+                    self.unknown_resource(ctx, model, "quantifier callback without a checked cost bound", e.loc)
         if e.kind == "forall":
             return L.forall([i], L.implies(rng, body))
         return L.exists([i], L.and_(rng, body))
 
     def ev_Builtin(self, e: ir.Builtin, ctx: Ctx) -> Val:
         name = e.name
+        if name == "cost":
+            if not ctx.spec:
+                raise VCError("cost() is only available in a specification", e.loc)
+            if len(e.args) != 1 or not isinstance(e.args[0], ir.Lit) or not isinstance(e.args[0].value, str):
+                raise VCError("cost() takes one literal model name", e.loc)
+            model = e.args[0].value
+            if model not in ir.RESOURCE_KEYS:
+                choices = ", ".join(f"'{name}' ({unit})" for name, unit in ir.RESOURCE_MODELS.items())
+                raise VCError(f"unknown cost model '{model}'; choose {choices}", e.loc)
+            value = ctx.env.get(ir.RESOURCE_KEYS[model])
+            if not isinstance(value, L.Term):
+                raise VCError(f"cost('{model}') is not available in this specification", e.loc)
+            return value
         if name == "comp":
             return self.comprehension(e, self.ev(e.args[0], ctx), ctx)
         if name == "each":
@@ -1722,11 +1822,19 @@ class VCGen:
             ks = sort_of(e.ty.key)
             vals: L.Term = L.const_array(L.ARRAY(sort_of(e.ty.val), ks), default_term(sort_of(e.ty.val)))
             has: L.Term = L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE)
+            seen: list[L.Term] = []
+            allocated = L.ZERO
             for ke, ve in zip(e.args[0::2], e.args[1::2]):
                 k = self.ev(ke, ctx)
                 v = coerce(self.ev(ve, ctx), e.ty.val)
+                duplicate = L.or_(*(L.eq(k, previous) for previous in seen)) if seen else L.FALSE
+                allocated = L.add(allocated, L.ite(duplicate, L.ZERO, L.ONE))  # type: ignore[arg-type]
+                seen.append(k)  # type: ignore[arg-type]
                 vals = L.store(vals, k, v)  # type: ignore[arg-type]
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
+            entries = L.IntV(len(e.args) // 2)
+            self.charge_resource(ctx, "work", entries)
+            self.charge_resource(ctx, "alloc", allocated)
             return DictVal(vals, has, e.ty)
         args = [self.ev(a, ctx) for a in e.args]
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
@@ -1849,6 +1957,8 @@ class VCGen:
         if name in ("dict_keys", "dict_values"):
             (d,) = args
             assert isinstance(d, DictVal)
+            for model in ("work", "alloc"):
+                self.unknown_resource(ctx, model, f"copy of dictionary {name}", e.loc)
             n = next(self.counter)
             keys = L.Const(f"keys@{n}", L.ARRAY(sort_of(d.ty.key)))
             ln = L.Const(f"keys@{n}.len", L.INT)
@@ -1884,6 +1994,8 @@ class VCGen:
             n = next(self.counter)
             arr = L.Const(f"cat@{n}.arr", sort_of(xs.ty))
             ln = L.add(xs.len, ys.len)
+            self.charge_resource(ctx, "work", ln)
+            self.charge_resource(ctx, "alloc", ln)
             i = L.Const(f"i!{n}", L.INT)
             k = L.Const(f"k!{n}", L.INT)
             ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(arr, i), xs.at(i))), patterns=((L.select(arr, i),),)))
@@ -1895,6 +2007,8 @@ class VCGen:
             arr, assume = self.defined_symbol(ctx, f"range@{n}.arr", L.ARRAY(L.INT))
             i = L.Const(f"i!{n}", L.INT)
             ln = L.max_(L.sub(hi, lo), L.ZERO)  # type: ignore[arg-type]
+            self.charge_resource(ctx, "work", ln)
+            self.charge_resource(ctx, "alloc", ln)
             assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), L.add(lo, i))), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
             return ListVal(arr, L.ZERO, ln, e.ty)
         if name == "list_repeat":
@@ -1905,9 +2019,13 @@ class VCGen:
             arr, assume = self.defined_symbol(ctx, f"rep@{n}.arr", sort_of(xs.ty))
             i = L.Const(f"i!{n}", L.INT)
             ln = L.mul(L.IntV(width), L.max_(k, L.ZERO))  # type: ignore[arg-type]
+            self.charge_resource(ctx, "work", ln)
+            self.charge_resource(ctx, "alloc", ln)
             assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), xs.at(L.App("emod", (i, L.IntV(width)), L.INT)))), patterns=((L.select(arr, i),),)))
             return ListVal(arr, L.ZERO, ln, xs.ty)
         if name == "dict_copy":
+            for model in ("work", "alloc"):
+                self.unknown_resource(ctx, model, "copy of dictionary", e.loc)
             return args[0]  # dicts are values in the model; aliasing is excluded
         if name == "list_append":
             xs, v = args
@@ -1958,6 +2076,7 @@ class VCGen:
         if name == "sum":
             (xs,) = args
             assert isinstance(xs, ListVal)
+            self.charge_resource(ctx, "work", xs.len)
             fd = "seqsum" if xs.ty.elem == ir.INT else "seqsum_r"
             self.theory_fns.add(fd)
             total = L.Fn(fd, (xs.arr, xs.off, L.add(xs.off, xs.len)), sort_of(xs.ty.elem))
@@ -1966,15 +2085,17 @@ class VCGen:
         if name == "count":
             xs, v = args
             assert isinstance(xs, ListVal)
+            self.charge_resource(ctx, "work", xs.len)
             fd = f"seqcount_{sort_of(xs.ty.elem).name.lower()}"
             self.theory_fns.add(fd)
             return L.Fn(fd, (xs.arr, xs.off, L.add(xs.off, xs.len), v), L.INT)  # type: ignore[arg-type]
         if name == "contains":
             xs, v = args
             assert isinstance(xs, ListVal)
+            self.bounded_resource(ctx, "work", "list_contains", xs.len)
             i = L.Const(f"in!{next(self.counter)}", L.INT)
             return L.exists([i], L.and_(L.le(L.ZERO, i), L.lt(i, xs.len), L.eq(xs.at(i), v)))  # type: ignore[arg-type]
-        if name == "slice":
+        if name in ("slice", "slice_view"):
             xs, lo, hi = args
             assert isinstance(xs, ListVal)
             n = xs.len
@@ -1985,11 +2106,13 @@ class VCGen:
                 assert not isinstance(b, ListVal)
                 return L.ite(L.lt(b, L.ZERO), L.max_(L.add(b, n), L.ZERO), L.min_(b, n))
 
-            if lo is NONE_V and hi is NONE_V:
-                return xs
             lo2 = norm(lo, L.ZERO)
             hi2 = norm(hi, n)
-            return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty)
+            length = L.max_(L.sub(hi2, lo2), L.ZERO)
+            if name == "slice":
+                self.charge_resource(ctx, "work", length)
+                self.charge_resource(ctx, "alloc", length)
+            return ListVal(xs.arr, L.add(xs.off, lo2), length, xs.ty)
         (x,) = args[:1]
         assert not isinstance(x, ListVal)
         if name == "to_real":
@@ -2010,26 +2133,40 @@ class VCGen:
 
     def string_op(self, name: str, args: list, e: ir.Builtin, ctx: Ctx) -> Val:
         if name == "str_concat":
+            size = L.ZERO
+            for arg in args:
+                size = L.add(size, L.App("str.len", (arg,), L.INT))
+            self.charge_resource(ctx, "work", size)
+            self.charge_resource(ctx, "alloc", size)
             return L.App("str.++", tuple(args), L.STR)
         if name == "str_len":
             return L.App("str.len", (args[0],), L.INT)
         if name == "str_contains":  # sub in s
+            size = L.mul(L.App("str.len", (args[0],), L.INT), L.App("str.len", (args[1],), L.INT))
+            self.bounded_resource(ctx, "work", "str_contains", size)
             return L.App("str.contains", (args[0], args[1]), L.BOOL)
         if name == "str_startswith":
+            self.bounded_resource(ctx, "work", "str_startswith", L.App("str.len", (args[1],), L.INT))
             return L.App("str.prefixof", (args[1], args[0]), L.BOOL)
         if name == "str_endswith":
+            self.bounded_resource(ctx, "work", "str_endswith", L.App("str.len", (args[1],), L.INT))
             return L.App("str.suffixof", (args[1], args[0]), L.BOOL)
         if name == "str_of_int":
+            for model in ("work", "alloc"):
+                self.unknown_resource(ctx, model, "integer-to-string conversion", e.loc)
             return L.App("str.from_int", (args[0],), L.STR)
         if name == "str_lt":
             return L.App("str.lt", (args[0], args[1]), L.BOOL)
         if name == "str_le":
             return L.App("str.le", (args[0], args[1]), L.BOOL)
         if name == "str_find":
+            size = L.mul(L.App("str.len", (args[0],), L.INT), L.App("str.len", (args[1],), L.INT))
+            self.bounded_resource(ctx, "work", "str_find", size)
             return L.App("str.indexof", (args[0], args[1], L.ZERO), L.INT)
         if name == "str_index":
             s_, i = args
             n = L.App("str.len", (s_,), L.INT)
+            self.charge_resource(ctx, "work", L.ONE)
             self.oblige("index", ctx, L.and_(L.le(L.neg(n), i), L.lt(i, n)), e.loc, f"index into '{_expr_name(e.args[0])}' is within -len..len-1")
             j = L.ite(L.lt(i, L.ZERO), L.add(i, n), i)
             return L.App("str.at", (s_, j), L.STR)
@@ -2043,7 +2180,10 @@ class VCGen:
                 return L.ite(L.lt(b, L.ZERO), L.max_(L.add(b, n), L.ZERO), L.min_(b, n))
 
             lo2, hi2 = norm(lo, L.ZERO), norm(hi, n)
-            return L.App("str.substr", (s_, lo2, L.max_(L.sub(hi2, lo2), L.ZERO)), L.STR)
+            size = L.max_(L.sub(hi2, lo2), L.ZERO)
+            self.charge_resource(ctx, "work", size)
+            self.charge_resource(ctx, "alloc", size)
+            return L.App("str.substr", (s_, lo2, size), L.STR)
         if name == "str_fn":
             # lower(), strip(), replace(), ...: deterministic, not interpreted
             op = e.args[0]
@@ -2051,6 +2191,8 @@ class VCGen:
             flat: list[L.Term] = []
             for a in args[1:]:
                 flat.extend(flatten(a))
+            for model in ("work", "alloc"):
+                self.unknown_resource(ctx, model, f"string operation '{op.value}'", e.loc)
             return L.Fn(f"str.{op.value}", tuple(flat), sort_of(e.ty))
         raise VCError(f"unknown string operation {name}", e.loc)
 
@@ -2108,7 +2250,20 @@ class VCGen:
         if not pure:
             # Values unknown; obligations and effects as for any element.
             self.each_element(e, seq, ctx)
+            self.charge_resource(ctx, "alloc", ln)
             return ListVal(arr, L.ZERO, ln, e.ty)
+        resource_models = {str(arg.value) for cl in self.fn.ensures for part in self.resource_parts(cl.expr) for node in ir.walk_expr(part) if isinstance(node, ir.Builtin) and node.name == "cost" for arg in node.args if isinstance(arg, ir.Lit)}
+        if resource_models:
+            callback_costs = self.comprehension_callback_costs(seq, elem, body, cond, ctx, resource_models)
+            if "work" in callback_costs:
+                self.charge_resource(ctx, "work", L.add(seq.len, callback_costs["work"]))
+            if "alloc" in callback_costs:
+                self.charge_resource(ctx, "alloc", callback_costs["alloc"])
+        else:
+            body_steps = L.IntV(sum(1 for _ in ir.walk_expr(body)))
+            cond_steps = L.IntV(sum(1 for _ in ir.walk_expr(cond))) if cond is not None else L.ZERO
+            self.charge_resource(ctx, "work", L.add(seq.len, L.add(L.mul(seq.len, cond_steps), L.mul(ln, body_steps))))
+        self.charge_resource(ctx, "alloc", ln)
         i = L.Const(f"{elem}!{n}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
         sub = ctx.sub(rng, spec=True)
@@ -2130,9 +2285,105 @@ class VCGen:
             sub_j.bound[elem] = seq.at(j)
             bj = self.ev(body, sub_j)
             cj = self.ev(cond, sub_j)
+            matches, assume_matches = self.defined_symbol(ctx, f"comp@{n}.matches", L.ARRAY(L.BOOL))
+            source_range = L.and_(L.le(L.ZERO, j), L.lt(j, seq.len))
+            assume_matches(L.Quant("forall", (j,), L.implies(source_range, L.eq(L.select(matches, j), cj)), patterns=((L.select(matches, j),),)))
+            self.theory_fns.add("seqcount_bool")
+            assume(L.eq(ln, L.Fn("seqcount_bool", (matches, L.ZERO, seq.len, L.BoolV(True)), L.INT)))
             # every element comes from some accepted source element
             assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
         return ListVal(arr, L.ZERO, ln, e.ty)
+
+    def comprehension_callback_costs(self, seq: ListVal, elem: str, body: ir.Expr, cond: ir.Expr | None, ctx: Ctx, models: set[str]) -> dict[str, L.Term]:
+        models = {"alloc" if model == "peak" else model for model in models}
+        if ctx.state is None:
+            return {model: L.ZERO for model in models}
+        i = L.Const(f"cost!{next(self.counter)}", L.INT)
+        rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
+        sub = ctx.sub(rng, quiet=True, binders=ctx.binders + (i,))
+        sub.bound[elem] = seq.at(i)
+        local = ctx.state.copy()
+        for key in set(ir.RESOURCE_KEYS.values()):
+            local.env[key] = L.ZERO
+        sub.state = local
+        accepted = self.ev(cond, sub) if cond is not None else None
+        cond_costs = self.resource_state(sub)
+        for key in cond_costs:
+            local.env[key] = L.ZERO
+        self.ev(body, sub)
+        body_costs = self.resource_state(sub)
+        sums: dict[str, L.Term] = {}
+        for model in models:
+            key = ir.RESOURCE_KEYS[model]
+            body_cost = body_costs[key]
+            if accepted is not None:
+                body_cost = L.ite(accepted, body_cost, L.ZERO)
+            callback_cost = L.add(cond_costs[key], body_cost)
+            if callback_cost == L.ZERO:
+                sums[model] = L.ZERO
+            elif not isinstance(seq.len, L.IntV) and (bound := self.comprehension_resource_bound(body, cond, model)) is not None:
+                sums[model] = self.bounded_resource_delta(ctx, f"comp_{model}", L.mul(seq.len, bound))
+            elif isinstance(seq.len, L.IntV):
+                total = L.ZERO
+                for index in range(seq.len.value):
+                    total = L.add(total, L.substitute(callback_cost, {i: L.IntV(index)}))
+                sums[model] = total
+            else:
+                values, assume = self.defined_symbol(ctx, f"comp_cost_{model}@{next(self.counter)}", L.ARRAY(L.INT))
+                assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(values, i), callback_cost)), patterns=((L.select(values, i),),)))
+                self.theory_fns.add("seqsum")
+                sums[model] = L.Fn("seqsum", (values, L.ZERO, seq.len), L.INT)
+        return sums
+
+    def bounded_resource_delta(self, ctx: Ctx, name: str, upper: L.Term) -> L.Term:
+        """An abstract aggregate cost constrained by a proved upper bound."""
+        stem = f"{name}@{next(self.counter)}"
+        amount: L.Term = L.Fn(stem, ctx.binders, L.INT) if ctx.binders else L.Const(stem, L.INT)
+        assume = ctx.assume_for_all_binders if ctx.binders else ctx.assume
+        assume(L.and_(L.le(L.ZERO, amount), L.le(amount, upper)))
+        return amount
+
+    def comprehension_resource_bound(self, body: ir.Expr, cond: ir.Expr | None, model: str) -> L.Term | None:
+        """Upper-bound one callback's resource use from checked callee summaries."""
+        model = "alloc" if model == "peak" else model
+        exprs = [body] + ([cond] if cond is not None else [])
+        calls = [node for expr in exprs for node in ir.walk_expr(expr) if isinstance(node, ir.Call)]
+        if any(isinstance(node, (ir.Extern, ir.New)) for expr in exprs for node in ir.walk_expr(expr)):
+            return None
+        if model == "alloc" and any(
+            isinstance(node, ir.ListLit)
+            or isinstance(node, ir.Builtin) and node.name in ("slice", "list_concat", "list_repeat", "dict_copy", "comp", "str_of_int")
+            for expr in exprs
+            for node in ir.walk_expr(expr)
+        ):
+            return None
+        limits: list[int] = []
+        for call in calls:
+            target = self.program.resolve(self.module, call.func)
+            if target is None:
+                return None
+            found: list[int] = []
+            for clause in target.fn.ensures:
+                for part in self.resource_parts(clause.expr):
+                    if not isinstance(part, ir.Binary) or part.op not in ("<=", "le"):
+                        continue
+                    lhs = part.left
+                    if (
+                        isinstance(lhs, ir.Builtin)
+                        and lhs.name == "cost"
+                        and lhs.args
+                        and isinstance(lhs.args[0], ir.Lit)
+                        and lhs.args[0].value == model
+                        and isinstance(part.right, ir.Lit)
+                        and isinstance(part.right.value, int)
+                        and part.right.value >= 0
+                    ):
+                        found.append(part.right.value)
+            if not found:
+                return None
+            limits.append(max(found))
+        steps = sum(1 for expr in exprs for _ in ir.walk_expr(expr)) if model == "work" else 0
+        return L.IntV(steps + sum(limits))
 
     def same_comp(self, arr: L.Term, b: L.Term, seq: ListVal, i: L.Const, ctx: Ctx) -> L.Term:
         """The array of an earlier comprehension computing the same elements
@@ -2196,9 +2447,15 @@ class VCGen:
 
     def each_element(self, e: ir.Builtin, seq: Val, ctx: Ctx) -> None:
         assert isinstance(seq, ListVal)
+        self.unknown_resource(ctx, "work", "effectful comprehension callback", e.loc)
+        self.unknown_resource(ctx, "alloc", "effectful comprehension callback", e.loc)
         elem_lit = e.args[1]
         assert isinstance(elem_lit, ir.Lit)
         elem, _, idx = str(elem_lit.value).partition(",")  # "x" or "x,i": the element and its index
+        body, cond = e.args[2], (e.args[3] if len(e.args) > 3 else None)
+        body_steps = L.IntV(sum(1 for _ in ir.walk_expr(body)))
+        cond_steps = L.IntV(sum(1 for _ in ir.walk_expr(cond))) if cond is not None else L.ZERO
+        self.charge_resource(ctx, "work", L.add(seq.len, L.mul(seq.len, L.add(body_steps, cond_steps))))
         i = L.Const(f"{elem}!{next(self.counter)}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
         binds: dict[str, Val] = {elem: seq.at(i)}
@@ -2248,6 +2505,9 @@ class VCGen:
     def quant_each(self, e: ir.Quant, ctx: Ctx) -> Val:
         """``all``/``any`` in code over a body with effects: an unknown truth
         value, and the body's obligations and effects for every element."""
+        self.unknown_resource(ctx, "work", "short-circuit quantifier callback", e.loc)
+        self.unknown_resource(ctx, "alloc", "short-circuit quantifier callback", e.loc)
+        self.unknown_resource(ctx, "external_calls", "short-circuit quantifier callback", e.loc)
         n = next(self.counter)
         if e.seq is not None and isinstance(e.seq.ty, ir.TDict):
             d = self.ev(e.seq, ctx)
@@ -2275,6 +2535,7 @@ class VCGen:
         r = self.fresh("comprehension", e.ty)
         if isinstance(r, ListVal):
             ctx.assume(L.le(L.ZERO, r.len))
+            self.charge_resource(ctx, "alloc", r.len)
         return r
 
     def _effectful(self, e: ir.Expr) -> bool:
@@ -2284,7 +2545,7 @@ class VCGen:
                 return True
             if isinstance(sub, ir.Call):
                 tgt = self.program.resolve(self.module, sub.func)
-                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates):
+                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates or self._resource_only_call(tgt.key)):
                     return True
         return False
 
@@ -2296,9 +2557,46 @@ class VCGen:
                 return False
             if isinstance(sub, ir.Call):
                 tgt = self.program.resolve(self.module, sub.func)
-                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates):
+                if tgt is None or not (tgt.key in self.program.definitional or tgt.key in self.program.predicates or self._resource_only_call(tgt.key)):
                     return False
         return True
+
+    def _resource_only_call(self, key: str) -> bool:
+        """A cost-annotated pure helper can be evaluated through its contract.
+
+        Resource contracts keep these functions out of logical definitions,
+        but a comprehension may still compose their checked result and cost
+        summaries element by element.
+        """
+        ref = self.program.ref(key)
+        fn = ref.fn
+        has_cost = any(
+            isinstance(node, ir.Builtin) and node.name == "cost"
+            for clause in fn.ensures
+            for node in ir.walk_expr(clause.expr)
+        )
+        return (
+            has_cost
+            and not fn.raises
+            and not self.program.mutated.get(key)
+            and not self.program.heap_writes.get(key)
+            and not fn.unsupported
+            and not any(
+                isinstance(stmt, (ir.While, ir.ForEach, ir.ForRange, ir.Append, ir.IndexAssign, ir.FieldAssign, ir.DictDel, ir.Raise, ir.Unsupported, ir.ExprStmt))
+                for stmt in ir.walk_stmts(fn.body)
+            )
+            and all(
+                not isinstance(node, (ir.Extern, ir.New))
+                and (
+                    not isinstance(node, ir.Call)
+                    or (target := self.program.resolve(ref.module, node.func)) is not None
+                    and target.key in self.program.definitional | self.program.predicates
+                )
+                for stmt in ir.walk_stmts(fn.body)
+                for expr in ir.stmt_exprs(stmt)
+                for node in ir.walk_expr(expr)
+            )
+        )
 
     def await_havoc(self, ctx: Ctx, loc: ir.Loc) -> None:
         """Other tasks run while this one awaits: objects that existed when
@@ -2309,7 +2607,7 @@ class VCGen:
             return
         self.note(loc, "objects created during this call are not shared with concurrent tasks")
         alloc0 = self.entry["@alloc"]
-        for key in [k for k in env if k.startswith("@") and k != "@alloc"]:
+        for key in [k for k in env if k.startswith("@") and k != "@alloc" and k not in ir.RESOURCE_KEYS.values()]:
             old = env[key]
             assert isinstance(old, L.Term)
             new = L.Const(f"{key[1:]}@await{loc.line}.{next(self.counter)}", old.sort)
@@ -2378,6 +2676,9 @@ class VCGen:
                     self.note(e.loc, "unchecked code leaves objects satisfying their class invariants")
                 if any(d.lifecycles for d in self.program.classes.values()):
                     self.note(e.loc, "unchecked code changes objects only as their lifecycles allow")
+        self.charge_resource(ctx, "external_calls", L.ONE)
+        for model in ("work", "alloc"):
+            self.unknown_resource(ctx, model, f"unchecked call '{e.name}'", e.loc)
         r = self.fresh(f"{e.name.split('.')[-1]}()", e.ty) if e.ty != ir.NONE else NONE_V
         if isinstance(r, ListVal):
             ctx.assume(L.le(L.ZERO, r.len))
@@ -2396,7 +2697,7 @@ class VCGen:
         assert ctx.state is not None
         env = ctx.state.env
         alloc0, alloc_now = self.entry.get("@alloc"), env["@alloc"]
-        for key in [k for k in env if k.startswith("@") and k != "@alloc"]:
+        for key in [k for k in env if k.startswith("@") and k != "@alloc" and k not in ir.RESOURCE_KEYS.values()]:
             old = env[key]
             assert isinstance(old, L.Term)
             env[key] = L.Const(f"{key[1:]}@{next(self.counter)}", old.sort)
@@ -2482,10 +2783,11 @@ class VCGen:
         heap_pre = self.heap_env(ctx.env) if ctx.state is None else self.heap_env(ctx.state.env)
         predicate = callee.key in self.program.predicates
         definitional = callee.key in self.program.definitional or predicate
-        if ctx.spec and not definitional:
+        contractual = self._resource_only_call(callee.key)
+        if ctx.spec and not (definitional or contractual):
             raise VCError(f"specs may only call pure (loop-free, mutation-free) functions; '{fn.name}' is not", loc)
         # Callee preconditions (which may read object fields).
-        cctx = Ctx(base=ctx.base, env={**heap_pre, **pmap}, module=callee.module, guard=ctx.guard, spec=True, quiet=True)
+        cctx = Ctx(base=ctx.base, env={**heap_pre, **pmap, **{key: L.ZERO for key in ir.RESOURCE_KEYS.values()}}, module=callee.module, guard=ctx.guard, spec=True, quiet=True)
         for rq in fn.requires:
             g = self.ev(rq.expr, cctx)
             self.oblige("call", ctx, g, loc, f"call to '{fn.name}' satisfies '@requires {rq.text}'", clause=rq)
@@ -2520,11 +2822,28 @@ class VCGen:
         post = dict(pmap)
         if ctx.state is not None and not ctx.spec:
             post.update(self.call_effects(callee, args, arg_exprs, ctx, new_self))
+            if self.resource_tracking:
+                for model in ir.RESOURCE_STATE_MODELS:
+                    key = ir.RESOURCE_KEYS[model]
+                    name = f"{model}_{fn.name}@{next(self.counter)}"
+                    delta: L.Term = L.Fn(name, ctx.binders, L.INT) if ctx.binders else L.Const(name, L.INT)
+                    assume = ctx.assume_for_all_binders if ctx.binders else ctx.assume
+                    assume(L.le(L.ZERO, delta))
+                    post[key] = delta
+                    self.charge_resource(ctx, model, delta)
         # Assume the postcondition (code context; spec calls use lemma axioms).
-        if not ctx.spec and fn.ensures and not self.definitional_mode and not predicate:
+        if (not ctx.spec or contractual) and fn.ensures and not predicate:
             ectx = Ctx(base=ctx.base, env=post, module=callee.module, guard=ctx.guard, old_env={**heap_pre, **pmap}, result=r if r is not NONE_V else None, spec=True, quiet=True)
             for en in fn.ensures:
-                ctx.assume(self.ev(en.expr, ectx))
+                has_cost = any(isinstance(x, ir.Builtin) and x.name == "cost" for x in ir.walk_expr(en.expr))
+                if has_cost and not self.resource_tracking:
+                    continue
+                if ctx.spec and contractual and has_cost:
+                    continue
+                if self.definitional_mode:
+                    continue
+                assume = ctx.assume_for_all_binders if ctx.binders else ctx.assume
+                assume(self.ev(en.expr, ectx))
         return r
 
     def call_effects(self, callee: FuncRef, args: list[Val], arg_exprs: list[ir.Expr | None], ctx: Ctx, new_self: bool = False, returned: bool = True) -> dict[str, Val]:
@@ -2590,7 +2909,28 @@ class VCGen:
             self.deps.add(callee.key)
             exprs: list[ir.Expr | None] = [None if isinstance(a, ir.Var) and a.name in ctx.bound else a for a in c.args]
             self.call_effects(callee, args, exprs, ctx, new_self=callee.fn.name.endswith(".__init__"), returned=False)
+            if self.resource_tracking:
+                post = {ir.RESOURCE_KEYS[model]: self.fresh(f"raised_{model}_{callee.fn.name}", ir.INT) for model in ir.RESOURCE_STATE_MODELS}
+                for model in ir.RESOURCE_STATE_MODELS:
+                    key = ir.RESOURCE_KEYS[model]
+                    delta = post[key]
+                    assert isinstance(delta, L.Term)
+                    ctx.assume(L.le(L.ZERO, delta))
+                    self.charge_resource(ctx, model, delta)
+                ectx = Ctx(base=ctx.base, env={**{p.name: a for p, a in zip(callee.fn.params, args)}, **post}, module=callee.module, spec=True, quiet=True)
+                for en in callee.fn.ensures:
+                    parts = self.resource_parts(en.expr)
+                    if parts and not callee.fn.trusted:
+                        ctx.assume(L.and_(*(self.ev(part, ectx) for part in parts)))
         return NONE_V
+
+    @staticmethod
+    def resource_parts(expr: ir.Expr) -> list[ir.Expr]:
+        if isinstance(expr, ir.Binary) and expr.op == "and":
+            return VCGen.resource_parts(expr.left) + VCGen.resource_parts(expr.right)
+        if any(isinstance(x, ir.Builtin) and x.name == "cost" for x in ir.walk_expr(expr)):
+            return [expr]
+        return []
 
     def unfold(self, callee: FuncRef, pmap: dict[str, Val], r: L.Term, ctx: Ctx, loc: ir.Loc) -> None:
         """A trusted predicate's '@ensures' at this one application, as a

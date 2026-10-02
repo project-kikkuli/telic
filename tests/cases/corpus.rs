@@ -639,3 +639,17 @@ pub fn clamped(x: u32) -> u32 {
     //@ ensures result <= 10
     units::clamp(x, 10)
 }
+
+// expect: proved
+pub fn short_circuit_and_skipped(x: bool) -> bool {
+    //@ requires !x
+    //@ ensures cost("work") == 3
+    x && true
+}
+
+// expect: proved
+pub fn short_circuit_and_executed(x: bool) -> bool {
+    //@ requires x
+    //@ ensures cost("work") == 4
+    x && true
+}

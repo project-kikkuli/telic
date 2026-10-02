@@ -2532,6 +2532,10 @@ class ExprLowerer:
             if len(n.args) != 2:
                 raise self.err("implies() takes two arguments", n)
             return ir.Binary(ir.BOOL, loc, "implies", self.cond(n.args[0]), self.cond(n.args[1]))
+        if self.spec and name == "cost":
+            if len(n.args) != 1 or n.keywords or not isinstance(n.args[0], ast.Constant) or not isinstance(n.args[0].value, str):
+                raise self.err("cost() takes one literal model name", n)
+            return ir.Builtin(ir.INT, loc, "cost", (ir.Lit(ir.STR, loc, n.args[0].value),))
         if name in ("all", "any"):
             return self.quant(n, loc, "forall" if name == "all" else "exists")
         if name == "len":

@@ -101,6 +101,7 @@ TRUE_HELPERS = {
     "cb1.rs": {"pos"},
     "cb1.swift": {"pos"},
     "t45.py": {"Base.__init__", "Base.m"},
+    "resource_shortcircuit.py": {"right", "bounded_callback", "callback_upper", "any_upper", "membership_singleton"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.

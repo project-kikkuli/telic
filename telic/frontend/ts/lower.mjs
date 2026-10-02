@@ -2835,6 +2835,10 @@ class FunctionLowerer {
       const a = this.cond(args[0]), b = this.withTags(this.tagFacts(args[0]).pos, () => this.cond(args[1]));
       return { e: "Binary", ty: BOOL, loc, op: "implies", left: a, right: b };
     }
+    if (this.spec && name === "cost") {
+      if (args.length !== 1 || !ts.isStringLiteral(args[0])) throw this.err("cost() takes one literal model name", this.nline(n));
+      return { e: "Builtin", ty: INT, loc, name: "cost", args: [{ e: "Lit", ty: STR, loc, value: args[0].text }] };
+    }
     if (this.spec && name === "sum") {
       const x = this.expr(args[0]);
       if (x.ty.k !== "list" || !isNum(x.ty.elem)) throw this.err("sum() needs an array of numbers", this.nline(n));

@@ -1027,7 +1027,7 @@ class ExprLowerer:
             lo, hi = self.hoist_var(lo), self.hoist_var(hi)
             ok = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), lo), ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", lo, hi), ir.Binary(ir.BOOL, loc, "le", hi, ir.Builtin(ir.INT, loc, "len", (b,)))))
             self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", ok, loc, "slice range is within bounds"), native=True))
-        return self.elems_kinded(ir.Builtin(b.ty, loc, "slice", (b, lo, hi)), self.kind_of_elems(b))
+        return self.elems_kinded(ir.Builtin(b.ty, loc, "slice_view", (b, lo, hi)), self.kind_of_elems(b))
 
     # -- calls -------------------------------------------------------------------------
 
@@ -1131,6 +1131,13 @@ class ExprLowerer:
     def builtin_call(self, name: str, args: list[tuple[str | None, X]], x: X, expect: Any, kind: Any) -> ir.Expr:
         loc = self.loc(x)
         vals = lambda: [a for _, a in args]  # noqa: E731
+        if self.spec and name == "cost":
+            if len(args) != 1:
+                raise self.err("cost() takes one literal model name", x)
+            model = self.expr(args[0][1], ir.STR)
+            if not isinstance(model, ir.Lit) or not isinstance(model.value, str):
+                raise self.err("cost() takes one literal model name", x)
+            return ir.Builtin(ir.INT, loc, "cost", (model,))
         if name in ("min", "max") and len(args) >= 2:
             es = [self.expr(a, expect, kind) for a in vals()]
             ty = es[0].ty
@@ -1676,7 +1683,7 @@ class ExprLowerer:
             bv = self.hoist_var(b)
             ln = ir.Builtin(ir.INT, loc, "len", (bv,))
             self._bounds(ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), i), ir.Binary(ir.BOOL, loc, "le", i, ln)), "insert position is within 0...count", loc)
-            new = ir.Builtin(t, loc, "list_concat", (ir.Builtin(t, loc, "list_append", (ir.Builtin(t, loc, "slice", (bv, ir.Lit(ir.INT, loc, 0), i)), v)), ir.Builtin(t, loc, "slice", (bv, i, ln))))
+            new = ir.Builtin(t, loc, "list_concat", (ir.Builtin(t, loc, "list_append", (ir.Builtin(t, loc, "slice_view", (bv, ir.Lit(ir.INT, loc, 0), i)), v)), ir.Builtin(t, loc, "slice_view", (bv, i, ln))))
             return self.list_update(base_x, bv, lambda cur: new, x)
         if m in ("removeLast", "removeFirst", "remove", "popLast") and (not args or m == "remove" and labels == ["at"]):
             bv = self.hoist_var(b)
@@ -1694,13 +1701,13 @@ class ExprLowerer:
                 r = self.fl.fresh("pop", ot)
                 new_n = self.fl.fresh("popped", t)
                 nonempty = ir.Binary(ir.BOOL, loc, "gt", ln, ir.Lit(ir.INT, loc, 0))
-                self.pre.append(ir.If(loc, nonempty, (ir.Assign(loc, r, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, bv, i, wrap=False),))), ir.Assign(loc, new_n, ir.Builtin(t, loc, "slice", (bv, ir.Lit(ir.INT, loc, 0), i)))), (ir.Assign(loc, r, ir.Lit(ot, loc, None)), ir.Assign(loc, new_n, bv))))
+                self.pre.append(ir.If(loc, nonempty, (ir.Assign(loc, r, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, bv, i, wrap=False),))), ir.Assign(loc, new_n, ir.Builtin(t, loc, "slice_view", (bv, ir.Lit(ir.INT, loc, 0), i)))), (ir.Assign(loc, r, ir.Lit(ot, loc, None)), ir.Assign(loc, new_n, bv))))
                 self.list_update(base_x, bv, lambda cur: ir.Var(t, loc, new_n), x)
                 if ek:
                     self.fl.kinds[r] = ek
                 return ir.Var(ot, loc, r)
             got = self.hoist(ir.Index(t.elem, loc, bv, i, wrap=False))
-            new = ir.Builtin(t, loc, "list_concat", (ir.Builtin(t, loc, "slice", (bv, ir.Lit(ir.INT, loc, 0), i)), ir.Builtin(t, loc, "slice", (bv, ir.Binary(ir.INT, loc, "add", i, ir.Lit(ir.INT, loc, 1)), ln))))
+            new = ir.Builtin(t, loc, "list_concat", (ir.Builtin(t, loc, "slice_view", (bv, ir.Lit(ir.INT, loc, 0), i)), ir.Builtin(t, loc, "slice_view", (bv, ir.Binary(ir.INT, loc, "add", i, ir.Lit(ir.INT, loc, 1)), ln))))
             self.list_update(base_x, bv, lambda cur: new, x)
             return self.ranged(got, ek) if t.elem == ir.INT else got
         if m == "removeAll" and not args:
@@ -1744,7 +1751,7 @@ class ExprLowerer:
         lo, hi = int_range(kind)
         k = f"k${self._tick()}"
         bv = self.hoist_var(b)
-        part = ir.Binary(ir.INT, loc, "add", init, ir.Builtin(ir.INT, loc, "sum", (ir.Builtin(bv.ty, loc, "slice", (bv, ir.Lit(ir.INT, loc, 0), ir.Var(ir.INT, loc, k))),)))
+        part = ir.Binary(ir.INT, loc, "add", init, ir.Builtin(ir.INT, loc, "sum", (ir.Builtin(bv.ty, loc, "slice_view", (bv, ir.Lit(ir.INT, loc, 0), ir.Var(ir.INT, loc, k))),)))
         fits = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, lo), part), ir.Binary(ir.BOOL, loc, "le", part, ir.Lit(ir.INT, loc, hi)))
         q = ir.Quant(ir.BOOL, loc, "forall", k, ir.Lit(ir.INT, loc, 1), ir.Binary(ir.INT, loc, "add", ir.Builtin(ir.INT, loc, "len", (bv,)), ir.Lit(ir.INT, loc, 1)), fits)
         self.pre.append(ir.AssertStmt(loc, ir.Clause("assert", q, loc, f"{kind} running total does not overflow"), native=True))
