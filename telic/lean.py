@@ -588,7 +588,13 @@ class LeanOutcome:
     errors: list[str] = field(default_factory=list)
 
 
-def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = None, auto: bool = True) -> None:
+def _lean_receipt_key(statement: str, identity: Any) -> str:
+    source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    payload = json.dumps([statement, identity, source], sort_keys=True)
+    return "lean:" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto: bool = True) -> None:
     """Try Lean on every 'unknown' verdict of one function report."""
     lean = find_lean()
     unknown = [v for v in rep.verdicts if v.status == "unknown"]
@@ -598,13 +604,16 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
         for v in unknown:
             v.lean = LeanOutcome("unavailable", "Lean 4 not found (set TELIC_LEAN or put 'lean' on PATH)")
         return
+    from .toolchain import lean as lean_identity
+
+    identity = lean_identity()
     root = root or getattr(program, "root", os.getcwd())
     src = rep.ref.module.path
     side = sidecar_path(os.path.join(root, src) if not os.path.isabs(src) else src)
     stored = read_sidecar(side)
     if not auto and not stored:
         return
-    attempts: list[tuple[Any, Attempt, str, str]] = []  # (verdict, attempt, hash, source)
+    attempts: list[tuple[Any, Attempt, str, str, str]] = []  # (verdict, attempt, hash, source, cache key)
     groups: dict[str, list] = {}
     for v in unknown:
         try:
@@ -613,7 +622,7 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
             v.lean = LeanOutcome("unsupported", f"cannot express in Lean: {e}")
             continue
         h = statement_hash(stmt, defs_text)
-        k = key_fn(v.ob, theory)
+        k = _lean_receipt_key(h, identity)
         sp = stored.get(v.ob.id)
         if sp is None or sp.hash != h:
             # The obligation id carries line numbers; a proof whose statement
@@ -623,7 +632,9 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
             if moved:
                 sp = moved[0]
         hit = cache.get(k)
-        if hit is not None and hit.get("method", "").startswith("lean") and (sp is None or hit.get("proof_hash") == _phash(sp.proof)):
+        valid = hit is not None and hit.get("method") == "lean:auto"
+        valid = valid or hit is not None and hit.get("method") == "lean:proof" and sp is not None and sp.hash == h and hit.get("proof_hash") == _phash(sp.proof)
+        if valid:
             v.status = "proved"
             v.method = "cache"
             v.reason = hit["method"]
@@ -634,18 +645,18 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
             # still try automation below
         name = theorem_name(v.ob)
         if sp is not None and sp.hash == h:
-            attempts.append((v, Attempt(name, stmt, sp.proof), h, "sidecar"))
+            attempts.append((v, Attempt(name, stmt, sp.proof), h, "sidecar", k))
         else:
             if not auto:
                 continue
             tactics = "first\n  | " + "\n  | ".join(AUTO_TACTICS + _def_tactics(theory, v.ob))
-            attempts.append((v, Attempt(name, stmt, tactics), h, "auto"))
+            attempts.append((v, Attempt(name, stmt, tactics), h, "auto", k))
         groups.setdefault(defs_text, []).append(len(attempts) - 1)
     for defs_text, idxs in groups.items():
         batch = [attempts[i][1] for i in idxs]
         results, _ = check_attempts(lean, validated_defs(lean, defs_text), batch)
         for i, res in zip(idxs, results):
-            v, at, h, how = attempts[i]
+            v, at, h, how, k = attempts[i]
             if res.ok:
                 method = "lean:proof" if how == "sidecar" else "lean:auto"
                 v.status = "proved"
@@ -654,7 +665,7 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
                 entry = {"method": method}
                 if how == "sidecar":
                     entry["proof_hash"] = _phash(at.proof)
-                cache.put(key_fn(v.ob, theory), entry)
+                cache.put(k, entry)
             else:
                 prev = v.lean
                 if prev is not None and prev.status == "stale":

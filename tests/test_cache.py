@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from telic.checker import CheckOptions, check
+from telic.checker import CheckOptions, check, obligation_key
 from telic.engine import binary
 
 SRC = """
@@ -38,6 +38,125 @@ def test_second_run_is_fully_cached(tmp_path):
     assert r1.solved > 0 and r2.solved == 0 and r2.cache_hits == r1.cache_hits + r1.solved
 
 
+def test_mathematical_receipts_survive_an_unrelated_kernel_fingerprint_change(tmp_path, monkeypatch):
+    import telic.checker as checker
+
+    (tmp_path / "m.py").write_text(SRC)
+    opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), receipts=False, infer=False, lean=False)
+    monkeypatch.setattr(checker, "toolchain_id", lambda: "kernel-a")
+    first = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+    monkeypatch.setattr(checker, "toolchain_id", lambda: "kernel-b")
+    second = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+    assert first.solved > 0 and second.solved == 0
+    assert second.cache_hits >= first.solved
+
+
+def test_mathematical_receipts_bind_resource_budget(tmp_path):
+    (tmp_path / "m.py").write_text(SRC)
+    path = str(tmp_path / ".telic/cache.json")
+    first = check([str(tmp_path / "m.py")], CheckOptions(cache_path=path, receipts=False, infer=False, lean=False, rlimit=2_000_000), root=str(tmp_path))
+    second = check([str(tmp_path / "m.py")], CheckOptions(cache_path=path, receipts=False, infer=False, lean=False, rlimit=1_900_000), root=str(tmp_path))
+    assert first.solved > 0 and second.solved > 0
+
+
+def test_mathematical_receipts_bind_timeout_budget(tmp_path):
+    (tmp_path / "m.py").write_text(SRC)
+    path = str(tmp_path / ".telic/cache.json")
+    first = check([str(tmp_path / "m.py")], CheckOptions(cache_path=path, receipts=False, infer=False, lean=False, timeout_ms=60000), root=str(tmp_path))
+    second = check([str(tmp_path / "m.py")], CheckOptions(cache_path=path, receipts=False, infer=False, lean=False, timeout_ms=59000), root=str(tmp_path))
+    assert first.solved > 0 and second.solved > 0
+
+
+def test_mathematical_receipts_bind_selected_python_z3_library(tmp_path, monkeypatch):
+    import telic.toolchain as toolchain
+
+    (tmp_path / "m.py").write_text(SRC)
+    opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), receipts=False, infer=False, lean=False)
+    monkeypatch.setattr(toolchain, "python_z3", lambda: ("z3", "library-a"))
+    first = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+    monkeypatch.setattr(toolchain, "python_z3", lambda: ("z3", "library-b"))
+    second = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
+    assert first.solved > 0 and second.solved > 0
+
+
+def test_native_mathematical_receipts_bind_selected_z3_executable(tmp_path, monkeypatch):
+    if binary() is None:
+        pytest.skip("telic-core not built")
+    import telic.toolchain as toolchain
+
+    path = tmp_path / "m.py"
+    path.write_text("def m(x: int) -> int:\n    #@ requires x >= 0\n    #@ ensures result >= x\n    return x + 1\n")
+    options = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), receipts=False, infer=False, lean=False, engine="ox", replay=False)
+    monkeypatch.setattr(toolchain, "native_z3", lambda: ("z3", "executable-a"))
+    first = check([str(path)], options, root=str(tmp_path))
+    monkeypatch.setattr(toolchain, "native_z3", lambda: ("z3", "executable-b"))
+    second = check([str(path)], options, root=str(tmp_path))
+    assert first.solved > 0 and second.solved > 0
+
+
+def test_mathematical_receipts_bind_unused_parameter_signature(tmp_path):
+    path = tmp_path / "m.py"
+    cache = str(tmp_path / ".telic/cache.json")
+    options = CheckOptions(cache_path=cache, receipts=False, infer=False, lean=False)
+    path.write_text("def m(x: int) -> int:\n    #@ ensures result == 0\n    return 0\n")
+    first = check([str(path)], options, root=str(tmp_path))
+    path.write_text("def m(x: bool) -> int:\n    #@ ensures result == 0\n    return 0\n")
+    second = check([str(path)], options, root=str(tmp_path))
+    assert first.solved > 0 and second.solved > 0
+
+
+@pytest.mark.parametrize("engine", ["python", "ox"])
+def test_mathematical_receipts_bind_unused_record_field_sorts(tmp_path, engine):
+    if engine == "ox" and binary() is None:
+        pytest.skip("telic-core not built")
+    path = tmp_path / "m.py"
+    cache = str(tmp_path / ".telic/cache.json")
+    options = CheckOptions(cache_path=cache, receipts=False, infer=False, lean=False, engine=engine, replay=False)
+    prefix = "class Box:\n    def __init__(self):\n        self.value: int = 0\n"
+    suffix = "\ndef read(box: Box) -> int:\n    #@ ensures result == 0\n    return 0\n"
+    path.write_text(prefix + "        self.unused: int = 1\n" + suffix)
+    first = check([str(path)], options, root=str(tmp_path))
+    path.write_text(prefix + "        self.unused: bool = True\n" + suffix)
+    second = check([str(path)], options, root=str(tmp_path))
+    read = next(f for f in second.functions if f.fn.name == "read")
+    assert first.solved > 0 and any(v.method == "z3" for v in read.verdicts)
+
+
+def test_mathematical_receipts_bind_reachable_theory_axioms():
+    from telic import ir, logic as L
+    from telic.checker import Theory
+    from telic.vcgen import Obligation
+
+    call = L.Fn("f", (L.ONE,), L.INT)
+    ob = Obligation(id="axiom", func="f", kind="test", loc=ir.Loc(1), site=None, message="", hyps=[], goal=L.eq(call, L.ONE))
+    positive = Theory(axioms=[L.Axiom("f_rule", L.eq(call, L.ONE), "", symbol="f")])
+    negative = Theory(axioms=[L.Axiom("f_rule", L.eq(call, L.ZERO), "", symbol="f")])
+    assert obligation_key(ob, positive, 2_000_000) != obligation_key(ob, negative, 2_000_000)
+
+
+def test_unknown_solver_results_are_not_persisted_as_math_receipts(tmp_path, monkeypatch):
+    import telic.checker as checker
+    from telic.smt import SmtResult
+
+    (tmp_path / "m.py").write_text(SRC)
+    cache_path = tmp_path / ".telic/cache.json"
+    options = CheckOptions(cache_path=str(cache_path), receipts=False, infer=False, lean=False, replay=False)
+    monkeypatch.setattr(checker, "solve_all", lambda obs, *args: [SmtResult("unknown", 0.0, reason="resource limit") for _ in obs])
+    first = check([str(tmp_path / "m.py")], options, root=str(tmp_path))
+    second = check([str(tmp_path / "m.py")], options, root=str(tmp_path))
+    assert first.solved > 0 and second.solved == first.solved
+    assert all(value.get("method") != "unknown" for value in checker.ProofCache(str(cache_path)).data.values())
+
+
+def test_lean_receipts_have_a_separate_statement_and_solver_key():
+    from telic.lean import _lean_receipt_key
+
+    first = _lean_receipt_key("statement-a", ("Lean 4", "binary-a"))
+    assert first.startswith("lean:")
+    assert first != _lean_receipt_key("statement-b", ("Lean 4", "binary-a"))
+    assert first != _lean_receipt_key("statement-a", ("Lean 4", "binary-b"))
+
+
 @pytest.mark.parametrize("variable", ["TELIC_Z3", "TELIC_LEAN", "TELIC_CORE"])
 def test_toolchain_receipts_bind_solver_overrides(tmp_path, monkeypatch, variable):
     import telic.checker as checker
@@ -65,7 +184,7 @@ def test_python_z3_identity_hashes_loaded_library(monkeypatch, tmp_path):
     assert python_z3()[1] == hashlib.sha256(Path(loaded._name).read_bytes()).hexdigest()
 
 
-def test_each_check_refreshes_selected_tool_identity(tmp_path, monkeypatch):
+def test_lean_replacement_keeps_mathematical_receipts(tmp_path, monkeypatch):
     monkeypatch.delenv("TELIC_LEAN", raising=False)
     opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), lean=False)
     solved = []
@@ -75,7 +194,7 @@ def test_each_check_refreshes_selected_tool_identity(tmp_path, monkeypatch):
         executable.chmod(0o755)
         monkeypatch.setenv("TELIC_LEAN", str(executable))
         solved.append(run(tmp_path, SRC).solved)
-    assert solved[0] > 0 and solved[1] == solved[0]
+    assert solved[0] > 0 and solved[1] == 0
 
 
 def test_editing_a_body_rechecks_only_that_body(tmp_path):

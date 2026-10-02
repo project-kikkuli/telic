@@ -87,11 +87,14 @@ def _calls(fn: ir.Function, extra: list[ir.Clause]) -> set[str]:
 
 
 def request(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_ms: int, rlimit: int, jobs: int | None) -> tuple[dict[str, Any], irjson.TermWriter]:
+    from .checker import _math_schema
+
     extra_by_key = {ref.key: [c for cs in opts.extra_invariants.values() for c in cs] for ref, opts in tasks}
     req, tw = _base(program, theory, extra_by_key, timeout_ms, rlimit, jobs)
     req["tasks"] = [
         {
             "key": ref.key,
+            "schema": _math_schema(program, ref),
             "options": {
                 "extra_invariants": {str(line): [irjson.clause(c) for c in cs] for line, cs in opts.extra_invariants.items()},
                 "variants": {str(line): irjson.expr(e) for line, e in opts.variants.items()},

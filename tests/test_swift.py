@@ -51,7 +51,8 @@ def expectations(path: Path) -> dict[str, str]:
 
 @pytest.fixture(scope="module")
 def report():
-    rep = check([str(CORPUS)], CheckOptions(cache_path=None, lean=False), root=str(CORPUS.parent))
+    cache = Path(__file__).resolve().parent.parent / ".telic" / "cache.json"
+    rep = check([str(CORPUS)], CheckOptions(cache_path=str(cache), lean=False, receipts=False), root=str(CORPUS.parent))
     return rep, {f.fn.name: f for f in rep.functions}
 
 

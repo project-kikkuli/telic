@@ -498,6 +498,12 @@ def unchecked_json(enc: Z3Encoder, model: z3.ModelRef, t: L.Term, depth: int) ->
 # it and reading a model; wall-clock time is only a safety net.
 RLIMIT = 2_000_000
 SEED = 0
+_PYTHON_SOLVER_ID: tuple[str, str] | None = None
+
+
+def refresh_query_identity() -> None:
+    global _PYTHON_SOLVER_ID
+    _PYTHON_SOLVER_ID = None
 
 
 def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int = RLIMIT) -> SmtResult:
@@ -525,6 +531,40 @@ def solve(ob: Obligation, theory: Theory, timeout_ms: int = 60000, rlimit: int =
             if again.status == "proved":
                 return again
     return res
+
+
+def query_fingerprint(ob: Obligation, theory: Theory, timeout_ms: int, rlimit: int) -> str:
+    """Identify the exact encoded queries whose UNSAT result can prove ob."""
+    import hashlib
+
+    terms = list(ob.hyps) + [ob.goal]
+    with_lemmas = theory.closure(terms, ob.exclude_axioms, lemmas=True)
+    without = theory.closure(terms, ob.exclude_axioms, lemmas=False)
+    stages = [(with_lemmas, rlimit)] if len(with_lemmas[1]) == len(without[1]) else [(without, rlimit // 10), (with_lemmas, rlimit)]
+    material = [f"timeout={timeout_ms};rlimit={rlimit};seed={SEED}", repr(ob.inputs)]
+    for (defs, axioms), budget in stages:
+        variants = [(defs, axioms, budget)]
+        if any(d.recursive for d in defs):
+            opaque = [dataclasses.replace(d, body=None) if d.recursive else d for d in defs]
+            variants.append((opaque, axioms, budget))
+        for stage_defs, stage_axioms, stage_budget in variants:
+            material.append(f"stage-rlimit={stage_budget}")
+            enc = Z3Encoder(stage_defs, stage_budget)
+            solver = z3.Solver(ctx=enc.ctx)
+            solver.set("random_seed", SEED)
+            for ax in stage_axioms:
+                solver.add(enc.term(ax.formula))
+            for hyp in ob.hyps:
+                solver.add(enc.term(hyp))
+            solver.add(z3.Not(enc.term(ob.goal)))
+            material.append(solver.sexpr())
+    global _PYTHON_SOLVER_ID
+    if _PYTHON_SOLVER_ID is None:
+        from .toolchain import python_z3
+
+        _PYTHON_SOLVER_ID = python_z3()
+    material.append(repr(_PYTHON_SOLVER_ID))
+    return hashlib.sha256("\0".join(material).encode()).hexdigest()[:24]
 
 
 class _Deadline:

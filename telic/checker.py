@@ -276,6 +276,13 @@ class ProofCache:
                 raw = json.loads(Path(path).read_text())
                 if raw.get("version") == self.VERSION:
                     self.data = raw.get("proofs", {})
+                    self.data = {
+                        key: value
+                        for key, value in self.data.items()
+                        if value.get("method") not in ("unknown", "sat")
+                        and (not value.get("method", "").startswith("lean") or key.startswith("lean:"))
+                        and (value.get("method") not in ("z3", "unsat") or key.startswith(("py:", "ox:", "sat:py:")))
+                    }
             except (OSError, ValueError):
                 self.data = {}
         self.used: set[str] = set()
@@ -347,21 +354,6 @@ def restore_receipt(rep: "FunctionReport", r: dict[str, Any]) -> None:
         rep.verdicts.append(Verdict(ob, "proved", "cache", 0.0, reason=o.get("method", "")))
 
 
-_sidecars: dict[str, dict] = {}
-
-
-def sidecar_proof_hash(ref: FuncRef, oid: str, root: str | None) -> str | None:
-    from .lean import _phash, read_sidecar, sidecar_path
-
-    path = ref.module.path
-    full = os.path.join(root or os.getcwd(), path) if not os.path.isabs(path) else path
-    side = sidecar_path(full)
-    if side not in _sidecars:
-        _sidecars[side] = read_sidecar(side)
-    sp = _sidecars[side].get(oid)
-    return _phash(sp.proof) if sp is not None else None
-
-
 def inference_key(program: Program, key: str, rlimit: int) -> str:
     """Inference results depend on a function and everything it calls."""
     from . import __version__
@@ -390,6 +382,9 @@ _TOOLCHAIN: str | None = None
 def refresh_toolchain_id() -> None:
     global _TOOLCHAIN
     _TOOLCHAIN = None
+    from .smt import refresh_query_identity
+
+    refresh_query_identity()
 
 
 def toolchain_id() -> str:
@@ -412,6 +407,11 @@ def toolchain_id() -> str:
         for name in semantic:
             f = pkg / name
             if not f.exists():
+                continue
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+        for f in sorted(pkg.glob("*.py")):
+            if f.name in semantic:
                 continue
             h.update(f.name.encode())
             h.update(f.read_bytes())
@@ -678,15 +678,45 @@ def code_value_calls(program: Program, rep: "FunctionReport") -> None:
             rep.problems.append((f"termination not proved: '{label}' {how}; no '@decreases' bounds recursion through a function value, so call it directly", loc))
 
 
-def obligation_key(ob: Obligation, theory: Theory, rlimit: int) -> str:
-    defs, axioms = theory.closure(list(ob.hyps) + [ob.goal], ob.exclude_axioms)
-    h = hashlib.sha256(f"{toolchain_id()} {rlimit}".encode())
-    h.update(L.canonical(ob.formula()).encode())
-    for d in defs:
-        h.update(f"def {d.name}({' '.join(L.canonical(p) for p in d.params)})={L.canonical(d.body) if d.body else '?'}".encode())
-    for a in axioms:
-        h.update(f"ax {L.canonical(a.formula)}".encode())
-    return h.hexdigest()[:24]
+def _math_schema(program: Program, ref: FuncRef) -> str:
+    from . import irjson
+
+    classes: set[str] = set()
+    pending = [param.ty for param in ref.fn.params] + [ref.fn.ret]
+    while pending:
+        ty = pending.pop()
+        if isinstance(ty, ir.TClass):
+            if ty.name not in classes:
+                classes.add(ty.name)
+                decl = program.classes.get(ty.name)
+                if decl is not None:
+                    pending.extend(field_ty for _, field_ty in decl.fields)
+        elif isinstance(ty, ir.TList):
+            pending.append(ty.elem)
+        elif isinstance(ty, ir.TOption):
+            pending.append(ty.inner)
+        elif isinstance(ty, ir.TDict):
+            pending.extend((ty.key, ty.val))
+        elif isinstance(ty, ir.TRecord):
+            pending.extend(field_ty for _, field_ty in ty.fields)
+    schema = {
+        "params": [[param.name, irjson.ty(param.ty)] for param in ref.fn.params],
+        "return": irjson.ty(ref.fn.ret),
+        "classes": {
+            name: [[field, irjson.ty(ty)] for field, ty in program.classes[name].fields]
+            for name in sorted(classes)
+            if name in program.classes
+        },
+    }
+    return json.dumps(schema, sort_keys=True, separators=(",", ":"))
+
+
+def obligation_key(ob: Obligation, theory: Theory, rlimit: int, timeout_ms: int = 60000, schema: str = "") -> str:
+    """Key mathematical evidence by the complete encoded query and solver."""
+    from .smt import query_fingerprint
+
+    h = hashlib.sha256(f"{query_fingerprint(ob, theory, timeout_ms, rlimit)}\0{schema}".encode()).hexdigest()[:24]
+    return "py:" + h
 
 
 # ---------------------------------------------------------------------------
@@ -784,24 +814,23 @@ class Vacuity:
             if res.status == "proved":
                 self.unsat.append(item)
                 cache.put(key, {"method": "unsat"})
-            elif res.status == "refuted":
-                cache.put(key, {"method": "sat"})
 
     def explain(self, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> dict[str, str]:
         out: dict[str, str] = {}
         for rep, gen in self.unsat:
             fn = rep.fn
+            schema = _math_schema(gen.program, gen.ref)
             classes = sorted({p.ty.name for p in fn.params if isinstance(p.ty, ir.TClass)})
             inv_unsat = False
             if gen.probes_contract:
                 out[rep.ref.key] = f"its @requires and @ensures can never hold together, so every proof that uses '{fn.name}' is vacuous; fix its contract"
                 continue
-            if gen.lemmas and _unsat(_unsat_probe(gen, gen.lemmas), theory, opts, cache):
+            if gen.lemmas and _unsat(_unsat_probe(gen, gen.lemmas), theory, opts, cache, schema):
                 preds = sorted(gen.program.funcs[k].fn.name for k in gen.deps if k in gen.program.predicates)
                 out[rep.ref.key] = f"the @ensures of trusted {', '.join(preds)} cannot hold at every value '{fn.name}' applies {'it' if len(preds) == 1 else 'them'} to, so every claim about '{fn.name}' is vacuous; fix the contract"
                 continue
             if gen.invariant_facts and fn.requires:
-                inv_unsat = _unsat(_unsat_probe(gen, gen.invariant_facts), theory, opts, cache)
+                inv_unsat = _unsat(_unsat_probe(gen, gen.invariant_facts), theory, opts, cache, schema)
             elif gen.invariant_facts:
                 inv_unsat = True
             if inv_unsat:
@@ -814,13 +843,13 @@ class Vacuity:
         return out
 
 
-def _unsat(ob: Obligation, theory: Theory, opts: "CheckOptions", cache: "ProofCache") -> bool:
-    key = "sat:" + obligation_key(ob, theory, opts.rlimit)
+def _unsat(ob: Obligation, theory: Theory, opts: "CheckOptions", cache: "ProofCache", schema: str = "") -> bool:
+    key = "sat:" + obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, schema)
     hit = cache.get(key)
-    if hit is None:
+    if hit is None or hit.get("method") != "unsat":
         res = solve(ob, theory, opts.timeout_ms, opts.rlimit)
-        hit = {"method": {"proved": "unsat", "refuted": "sat"}.get(res.status, "unknown")}
-        if hit["method"] != "unknown":
+        hit = {"method": "unsat" if res.status == "proved" else "sat"}
+        if hit["method"] == "unsat":
             cache.put(key, hit)
     return hit.get("method") == "unsat"
 
@@ -841,16 +870,16 @@ def _unsat_probe(gen: VCGen, facts: list[L.Term]) -> Obligation:
     return Obligation(id=f"{gen.fn.name}/vacuity", func=gen.ref.key, kind="vacuity", loc=gen.fn.loc, site=None, message="the entry state is satisfiable", hyps=list(facts), goal=L.FALSE, exclude_axioms=excl)
 
 
-def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache", rlimit: int) -> Vacuity:
+def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, cache: "ProofCache", rlimit: int, timeout_ms: int) -> Vacuity:
     v = Vacuity()
     for rep, gen in entries:
         lemmas = _body_lemmas(gen)
         if not (gen.fn.requires or gen.invariant_facts or gen.probes_contract or lemmas):
             continue
         ob = _unsat_probe(gen, gen.entry_facts + lemmas)
-        key = "sat:" + obligation_key(ob, theory, rlimit)
+        key = "sat:" + obligation_key(ob, theory, rlimit, timeout_ms, _math_schema(gen.program, gen.ref))
         hit = cache.get(key)
-        if hit is None:
+        if hit is None or hit.get("method") != "unsat":
             v.todo.append(((rep, gen), ob, key))
         elif hit.get("method") == "unsat":
             v.unsat.append((rep, gen))
@@ -906,7 +935,6 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     t0 = t0 or time.perf_counter()
     program = Program.build([m for m in modules if m.language != "aims"])
     selected = program.claimed() if opts.claims_only else set(program.funcs)
-    _sidecars.clear()
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)
     theory, theory_problems = build_theory(program, {})
@@ -1027,18 +1055,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 # without a contract telic only looks for crashes)
                 rep.problems.append(("termination not proved: add '@decreases <measure>' to this loop", ir.Loc(line)))
         for ob in obs:
-            key_ = obligation_key(ob, theory, opts.rlimit)
+            key_ = obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, _math_schema(program, rep.ref))
             hit = cache.get(key_)
-            if hit is not None and hit.get("method") == "unknown":
-                hits += 1
-                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason=f"{hit.get('reason', 'unknown')} (cached)"))
-                continue
-            if hit is not None and hit.get("method") == "lean:proof" and hit.get("proof_hash") != sidecar_proof_hash(ref, ob.id, root):
-                # The sidecar proof was edited or removed: Z3 already failed
-                # on this exact formula, so go straight back to Lean.
-                rep.verdicts.append(Verdict(ob, "unknown", "z3", 0.0, reason="needs Lean"))
-                continue
-            if hit is not None:
+            if hit is not None and hit.get("method") == "z3":
                 if cache.fresh(key_):
                     solved += 1  # a duplicate obligation proved earlier in this run
                 else:
@@ -1107,7 +1126,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     # ones it does not model yet go through the Python core.
     if engine_tasks:
         cached = [k[len(ENGINE_KEY) :] for k, v in cache.data.items() if k.startswith(ENGINE_KEY) and v.get("method") == "z3"]
-        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.rlimit, opts.jobs, cached, f"{toolchain_id()} {opts.rlimit}") or {}
+        from .toolchain import native_z3
+
+        answers = _engine.run(program, theory, [(ref, inf.options) for _, ref, inf, _, _ in engine_tasks], opts.timeout_ms, opts.rlimit, opts.jobs, cached, json.dumps(native_z3(), sort_keys=True)) or {}
         for rep, ref, inf, fkey, ft in engine_tasks:
             a = answers.get(ref.key)
             if a is None or a["status"] != "ok":
@@ -1137,13 +1158,12 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
                 rep.verdicts.append(v)
                 if o["status"] == "proved":
                     cache.put(ENGINE_KEY + o["key"], {"method": "z3"})
-                    cache.put(obligation_key(ob, theory, opts.rlimit), {"method": "z3"})
             staged.append((rep, fkey, ft))
 
     # Solve everything pending at once: each obligation gets its own Z3
     # context, and Z3 releases the GIL while it works, so threads use every
     # core.
-    vacuity = vacuity_checks(entry_checks, theory, cache, opts.rlimit)
+    vacuity = vacuity_checks(entry_checks, theory, cache, opts.rlimit, opts.timeout_ms)
     if pending or vacuity.todo:
         results = solve_all([v.ob for v, _ in pending] + [ob for _, ob, _ in vacuity.todo], theory, opts.timeout_ms, opts.rlimit, opts.jobs)
         vacuity.record(results[len(pending) :], cache)
@@ -1152,8 +1172,6 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
             v.status, v.seconds, v.model, v.state, v.reason = res.status, res.seconds, res.model, res.state, res.reason
             if res.status == "proved":
                 cache.put(key_, {"method": "z3"})
-            elif res.status == "unknown" and not res.reason.startswith("timeout"):
-                cache.put(key_, {"method": "unknown", "reason": res.reason})
 
     # Escalate: counterexamples get executed (each replay is a subprocess,
     # so they run side by side), unknowns go to Lean.
@@ -1172,7 +1190,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if opts.lean and any(v.status == "unknown" for v in rep.verdicts):
             from .lean import escalate
 
-            escalate(program, theory, rep, cache, lambda ob, th: obligation_key(ob, th, opts.rlimit), root=root, auto=opts.lean_auto)
+            escalate(program, theory, rep, cache, root=root, auto=opts.lean_auto)
         if any(v.status == "refuted" for v in rep.verdicts):
             rep.status = "refuted"
         elif ref.key in vacuous:
@@ -1216,7 +1234,14 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     from . import history
 
     gens = {r.ref.key: g for r, g in entry_checks}
-    lifecycles = history.check(program, reports, gens, lambda obs: solve_all(obs, theory, opts.timeout_ms, opts.rlimit, opts.jobs), cache, lambda ob: obligation_key(ob, theory, opts.rlimit))
+    lifecycles = history.check(
+        program,
+        reports,
+        gens,
+        lambda obs: solve_all(obs, theory, opts.timeout_ms, opts.rlimit, opts.jobs),
+        cache,
+        lambda ob: obligation_key(ob, theory, opts.rlimit, opts.timeout_ms, _math_schema(program, program.ref(ob.func)) if ob.func in program.funcs else ""),
+    )
 
     mirrors = []
     if any(f.mirrors for m in modules for f in m.functions.values()):

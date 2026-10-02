@@ -102,7 +102,7 @@ let rec wterm w (t : term) =
 
 let loc_json (l : Ir.loc) = Json.List [ Json.Int l.line; Json.Int l.col; Json.Int l.end_col ]
 
-type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; phases : (Smt.fundef list * Smt.axiom list * int * bool) list; probes : (string * Vc.value) list; state_consts : term list }
+type job = { ob : Vc.obligation; neg_goal : term; wall_ms : int; schema : string; phases : (Smt.fundef list * Smt.axiom list * int * bool) list; probes : (string * Vc.value) list; state_consts : term list }
 
 (* Leave z3 at a model whose input lists are short, if one exists: a
    counterexample is only confirmed by running it. *)
@@ -174,7 +174,7 @@ let solve_job z (jb : job) : Smt.result =
   go jb.phases
 
 (* [budget]: the wall-clock safety net and the resource limit *)
-let make_job th (wall_ms, rlimit) (ob : Vc.obligation) =
+let make_job th (wall_ms, rlimit) schema (ob : Vc.obligation) =
   let terms_ = ob.hyps @ [ ob.goal ] in
   let with_l = Smt.closure th terms_ ob.exclude true and without = Smt.closure th terms_ ob.exclude false in
   let phases =
@@ -202,43 +202,63 @@ let make_job th (wall_ms, rlimit) (ob : Vc.obligation) =
            && (match c.node with Const n -> not (String.contains n '!') | _ -> false)
            && match c.sort with Array _ | Rec _ -> false | _ -> true)
   in
-  { ob; neg_goal = not_ ob.goal; wall_ms; phases; probes = ob.inputs; state_consts }
+  { ob; neg_goal = not_ ob.goal; wall_ms; schema; phases; probes = ob.inputs; state_consts }
 
-(* A job's cache key: a structural digest of everything the solver sees
-   (definitions, axioms, hypotheses, goal) and [salt] (the toolchain), so it
-   does not depend on term ids or on the rest of the request. *)
-let job_key salt (jb : job) : string =
-  let memo = Hashtbl.create 1024 in
-  let rec h (t : term) =
-    match Hashtbl.find_opt memo t.id with
-    | Some d -> d
-    | None ->
-      let kids xs = String.concat "," (Array.to_list (Array.map h xs)) in
-      let node =
-        match t.node with
-        | Const n -> "c" ^ n
-        | Num q -> Printf.sprintf "n%d/%d" q.n q.d
-        | Big s -> "B" ^ s
-        | BoolV b -> if b then "T" else "F"
-        | StrV s -> "s" ^ String.escaped s
-        | App (op, xs) -> "a" ^ op ^ "(" ^ kids xs ^ ")"
-        | Fn (n, xs) -> "f" ^ n ^ "(" ^ kids xs ^ ")"
-        | Quant (k, vs, b, ps) -> "q" ^ k ^ "(" ^ kids vs ^ ")" ^ h b ^ "[" ^ String.concat ";" (List.map kids ps) ^ "]"
-      in
-      let d = Digest.to_hex (Digest.string (node ^ ":" ^ Smt.sort_smt t.sort)) in
-      Hashtbl.add memo t.id d;
-      d
+(* A job's cache key is the exact SMT-LIB query for every solver stage. *)
+let normalize_query text =
+  let aliases = Hashtbl.create 16 in
+  let next = ref 0 in
+  let out = Buffer.create (String.length text) in
+  let rec copy quoted i =
+    if i < String.length text then
+      if quoted then
+        if text.[i] = '"' && i + 1 < String.length text && text.[i + 1] = '"' then begin
+          Buffer.add_string out "\"\"";
+          copy true (i + 2)
+        end else begin
+          Buffer.add_char out text.[i];
+          copy (text.[i] <> '"') (i + 1)
+        end
+      else if text.[i] = '"' then begin
+        Buffer.add_char out text.[i];
+        copy true (i + 1)
+      end else if text.[i] = '|' && i + 2 < String.length text && text.[i + 1] = '$' then
+        match String.index_from_opt text (i + 2) '|' with
+        | Some j ->
+            let raw = String.sub text (i + 2) (j - i - 2) in
+            if raw <> "" && String.for_all (fun c -> c >= '0' && c <= '9') raw then begin
+              let alias = match Hashtbl.find_opt aliases raw with
+                | Some name -> name
+                | None -> let name = string_of_int !next in incr next; Hashtbl.add aliases raw name; name
+              in
+              Buffer.add_string out ("|$q" ^ alias ^ "|");
+              copy false (j + 1)
+            end else begin
+              Buffer.add_char out text.[i];
+              copy false (i + 1)
+            end
+        | None -> Buffer.add_char out text.[i]; copy false (i + 1)
+      else begin
+        Buffer.add_char out text.[i];
+        copy false (i + 1)
+      end
   in
+  copy false 0;
+  Buffer.contents out
+
+let job_key salt (jb : job) : string =
   let b = Buffer.create 1024 in
   Buffer.add_string b salt;
+  Buffer.add_char b '\000';
+  Buffer.add_string b jb.schema;
+  Buffer.add_char b '\000';
   List.iter
-    (fun ((defs : Smt.fundef list), (axioms : Smt.axiom list), _, prove_only) ->
-      if prove_only then Buffer.add_string b "\nopaque";
-      List.iter (fun (d : Smt.fundef) -> Buffer.add_string b ("\ndef " ^ d.fname ^ "(" ^ String.concat "," (List.map h d.params) ^ ")" ^ Smt.sort_smt d.fsort ^ "=" ^ match d.body with Some x -> h x | None -> "?")) defs;
-      List.iter (fun (a : Smt.axiom) -> Buffer.add_string b ("\nax " ^ h a.formula)) axioms)
+    (fun ((defs : Smt.fundef list), (axioms : Smt.axiom list), rlimit, prove_only) ->
+      Buffer.add_string b (Printf.sprintf "\nrlimit=%d;prove_only=%b\n" rlimit prove_only);
+      Buffer.add_string b (normalize_query (Smt.script defs axioms jb.ob.hyps jb.neg_goal)))
     jb.phases;
-  List.iter (fun x -> Buffer.add_string b ("\nhyp " ^ h x)) jb.ob.hyps;
-  Buffer.add_string b ("\ngoal " ^ h jb.neg_goal);
+  List.iter (fun (_, v) -> List.iter (fun (t : term) -> Buffer.add_string b ("\ninput-sort=" ^ Smt.sort_smt t.sort)) (Vc.flatten v)) jb.probes;
+  Buffer.add_string b (Printf.sprintf "\ntimeout=%d;seed=%d" jb.wall_ms Smt.seed);
   Digest.to_hex (Digest.string (Buffer.contents b))
 
 (* Solve jobs on up to [jobs_n] domains, each driving its own z3. *)
@@ -311,7 +331,7 @@ let infer prog th jobs_n budget (tasks : itask list) =
             | Ok obs -> Some (t, List.filter (fun (o : Vc.obligation) -> (o.kind = "inv.entry" || o.kind = "inv.step") && match o.clause with Some c -> c.inferred | None -> false) obs))
           only
       in
-      let jobs = Array.of_list (List.concat_map (fun (_, obs) -> List.map (make_job th budget) obs) batch) in
+      let jobs = Array.of_list (List.concat_map (fun (_, obs) -> List.map (make_job th budget "") obs) batch) in
       let res = solve_parallel jobs_n jobs in
       let failed = Hashtbl.create 64 in
       Array.iteri (fun i (jb : job) -> if res.(i).status <> "proved" then match jb.ob.clause with Some c -> Hashtbl.replace failed (Obj.repr c) () | None -> ()) jobs;
@@ -351,7 +371,7 @@ let infer prog th jobs_n budget (tasks : itask list) =
             (sites t))
       tasks;
     let entries = List.rev !entries in
-    let jobs = Array.of_list (List.concat_map (fun (_, _, _, obs) -> match obs with Some obs -> List.map (make_job th budget) obs | None -> []) entries) in
+    let jobs = Array.of_list (List.concat_map (fun (_, _, _, obs) -> match obs with Some obs -> List.map (make_job th budget "") obs | None -> []) entries) in
     let res = solve_parallel jobs_n jobs in
     let pos = ref 0 in
     let decided = Hashtbl.create 16 in
@@ -537,6 +557,7 @@ let () =
   List.iter
     (fun task ->
       let key = Json.to_str (Json.member "key" task) in
+      let schema = match Json.member "schema" task with Json.String s -> s | _ -> "" in
       let info = Hashtbl.find funcs key in
       let oj = Json.member "options" task in
       let opts =
@@ -550,7 +571,7 @@ let () =
       match Vc.run g with
       | obs ->
         let jobs =
-          List.map (make_job th budget) obs
+          List.map (make_job th budget schema) obs
         in
         all_jobs := List.rev_append jobs !all_jobs;
         results := (key, `Ok (g, jobs)) :: !results

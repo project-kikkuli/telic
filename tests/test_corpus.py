@@ -27,7 +27,8 @@ def expectations(path: Path) -> dict[str, str]:
 
 
 def run(path: Path):
-    rep = check([str(path)], CheckOptions(cache_path=None, lean=False), root=str(path.parent))
+    cache = Path(__file__).resolve().parent.parent / ".telic" / "cache.json"
+    rep = check([str(path)], CheckOptions(cache_path=str(cache), lean=False, receipts=False), root=str(path.parent))
     return rep, {f.fn.name: f for f in rep.functions}
 
 

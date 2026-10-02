@@ -3,12 +3,13 @@
 Skipped when ``telic-core`` has not been built (``make -C core`` with OxCaml).
 """
 
+import json
 from pathlib import Path
 
 import pytest
 
 from telic import engine
-from telic.checker import CheckOptions, build_theory, check, load_modules, solve_all
+from telic.checker import CheckOptions, ProofCache, _math_schema, build_theory, check, load_modules, obligation_key, solve_all
 from telic.program import Program
 from telic.infer import infer_rlimit
 from telic.smt import RLIMIT
@@ -26,7 +27,11 @@ def _differential(path: Path):
     p = Program.build(mods)
     th, _ = build_theory(p, {})
     tasks = [(r, Options()) for r in p.funcs.values() if not r.fn.unsupported and not r.fn.trusted and not r.module.context]
-    res = engine.run(p, th, tasks, 60000, RLIMIT, None)
+    cache_path = Path(__file__).resolve().parent.parent / ".telic" / "cache.json"
+    cache = ProofCache(str(cache_path))
+    from telic.toolchain import native_z3
+
+    res = engine.run(p, th, tasks, 60000, RLIMIT, None, [k[3:] for k, v in cache.data.items() if k.startswith("ox:") and v.get("method") == "z3"], json.dumps(native_z3(), sort_keys=True))
     assert res is not None
     diffs, compared, generated = [], 0, []
     for ref, _ in tasks:
@@ -38,9 +43,22 @@ def _differential(path: Path):
             generated.append((ref, r, VCGen(p, ref).run()))
         except VCError:
             diffs.append(f"{ref.key}: engine generated VCs the Python core rejects")
-    solved = iter(solve_all([o for _, _, obs in generated for o in obs], th, 60000, RLIMIT, None))
+    pending = []
+    py_status = {}
+    for ref, _, obs in generated:
+        for ob in obs:
+            key = obligation_key(ob, th, RLIMIT, 60000, _math_schema(p, ref))
+            hit = cache.get(key)
+            if hit is not None and hit.get("method") == "z3":
+                py_status[key] = "proved"
+            else:
+                pending.append((key, ob))
+    for (key, ob), result in zip(pending, solve_all([ob for _, ob in pending], th, 60000, RLIMIT, None)):
+        py_status[key] = result.status
+        if result.status == "proved":
+            cache.put(key, {"method": "z3"})
     for ref, r, obs in generated:
-        py = {o.id: next(solved).status for o in obs}
+        py = {o.id: py_status[obligation_key(o, th, RLIMIT, 60000, _math_schema(p, ref))] for o in obs}
         ox = {o["ob"].id: o["status"] for o in r["obligations"]}
         if set(py) != set(ox):
             diffs.append(f"{ref.key}: obligations differ {sorted(set(py) ^ set(ox))}")
@@ -49,6 +67,10 @@ def _differential(path: Path):
             # "unknown" may differ by timing; a proved/refuted split may not.
             if py[k] != ox[k] and "unknown" not in (py[k], ox[k]):
                 diffs.append(f"{k}: python {py[k]}, engine {ox[k]}")
+        for o in r["obligations"]:
+            if o["status"] == "proved":
+                cache.put("ox:" + o["key"], {"method": "z3"})
+    cache.save()
     return compared, diffs
 
 
@@ -132,15 +154,40 @@ def test_engine_infers_what_python_infers(name):
 
 
 @pytest.mark.parametrize("name", ["corpus.py", "objects/bank.py"])
-def test_engine_reuses_the_obligation_cache(tmp_path, monkeypatch, name):
+def test_engine_reuses_the_obligation_cache(monkeypatch, name):
     monkeypatch.setenv("TELIC_ENGINE", "ox")
     path = CASES / name
-    opts = CheckOptions(cache_path=str(tmp_path / "cache.json"), lean=False, replay=False, receipts=False, engine="ox")
+    cache = Path(__file__).resolve().parent.parent / ".telic" / "cache.json"
+    opts = CheckOptions(cache_path=str(cache), lean=False, replay=False, receipts=False, engine="ox")
     first = check([str(path)], opts, root=str(path.parent))
     second = check([str(path)], opts, root=str(path.parent))
     proved = lambda rep: {v.ob.id for f in rep.functions for v in f.verdicts if v.status == "proved"}  # noqa: E731
     assert proved(first) and proved(first) == proved(second)
     assert second.cache_hits >= len(proved(first))
+
+
+def test_native_query_receipt_ignores_unrelated_term_id_shifts(tmp_path):
+    from telic.toolchain import native_z3
+
+    salt = json.dumps(native_z3(), sort_keys=True)
+    target = "def target(x: int) -> int:\n    #@ requires x >= 0\n    #@ ensures result >= x\n    return x + 1\n"
+    unrelated = "def unrelated(x: int) -> int:\n    #@ ensures result == x * 23 + 17\n    return (x + 1) * 23 - 6\n\n"
+
+    def run(source, cached=()):
+        path = tmp_path / "m.py"
+        path.write_text(source)
+        modules = load_modules([str(path)], str(tmp_path))
+        program = Program.build(modules)
+        theory, _ = build_theory(program, {})
+        ref = next(ref for ref in program.funcs.values() if ref.fn.name == "target")
+        result = engine.run(program, theory, [(ref, Options())], 60000, RLIMIT, None, list(cached), salt)
+        return result[ref.key]["obligations"]
+
+    first = run(target)
+    keys = [ob["key"] for ob in first if ob["status"] == "proved"]
+    assert keys
+    shifted = run(unrelated + target, keys)
+    assert shifted and all(ob["status"] == "proved" and ob["reason"] == "cache" for ob in shifted)
 
 
 def test_a_field_telic_cannot_model_fails_only_what_touches_it():
