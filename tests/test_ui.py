@@ -444,34 +444,55 @@ def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
         assert "proved" not in got.detail
 
 
-def _static_source_case(tmp_path, app, property):
-    from telic.ui.static import check, extract
+def _static_source_case(tmp_path, app, property, stylesheet=""):
+    from telic.ui.config import load
+    from telic.ui.run import run
+    from telic.ui.static import extract
 
-    (tmp_path / "App.tsx").write_text(app)
-    (tmp_path / "main.tsx").write_text(
+    example = Path(__file__).parents[1] / "examples" / "ui" / "notes-react"
+    node_modules = example / "node_modules"
+    if not node_modules.is_dir():
+        pytest.skip("source UI cases need the installed, locked notes-react Vite toolchain")
+    project = tmp_path / "vite-app"
+    shutil.rmtree(project, ignore_errors=True)
+    shutil.copytree(example, project, ignore=shutil.ignore_patterns("node_modules", ".telic", "dist"))
+    (project / "node_modules").symlink_to(node_modules.resolve(), target_is_directory=True)
+    (project / "src" / "App.tsx").write_text(app)
+    (project / "src" / "main.tsx").write_text(
         'import { createRoot } from "react-dom/client";\n'
         'import App from "./App";\n'
+        'import "./index.css";\n'
         'createRoot(document.getElementById("root")!).render(<App />);\n'
     )
-    (tmp_path / "index.html").write_text('<body><div id="root"></div><script type="module" src="/main.tsx"></script></body>')
+    (project / "src" / "index.css").write_text(stylesheet)
+    (project / "index.html").write_text('<!doctype html><html><head><title>Source UI</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>')
     scan = Scan()
-    scan_source(f"//@ ui source: {property}", "App.tsx", scan)
-    model, identity, why = extract(str(tmp_path), str(tmp_path))
-    return model, identity, why, (check(model, identity or "", scan.lemmas[0]) if model else None)
+    source_path = "vite-app/src/App.tsx"
+    scan_source(f"//@ ui source: {property}", source_path, scan)
+    root = str(tmp_path)
+    cfg = load(str(project / "telic.toml"), root)
+    model, identity, why = extract(
+        str(project), root, "index.html", "vite-react", config_path=str(project / "telic.toml"),
+        command=cfg.command, config_digest=cfg.digest(),
+    )
+    got = run(scan, root, enabled=False).results[0]
+    return model, identity, why, got
 
 
-def test_source_ui_proof_follows_a_mounted_modal_close_handler(tmp_path):
-    model, _, why, got = _static_source_case(
-        tmp_path,
-        '''import { useState } from "react";
+def test_source_ui_does_not_prove_raw_tsx_from_a_static_server(tmp_path):
+    from telic.ui.static import StaticOutcome, extract
+
+    (tmp_path / "App.tsx").write_text('''import { useState } from "react";
 export default function App() {
   const [open, setOpen] = useState(true);
   return <main>{open ? <div role="dialog" aria-label="Help"><button onClick={() => setOpen(false)}>Close</button></div> : <h1>Home</h1>}</main>;
-}''',
-        'always reachable home from overlay "Help"',
-    )
-    assert why is None and model is not None
-    assert got.status == "proved" and got.method == "source proof"
+}''')
+    (tmp_path / "main.tsx").write_text('import { createRoot } from "react-dom/client"; import App from "./App"; createRoot(document.getElementById("root")!).render(<App />);')
+    (tmp_path / "index.html").write_text('<body><div id="root"></div><script type="module" src="/main.tsx"></script></body>')
+    model, identity, why = extract(str(tmp_path), str(tmp_path))
+    got = StaticOutcome("open", "source model", why or "no executable app provenance")
+    assert model is None and why and "cannot execute TypeScript or JSX" in why
+    assert got.status == "open" and got.method == "source model"
 
 
 def test_source_ui_does_not_prove_an_unmounted_export(tmp_path):
@@ -482,10 +503,11 @@ def test_source_ui_does_not_prove_an_unmounted_export(tmp_path):
         'export default function App() { const [open] = useState(true); return open ? <button>Save</button> : null; }\n'
     )
     model, _, why = extract(str(tmp_path), str(tmp_path))
-    assert model is None and why and "not connected to a verified React createRoot" in why
+    assert model is None and why and "verified React createRoot" in why
 
 
 def test_source_ui_requires_html_to_load_the_mounted_entry(tmp_path):
+    from telic.ui.config import load
     from telic.ui.static import extract
 
     _static_source_case(
@@ -493,9 +515,11 @@ def test_source_ui_requires_html_to_load_the_mounted_entry(tmp_path):
         'import { useState } from "react"; export default function App() { const [open] = useState(true); return open ? <button>Save</button> : null; }',
         'reachable button "Save"',
     )
-    (tmp_path / "index.html").write_text('<body><div id="root"></div></body>')
-    model, _, why = extract(str(tmp_path), str(tmp_path))
-    assert model is None and why and "does not connect a #root root" in why
+    project = tmp_path / "vite-app"
+    (project / "index.html").write_text('<body><div id="root"></div></body>')
+    cfg = load(str(project / "telic.toml"), str(tmp_path))
+    model, _, why = extract(str(project), str(tmp_path), "index.html", "vite-react", config_path=str(project / "telic.toml"), command=cfg.command, config_digest=cfg.digest())
+    assert model is None and why and ("does not connect a #root root" in why or "cannot execute TypeScript or JSX" in why)
 
 
 def test_source_ui_refutes_a_modal_close_handler_that_keeps_it_open(tmp_path):
@@ -508,7 +532,7 @@ export default function App() {
 }''',
         'always reachable home from overlay "Help"',
     )
-    assert why is None and got.status == "refuted"
+    assert why is None and got.status == "refuted" and got.method == "source proof"
 
 
 def test_source_ui_rejects_a_shadowed_fake_react_hook(tmp_path):
@@ -572,7 +596,7 @@ export default function App() {
 }''',
         'reachable button "Secret"',
     )
-    assert why is None and got.status == "refuted"
+    assert why is None and got.status == "refuted" and got.method == "source proof"
 
 
 def test_source_ui_uses_native_implicit_roles(tmp_path):
@@ -585,7 +609,7 @@ export default function App() {
 }''',
         'never main',
     )
-    assert why is None and got.status == "refuted"
+    assert why is None and got.status == "refuted" and got.method == "source proof"
 
 
 def test_source_ui_models_child_then_parent_click_updates(tmp_path):
@@ -598,7 +622,7 @@ export default function App() {
 }''',
         'always reachable home from overlay "Help"',
     )
-    assert why is None and got.status == "proved"
+    assert why is None and got.status == "proved" and got.method == "source proof"
 
 
 def test_source_ui_bubbles_after_a_child_handler_returns(tmp_path):
@@ -611,7 +635,7 @@ export default function App() {
 }''',
         'always reachable home from overlay "Help"',
     )
-    assert why is None and got.status == "proved"
+    assert why is None and got.status == "proved" and got.method == "source proof"
 
 
 def test_source_ui_models_click_handlers_on_aria_disabled_controls(tmp_path):
@@ -624,7 +648,7 @@ export default function App() {
 }''',
         'always reachable home from overlay "Help"',
     )
-    assert why is None and got.status == "proved"
+    assert why is None and got.status == "proved" and got.method == "source proof"
 
 
 def test_source_ui_tracks_dynamic_jsx_names_and_functional_state_updates(tmp_path):
@@ -637,7 +661,149 @@ export default function App() {
 }''',
         'reachable button "Open"',
     )
-    assert why is None and got.status == "proved"
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    "body, expected, reason",
+    [
+        ('const [open]=useState(false); if(open) return <button>Save</button>;', 'reachable button "Save"', "refuted"),
+        ('const [open]=useState(true); throw new Error("boom"); return <button>Save</button>;', 'reachable button "Save"', "open"),
+    ],
+)
+def test_source_ui_respects_component_returns_and_render_failures(tmp_path, body, expected, reason):
+    model, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; export default function App(){' + body + '}',
+        expected,
+    )
+    if reason == "open":
+        assert model is None and why and "control flow" in why and got.status == "open"
+    else:
+        assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+def test_source_ui_keeps_physical_clicks_on_aria_hidden_controls(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App(){const [open,setOpen]=useState(false);return <main><button aria-hidden="true" onClick={()=>setOpen(true)}>Open</button>{open?<div role="dialog" aria-label="Help"/>:null}</main>}''',
+        'never overlay "Help"',
+    )
+    assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+def test_source_ui_uses_child_to_parent_bubbling_order(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App(){const [open,setOpen]=useState(true);return open?<div role="dialog" aria-label="Help" onClick={()=>setOpen(true)}><div onClick={()=>setOpen(false)}><button onClick={()=>setOpen(true)}>Close</button></div></div>:<h1>Home</h1>}''',
+        'reachable heading "Home"',
+    )
+    assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+def test_source_ui_does_not_bind_event_parameters_to_captured_state(tmp_path):
+    model, _, why, _ = _static_source_case(
+        tmp_path,
+        '''import { useState } from "react";
+export default function App(){const [open,setOpen]=useState(false);return <button onClick={(open)=>setOpen(!open)}>Open</button>}''',
+        'reachable heading "Home"',
+    )
+    assert model is None and why and "event parameter" in why
+
+
+@pytest.mark.parametrize(
+    "app, property, status",
+    [
+        ('<button><span hidden>Secret</span>Save</button>', 'reachable button "SecretSave"', "refuted"),
+        ('<div aria-label="Named">Hello</div>', 'reachable generic "Named"', "refuted"),
+        ('<button>A &amp; B</button>', 'reachable button "A & B"', "proved"),
+        ('<button>{open && <span>Hello</span>}Save</button>', 'reachable button "0Save"', "proved"),
+        ('<button>{open && <span>Hello</span>}Save</button>', 'reachable button "Save"', "refuted"),
+    ],
+)
+def test_source_ui_matches_accessible_names_and_react_rendering(tmp_path, app, property, status):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; export default function App(){const [open]=useState(0);return ' + app + ';}',
+        property,
+    )
+    assert why is None and got.status == status and got.method == "source proof"
+
+
+def test_source_ui_models_imported_css_visibility(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; export default function App(){const [ready]=useState(true);return <main><button className="off">Hidden</button><button className="on">Shown</button></main>}',
+        'reachable button "Hidden"',
+        ".off { display: none; } .on { visibility: visible; }",
+    )
+    assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<body hidden><div id="root"></div><script type="module" src="/main.tsx"></script></body>',
+        '<body style="display:none"><div id="root"></div><script type="module" src="/main.tsx"></script></body>',
+        '<head><button>Other</button></head><body><div id="root"></div><script type="module" src="/main.tsx"></script></body>',
+        '<body><div id="root"></div><script type="application/json" src="/main.tsx"></script></body>',
+    ],
+)
+def test_source_ui_rejects_hidden_reparsed_or_non_executable_html(tmp_path, html):
+    from telic.ui.config import load
+    from telic.ui.run import run
+    from telic.ui.static import extract
+
+    _static_source_case(
+        tmp_path,
+        'import { useState } from "react"; export default function App(){const [ready]=useState(true);return <button>Save</button>}',
+        'reachable button "Save"',
+    )
+    project = tmp_path / "vite-app"
+    (project / "index.html").write_text(html.replace("/main.tsx", "/src/main.tsx"))
+    cfg = load(str(project / "telic.toml"), str(tmp_path))
+    model, _, why = extract(
+        str(project), str(tmp_path), "index.html", "vite-react", config_path=str(project / "telic.toml"),
+        command=cfg.command, config_digest=cfg.digest(),
+    )
+    scan = Scan()
+    scan_source('//@ ui html: reachable button "Save"', "vite-app/src/App.tsx", scan)
+    result = run(scan, str(tmp_path), enabled=False).results[0]
+    assert model is None and why and "does not connect" in why
+    assert result.status == "open" and result.method != "source proof"
+
+
+def test_configured_source_proof_uses_the_served_static_tree(tmp_path):
+    from telic.ui.run import run
+
+    (tmp_path / "App.tsx").write_text('import { useState } from "react"; export default function App(){const [ready]=useState(true);return <button>Save</button>}')
+    (tmp_path / "main.tsx").write_text('import { createRoot } from "react-dom/client"; import App from "./App"; createRoot(document.getElementById("root")!).render(<App />);')
+    (tmp_path / "index.html").write_text('<body><div id="root"></div><script type="module" src="/main.tsx"></script></body>')
+    (tmp_path / "site").mkdir()
+    (tmp_path / "site" / "index.html").write_text('<button>Bad</button>')
+    (tmp_path / "telic.toml").write_text('[ui]\nstatic="site"\n')
+    scan = Scan()
+    scan_source('//@ ui configured: reachable button "Save"', "App.tsx", scan)
+    rep = run(scan, str(tmp_path), enabled=False)
+    assert rep.results[0].status == "open" and rep.results[0].method != "source proof"
+
+
+def test_configured_static_url_selects_the_served_html_entry(tmp_path):
+    from telic.ui.run import run
+
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "App.tsx").write_text('import { useState } from "react"; export default function App(){const [ready]=useState(true);return <button>Save</button>}')
+    (site / "main.tsx").write_text('import { createRoot } from "react-dom/client"; import App from "./App"; createRoot(document.getElementById("root")!).render(<App />);')
+    (site / "index.html").write_text('<body><div id="root"></div><script type="module" src="/main.tsx"></script></body>')
+    (site / "other.html").write_text('<body><button>Other</button></body>')
+    (tmp_path / "telic.toml").write_text('[ui]\nstatic="site"\nurl="/other.html"\n')
+    scan = Scan()
+    scan_source('//@ ui configured: reachable button "Save"', "site/App.tsx", scan)
+    rep = run(scan, str(tmp_path), enabled=False)
+    assert rep.results[0].status == "open" and rep.results[0].method != "source proof"
 
 
 @pytest.mark.parametrize(

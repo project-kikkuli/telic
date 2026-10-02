@@ -7,11 +7,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote, urlsplit
 
 from . import slots, source, static
 from .app import App, AppError, build_digest, torn_down_on_signals
@@ -123,7 +125,7 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
         cache = {}
     entries: dict[str, Any] = cache.get("entries", {})
     used: set[str] = set()
-    static_models: dict[str, tuple[dict[str, Any] | None, str | None, str | None]] = {}
+    static_models: dict[tuple[str, str, str | None], tuple[dict[str, Any] | None, str | None, str | None]] = {}
     for cfg_path, lems in groups.items():
         if cfg_path is None:
             for lem in lems:
@@ -145,8 +147,11 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
         app = UiApp(cfg.path)
         rep.apps.append(app)
         todo = []
+        pipeline = "vite-react" if cfg.command and not cfg.build and not cfg.static and not cfg.inputs and _verified_vite_command(cfg.command) else None
+        source_top = cfg.dir if pipeline else None
+        html_entry = _static_html_entry(cfg, source_top) if source_top else None
         for lem in lems:
-            source_result = _static_result(lem, cfg.path, cfg.dir, root, entries, used, static_models, configured=True)
+            source_result = _static_result(lem, cfg.path, source_top, root, entries, used, static_models, configured=source_top is not None, html_entry=html_entry, pipeline=pipeline, config_path=os.path.join(root, cfg.path) if pipeline else None, command=cfg.command if pipeline else None, config_digest=cfg.digest() if pipeline else None)
             if source_result is not None:
                 rep.results.append(source_result)
                 continue
@@ -189,10 +194,51 @@ def run(sc: Scan, root: str, enabled: bool = True, log: Callable[[str], None] | 
     return rep
 
 
-def _static_result(lem: UiLemma, app: str, top: str, root: str, entries: dict[str, Any], used: set[str], extracted: dict[str, tuple[dict[str, Any] | None, str | None, str | None]], configured: bool) -> UiResult | None:
-    if top not in extracted:
-        extracted[top] = static.extract(top, root)
-    model, identity, why = extracted[top]
+def _static_html_entry(cfg: UiConfig, top: str) -> str | None:
+    raw = urlsplit(cfg.url or "")
+    if raw.query or raw.fragment:
+        return None
+    if raw.scheme or raw.netloc:
+        if (raw.scheme != "http" or raw.hostname not in ("127.0.0.1", "localhost")
+                or "{port}" not in raw.netloc or raw.path not in ("", "/")):
+            return None
+    path = unquote(raw.path).lstrip("/")
+    if ".." in Path(path).parts:
+        return None
+    if not path:
+        return "index.html"
+    target = os.path.join(top, path)
+    if path.endswith("/") or os.path.isdir(target):
+        return os.path.join(path, "index.html")
+    if os.path.isfile(target):
+        return path
+    if "." not in os.path.basename(path):
+        return "index.html"
+    return path
+
+
+def _verified_vite_command(command: str) -> bool:
+    try:
+        args = tuple(shlex.split(command))
+    except ValueError:
+        return False
+    forms = {
+        ("npx", "vite", "--port", "{port}"),
+        ("npx", "vite", "--port", "{port}", "--strictPort"),
+        ("npx", "vite", "--port", "{port}", "--strictPort", "--host", "127.0.0.1"),
+        ("npx", "vite", "--port", "{port}", "--host", "127.0.0.1"),
+    }
+    return args in forms
+
+
+def _static_result(lem: UiLemma, app: str, top: str | None, root: str, entries: dict[str, Any], used: set[str], extracted: dict[tuple[str, str, str | None], tuple[dict[str, Any] | None, str | None, str | None]], configured: bool, html_entry: str | None = None, pipeline: str | None = None, config_path: str | None = None, command: str | None = None, config_digest: str | None = None) -> UiResult | None:
+    if top is None or html_entry is None and configured:
+        return None
+    entry = html_entry or "index.html"
+    cache_key = (top, entry, f"{pipeline}:{config_digest}" if pipeline else None)
+    if cache_key not in extracted:
+        extracted[cache_key] = static.extract(top, root, entry, pipeline, config_path=config_path, command=command, config_digest=config_digest)
+    model, identity, why = extracted[cache_key]
     if model is None:
         if configured:
             return None
