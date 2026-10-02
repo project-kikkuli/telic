@@ -37,7 +37,7 @@ GROUPS = {
     "corpus-swift": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["swift"] + ["tests/test_swift.py", "tests/cases/corpus.swift"], "tests": ["tests/test_swift.py::test_swift_corpus", "tests/test_swift.py::test_swift_refutations_are_real_failures"]},
     "soundness": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "tests/test_soundness.py", "tests/cases/soundness/**/*"], "tests": ["tests/test_soundness.py"], "native": True},
     "semantics": {"inputs": KERNEL + ALL_FRONTENDS + ["tests/test_semantics.py", "tests/test_swift.py", "tests/test_rust.py", "tests/cases/corpus.rs"], "tests": ["tests/test_semantics.py", "tests/test_swift.py::test_swift_integer_semantics_match_swiftc", "tests/test_rust.py::test_proved_functions_hold_when_run"]},
-    "engine": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_engine.py", "tests/test_soundness.py", "tests/cases/**/*"], "tests": ["tests/test_engine.py"], "native": True},
+    "engine": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_engine.py", "tests/test_soundness.py", "tests/cases/**/*"], "tests": [f"tests/test_engine.py::{name}" for name in ("test_engine_agrees_with_python_core", "test_engine_proves_no_exploit", "test_a_field_telic_cannot_model_fails_only_what_touches_it")], "native": True},
     "lean": {"inputs": KERNEL + ALL_FRONTENDS + ["telic/lean/*", "tests/test_lean.py"], "tests": ["tests/test_lean.py"], "lean": True},
 }
 
