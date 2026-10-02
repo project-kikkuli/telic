@@ -176,7 +176,7 @@ def test_adding_an_ancestor_override_invalidates_untrusted_entry_receipt(tmp_pat
     opts = CheckOptions(cache_path=str(tmp_path / ".telic/cache.json"), lean=False, replay=False, infer=False, engine=engine)
     added = "    def m(self) -> int:\n        self.x = -1\n        return self.x\n"
     statuses = []
-    for method in ("", added):
+    for method in ("\n\n\n", added):
         (tmp_path / "m.py").write_text(OVERRIDE_ENTRY.format(base_method=method))
         rep = check([str(tmp_path / "m.py")], opts, root=str(tmp_path))
         child = next(f for f in rep.functions if f.fn.name == "Sub.m")
