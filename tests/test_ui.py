@@ -444,7 +444,7 @@ def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
         assert "proved" not in got.detail
 
 
-def _static_source_case(tmp_path, app, property, stylesheet="", modules=None):
+def _static_source_case(tmp_path, app, property, stylesheet="", modules=None, entry_source=None):
     from telic.ui.config import load
     from telic.ui.run import run
     from telic.ui.static import extract
@@ -462,12 +462,12 @@ def _static_source_case(tmp_path, app, property, stylesheet="", modules=None):
         target = project / "src" / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
-    (project / "src" / "main.tsx").write_text(
+    (project / "src" / "main.tsx").write_text(entry_source or (
         'import { createRoot } from "react-dom/client";\n'
         'import App from "./App";\n'
         'import "./index.css";\n'
         'createRoot(document.getElementById("root")!).render(<App />);\n'
-    )
+    ))
     (project / "src" / "index.css").write_text(stylesheet)
     (project / "index.html").write_text('<!doctype html><html><head><title>Source UI</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>')
     scan = Scan()
@@ -889,6 +889,102 @@ def test_source_ui_follows_configured_vite_component_reexports(tmp_path):
             "Barrel.ts": 'export {Widget} from "./Widget";',
             "Widget.tsx": 'export function Widget(){return <button>Ready</button>}',
         },
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    ("app", "app_import", "expected"),
+    [
+        ('export default function App(){return <button>Ready</button>}', 'import {App} from "./App";', "open"),
+        ('export default function App(){return <button>Ready</button>}', 'import {Missing as App} from "./App";', "open"),
+        ('export function App(){return <button>Ready</button>}', 'import {App} from "./App";', "proved"),
+        ('export default function App(){return <button>Ready</button>}', 'import type {App} from "./App";', "open"),
+        ('export function App(){return <button>Ready</button>}', 'import type {App} from "./App";', "open"),
+    ],
+)
+def test_source_ui_checks_entry_runtime_export_binding(tmp_path, app, app_import, expected):
+    entry = (
+        'import {createRoot} from "react-dom/client";\n'
+        f'{app_import}\n'
+        'createRoot(document.getElementById("root")!).render(<App />);\n'
+    )
+    model, _, why, got = _static_source_case(
+        tmp_path,
+        app,
+        'reachable button "Ready"',
+        entry_source=entry,
+    )
+    if expected == "open":
+        assert model is None and why and "entry import" in why and "vite-app/src/main.tsx" in why
+        assert got.status == "open" and got.method != "source proof"
+    else:
+        assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    ("app", "fallback_name"),
+    [
+        ('export default function App(){return <button aria-labelledby="missing">Save</button>}', "Save"),
+        ('export default function App(){return <button aria-labelledby="missing" aria-label="Explicit">Save</button>}', "Explicit"),
+    ],
+)
+def test_source_ui_falls_back_when_aria_labelledby_resolves_no_ids(tmp_path, app, fallback_name):
+    from telic.ui.spec import UiLemma
+    from telic.ui.static import check as check_source
+
+    model, identity, why, got = _static_source_case(
+        tmp_path,
+        app,
+        f'never button "{fallback_name}"',
+    )
+    prop = parse_prop(f'reachable button "{fallback_name}"')[0]
+    reachable = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, f'reachable button "{fallback_name}"', (), prop))
+    assert why is None and got.status == "refuted" and got.method == "source proof"
+    assert reachable.status == "proved" and reachable.method == "source proof"
+
+
+def test_source_ui_aria_labelledby_uses_resolved_members_of_a_partial_reference_list(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'export default function App(){return <><span id="known">Known</span><button aria-labelledby="missing known" aria-label="Explicit">Save</button></>}',
+        'reachable button "Known"',
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
+def test_source_ui_does_not_offer_actions_through_hidden_fragment_groups(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; export default function App(){const [open,setOpen]=useState(false);return <><main className="hidden"><><button onClick={()=>setOpen(true)}>Open</button></></main>{open?<div role="dialog" aria-label="Help" />:null}</>}',
+        'reachable dialog "Help"',
+        stylesheet=".hidden { visibility: hidden }",
+    )
+    assert why is None and got.status == "refuted" and got.method == "source proof"
+
+
+@pytest.mark.parametrize(
+    ("app", "reason"),
+    [
+        ('export default function App(){const markup={__html:"<button>Hidden</button>"};return <main dangerouslySetInnerHTML={markup} />}', "dangerouslySetInnerHTML"),
+        ('export default function App(){return <div is="x-widget">Visible</div>}', "native prop 'is'"),
+    ],
+)
+def test_source_ui_rejects_unmodeled_dom_rendering_properties(tmp_path, app, reason):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        app,
+        'never button "Hidden"',
+    )
+    assert why and "vite-app/src/App.tsx:" in why and reason in why
+    assert got.status == "open" and got.method != "source proof"
+
+
+def test_source_ui_allows_inert_data_attributes(tmp_path):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'export default function App(){return <button data-testid="save">Save</button>}',
+        'reachable button "Save"',
     )
     assert why is None and got.status == "proved" and got.method == "source proof"
 

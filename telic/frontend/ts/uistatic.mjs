@@ -13,6 +13,8 @@ const strip = (e) => {
 };
 const modeledAria = new Set(["aria-label", "aria-labelledby", "aria-modal", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
 const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "kbd"]);
+const modeledGlobalProps = new Set(["id", "className", "title", "lang", "dir", "hidden"]);
+const modeledTagProps = new Map([["button", new Set(["disabled", "type"])]]);
 const invalidStatic = Symbol("invalid static value");
 const lineOf = (sf, n) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
 
@@ -328,6 +330,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   let renderedStatefulChildren = 0;
   const render = (e, conditionalMount = false) => {
     e = strip(e);
+    if (ts.isJsxExpression(e)) return e.expression ? render(e.expression, conditionalMount) : { type: "empty" };
     if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
@@ -417,13 +420,21 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       if (name === "style") fail(sf, a, "inline style objects are outside the source UI model");
       if (name === "value" || name === "checked") fail(sf, a, `native ${name} semantics are outside the source UI model`);
       if (name === "role" && !["div", "span"].includes(tag)) fail(sf, a, `role override on native ${tag} is outside the source UI model`);
-      if (["inert", "popover", "popovertarget", "contenteditable"].includes(name.toLowerCase())) fail(sf, a, `native ${name} behavior is outside the source UI model`);
-      if (name.startsWith("aria-") && !modeledAria.has(name.toLowerCase())) fail(sf, a, `ARIA attribute '${name}' changes behavior outside the source UI model`);
+      if (name.startsWith("aria-") && (name !== name.toLowerCase() || !modeledAria.has(name))) fail(sf, a, `ARIA attribute '${name}' changes behavior outside the source UI model`);
+      if (name.startsWith("on") && name !== "onClick") fail(sf, a, `event '${name}' is outside the source UI model`);
+      if (name === "onClick" && (!a.initializer || !ts.isJsxExpression(a.initializer) || !a.initializer.expression)) fail(sf, a, "onClick must use a modeled source handler");
+      const dataAttribute = /^data-[a-z][a-z0-9_.:-]*$/.test(name);
+      if (!modeledGlobalProps.has(name) && !modeledTagProps.get(tag)?.has(name) && name !== "role" && !modeledAria.has(name) && !dataAttribute && name !== "onClick") {
+        fail(sf, a, `native prop '${name}' has DOM or accessibility effects outside the source UI model`);
+      }
+      if (name === "type" && (tag !== "button" || !a.initializer || !ts.isStringLiteral(a.initializer) || a.initializer.text !== "button")) {
+        fail(sf, a, "button type semantics are modeled only for type=\"button\"");
+      }
+      if (dataAttribute) continue;
       if (!a.initializer) { props[name] = ["lit", true]; continue; }
       if (ts.isStringLiteral(a.initializer)) props[name] = ["jsx-lit", a.initializer.text];
       else if (ts.isJsxExpression(a.initializer) && a.initializer.expression) {
         if (name === "onClick") events.click = handler(a.initializer.expression);
-        else if (/^on[A-Z]/.test(name)) fail(sf, a, `event '${name}' is outside the source UI model`);
         else props[name] = enc(a.initializer.expression, new Set());
       } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
     }
@@ -509,7 +520,7 @@ function resolveNamedExport(path, exportName, seen = new Set()) {
     const declaration = ts.isVariableDeclaration(parent) && ts.isVariableDeclarationList(parent.parent) && ts.isVariableStatement(parent.parent.parent) ? parent.parent.parent : null;
     const statementMods = declaration && ts.canHaveModifiers(declaration) ? ts.getModifiers(declaration) || [] : [];
     const defaultExport = candidate.name === "default" || [...own, ...statementMods].some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
-    const namedExport = [...own, ...statementMods].some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    const namedExport = !defaultExport && [...own, ...statementMods].some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
     return exportName === "default" ? defaultExport : candidate.name === exportName && namedExport;
   });
   if (direct) return { path, sf: direct.sf, node: direct.node, name: direct.name };
@@ -517,7 +528,17 @@ function resolveNamedExport(path, exportName, seen = new Set()) {
   const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
   const matches = [];
   for (const statement of sf.statements) {
-    if (!ts.isExportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
+    if (!ts.isExportDeclaration(statement)) continue;
+    if (!statement.moduleSpecifier && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const item of statement.exportClause.elements) {
+        if (item.name.text !== exportName || item.isTypeOnly) continue;
+        const localName = (item.propertyName || item.name).text;
+        const candidate = candidates.find((c) => c.name === localName);
+        if (candidate) matches.push({ path, sf: candidate.sf, node: candidate.node, name: candidate.name });
+      }
+      continue;
+    }
+    if (!ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
     const resolved = resolveModule(path, statement.moduleSpecifier.text);
     if (!resolved) continue;
     if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
@@ -691,6 +712,10 @@ function resolveComponent(fromPath, sf, name, current) {
 }
 
 function mountedComponent(target, files) {
+  const sameComponent = (resolved, exported) => exported && exported.path === target.path
+    && exported.node.getStart(exported.sf) === target.node.getStart(target.sf);
+  const isTargetDeclaration = (resolved, name) => resolved === target.path
+    && componentCandidates(resolved, files.find((f) => f.path === resolved)?.text || "").some((c) => c.name === name && c.node.getStart(c.sf) === target.node.getStart(target.sf));
   const rootLookup = (e) => {
     e = strip(e);
     if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression) || !ts.isIdentifier(e.expression.expression) || e.expression.expression.text !== "document" || e.arguments.length !== 1 || !ts.isStringLiteralLike(e.arguments[0])) return false;
@@ -709,15 +734,33 @@ function mountedComponent(target, files) {
       const from = s.moduleSpecifier.text;
       const clause = s.importClause;
       if (from === "react-dom/client" && clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-        for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
+        for (const item of clause.namedBindings.elements) if (!clause.isTypeOnly && !item.isTypeOnly && (item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
       } else if (from.startsWith(".")) {
         const importedPath = resolveModule(f.path, from);
         if (from.endsWith(".css") && importedPath) continue;
-        if (importedPath === target.path && clause) {
-          if (target.defaultExport && clause.name) targetBinding = clause.name.text;
-          if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-            for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === target.name) targetBinding = item.name.text;
+        if (importedPath && clause) {
+          if (clause.name) {
+            const exported = clause.isTypeOnly ? null : resolveNamedExport(importedPath, "default");
+            if (sameComponent(importedPath, exported)) targetBinding = clause.name.text;
+            else if (clause.isTypeOnly && importedPath === target.path && target.defaultExport
+              || !exported && isTargetDeclaration(importedPath, clause.name.text)) {
+              fail(sf, s, `entry default import '${clause.name.text}' does not resolve to a runtime export of the mounted component`);
+            }
+            else importsOnlyExpected = false;
           }
+          if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+            for (const item of clause.namedBindings.elements) {
+              const exportedName = (item.propertyName || item.name).text;
+              const typeOnly = clause.isTypeOnly || item.isTypeOnly;
+              const exported = typeOnly ? null : resolveNamedExport(importedPath, exportedName);
+              if (!typeOnly && sameComponent(importedPath, exported)) targetBinding = item.name.text;
+              else if (typeOnly && isTargetDeclaration(importedPath, exportedName)
+                || !exported && isTargetDeclaration(importedPath, item.name.text)) {
+                fail(sf, s, `entry import '${exportedName}' does not resolve to a runtime export of the mounted component`);
+              }
+            }
+          }
+          if (clause.namedBindings && !ts.isNamedImports(clause.namedBindings)) importsOnlyExpected = false;
         } else importsOnlyExpected = false;
       } else importsOnlyExpected = false;
     }
@@ -751,7 +794,9 @@ for (const f of input.files) {
     const exported = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
     if (!exported) continue;
     const defaultExport = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
-    const mountRoot = mountedComponent({ path: f.path, name: c.name, defaultExport }, input.files);
+    let mountRoot;
+    try { mountRoot = mountedComponent({ path: f.path, name: c.name, defaultExport, sf: c.sf, node: c.node }, input.files); }
+    catch (e) { errors.push(String(e && e.message || e).split("\n")[0]); continue; }
     if (!mountRoot) continue;
     connected = true;
     try { models.push({ ...scanComponent(f.path, f.text, c.sf, c.node), mountRoot: mountRoot.root, mountEntry: mountRoot.entry }); }

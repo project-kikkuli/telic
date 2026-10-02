@@ -213,6 +213,7 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
     entries = []
     css_texts: list[str] = []
     resolutions: dict[str, str | None] = {}
+    toolchain_digest: str | None = None
     dig = hashlib.sha256()
     for full in files:
         try:
@@ -258,6 +259,16 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         verified, tool_inputs, toolchain_digest, why = _vite_react_inputs(top)
         if not verified:
             return None, None, why
+        for full in css:
+            try:
+                data = Path(full).read_bytes()
+                text = data.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                return None, None, f"cannot read app stylesheet {os.path.relpath(full, root)}: {e}"
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            entries.append({"path": rel, "text": text})
+            css_texts.append(text)
+            dig.update(rel.encode() + b"\0" + data + b"\0")
         resolver = EXTRACTOR.with_name("uivite-resolve.mjs")
         try:
             resolved = subprocess.run(
@@ -280,17 +291,6 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
             return None, None, f"cannot resolve the configured Vite module graph: {e}"
         dig.update(toolchain_digest.encode())
         dig.update(resolver.read_bytes())
-        for full in css:
-            try:
-                data = Path(full).read_bytes()
-                text = data.decode("utf-8")
-            except (OSError, UnicodeDecodeError) as e:
-                return None, None, f"cannot read app stylesheet {os.path.relpath(full, root)}: {e}"
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            entries.append({"path": rel, "text": text})
-            css_texts.append(text)
-            dig.update(rel.encode() + b"\0" + data + b"\0")
-        entries.extend({"path": os.path.relpath(full, top).replace(os.sep, "/"), "text": Path(full).read_text(encoding="utf-8")} for full in css)
         dig.update(os.path.relpath(config_path, root).replace(os.sep, "/").encode() + b"\0" + config_bytes + b"\0")
         for full in tool_inputs:
             try:
@@ -455,7 +455,13 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         return None, identity, "a browser cannot execute TypeScript or JSX from a raw static directory"
     models[0]["dependencies"] = sorted([*(e["path"] for e in entries), *html_deps, *([os.path.relpath(p, root).replace(os.sep, "/") for p in tool_inputs] if pipeline == "vite-react" else [])])
     models[0]["pipeline"] = pipeline or "raw-static"
-    models[0]["trust"] = ["configured Vite plugin resolver selected each analyzed local module", "installed Vite, React plugin, React, React DOM, and transitive package contents match the hashed toolchain identity", "the finite React and browser accessibility semantics implemented by this extractor match the selected runtime behavior"] if pipeline == "vite-react" else []
+    models[0]["semantic_model"] = "finite-react-accessibility-v1" if pipeline == "vite-react" else "raw-static-untrusted"
+    models[0]["toolchain_hash"] = toolchain_digest
+    models[0]["trust"] = [
+        "the configured Vite resolver selects the same local modules the analyzed source graph uses",
+        "installed compiler/runtime package bytes are identified by toolchain_hash; hashes and lock versions do not prove their semantics",
+        "admitted React DOM rendering and accessibility behavior follows finite-react-accessibility-v1",
+    ] if pipeline == "vite-react" else []
     models[0]["styles"] = styles
     models[0]["layout_sensitive"] = layout_sensitive
     return models[0], identity, None
@@ -487,7 +493,13 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
     relevant = [i for i, snap in enumerate(snaps) if prop.cond.eval(snap, "home")]
     good = [i for i, snap in enumerate(snaps) if _goal(prop.goal, snap)]
     source_lines = [f"{model['path']}:{model['line']}"]
-    receipt = {"source_hash": identity, "dependencies": model.get("dependencies", [])}
+    receipt = {
+        "source_hash": identity,
+        "dependencies": model.get("dependencies", []),
+        "semantic_model": model.get("semantic_model"),
+        "toolchain_hash": model.get("toolchain_hash"),
+        "trusted_assumptions": model.get("trust", []),
+    }
     if prop.kind == "reachable":
         if good:
             return StaticOutcome("proved", "source proof", f"all source-reachable finite states were closed ({len(states)} states); witness {paths[good[0]] or ['initial state']}", paths[good[0]], source_lines, receipt)
@@ -714,10 +726,10 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
         if kind in ("empty", "text"):
             return
         if kind == "group":
-            for c in n["children"]: visit(c, ancestors)
+            for c in n["children"]: visit(c, ancestors, False, inherited_visibility)
             return
         if kind == "branch":
-            visit(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], ancestors)
+            visit(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], ancestors, False, inherited_visibility)
             return
         if kind == "component":
             visit(n["child"], ancestors, False, inherited_visibility)
@@ -784,9 +796,12 @@ def _accessible_name(node: dict[str, Any], props: dict[str, Any], state: dict[st
     references = _display(props.get("aria-labelledby", ""))
     if references:
         labels = _id_texts(model["render"], state, model)
-        if len(set(references.split())) != len(references.split()):
+        ids = references.split()
+        if len(set(ids)) != len(ids):
             raise ValueError("aria-labelledby repeats an id outside the source name model")
-        return _display(" ".join(labels[x] for x in references.split() if x in labels))
+        resolved = [labels[x] for x in ids if x in labels]
+        if resolved:
+            return _display(" ".join(resolved))
     aria = _display(props.get("aria-label", ""))
     if aria:
         return aria
