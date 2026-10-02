@@ -1,6 +1,7 @@
 """The CI ratchet: regressions fail, acceptances and improvements pass."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +25,16 @@ def other(x: int) -> int:
 
 
 def sh(cwd, *cmd):
-    return subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True)
+    env = None
+    if cmd[0] == "git":
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Telic tests",
+            "GIT_AUTHOR_EMAIL": "telic-tests@example.invalid",
+            "GIT_COMMITTER_NAME": "Telic tests",
+            "GIT_COMMITTER_EMAIL": "telic-tests@example.invalid",
+        }
+    return subprocess.run(list(cmd), cwd=cwd, capture_output=True, text=True, env=env)
 
 
 def telic(cwd, *args):
@@ -37,8 +47,6 @@ def repo(tmp_path):
     (tmp_path / "lib" / "cap.py").write_text(SRC)
     (tmp_path / "lib" / "unrelated.py").write_text("def f(x: int) -> int:\n    #@ ensures result == x\n    return x\n")
     sh(tmp_path, "git", "init", "-q", "-b", "main")
-    sh(tmp_path, "git", "config", "user.email", "t@example.com")
-    sh(tmp_path, "git", "config", "user.name", "t")
     assert telic(tmp_path, "init", "--no-hook").returncode == 0
     sh(tmp_path, "git", "add", "-A")
     sh(tmp_path, "git", "commit", "-qm", "init")
@@ -150,8 +158,6 @@ def test_changed_override_rechecks_callers_through_the_base(tmp_path, parent, cl
     (tmp_path / "square.py").write_text(SUB.format(parent=parent, cls=cls, body="1"))
     (tmp_path / "caller.py").write_text(CALLER)
     sh(tmp_path, "git", "init", "-q", "-b", "main")
-    sh(tmp_path, "git", "config", "user.email", "t@example.com")
-    sh(tmp_path, "git", "config", "user.name", "t")
     assert telic(tmp_path, "init", "--no-hook").returncode == 0
     sh(tmp_path, "git", "add", "-A")
     sh(tmp_path, "git", "commit", "-qm", "init")
@@ -221,8 +227,6 @@ def test_since_follows_imports_as_a_full_check_does(tmp_path, case):
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     sh(tmp_path, "git", "init", "-q", "-b", "main")
-    sh(tmp_path, "git", "config", "user.email", "t@example.com")
-    sh(tmp_path, "git", "config", "user.name", "t")
     assert telic(tmp_path, "init", "--no-hook").returncode == 0
     sh(tmp_path, "git", "add", "-A")
     sh(tmp_path, "git", "commit", "-qm", "init")

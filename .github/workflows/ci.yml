@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
       - name: Toolchain identity
         run: |
-          echo "TELIC_CI_ID=$ImageVersion python=3.11 node=22 ocaml=5.2 $(apt-cache policy z3 | sed -n 's/ *Candidate: /z3=/p')" >> "$GITHUB_ENV"
+          echo "TELIC_CI_ID=$ImageVersion python=3.11.14 node=22 ocaml=5.2 $(apt-cache policy z3 | sed -n 's/ *Candidate: /z3=/p')" >> "$GITHUB_ENV"
       - uses: actions/cache/restore@v4
         with:
           path: .telic
@@ -47,7 +47,7 @@ jobs:
       - if: steps.plan.outputs.needed == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.11.14"
       - if: steps.plan.outputs.needed == 'true'
         uses: actions/setup-node@v4
         with:

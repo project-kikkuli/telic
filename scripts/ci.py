@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
+import glob
 import hashlib
 import json
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -16,38 +20,276 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 RECEIPTS = ROOT / ".telic" / "ci-verdicts.json"
-TEST_SETUP = [".github/constraints.txt", "pyproject.toml", "tests/conftest.py"]
-PROOF_SETUP = [".github/constraints.txt", "pyproject.toml"]
-KERNEL = ["telic/*.py", "telic/frontend/**/*.py", "telic/frontend/**/*.mjs", "telic/frontend/**/package*.json"] + [f"telic/{name}.py" for name in (
-    "__init__", "ir", "contracts", "program", "logic", "vcgen", "infer", "smt", "checker",
-    "jobs", "slots", "irjson", "engine", "history", "lifecycle", "equiv", "replay", "replay_harness",
-    "lean", "prover", "toolchain", "runtime", "aim", "render_expr", "gaps", "evidence",
-)] + ["telic/ui/spec.py"]
-KERNEL += ["lean-toolchain", "telic/lean/*"]
-FRONTENDS = {
-    "python": ["telic/frontend/__init__.py", "telic/frontend/python*.py", "telic/frontend/aim_file.py"],
-    "typescript": ["telic/frontend/typescript.py", "telic/frontend/ts/*.mjs", "telic/frontend/ts/package*.json"],
-    "rust": ["telic/frontend/rust*.py"],
-    "swift": ["telic/frontend/swift*.py"],
+CI_SETUP = ["scripts/ci.py", ".github/workflows/ci.yml", ".github/constraints.txt", "pyproject.toml"]
+TEST_SETUP = CI_SETUP + ["tests/conftest.py"]
+PROOF_SETUP = CI_SETUP
+
+_JS_IMPORT = re.compile(r"(?m)^\s*(?:import\s+(?:[^\n]*?\s+from\s*)?|import\s*|export\s+[^\n]*?\s+from\s*)[\"'](\.[^\"']+)[\"']")
+_JS_DYNAMIC_IMPORT = re.compile(r"\bimport\s*\(\s*[\"'](\.[^\"']+)[\"']")
+_PY_DIRECTIVE = {
+    name: re.compile(rf"^\s*#@\s*(?:\[[^]]+\]\s*)?{name}\b", re.M)
+    for name in ("mirrors", "ui")
 }
-ALL_FRONTENDS = [p for paths in FRONTENDS.values() for p in paths]
-GROUPS = {
-    "proof": {"inputs": ["telic/**/*.py", "telic/**/*.proof.lean", "telic/frontend/ts/*.mjs", "telic/frontend/ts/package*.json", "core/*.ml", "core/Makefile", "telic/lean/*", "telic.ledger.json"] + PROOF_SETUP, "native": True},
-    "corpus-python": {"inputs": KERNEL + FRONTENDS["python"] + ["tests/test_corpus.py", "tests/cases/corpus.py"], "tests": ["tests/test_corpus.py::test_python_corpus", "tests/test_corpus.py::test_python_refutations_are_confirmed_by_execution"]},
-    "corpus-typescript": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["typescript"] + ["tests/test_corpus.py", "tests/cases/corpus.ts"], "tests": ["tests/test_corpus.py::test_typescript_corpus"]},
-    "corpus-rust": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["rust"] + ["tests/test_rust.py", "tests/cases/corpus.rs", "tests/cases/rust_crate/**/*"], "tests": [f"tests/test_rust.py::{name}" for name in ("test_rust_corpus", "test_rust_refutations_are_real_panics", "test_crate_across_files", "test_crate_file_alone_uses_its_crate", "test_crate_is_valid_rust_and_refutations_replay")]},
-    "corpus-swift": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["swift"] + ["tests/test_swift.py", "tests/cases/corpus.swift"], "tests": ["tests/test_swift.py::test_swift_corpus", "tests/test_swift.py::test_swift_refutations_are_real_failures"]},
-    "soundness": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_soundness.py", "tests/cases/soundness/**/*"], "tests": ["tests/test_soundness.py"], "native": True},
-    "semantics": {"inputs": KERNEL + ALL_FRONTENDS + ["tests/test_semantics.py", "tests/test_swift.py", "tests/test_rust.py", "tests/cases/corpus.rs"], "tests": ["tests/test_semantics.py", "tests/test_swift.py::test_swift_integer_semantics_match_swiftc", "tests/test_rust.py::test_proved_functions_hold_when_run"]},
-    "engine": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_engine.py", "tests/test_soundness.py", "tests/cases/**/*"], "tests": [f"tests/test_engine.py::{name}" for name in ("test_engine_agrees_with_python_core", "test_engine_proves_no_exploit", "test_a_field_telic_cannot_model_fails_only_what_touches_it")], "native": True},
-    "lean": {"inputs": KERNEL + ALL_FRONTENDS + ["telic/lean/*", "tests/test_lean.py"], "tests": ["tests/test_lean.py"], "lean": True},
-    "cache": {"inputs": KERNEL + FRONTENDS["python"] + ["core/*.ml", "core/Makefile", "tests/test_cache.py", "tests/test_engine.py", "tests/test_corpus.py"], "tests": ["tests/test_cache.py", "tests/test_engine.py::test_engine_agrees_with_python_core", "tests/test_engine.py::test_native_query_receipt_ignores_unrelated_term_id_shifts"], "native": True},
+_HOST_DIRECTIVE = {
+    name: re.compile(rf"^\s*//@\s*(?:\[[^]]+\]\s*)?{name}\b", re.M)
+    for name in ("mirrors", "ui")
 }
 
+
+def _python_module(path: Path) -> str:
+    rel = path.relative_to(ROOT).with_suffix("")
+    parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
+    return ".".join(parts)
+
+
+def _module_file(module: str) -> Path | None:
+    if not module:
+        return None
+    if module == "telic" or module.startswith("telic.") or module == "tests" or module.startswith("tests."):
+        base = ROOT.joinpath(*module.split("."))
+    else:
+        base = ROOT / "tests" / module
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _local_imports(path: Path) -> set[Path]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    package = _python_module(path)
+    if path.name != "__init__.py":
+        package = package.rpartition(".")[0]
+    out: set[Path] = set()
+    for node in ast.walk(tree):
+        modules: list[str] = []
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names if alias.name == "telic" or alias.name.startswith("telic.") or alias.name == "tests" or alias.name.startswith("tests."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".") if package else []
+                if node.level > len(parts) + 1:
+                    raise RuntimeError(f"invalid relative import in {path.relative_to(ROOT)}:{node.lineno}")
+                base = parts[: len(parts) - node.level + 1]
+                if node.module:
+                    modules.append(".".join(base + node.module.split(".")))
+                else:
+                    modules.extend(".".join(base + [alias.name]) for alias in node.names)
+            elif node.module and (node.module == "telic" or node.module.startswith("telic.") or node.module == "tests" or node.module.startswith("tests.")):
+                modules.append(node.module)
+                modules.extend(f"{node.module}.{alias.name}" for alias in node.names)
+        for module in modules:
+            found = _module_file(module)
+            if found is not None:
+                out.add(found)
+    return out
+
+
+def python_sources(roots: list[str], excluded: list[str] = ()) -> list[str]:
+    """Follow every repository-local Python import from executable roots.
+
+    Language dispatch, UI execution, and prover-agent commands are excluded
+    here and added only by the gate paths that actually select them. Imports
+    inside functions are included conservatively because the loader dispatches
+    through those paths at runtime.
+    """
+    seen: set[Path] = set()
+    todo = [ROOT / root for root in roots]
+    while todo:
+        path = todo.pop()
+        if path in seen:
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"missing CI Python dependency: {path.relative_to(ROOT)}")
+        rel = str(path.relative_to(ROOT))
+        if any(fnmatch.fnmatch(rel, pattern) for pattern in excluded):
+            continue
+        seen.add(path)
+        todo.extend(_local_imports(path) - seen)
+    return sorted(str(path.relative_to(ROOT)) for path in seen)
+
+
+def javascript_sources(roots: list[str]) -> list[str]:
+    """Follow local ES module edges used by the TypeScript lowering/replay workers."""
+    seen: set[Path] = set()
+    todo = [ROOT / root for root in roots]
+    while todo:
+        path = todo.pop()
+        if path in seen:
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"missing CI JavaScript dependency: {path.relative_to(ROOT)}")
+        seen.add(path)
+        source = path.read_text()
+        imports = _JS_IMPORT.findall(source) + _JS_DYNAMIC_IMPORT.findall(source)
+        for spec in imports:
+            base = (path.parent / spec).resolve()
+            candidates = (base, base.with_suffix(".mjs"), base.with_suffix(".js"), base / "index.mjs")
+            dep = next((candidate for candidate in candidates if candidate.is_file() and candidate.is_relative_to(ROOT)), None)
+            if dep is None:
+                raise RuntimeError(f"unresolved local JavaScript import {spec!r} in {path.relative_to(ROOT)}")
+            todo.append(dep)
+        if "import(" in source and not _JS_DYNAMIC_IMPORT.search(source):
+            todo.extend(ROOT.glob("telic/frontend/ts/**/*.mjs"))
+    return sorted(str(path.relative_to(ROOT)) for path in seen)
+
+
+def has_directive(patterns: list[str], directive: str) -> bool:
+    for pattern in patterns:
+        for path in ROOT.glob(pattern):
+            if not path.is_file():
+                continue
+            markers = _PY_DIRECTIVE if path.suffix == ".py" else _HOST_DIRECTIVE
+            if markers[directive].search(path.read_text(errors="replace")):
+                return True
+    return False
+
+
+def verifier_sources(languages: set[str], replay: bool, mirrors: bool, ui: bool, prover: bool = False) -> list[str]:
+    roots = ["telic/checker.py", "telic/frontend/python.py"]
+    if replay:
+        roots.append("telic/replay_harness.py")
+    for language in languages - {"python"}:
+        if language == "typescript":
+            roots.append("telic/frontend/typescript.py")
+        elif language == "rust":
+            roots.append("telic/frontend/rust.py")
+        elif language == "swift":
+            roots.append("telic/frontend/swift.py")
+    excluded = []
+    if not ui:
+        excluded.append("telic/ui/run.py")
+    if not mirrors:
+        excluded.append("telic/equiv.py")
+    if not prover:
+        excluded.append("telic/prover.py")
+    for language in {"typescript", "rust", "swift"} - languages:
+        excluded.append({
+            "typescript": "telic/frontend/typescript.py",
+            "rust": "telic/frontend/rust*.py",
+            "swift": "telic/frontend/swift*.py",
+        }[language])
+    if not replay:
+        excluded.extend(["telic/replay.py", "telic/replay_harness.py", "telic/frontend/*_replay.py"])
+    return python_sources(roots, excluded)
+
+
+def telic_python_sources() -> list[str]:
+    return sorted(str(path.relative_to(ROOT)) for path in (ROOT / "telic").rglob("*.py") if "demo" not in path.relative_to(ROOT).parts)
+
+
+def proof_sidecars() -> list[str]:
+    return sorted(str(path.relative_to(ROOT)) for path in (ROOT / "telic").rglob("*.proof.lean") if "demo" not in path.relative_to(ROOT).parts)
+
+
+def test_inputs(patterns: list[str], *, languages: set[str], replay: bool, native: bool = False,
+                lean: bool = False, prover: bool = False) -> list[str]:
+    fixtures = [pattern for pattern in patterns if pattern.startswith("tests/cases/")]
+    mirrors = has_directive(fixtures, "mirrors")
+    ui = has_directive(fixtures, "ui")
+    test_roots = [pattern for pattern in patterns if pattern.startswith("tests/") and not any(c in pattern for c in "*?[")]
+    files = verifier_sources(languages, replay, mirrors, ui, prover) + python_sources(test_roots + ["tests/conftest.py"])
+    if "typescript" in languages:
+        files += javascript_sources(["telic/frontend/ts/lower.mjs", "telic/frontend/ts/harness.mjs"])
+        files += ["telic/frontend/ts/package.json", "telic/frontend/ts/package-lock.json"]
+    if native:
+        files += ["core/**/*"]
+    if lean:
+        files += ["telic/lean/**/*.lean", "telic/lean/lean-toolchain", "telic/**/*.proof.lean"]
+    return sorted(set(files + patterns + ["telic/lean/lean-toolchain"]))
+
+
+def _executable_identity(command: str, args: tuple[str, ...] = ("--version",), selected: str | None = None) -> list[str]:
+    found = selected if selected and Path(selected).is_file() else shutil.which(command)
+    if found is None:
+        return [command, "unavailable"]
+    path = Path(found).resolve()
+    try:
+        version = subprocess.run([str(path), *args], capture_output=True, text=True, timeout=10)
+        label = (version.stdout or version.stderr).strip()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [command, str(path), f"unavailable:{type(exc).__name__}"]
+    return [command, str(path), label, digest]
+
+
+def runtime_identity(name: str, group: dict) -> dict:
+    py = Path(sys.executable).resolve()
+    identity = {
+        "ci": os.environ.get("TELIC_CI_ID", ""),
+        "python": [sys.implementation.name, platform.python_version(), platform.python_build(), str(py), hashlib.sha256(py.read_bytes()).hexdigest()],
+    }
+    tools = list(group.get("tools", []))
+    if group.get("native"):
+        tools.extend(["native-z3", "core"])
+    if group.get("lean") or name == "proof" and proof_sidecars():
+        tools.append("lean")
+    for tool in sorted(set(tools)):
+        if tool == "native-z3" and "z3-package-sha256=" in identity["ci"]:
+            # CI binds the selected executable to the SHA256 in the signed apt
+            # package index; apt installs that exact package after planning.
+            identity[tool] = [tool, identity["ci"].split("z3-package-sha256=", 1)[1].split()[0]]
+        elif tool == "core":
+            override = os.environ.get("TELIC_CORE")
+            binary = Path(override) if override and Path(override).is_file() else ROOT / "core" / "telic-core"
+            identity[tool] = _executable_identity("telic-core", ("--source-hash",), str(binary) if binary.is_file() else None)
+        elif tool == "lean":
+            from telic.lean import find_lean
+
+            identity[tool] = _executable_identity("lean", ("--version",), find_lean())
+        elif tool == "native-z3":
+            identity[tool] = _executable_identity("z3", ("--version",), os.environ.get("TELIC_Z3"))
+        else:
+            identity[tool] = _executable_identity(tool)
+    # Python Z3 is installed only after the plan. Its exact package version is
+    # constrained in .github/constraints.txt; the solver receipt hashes the
+    # loaded shared library once the gate runs.
+    identity["python-z3-package"] = "constraints:.github/constraints.txt"
+    return identity
+
+
+_SOUNDNESS = [f"tests/cases/soundness/**/*.{ext}" for ext in ("py", "ts", "tsx", "rs", "swift")]
+_ENGINE_CASES = ["tests/cases/corpus.*", "tests/cases/objects/*.py", "tests/cases/objects/*.ts", *_SOUNDNESS,
+                 "tests/cases/unmodelled.py"]
+_RUST_CASES = ["tests/cases/corpus.rs", "tests/cases/rust_crate/**/*"]
+_PROOF_INPUTS = telic_python_sources() + proof_sidecars() + ["core/**/*", "telic.ledger.json"]
+
+_CORPUS_TESTS = {
+    "corpus-python": ("tests/test_corpus.py", ["tests/cases/corpus.py"], {"python"}, True),
+    "corpus-typescript": ("tests/test_corpus.py", ["tests/cases/corpus.ts"], {"python", "typescript"}, True),
+    "corpus-rust": ("tests/test_rust.py", _RUST_CASES, {"python", "rust"}, True),
+    "corpus-swift": ("tests/test_swift.py", ["tests/cases/corpus.swift"], {"python", "swift"}, True),
+}
+
+
+def _corpus_group(name: str, tests: list[str]) -> dict:
+    test_file, fixtures, languages, replay = _CORPUS_TESTS[name]
+    patterns = [test_file, *fixtures]
+    tools = [{"typescript": "node", "rust": "rustc", "swift": "swiftc"}[lang] for lang in languages if lang != "python"]
+    return {"inputs": test_inputs(patterns, languages=languages, replay=replay) + TEST_SETUP, "tests": tests, "tools": tools}
+
+
+GROUPS = {
+    "proof": {"inputs": _PROOF_INPUTS + PROOF_SETUP, "native": True},
+    "corpus-python": _corpus_group("corpus-python", ["tests/test_corpus.py::test_python_corpus", "tests/test_corpus.py::test_python_refutations_are_confirmed_by_execution"]),
+    "corpus-typescript": _corpus_group("corpus-typescript", ["tests/test_corpus.py::test_typescript_corpus"]),
+    "corpus-rust": _corpus_group("corpus-rust", [f"tests/test_rust.py::{name}" for name in ("test_rust_corpus", "test_rust_refutations_are_real_panics", "test_crate_across_files", "test_crate_file_alone_uses_its_crate", "test_crate_is_valid_rust_and_refutations_replay")]),
+    "corpus-swift": _corpus_group("corpus-swift", ["tests/test_swift.py::test_swift_corpus", "tests/test_swift.py::test_swift_refutations_are_real_failures"]),
+    "soundness": {"inputs": test_inputs(["tests/test_soundness.py", *_SOUNDNESS], languages={"python", "typescript", "rust", "swift"}, replay=True) + TEST_SETUP, "tests": ["tests/test_soundness.py"], "tools": ["node", "rustc", "swiftc"]},
+    "semantics": {"inputs": test_inputs(["tests/test_semantics.py", "tests/test_swift.py", "tests/test_rust.py", "tests/cases/corpus.rs"], languages={"python", "typescript", "rust", "swift"}, replay=True) + TEST_SETUP, "tests": ["tests/test_semantics.py", "tests/test_swift.py::test_swift_integer_semantics_match_swiftc", "tests/test_rust.py::test_proved_functions_hold_when_run"], "tools": ["node", "rustc", "swiftc"]},
+    "engine": {"inputs": test_inputs(["tests/test_engine.py", "tests/test_soundness.py", *_ENGINE_CASES], languages={"python", "typescript", "rust", "swift"}, replay=True, native=True) + TEST_SETUP, "tests": [f"tests/test_engine.py::{name}" for name in ("test_engine_agrees_with_python_core", "test_engine_proves_no_exploit", "test_a_field_telic_cannot_model_fails_only_what_touches_it")], "native": True, "tools": ["node", "rustc", "swiftc"]},
+    "lean": {"inputs": test_inputs(["tests/test_lean.py"], languages={"python"}, replay=False, lean=True, prover=True) + TEST_SETUP, "tests": ["tests/test_lean.py"], "lean": True, "tools": ["lean"]},
+    "cache": {"inputs": test_inputs(["tests/test_cache.py", "tests/test_engine.py", "tests/cases/corpus.*", "tests/cases/objects/*.py", "tests/cases/objects/*.ts"], languages={"python", "typescript", "rust", "swift"}, replay=True, native=True) + TEST_SETUP, "tests": ["tests/test_cache.py", "tests/test_engine.py::test_engine_agrees_with_python_core", "tests/test_engine.py::test_native_query_receipt_ignores_unrelated_term_id_shifts"], "native": True, "tools": ["node"]},
+}
 
 def inputs(patterns: list[str]) -> set[str]:
     tracked = set(subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT, text=True).splitlines())
-    return {str(p.relative_to(ROOT)) for pattern in patterns for p in ROOT.glob(pattern) if p.is_file() and str(p.relative_to(ROOT)) in tracked}
+    found: set[str] = set()
+    for pattern in patterns:
+        if not glob.has_magic(pattern) and not (ROOT / pattern).is_file():
+            raise RuntimeError(f"missing required CI evidence input: {pattern}")
+        found.update(str(p.relative_to(ROOT)) for p in ROOT.glob(pattern) if p.is_file() and str(p.relative_to(ROOT)) in tracked)
+    return found
 
 
 def baseline(since: str | None) -> dict | None:
@@ -62,7 +304,7 @@ def baseline(since: str | None) -> dict | None:
 def key(name: str, since: str | None) -> str:
     setup = PROOF_SETUP if name == "proof" else TEST_SETUP
     paths = inputs(setup + GROUPS[name]["inputs"])
-    identity = os.environ.get("TELIC_CI_ID", f"{platform.system()} {platform.machine()} {platform.python_version()}")
+    identity = runtime_identity(name, GROUPS[name])
     h = hashlib.sha256(json.dumps([name, GROUPS[name], identity], sort_keys=True).encode())
     if name == "proof":
         h.update(json.dumps(baseline(since), sort_keys=True).encode())
@@ -89,8 +331,8 @@ def proof(since: str | None, record: bool) -> bool:
     scope = None
     if since and not record:
         changed = changed_files(str(ROOT), since)
-        compiler = KERNEL + ALL_FRONTENDS + ["telic/aim.py", "telic/ledger.py", "core/*.ml", "core/Makefile", "telic/lean/*"]
-        if not any(fnmatch.fnmatch(path, pattern) for path in changed for pattern in compiler):
+        compiler = set(_PROOF_INPUTS + PROOF_SETUP)
+        if not any(path in compiler or fnmatch.fnmatch(path, "core/**/*") for path in changed):
             scope = affected_files(str(ROOT), changed, old) & set(paths)
             scope |= {k.split("::")[0] for k in (old or {}).get("functions", {}) if not (ROOT / k.split("::")[0]).exists()}
             paths = sorted(p for p in scope if (ROOT / p).exists())
