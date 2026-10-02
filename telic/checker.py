@@ -387,33 +387,38 @@ def inference_key(program: Program, key: str, rlimit: int) -> str:
 _TOOLCHAIN: str | None = None
 
 
+def refresh_toolchain_id() -> None:
+    global _TOOLCHAIN
+    _TOOLCHAIN = None
+
+
 def toolchain_id() -> str:
     """Evidence is only as good as the verifier that produced it, so every
     receipt is bound to the exact telic sources and Z3 version (a telic fix
     or a solver upgrade invalidates old receipts instead of trusting them)."""
     global _TOOLCHAIN
     if _TOOLCHAIN is None:
-        import z3
+        from . import toolchain
 
-        h = hashlib.sha256(f"z3 {z3.get_version_string()}".encode())
+        identity = json.dumps({"python_z3": toolchain.python_z3(), "native_z3": toolchain.native_z3(), "lean": toolchain.lean(), "core": toolchain.core()}, sort_keys=True)
+        h = hashlib.sha256(identity.encode())
         pkg = Path(__file__).resolve().parent
         semantic = (
             "__init__.py", "ir.py", "contracts.py", "program.py", "logic.py", "vcgen.py",
             "infer.py", "smt.py", "checker.py", "jobs.py", "slots.py", "irjson.py", "engine.py",
             "history.py", "lifecycle.py", "equiv.py", "replay.py", "replay_harness.py", "lean.py",
-            "prover.py",
+            "toolchain.py", "prover.py", "evidence.py",
         )
         for name in semantic:
             f = pkg / name
+            if not f.exists():
+                continue
             h.update(f.name.encode())
             h.update(f.read_bytes())
         for f in sorted((pkg / "frontend").rglob("*")):
             if f.is_file() and (f.suffix in (".py", ".mjs") or f.name.startswith("package") and f.suffix == ".json") and "node_modules" not in f.parts:
                 h.update(f.relative_to(pkg).as_posix().encode())
                 h.update(f.read_bytes())
-        for f in sorted((pkg / "ui").rglob("*.py")):
-            h.update(f.relative_to(pkg).as_posix().encode())
-            h.update(f.read_bytes())
         for f in sorted(pkg.rglob("*.lean")):
             if "demo" not in f.parts:
                 h.update(f.relative_to(pkg).as_posix().encode())
@@ -425,6 +430,9 @@ def toolchain_id() -> str:
             if f.name != "source_hash.ml":
                 h.update(f.name.encode())
                 h.update(f.read_bytes())
+        core_makefile = pkg.parent / "core" / "Makefile"
+        if core_makefile.exists():
+            h.update(b"core/Makefile\0" + core_makefile.read_bytes())
         _TOOLCHAIN = h.hexdigest()[:16]
     return _TOOLCHAIN
 
@@ -470,12 +478,27 @@ def _classes(program: Program, names: set[str] | None = None) -> str:
                 ],
                 "bases": program.classes[n].bases,
                 "owner": program.classes[n].owner,
+                "methods": _class_methods(program, n),
             }
             for n in sorted(expanded)
             if n in program.classes
         }
         memo["@classes:" + ",".join(sorted(names))] = json.dumps(decls, sort_keys=True, default=str)
     return memo["@classes:" + ",".join(sorted(names))]
+
+
+def _class_methods(program: Program, cls: str) -> list[dict[str, Any]]:
+    names = {
+        ref.fn.name.split(".", 1)[1]
+        for ref in program.funcs.values()
+        if any(ref.fn.name.startswith(f"{owner}.") for owner in program.mro(cls))
+    }
+    resolved = []
+    for name in sorted(names):
+        ref = program.member(cls, name)
+        if ref is not None:
+            resolved.append({"name": name, "target": ref.key, "dispatch": sorted(program.dispatch.get(ref.key, ()))})
+    return resolved
 
 
 def _class_refs(value: Any) -> set[str]:
@@ -545,6 +568,11 @@ def _callee_contract(ref: FuncRef, program: Program) -> dict[str, Any]:
         "unit": fn.unit,
         "definitional": ref.key in program.definitional,
         "predicate": ref.key in program.predicates,
+        "untrusted": sorted(program.untrusted.get(ref.key, ())),
+        "dispatch": sorted(program.dispatch.get(ref.key, ())),
+        "later": sorted(program.later.get(ref.key, ())),
+        "recursive": ref.key in program.recursive,
+        "recursive_group": sorted(k for k in program.recursive if program.same_scc(ref.key, k)),
         "effects": {
             "mutated": sorted(program.mutated.get(ref.key, ())),
             "appends": sorted(program.appends.get(ref.key, ())),
@@ -575,6 +603,9 @@ def function_key(program: Program, key: str, root: str | None, rlimit: int) -> s
             seen.add(k)
             todo.extend(program.callees.get(k, ()))
             todo.extend(program.dispatch.get(k, ()))
+            later = program.later.get(k, ())
+            value_targets.update(later)
+            todo.extend(later)
             for _, _, targets in program.code_calls.get(k, ()):
                 value_targets.update(targets)
                 todo.extend(targets)
@@ -871,6 +902,7 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
 
 
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None, ui: Any = None) -> Report:
+    refresh_toolchain_id()
     t0 = t0 or time.perf_counter()
     program = Program.build([m for m in modules if m.language != "aims"])
     selected = program.claimed() if opts.claims_only else set(program.funcs)
