@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import time
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -419,7 +418,7 @@ def toolchain_id() -> str:
             if "demo" not in f.parts:
                 h.update(f.relative_to(pkg).as_posix().encode())
                 h.update(f.read_bytes())
-        lean_toolchain = pkg.parent / "lean-toolchain"
+        lean_toolchain = pkg / "lean" / "lean-toolchain"
         if lean_toolchain.exists():
             h.update(b"lean-toolchain\0" + lean_toolchain.read_bytes())
         for f in sorted((pkg.parent / "core").glob("*.ml")):
@@ -537,8 +536,10 @@ def _callee_contract(ref: FuncRef, program: Program) -> dict[str, Any]:
         "requires": [irjson.clause(c) for c in fn.requires],
         "ensures": [irjson.clause(c) for c in fn.ensures],
         "raises": [irjson.clause(c) for c in fn.raises],
+        "decreases": irjson.clause(fn.decreases),
         "unsupported": [(message, loc.line) for message, loc in fn.unsupported],
         "trusted": fn.trusted,
+        "escaped": sorted(fn.escaped),
         "is_async": fn.is_async,
         "rejects": fn.rejects,
         "unit": fn.unit,
@@ -550,6 +551,7 @@ def _callee_contract(ref: FuncRef, program: Program) -> dict[str, Any]:
             "heap_writes": {name: sorted(targets) for name, targets in sorted(program.heap_writes.get(ref.key, {}).items())},
             "heap_reads": sorted(program.heap_reads.get(ref.key, ())),
             "allocates": ref.key in program.allocates,
+            "views": sorted(program.views.get(ref.key, ())),
             "hands_out": ref.key in program.hands_out,
             "unchecked_writer": ref.key in program.unchecked_writers,
             "passthrough": ref.key in program.passthrough,
@@ -595,6 +597,7 @@ def function_key(program: Program, key: str, root: str | None, rlimit: int) -> s
                         if callee is not None:
                             todo.append(callee.key)
     h = hashlib.sha256(f"fn {toolchain_id()} {key} {rlimit}".encode())
+    h.update((Path(__file__).with_name("render_expr.py")).read_bytes())
     h.update(_classes(program, classes).encode())
     for k in sorted(seen):
         if k not in program.funcs:
