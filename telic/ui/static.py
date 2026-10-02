@@ -600,8 +600,13 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
     if unsupported:
         wrapper = unsupported[0]
         return StaticOutcome("open", "source model", f"mounted {wrapper['name']} at {wrapper.get('path', model['path'])}:{wrapper['line']} has render or lifecycle behavior outside this source model")
+    stop = None
+    if prop.kind == "reachable":
+        stop = lambda snap: _goal(prop.goal, snap)
+    elif prop.kind in ("always", "never"):
+        stop = lambda snap: prop.cond.eval(snap, "home") and _goal(prop.goal, snap) == (prop.kind == "never")
     try:
-        states, edges, snaps = _graph(model)
+        states, edges, snaps, closed = _explore(model, stop)
     except ValueError as e:
         return StaticOutcome("open", "source model", str(e))
     if prop.kind in ("unobscured", "persists"):
@@ -625,16 +630,22 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
     premise = f"; assumptions: {'; '.join(assumptions)}" if assumptions else ""
     if prop.kind == "reachable":
         if good:
-            return StaticOutcome("proved", "source proof", f"all source-reachable finite states were closed ({len(states)} states); witness {paths[good[0]] or ['initial state']}{premise}", paths[good[0]], source_lines, receipt)
+            return StaticOutcome("proved", "source proof", f"source-enabled witness {paths[good[0]] or ['initial state']}{premise}", paths[good[0]], source_lines, receipt)
+        if not closed:
+            return StaticOutcome("open", "source proof", "the explored source transitions did not close and no concrete reachability witness was found")
         return StaticOutcome("refuted", "source proof", f"the source model closes with no state satisfying {prop.goal}{premise}", [], source_lines, receipt)
     if prop.kind in ("always", "never"):
         bad = [i for i in relevant if _goal(prop.goal, snaps[i]) == (prop.kind == "never")]
         if bad:
             return StaticOutcome("refuted", "source proof", f"source state violates {prop}{premise}", paths[bad[0]], source_lines, receipt)
+        if not closed:
+            return StaticOutcome("open", "source proof", f"the explored source transitions did not close; the invariant is not proved")
         if not relevant:
             return StaticOutcome("open", "source proof", f"{prop} has no reachable state where its condition holds", None, source_lines, receipt)
         return StaticOutcome("proved", "source proof", f"all {len(relevant)} relevant source-reachable states satisfy {prop}{premise}", None, source_lines, receipt)
     if prop.kind == "always_reachable":
+        if not closed:
+            return StaticOutcome("open", "source proof", "the source transition relation did not close for the all-states reachability obligation")
         if not relevant:
             return StaticOutcome("open", "source proof", f"{prop} has no reachable source state where its condition holds", None, source_lines, receipt)
         for start in relevant:
@@ -661,7 +672,7 @@ def _goal(goal: Pred | Target, snap: Snapshot) -> bool:
 def _css_style(node: dict[str, Any], props: dict[str, Any], model: dict[str, Any], inherited: str) -> tuple[str | None, str]:
     display = None
     visibility = inherited
-    classes = set(str(props.get("className", "")).split())
+    classes = set(_react_dom_string(props.get("className", "")).split())
     tag = node.get("tag", "").lower()
     for rule in sorted(model.get("styles", []), key=lambda r: r["specificity"]):
         if (rule["tag"] is None or rule["tag"] == tag) and set(rule["classes"]) <= classes:
@@ -673,10 +684,19 @@ def _css_style(node: dict[str, Any], props: dict[str, Any], model: dict[str, Any
 
 
 def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple[int, str]]], list[Snapshot]]:
+    states, edges, snaps, closed = _explore(model)
+    if not closed:
+        raise ValueError(f"the source state space exceeds {MAX_STATES} states; finite closure was not established")
+    return states, edges, snaps
+
+
+def _explore(model: dict[str, Any], stop: Any = None) -> tuple[list[dict[str, Any]], list[list[tuple[int, str]]], list[Snapshot], bool]:
     declarations = model["states"]
     state_defs = {d["name"]: d for d in declarations}
     initial = {d["name"]: d["initial"] for d in declarations}
     initial["@route"] = model.get("initial_route", "/")
+    for effect in model.get("effects", []):
+        initial[f"@effect:{effect['id']}"] = None
     for d in declarations:
         if not isinstance(d["initial"], (bool, int, str)) and d["initial"] is not None:
             raise ValueError(f"state `{d['name']}` has a non-finite initial value at {model['path']}:{d['line']}")
@@ -684,6 +704,8 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
     indexes = {_key(initial): 0}
     edges: list[list[tuple[int, str]]] = [[]]
     snaps = [_snapshot(model["render"], initial, model)]
+    if stop is not None and stop(snaps[0]):
+        return states, edges, snaps, False
     q = deque([0])
     while q:
         i = q.popleft()
@@ -691,12 +713,24 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
         for action in _actions(model["render"], current, model):
             nxt = dict(current)
             _execute(action["handler"], current, nxt, state_defs)
+            if action.get("effect_slot"):
+                nxt[action["effect_slot"]] = action["dependencies"]
             before_mounts = _mounted_components(model["render"], current)
             after_mounts = _mounted_components(model["render"], nxt)
             for declaration in declarations:
                 owner = declaration.get("owner")
-                if owner and owner in before_mounts and owner not in after_mounts:
+                before_owner = {item for item in before_mounts if item == owner or item.startswith(owner + "|")} if owner else set()
+                after_owner = {item for item in after_mounts if item == owner or item.startswith(owner + "|")} if owner else set()
+                if owner and before_owner and before_owner != after_owner:
                     nxt[declaration["name"]] = declaration["initial"]
+            for effect in model.get("effects", []):
+                owner = effect.get("owner")
+                if not owner:
+                    continue
+                before_owner = {item for item in before_mounts if item == owner or item.startswith(owner + "|")}
+                after_owner = {item for item in after_mounts if item == owner or item.startswith(owner + "|")}
+                if before_owner and before_owner != after_owner:
+                    nxt.pop(f"@effect:{effect['id']}", None)
             for name, value in nxt.items():
                 if isinstance(value, int) and not isinstance(value, bool) and not -(2**53 - 1) <= value <= 2**53 - 1:
                     raise ValueError(f"state `{name}` exceeds JavaScript's exact integer range at {model['path']}:{action['line']}")
@@ -704,15 +738,18 @@ def _graph(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[list[tuple
             j = indexes.get(key)
             if j is None:
                 if len(states) >= MAX_STATES:
-                    raise ValueError(f"the source state space exceeds {MAX_STATES} states; finite closure was not established")
+                    return states, edges, snaps, False
                 j = len(states)
                 indexes[key] = j
                 states.append(nxt)
                 edges.append([])
                 snaps.append(_snapshot(model["render"], nxt, model))
+                if stop is not None and stop(snaps[-1]):
+                    edges[i].append((j, action["label"]))
+                    return states, edges, snaps, False
                 q.append(j)
             edges[i].append((j, action["label"]))
-    return states, edges, snaps
+    return states, edges, snaps, True
 
 
 def _key(state: dict[str, Any]) -> tuple:
@@ -736,6 +773,8 @@ def _eval(e: Any, state: dict[str, Any], locals_: dict[str, Any] | None = None) 
     op = e[0]
     if op == "lit":
         return e[1]
+    if op == "jsx-lit":
+        return _jsx_entities(e[1])
     if op == "state":
         return state[e[1]]
     if op == "route":
@@ -864,6 +903,9 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
         if kind == "component":
             visit(n["child"], ancestors, False, inherited_visibility)
             return
+        if kind == "provider":
+            for child in n.get("children", []): visit(child, ancestors, False, inherited_visibility)
+            return
         if kind != "element":
             raise ValueError("render node is malformed")
         props = {k: _eval(v, state) for k, v in n["props"].items()}
@@ -882,35 +924,66 @@ def _actions(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any])
         next_ancestors = [*ancestors, n["events"]["click"]] if n["events"].get("click") is not None and not disabled else ancestors
         for c in children: visit(c, next_ancestors, False, visibility)
     visit(tree, [])
+    mounted = _mounted_components(tree, state)
+    for effect in model.get("effects", []):
+        owner = effect.get("owner")
+        if owner and not any(item == owner or item.startswith(owner + "|") for item in mounted):
+            continue
+        dependencies = tuple(_eval(item, state) for item in effect["deps"])
+        if any(isinstance(value, (list, dict)) for value in dependencies):
+            raise ValueError(f"effect dependency at {effect['path']}:{effect['line']} is not a finite scalar")
+        slot = f"@effect:{effect['id']}"
+        if state.get(slot) != dependencies:
+            out.append({"handler": effect["setup"], "label": f"run effect at {effect['path']}:{effect['line']}", "line": effect["line"], "effect_slot": slot, "dependencies": dependencies})
     return out
 
 
 def _mounted_components(tree: dict[str, Any], state: dict[str, Any]) -> set[str]:
     mounted: set[str] = set()
     tree = _active_render(tree, state)
-    def visit(node: dict[str, Any]) -> None:
+    def keyed(scope: tuple[str, ...], node: dict[str, Any]) -> tuple[str, ...]:
+        if node.get("key") is None:
+            return scope
+        value = _eval(node["key"], state)
+        if isinstance(value, (list, dict)) or value is None:
+            raise ValueError("React key is not a finite string or number")
+        return (*scope, _react_dom_string(value))
+
+    def visit(node: dict[str, Any], scope: tuple[str, ...] = ()) -> None:
         kind = node["type"]
         if kind == "branch":
-            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
+            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"], scope)
         elif kind == "group":
-            for child in node["children"]: visit(child)
+            for child in node["children"]: visit(child, scope)
         elif kind == "component":
-            mounted.add(node["id"])
-            visit(node["child"])
+            component_scope = keyed(scope, node)
+            mounted.add(node["id"] if not component_scope else f"{node['id']}|{json.dumps(component_scope)}")
+            visit(node["child"], component_scope)
+        elif kind == "provider":
+            for child in node.get("children", []): visit(child, scope)
         elif kind == "element":
-            for child in node["children"]: visit(child)
+            element_scope = keyed(scope, node)
+            for child in node["children"]: visit(child, element_scope)
     visit(tree)
     return mounted
 
 
 def _display(value: Any) -> str:
+    return _react_dom_string(value).strip()
+
+
+def _react_dom_string(value: Any) -> str:
     if value is None:
         return ""
     if value is True:
         return "true"
     if value is False:
         return "false"
-    return str(value).strip()
+    if isinstance(value, list):
+        return ",".join(_react_dom_string(item) for item in value)
+    if isinstance(value, dict):
+        return "[object Object]"
+    return str(value)
 
 
 def _hidden(props: dict[str, Any]) -> bool:
@@ -949,6 +1022,7 @@ def _id_texts(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]
         if kind == "jsxText": return _jsx_entities(node["value"])
         if kind == "empty": return ""
         if kind == "component": return raw_text(node["child"])
+        if kind == "provider": return "".join(raw_text(child) for child in node.get("children", []))
         if kind == "group": return "".join(raw_text(c) for c in node["children"])
         if kind == "branch": return raw_text(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
         return "".join(raw_text(c) for c in node["children"])
@@ -960,6 +1034,8 @@ def _id_texts(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]
             for child in node["children"]: visit(child)
         elif kind == "component":
             visit(node["child"])
+        elif kind == "provider":
+            for child in node.get("children", []): visit(child)
         elif kind == "element":
             props = {k: _eval(v, state) for k, v in node["props"].items()}
             key = props.get("id")
@@ -998,6 +1074,7 @@ def _tree_text(n: dict[str, Any], state: dict[str, Any], model: dict[str, Any], 
     if n["type"] == "jsxText": return _jsx_entities(n["value"])
     if inherited_aria_hidden: return ""
     if n["type"] == "component": return _tree_text(n["child"], state, model, inherited_visibility, inherited_aria_hidden)
+    if n["type"] == "provider": return "".join(_tree_text(child, state, model, inherited_visibility, inherited_aria_hidden) for child in n.get("children", []))
     if n["type"] == "group": return "".join(_tree_text(c, state, model, inherited_visibility, inherited_aria_hidden) for c in n["children"])
     if n["type"] == "branch": return _tree_text(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], state, model, inherited_visibility, inherited_aria_hidden)
     props = {k: _eval(v, state) for k, v in n.get("props", {}).items()}
@@ -1018,6 +1095,7 @@ def _snapshot(render: dict[str, Any], state: dict[str, Any], model: dict[str, An
         if kind == "group": return [x for c in n["children"] for x in build(c, inherited_visibility, inherited_aria_hidden)]
         if kind == "branch": return build(n["yes"] if _truthy(_eval(n["test"], state)) else n["no"], inherited_visibility, inherited_aria_hidden)
         if kind == "component": return build(n["child"], inherited_visibility, inherited_aria_hidden)
+        if kind == "provider": return [x for child in n.get("children", []) for x in build(child, inherited_visibility, inherited_aria_hidden)]
         props = {k: _eval(v, state) for k, v in n["props"].items()}
         if _dom_hidden(props): return []
         aria_hidden = inherited_aria_hidden or props.get("aria-hidden") is True or props.get("aria-hidden") == "true"
@@ -1061,6 +1139,8 @@ def _active_render(node: dict[str, Any], state: dict[str, Any]) -> dict[str, Any
         return {**node, "children": [_active_render(child, state) for child in node["children"]]}
     if kind == "component":
         return {**node, "child": _active_render(node["child"], state)}
+    if kind == "provider":
+        return {**node, "children": [_active_render(child, state) for child in node.get("children", [])]}
     if kind == "element" and node.get("children"):
         return {**node, "children": [_active_render(child, state) for child in node["children"]]}
     return node

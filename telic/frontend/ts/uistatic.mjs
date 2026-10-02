@@ -127,17 +127,19 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return found;
   };
   for (const s of sf.statements) {
-    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || isForwardingStateHook(sf, s) || isStaticDeclaration(sf, s)) continue;
+    if (ts.isImportDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || isForwardingStateHook(sf, s) || isStaticDeclaration(sf, s) || isContextDeclaration(sf, s) || ts.isFunctionDeclaration(s)) continue;
     if (s === component) continue;
     if (ts.isVariableStatement(s) && s.declarationList.declarations.length === 1 && owns(s, component)) continue;
     fail(sf, s, "module-level executable code outside the mounted component is not modeled");
   }
   const namedHooks = new Set();
+  const namedEffectHooks = new Set();
   const reactObjects = new Set();
   const routerHooks = new Map();
   const routerComponents = new Map();
   const routerUses = new Set();
   const customHooks = new Map();
+  const contextHooks = new Map();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
     if (s.moduleSpecifier.text.endsWith(".css")) {
@@ -164,21 +166,24 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         for (const item of s.importClause.namedBindings.elements) {
           const localName = item.name.text;
           const exportedName = (item.propertyName || item.name).text;
-          const hook = /^use[A-Z]/.test(localName) && !item.isTypeOnly && resolveForwardingStateHook(importedPath, exportedName);
+          const context = !item.isTypeOnly && !s.importClause.isTypeOnly && /^use[A-Z]/.test(localName) && contextHook(importedPath, exportedName);
+          if (context) contextHooks.set(localName, context);
+          const hook = /^use[A-Z]/.test(localName) && !item.isTypeOnly && !s.importClause.isTypeOnly && resolveForwardingStateHook(importedPath, exportedName);
           if (hook) customHooks.set(localName, hook);
         }
       }
       continue;
     }
     const clause = s.importClause;
-    if (!clause) continue;
+    if (!clause || clause.isTypeOnly) continue;
     if (clause.name) reactObjects.add(clause.name.text);
     if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) reactObjects.add(clause.namedBindings.name.text);
     if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
       for (const specifier of clause.namedBindings.elements) {
         const imported = (specifier.propertyName || specifier.name).text;
-        if (/^use[A-Z]/.test(imported) && imported !== "useState") fail(sf, specifier, `React hook '${imported}' is outside the source UI model`);
-        if (imported === "useState") namedHooks.add(specifier.name.text);
+        if (/^use[A-Z]/.test(imported) && !["useState", "useContext", "useEffect"].includes(imported) && !specifier.isTypeOnly) fail(sf, specifier, `React hook '${imported}' is outside the source UI model`);
+        if (imported === "useState" && !specifier.isTypeOnly && !clause.isTypeOnly) namedHooks.add(specifier.name.text);
+        if (imported === "useEffect" && !specifier.isTypeOnly) namedEffectHooks.add(specifier.name.text);
       }
     }
   }
@@ -203,8 +208,13 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     const binding = ts.isIdentifier(call.expression) ? call.expression.text : ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) ? call.expression.expression.text : "";
     return isImportedStateHook(call) && !shadows.has(binding);
   };
+  const isEffectHook = (call) => ts.isIdentifier(call.expression) && namedEffectHooks.has(call.expression.text)
+    || ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "useEffect" && ts.isIdentifier(call.expression.expression) && reactObjects.has(call.expression.expression.text);
   const states = new Map();
   const setters = new Map();
+  const externalValues = new Map();
+  let activeContexts = new Map(componentProps.contexts || []);
+  const pendingEffects = [];
   const navigateBindings = new Set();
   const locationBindings = new Set();
   const modeledHooks = new Set();
@@ -226,7 +236,27 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         modeledHooks.add(init);
         continue;
       }
-      if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "useEffect") fail(sf, init, "React effects are outside the source UI model");
+      if (ts.isObjectBindingPattern(d.name) && init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && contextHooks.has(init.expression.text)) {
+        const context = contextHooks.get(init.expression.text).context;
+        const fields = activeContexts.get(context);
+        if (!fields) fail(sf, init, `custom hook '${init.expression.text}' reads context '${context}' without a mounted provider frame`);
+        for (const item of d.name.elements) {
+          if (!ts.isBindingElement(item) || item.dotDotDotToken || item.initializer || !ts.isIdentifier(item.name)) fail(sf, item, "context destructuring must bind named fields");
+          const field = item.propertyName ? item.propertyName.getText(sf) : item.name.text;
+          if (!Object.hasOwn(fields, field)) fail(sf, item, `context value has no field '${field}'`);
+          const local = item.name.text;
+          const value = fields[field];
+          if (value[0] === "setter") setters.set(local, value[1]);
+          else externalValues.set(local, value);
+        }
+        modeledHooks.add(init);
+        continue;
+      }
+      if (init && ts.isCallExpression(init) && isEffectHook(init)) {
+        pendingEffects.push({ call: init, line: lineOf(sf, init) });
+        modeledHooks.add(init);
+        continue;
+      }
       if (!ts.isArrayBindingPattern(d.name) || !init || !ts.isCallExpression(init)) {
         if (init && ts.isCallExpression(init)) fail(sf, init, "component initializer calls an unmodeled function");
         continue;
@@ -244,7 +274,11 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       modeledHooks.add(init);
       const [value, set] = d.name.elements;
       if (!value || !ts.isIdentifier(value.name) || (set && !ts.isIdentifier(set.name)) || !initialArg) fail(sf, d, "state hook must bind a named state and setter with an explicit initial value");
-      const initial = literal(initialArg, sf);
+      let initial = literal(initialArg, sf);
+      if (!initial && ts.isIdentifier(initialArg)) {
+        const value = componentProps.values.get(initialArg.text);
+        if (value && ["lit", "jsx-lit"].includes(value[0]) && ["string", "number", "boolean"].includes(typeof value[1])) initial = ["lit", value[1]];
+      }
       if (!initial) fail(sf, initialArg, "state initializer is not a finite boolean, number, string, or null literal");
       const bindings = new Set([...states.keys(), ...setters.keys()]);
       if (bindings.has(value.name.text) || (set && (bindings.has(set.name.text) || value.name.text === set.name.text))) fail(sf, d, "state and setter bindings must be unique in the component");
@@ -256,6 +290,11 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   for (const s of body.statements) {
     if (ts.isExpressionStatement(s)) {
       const e = strip(s.expression);
+      if (ts.isCallExpression(e) && isEffectHook(e)) {
+        pendingEffects.push({ call: e, line: lineOf(sf, e) });
+        modeledHooks.add(e);
+        continue;
+      }
       if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && /^use[A-Z]/.test(e.expression.text)) fail(sf, e, `hook '${e.expression.text}' has effects outside the source UI model`);
       fail(sf, s, "component has a top-level effect outside the source UI model");
     }
@@ -271,7 +310,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     ts.forEachChild(n, inspectHooks);
   };
   inspectHooks(component);
-  const substitutions = new Map([...componentProps.values]);
+  const substitutions = new Map([...externalValues, ...componentProps.values]);
   for (const s of sf.statements) if (isStaticDeclaration(sf, s)) {
     for (const d of s.declarationList.declarations) substitutions.set(d.name.text, ["lit", staticValue(d.initializer, sf)]);
   }
@@ -325,6 +364,18 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return ["set", stateName, update, lineOf(sf, e)];
   };
 
+  const effects = pendingEffects.map(({ call, line }) => {
+    if (call.arguments.length !== 2) fail(sf, call, "source effect needs an explicit dependency array");
+    const callback = strip(call.arguments[0]);
+    const dependencies = strip(call.arguments[1]);
+    if ((!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) || !ts.isArrayLiteralExpression(dependencies)) fail(sf, call, "source effect needs a function and literal dependency array");
+    if (dependencies.elements.some((item) => ts.isSpreadElement(item))) fail(sf, dependencies, "effect dependency spreads are outside the source model");
+    if (ts.isBlock(callback.body) && callback.body.statements.some((item) => ts.isReturnStatement(item))) fail(sf, callback.body, "effect cleanup functions need lifecycle modeling");
+    const body = ts.isBlock(callback.body) ? statement(callback.body) : statement(ts.factory.createExpressionStatement(callback.body));
+    const deps = dependencies.elements.map((item) => enc(item, new Set()));
+    return { id: `${statePrefix}effect@${path}:${line}`, owner: statePrefix || null, deps, setup: body, path, line, cleanup: null };
+  });
+
   const handler = (e) => {
     e = strip(e);
     if (ts.isArrowFunction(e) || ts.isFunctionExpression(e)) {
@@ -360,12 +411,15 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   };
 
   const childStates = [];
+  const childEffects = [];
   let componentInstance = 0;
   let renderedStatefulChildren = 0;
   const render = (e, conditionalMount = false) => {
     e = strip(e);
     if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
     if (ts.isJsxElement(e) && ts.isIdentifier(e.openingElement.tagName) && routerComponents.get(e.openingElement.tagName.text) === "Routes") return renderRoutes(e, conditionalMount);
+    if (ts.isJsxElement(e) && ts.isPropertyAccessExpression(e.openingElement.tagName) && e.openingElement.tagName.name.text === "Provider") return contextProviderElement(e.openingElement, e.children, e, conditionalMount);
+    if (ts.isJsxSelfClosingElement(e) && ts.isPropertyAccessExpression(e.tagName) && e.tagName.name.text === "Provider") return contextProviderElement(e, [], e, conditionalMount);
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
     if (ts.isIdentifier(e) && e.text === "children" && componentProps.children) {
@@ -446,23 +500,56 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (!target) fail(sf, open.tagName, `composed component '${open.tagName.text}' is not defined in the source module closure`);
     const values = new Map();
     const handlers = new Map();
+    let componentKey = null;
     for (const a of open.attributes.properties) {
       if (!ts.isJsxAttribute(a) || !ts.isIdentifier(a.name)) fail(sf, a, "composed component spreads and namespaced props are outside the source UI model");
       const name = a.name.text;
+      if (name === "key") {
+        if (ts.isStringLiteral(a.initializer)) componentKey = ["lit", a.initializer.text];
+        else if (ts.isJsxExpression(a.initializer) && a.initializer.expression) componentKey = enc(a.initializer.expression, new Set());
+        else fail(sf, a, "component key must be a string or scalar expression");
+        continue;
+      }
       if (!a.initializer) { values.set(name, ["lit", true]); continue; }
       if (ts.isStringLiteral(a.initializer)) { values.set(name, ["jsx-lit", a.initializer.text]); continue; }
       if (!ts.isJsxExpression(a.initializer) || !a.initializer.expression) fail(sf, a, `composed component prop '${name}' is outside the source UI model`);
       if (/^on[A-Z]/.test(name)) handlers.set(name, handler(a.initializer.expression));
       else values.set(name, enc(a.initializer.expression, new Set()));
     }
-    const childStateStart = childStates.length;
-    const childTree = { type: "group", children: jsxChildren(children, conditionalMount) };
-    childTree.stateful = childStates.length > childStateStart;
     const instancePrefix = `${statePrefix}${target.path}@${componentInstance++}/`;
-    const nested = scanComponent(target.path, target.text, target.sf, target.node, true, { values, handlers, children: childTree }, instancePrefix, conditionalMount);
+    const childContexts = new Map(activeContexts);
+    for (const item of providerContextValues(target, instancePrefix, values)) childContexts.set(item.context, item.fields);
+    const previousContexts = activeContexts;
+    activeContexts = childContexts;
+    const childStateStart = childStates.length;
+    let childTree;
+    try { childTree = { type: "group", children: jsxChildren(children, conditionalMount) }; }
+    finally { activeContexts = previousContexts; }
+    childTree.stateful = childStates.length > childStateStart;
+    const nested = scanComponent(target.path, target.text, target.sf, target.node, true, { values, handlers, children: childTree, contexts: childContexts }, instancePrefix, conditionalMount);
     if (nested.states.length && values.has("key")) fail(sf, whole, `stateful child component '${open.tagName.text}' uses a React key whose identity changes are outside the source UI model`);
     childStates.push(...nested.states);
-    return { type: "component", id: instancePrefix, line: lineOf(sf, whole), componentPath: target.path, stateful: nested.states.length > 0, child: nested.render };
+    childEffects.push(...nested.effects);
+    return { type: "component", id: instancePrefix, key: componentKey, line: lineOf(sf, whole), componentPath: target.path, stateful: nested.states.length > 0, child: nested.render };
+  }
+
+  function contextProviderElement(open, children, whole, conditionalMount) {
+    if (!ts.isPropertyAccessExpression(open.tagName) || open.tagName.name.text !== "Provider" || !ts.isIdentifier(open.tagName.expression)) fail(sf, open.tagName, "context provider must resolve through an imported createContext value");
+    const context = contextSymbol(path, sf, open.tagName.expression.text);
+    if (!context) fail(sf, open.tagName, "context provider does not resolve to this module's runtime createContext symbol");
+    const attributes = open.attributes.properties;
+    if (attributes.length !== 1 || !ts.isJsxAttribute(attributes[0]) || attributes[0].name.getText(sf) !== "value" || !ts.isJsxExpression(attributes[0].initializer) || !attributes[0].initializer.expression || !ts.isObjectLiteralExpression(strip(attributes[0].initializer.expression))) fail(sf, open, "context provider value must be an explicit record of state fields");
+    const fields = {};
+    for (const property of strip(attributes[0].initializer.expression).properties) {
+      const fieldName = ts.isPropertyAssignment(property) && ts.isIdentifier(property.name) ? property.name.text
+        : ts.isShorthandPropertyAssignment(property) ? property.name.text : null;
+      const fieldValue = ts.isPropertyAssignment(property) ? strip(property.initializer)
+        : ts.isShorthandPropertyAssignment(property) ? property.name : null;
+      if (!fieldName || !fieldValue) fail(sf, property, "context provider fields must use explicit names");
+      if (ts.isIdentifier(fieldValue) && setters.has(fieldValue.text)) fields[fieldName] = ["setter", setters.get(fieldValue.text)];
+      else fields[fieldName] = enc(fieldValue, new Set());
+    }
+    return { type: "provider", context, value: fields, path, line: lineOf(sf, whole), children: jsxChildren(children, conditionalMount) };
   }
 
   function element(open, children, whole, conditionalMount) {
@@ -472,10 +559,16 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     if (!modeledTags.has(tag)) fail(sf, open.tagName, `native ${tag} accessibility semantics are outside the source UI model`);
     const props = {};
     const events = {};
+    let key = null;
     for (const a of open.attributes.properties) {
       if (!ts.isJsxAttribute(a)) fail(sf, a, "spread JSX attributes are outside the source UI model");
       const name = a.name.getText(sf);
-      if (name === "key") continue;
+      if (name === "key") {
+        if (ts.isStringLiteral(a.initializer)) key = ["lit", a.initializer.text];
+        else if (ts.isJsxExpression(a.initializer) && a.initializer.expression) key = enc(a.initializer.expression, new Set());
+        else fail(sf, a, "native key must be a string or scalar expression");
+        continue;
+      }
       if (name === "style") fail(sf, a, "inline style objects are outside the source UI model");
       if (name === "value" || name === "checked") fail(sf, a, `native ${name} semantics are outside the source UI model`);
       if (name === "role" && !["div", "span"].includes(tag)) fail(sf, a, `role override on native ${tag} is outside the source UI model`);
@@ -489,7 +582,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         else props[name] = enc(a.initializer.expression, new Set());
       } else fail(sf, a, `attribute '${name}' is outside the source UI model`);
     }
-    return { type: "element", tag, path, line: lineOf(sf, whole), props, events, children: jsxChildren(children, conditionalMount) };
+    return { type: "element", tag, path, line: lineOf(sf, whole), key, props, events, children: jsxChildren(children, conditionalMount) };
   }
 
   function jsxChildren(children, conditionalMount) {
@@ -522,7 +615,8 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
       if (ts.isExpressionStatement(v) && ts.isCallExpression(strip(v.expression)) && ts.isIdentifier(strip(v.expression).expression) && strip(v.expression).expression.text === d.setter) fail(sf, v, "state update occurs outside an event handler");
     }
   }
-  const renderTree = renderFlow(body.statements.filter((s) => !(ts.isVariableStatement(s) || ts.isFunctionDeclaration(s))), false, dynamicMount);
+  const effectCalls = new Set(pendingEffects.map(({ call }) => call));
+  const renderTree = renderFlow(body.statements.filter((s) => !(ts.isVariableStatement(s) || ts.isFunctionDeclaration(s)) && !(ts.isExpressionStatement(s) && effectCalls.has(strip(s.expression)))), false, dynamicMount);
   const statefulComponents = (node, into = new Set()) => {
     if (!node || typeof node !== "object") return into;
     if (node.type === "component" && node.stateful) into.add(node.componentPath);
@@ -537,7 +631,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return into;
   };
   statefulComponents(renderTree);
-  return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values(), ...childStates], render: renderTree, routerRequired: routerUses.size > 0 };
+  return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values(), ...childStates], effects: [...effects, ...childEffects], render: renderTree, routerRequired: routerUses.size > 0 };
 }
 
 function componentCandidates(path, text) {
@@ -556,6 +650,145 @@ function componentCandidates(path, text) {
   };
   find(sf);
   return out;
+}
+
+function reactBindings(sf, importedName) {
+  const names = new Set();
+  for (const statement of sf.statements) {
+    if (!ts.isImportDeclaration(statement) || statement.moduleSpecifier.text !== "react") continue;
+    const clause = statement.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    if (clause.name) names.add(clause.name.text);
+    if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) names.add(clause.namedBindings.name.text);
+    if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const item of clause.namedBindings.elements) {
+        if (!item.isTypeOnly && (item.propertyName || item.name).text === importedName) names.add(item.name.text);
+      }
+    }
+  }
+  return names;
+}
+
+function contextSymbol(path, sf, name) {
+  const createNames = reactBindings(sf, "createContext");
+  for (const statement of sf.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== name || !declaration.initializer) continue;
+      const init = strip(declaration.initializer);
+      if (ts.isCallExpression(init) && ts.isIdentifier(init.expression) && createNames.has(init.expression.text)) return `${path}#${name}`;
+      if (ts.isCallExpression(init) && ts.isPropertyAccessExpression(init.expression) && init.expression.name.text === "createContext" && ts.isIdentifier(init.expression.expression) && createNames.has(init.expression.expression.text)) return `${path}#${name}`;
+    }
+  }
+  return null;
+}
+
+function providerContextValues(target, statePrefix, props = new Map()) {
+  const sf = target.sf;
+  const useStateNames = reactBindings(sf, "useState");
+  const stateAliases = new Map();
+  const isUseState = (call) => ts.isIdentifier(call.expression) && useStateNames.has(call.expression.text)
+    || ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "useState" && ts.isIdentifier(call.expression.expression) && useStateNames.has(call.expression.expression.text);
+  for (const statement of target.node.body.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      const init = declaration.initializer && strip(declaration.initializer);
+      if (!ts.isArrayBindingPattern(declaration.name) || !init || !ts.isCallExpression(init) || !isUseState(init)) continue;
+      let initial = literal(init.arguments[0], sf);
+      if (!initial && ts.isIdentifier(strip(init.arguments[0]))) {
+        const value = props.get(strip(init.arguments[0]).text);
+        if (value && ["lit", "jsx-lit"].includes(value[0]) && ["string", "number", "boolean"].includes(typeof value[1])) initial = ["lit", value[1]];
+      }
+      if (!initial) continue;
+      const [value, setter] = declaration.name.elements;
+      if (!value || !ts.isIdentifier(value.name) || !setter || !ts.isIdentifier(setter.name)) continue;
+      const name = `${statePrefix}${value.name.text}`;
+      stateAliases.set(value.name.text, ["state", name]);
+      stateAliases.set(setter.name.text, ["setter", name]);
+    }
+  }
+  const found = [];
+  const visit = (node) => {
+    const open = ts.isJsxElement(node) ? node.openingElement : ts.isJsxSelfClosingElement(node) ? node : null;
+    if (open && ts.isPropertyAccessExpression(open.tagName) && open.tagName.name.text === "Provider" && ts.isIdentifier(open.tagName.expression)) {
+      const context = contextSymbol(target.path, sf, open.tagName.expression.text);
+      const attr = open.attributes.properties.find((item) => ts.isJsxAttribute(item) && item.name.getText(sf) === "value");
+      if (context && attr && attr.initializer && ts.isJsxExpression(attr.initializer) && attr.initializer.expression && ts.isObjectLiteralExpression(strip(attr.initializer.expression))) {
+        const fields = {};
+        for (const property of strip(attr.initializer.expression).properties) {
+          const fieldName = ts.isPropertyAssignment(property) && ts.isIdentifier(property.name) ? property.name.text
+            : ts.isShorthandPropertyAssignment(property) ? property.name.text : null;
+          const fieldValue = ts.isPropertyAssignment(property) ? strip(property.initializer)
+            : ts.isShorthandPropertyAssignment(property) ? property.name : null;
+          if (!fieldName || !ts.isIdentifier(fieldValue)) return;
+          const value = stateAliases.get(fieldValue.text);
+          if (!value) return;
+          fields[fieldName] = value;
+        }
+        found.push({ context, fields });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(target.node.body);
+  return found;
+}
+
+function contextHook(path, exportName, seen = new Set()) {
+  const key = `${path}\0${exportName}`;
+  if (seen.has(key)) return null;
+  seen.add(key);
+  const file = files.get(path);
+  if (!file) return null;
+  const kind = /\.(tsx|jsx)$/.test(path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
+  const useContextNames = reactBindings(sf, "useContext");
+  const functions = [];
+  const add = (node, name, exported) => { if (name === exportName && exported) functions.push(node); };
+  for (const statement of sf.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name) {
+      const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) || [] : [];
+      add(statement, statement.name.text, modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword));
+    }
+    if (ts.isExportDeclaration(statement) && !statement.isTypeOnly) {
+      if (ts.isStringLiteralLike(statement.moduleSpecifier)) {
+        const resolved = resolveModule(path, statement.moduleSpecifier.text);
+        if (!resolved) continue;
+        if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+          for (const item of statement.exportClause.elements) if (!item.isTypeOnly && item.name.text === exportName) {
+            const result = contextHook(resolved, (item.propertyName || item.name).text, seen);
+            if (result) return result;
+          }
+        } else if (!statement.exportClause && exportName !== "default") {
+          const result = contextHook(resolved, exportName, seen);
+          if (result) return result;
+        }
+      } else if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        for (const item of statement.exportClause.elements) if (!item.isTypeOnly && item.name.text === exportName) {
+          const local = (item.propertyName || item.name).text;
+          const fn = functions.find((node) => node.name?.text === local);
+          if (fn) functions.push(fn);
+        }
+      }
+    }
+  }
+  if (functions.length !== 1 || !useContextNames.size) return null;
+  const fn = functions[0];
+  let context = null;
+  const visit = (node) => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && useContextNames.has(node.expression.text) && node.arguments.length === 1 && ts.isIdentifier(node.arguments[0])) {
+      const symbol = contextSymbol(path, sf, node.arguments[0].text);
+      if (symbol) context = symbol;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(fn.body);
+  return context ? { path, context } : null;
+}
+
+function isContextDeclaration(sf, statement) {
+  if (!ts.isVariableStatement(statement)) return false;
+  return statement.declarationList.declarations.some((declaration) => ts.isIdentifier(declaration.name) && contextSymbol(sf.fileName, sf, declaration.name.text));
 }
 
 function resolveNamedExport(path, exportName, seen = new Set()) {
@@ -579,7 +812,7 @@ function resolveNamedExport(path, exportName, seen = new Set()) {
   const sf = ts.createSourceFile(path, file.text, ts.ScriptTarget.Latest, true, kind);
   const matches = [];
   for (const statement of sf.statements) {
-    if (!ts.isExportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
     const resolved = resolveModule(path, statement.moduleSpecifier.text);
     if (!resolved) continue;
     if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
@@ -664,7 +897,7 @@ function resolveForwardingStateHook(path, exportName, seen = new Set()) {
   if (direct) return direct;
   const matches = [];
   for (const statement of sf.statements) {
-    if (!ts.isExportDeclaration(statement)) continue;
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
     if (ts.isStringLiteralLike(statement.moduleSpecifier)) {
       const resolved = resolveModule(path, statement.moduleSpecifier.text);
       if (!resolved) continue;
@@ -721,7 +954,7 @@ function safeComponentModule(path, seen = new Set()) {
       }
     if (ts.isFunctionDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s) || ts.isExportDeclaration(s)) continue;
     if (ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)) continue;
-    if (isStaticDeclaration(sf, s) || ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
+    if (isStaticDeclaration(sf, s) || isContextDeclaration(sf, s) || ts.isVariableStatement(s) && s.declarationList.declarations.every((d) => d.initializer && (ts.isArrowFunction(strip(d.initializer)) || ts.isFunctionExpression(strip(d.initializer))))) continue;
     return false;
   }
   return true;

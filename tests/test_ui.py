@@ -877,6 +877,154 @@ export default function App(){const navigate=useNavigate();return <><button onCl
     assert outcome.status == "open" and "BrowserRouter" in outcome.detail
 
 
+@pytest.mark.parametrize(
+    "property, status, want",
+    [
+        ('reachable paragraph "1"', "proved", 'click button "Add"'),
+        ('never paragraph "0"', "refuted", "source state violates"),
+    ],
+)
+def test_source_ui_lowers_instance_scoped_context_provider_and_consumer(property, status, want, tmp_path):
+    model, identity, why, _ = _static_source_case(
+        tmp_path,
+        '''import {CounterProvider,useCounter} from "./Counter";
+function Readout(){const {count,setCount}=useCounter();return <><p>{count}</p><button onClick={()=>setCount(count+1)}>Add</button></>;}
+export default function App(){return <CounterProvider><Readout/></CounterProvider>}''',
+        property,
+        modules={"Counter.tsx": '''import {createContext,useContext,useState} from "react";
+const CounterContext=createContext(null);
+export function CounterProvider({children}){const [count,setCount]=useState(0);return <CounterContext.Provider value={{count,setCount}}>{children}</CounterContext.Provider>}
+export function useCounter(){const ctx=useContext(CounterContext);if(!ctx)throw new Error("missing provider");return ctx}''',},
+    )
+    assert why is None, why
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    prop, problem = parse_prop(property)
+    assert problem is None and prop is not None
+    outcome = check_source(model, identity, UiLemma("context", "vite-app/src/App.tsx", 1, property, (), prop=prop))
+    assert outcome.status == status and outcome.method == "source proof", outcome.detail
+    assert want in outcome.detail
+
+
+@pytest.mark.parametrize(
+    "property, status, want",
+    [
+        ('reachable paragraph "inner: inner changed"', "proved", 'click button "inner change"'),
+        ('never paragraph "outer: inner changed"', "proved", "source-reachable states satisfy"),
+        ('never paragraph "outer: outer changed"', "refuted", "source state violates"),
+    ],
+)
+def test_source_ui_context_scopes_use_nearest_provider_instance(property, status, want, tmp_path):
+    model, identity, why, _ = _static_source_case(
+        tmp_path,
+        '''import {CounterProvider,useCounter} from "./Counter";
+function Readout({label}){const {count,setCount}=useCounter();return <><p>{label}: {count}</p><button onClick={()=>setCount(label+" changed")}>{label} change</button></>;}
+export default function App(){return <CounterProvider initial="outer"><Readout label="outer"/><CounterProvider initial="inner"><Readout label="inner"/></CounterProvider></CounterProvider>}''',
+        property,
+        modules={"Counter.tsx": '''import {createContext,useContext,useState} from "react";
+const CounterContext=createContext(null);
+export function CounterProvider({children,initial}){const [count,setCount]=useState(initial);return <CounterContext.Provider value={{count,setCount}}>{children}</CounterContext.Provider>}
+export function useCounter(){const ctx=useContext(CounterContext);if(!ctx)throw new Error("missing provider");return ctx}''',},
+    )
+    assert why is None, why
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    prop, problem = parse_prop(property)
+    assert problem is None and prop is not None
+    result = check_source(model, identity, UiLemma("context-scope", "vite-app/src/App.tsx", 1, property, (), prop=prop))
+    assert result.status == status and result.method == "source proof", result.detail
+    assert want in result.detail
+
+
+def test_source_ui_native_key_change_remounts_stateful_descendants(tmp_path):
+    model, identity, why, _ = _static_source_case(
+        tmp_path,
+        '''import {useState} from "react"; import {Child} from "./Child";
+export default function App(){const [reset,setReset]=useState(false);const [ready,setReady]=useState(false);return <main><div key={reset?"b":"a"}><Child onOpen={()=>setReady(true)}/></div>{ready?(reset?<button>Reset done</button>:<button onClick={()=>setReset(true)}>Reset</button>):null}</main>}''',
+        'always dialog "Help" while button "Reset done"',
+        modules={"Child.tsx": '''import {useState} from "react";
+export function Child({onOpen}){const [open,setOpen]=useState(false);return open?<div role="dialog" aria-label="Help"><button onClick={()=>setOpen(false)}>Close</button></div>:<button onClick={()=>{setOpen(true);onOpen()}}>Open</button>}''',},
+    )
+    assert why is None
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    text = 'always dialog "Help" while button "Reset done"'
+    prop, problem = parse_prop(text)
+    assert problem is None and prop is not None
+    result = check_source(model, identity, UiLemma("key-reset", "vite-app/src/App.tsx", 1, text, (), prop=prop))
+    assert result.status == "refuted" and result.method == "source proof"
+    assert result.trace == ['click button "Open"', 'click button "Reset"']
+
+
+@pytest.mark.parametrize(
+    "app, property, status",
+    [
+        ('const classes=["hidden"];return <main className={classes}><button>Open</button></main>', 'reachable button "Open"', "refuted"),
+        ('const label=["Ready"];return <button aria-label={label}>Other</button>', 'reachable button "Ready"', "proved"),
+    ],
+)
+def test_source_ui_uses_react_dom_string_coercion_for_arrays(app, property, status, tmp_path):
+    model, identity, why, _ = _static_source_case(tmp_path, 'export default function App(){' + app + '}', property, ".hidden { visibility: hidden; }")
+    assert why is None
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    prop, problem = parse_prop(property)
+    assert problem is None and prop is not None
+    outcome = check_source(model, identity, UiLemma("coercion", "vite-app/src/App.tsx", 1, property, (), prop=prop))
+    assert outcome.status == status and outcome.method == "source proof", outcome.detail
+
+
+@pytest.mark.parametrize(
+    "app, modules, property",
+    [
+        ('import {type useState} from "react"; export default function App(){const [open,setOpen]=useState(false);return open?<button>Ready</button>:null}', {}, 'reachable button "Ready"'),
+        ('import {Widget} from "./Barrel"; export default function App(){return <Widget/>}', {
+            "Barrel.tsx": 'export type {Widget} from "./Widget";',
+            "Widget.tsx": 'export function Widget(){return <button>Ready</button>}',
+        }, 'reachable button "Ready"'),
+    ],
+)
+def test_source_ui_keeps_erased_runtime_bindings_open(app, modules, property, tmp_path):
+    model, identity, why, _ = _static_source_case(tmp_path, app, property, modules=modules)
+    assert why is None and model is not None
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    prop, problem = parse_prop(property)
+    assert problem is None and prop is not None
+    result = check_source(model, identity, UiLemma("erased-binding", "vite-app/src/App.tsx", 1, property, (), prop=prop))
+    assert result.status == "open" and "proved" not in result.detail
+
+
+@pytest.mark.parametrize(
+    "property, status",
+    [
+        ('reachable heading "Ready"', "proved"),
+        ('never heading "Ready"', "refuted"),
+    ],
+)
+def test_source_ui_runs_passive_effect_state_transitions(property, status, tmp_path):
+    model, identity, why, _ = _static_source_case(
+        tmp_path,
+        '''import {useEffect,useState} from "react";
+export default function App(){const [ready,setReady]=useState(false);useEffect(()=>setReady(true),[]);return ready?<h1>Ready</h1>:<h1>Loading</h1>}''',
+        property,
+    )
+    assert why is None, why
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source
+
+    prop, problem = parse_prop(property)
+    assert problem is None and prop is not None
+    outcome = check_source(model, identity, UiLemma("effect", "vite-app/src/App.tsx", 1, property, (), prop=prop))
+    assert outcome.status == status and outcome.method == "source proof", outcome.detail
+    assert any(step.startswith("run effect at ") for step in outcome.trace or [])
+
+
 def test_source_ui_binds_imported_component_props_and_handlers(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,
