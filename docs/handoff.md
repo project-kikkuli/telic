@@ -42,6 +42,11 @@ and checks stored Lean proofs. Conditional proofs remain open in the ledger.
 The ledger records existing gaps honestly and rejects regressions, lost
 claims and new unproved claims.
 
+The initial Linux baseline contains 66 functions: 27 proved, 3 trusted,
+8 open, 12 unsupported, 12 refuted and 4 errors, plus 9 module lowering
+diagnostics. It establishes an adoption ratchet, not a proof of the entire
+verifier. `telic.ledger.json` is the source for current counts and clauses.
+
 The full test battery, including browser exploration, remains available in
 the manual `.github/workflows/validation.yml` workflow. It does not run on
 push or pull request. See [ci.md](ci.md) for the mechanism and commands.

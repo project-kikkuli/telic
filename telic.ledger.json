@@ -1,0 +1,421 @@
+{
+  "aims": {
+    "ESCAPE": {
+      "clauses": [
+        "ui escape: always reachable home from overlay"
+      ],
+      "functions": [],
+      "status": "undeclared",
+      "text": null
+    },
+    "NAV": {
+      "clauses": [
+        "ui menu-visible: unobscured button \"Menu\""
+      ],
+      "functions": [],
+      "status": "undeclared",
+      "text": null
+    },
+    "SETTINGS": {
+      "clauses": [
+        "ui dark-mode: persists checkbox \"Dark mode\""
+      ],
+      "functions": [],
+      "status": "undeclared",
+      "text": null
+    }
+  },
+  "functions": {
+    "telic/checker.py::restore_receipt": {
+      "claims": [
+        "requires \"status\" in r and \"obs\" in r"
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/frontend/python.py::ExprLowerer@python.opaque": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/frontend/python.py::ExprLowerer@python.truthy": {
+      "obligations": 3,
+      "status": "refuted"
+    },
+    "telic/frontend/python.py::ExprLowerer@python.value_boolop": {
+      "claims": [
+        "requires len(vals) > 0"
+      ],
+      "obligations": 4,
+      "status": "refuted"
+    },
+    "telic/frontend/python.py::FunctionLowerer@python.__init__": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/frontend/python.py::FunctionLowerer@python._block_end": {
+      "claims": [
+        "requires len(stmts) > 0"
+      ],
+      "obligations": 3,
+      "status": "open"
+    },
+    "telic/frontend/python.py::FunctionLowerer@python._upcast": {
+      "obligations": 1,
+      "status": "refuted"
+    },
+    "telic/frontend/python.py::FunctionLowerer@python.coerce": {
+      "obligations": 2,
+      "status": "refuted"
+    },
+    "telic/frontend/python.py::FunctionLowerer@python.lower": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/frontend/python.py::PythonFrontend._lower_safely": {
+      "claims": [
+        "requires key in self.signatures"
+      ],
+      "obligations": 2,
+      "status": "refuted"
+    },
+    "telic/frontend/python.py::PythonFrontend.mro": {
+      "obligations": 0,
+      "status": "open"
+    },
+    "telic/frontend/python.py::_has_opaque": {
+      "obligations": 4,
+      "status": "refuted"
+    },
+    "telic/frontend/typescript.py::_clause": {
+      "claims": [
+        "requires d is None or (\"expr\" in d and wf_expr(d[\"expr\"]))"
+      ],
+      "obligations": 1,
+      "status": "open"
+    },
+    "telic/frontend/typescript.py::_expr": {
+      "claims": [
+        "decreases json_depth(d)",
+        "requires wf_expr(d)"
+      ],
+      "obligations": 105,
+      "status": "open"
+    },
+    "telic/frontend/typescript.py::_loc": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/frontend/typescript.py::_type": {
+      "claims": [
+        "decreases json_depth(t)",
+        "requires wf_type(t)"
+      ],
+      "obligations": 28,
+      "status": "open"
+    },
+    "telic/frontend/typescript.py::json_depth": {
+      "claims": [
+        "ensures result >= 0"
+      ],
+      "obligations": 0,
+      "status": "trusted"
+    },
+    "telic/frontend/typescript.py::utf16": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/frontend/typescript.py::wf_expr": {
+      "claims": [
+        "ensures result == (isinstance(d, dict) and \"e\" in d and \"ty\" in d and wf_type(d[\"ty\"]) and ( d[\"e\"] == \"Lit\" and \"value\" in d or d[\"e\"] == \"Var\" and \"name\" in d or d[\"e\"] == \"Result\" or d[\"e\"] == \"Old\" and \"expr\" in d and wf_expr(d[\"expr\"]) and json_depth(d[\"expr\"]) < json_depth(d) or d[\"e\"] == \"Unary\" and \"op\" in d and \"arg\" in d and wf_expr(d[\"arg\"]) and json_depth(d[\"arg\"]) < json_depth(d) or d[\"e\"] == \"Binary\" and \"op\" in d and \"left\" in d and \"right\" in d and wf_expr(d[\"left\"]) and json_depth(d[\"left\"]) < json_depth(d) and wf_expr(d[\"right\"]) and json_depth(d[\"right\"]) < json_depth(d) or d[\"e\"] == \"Ite\" and \"cond\" in d and \"then\" in d and \"orelse\" in d and wf_expr(d[\"cond\"]) and json_depth(d[\"cond\"]) < json_depth(d) and wf_expr(d[\"then\"]) and json_depth(d[\"then\"]) < json_depth(d) and wf_expr(d[\"orelse\"]) and json_depth(d[\"orelse\"]) < json_depth(d) or (d[\"e\"] == \"Call\" and \"func\" in d or d[\"e\"] == \"Builtin\" and \"name\" in d or d[\"e\"] == \"New\" and \"cls\" in d or d[\"e\"] == \"Extern\" and \"name\" in d) and \"args\" in d and isinstance(d[\"args\"], list) and all(wf_expr(a) and json_depth(a) < json_depth(d) for a in d[\"args\"]) or d[\"e\"] == \"Index\" and \"seq\" in d and \"idx\" in d and \"wrap\" in d and wf_expr(d[\"seq\"]) and json_depth(d[\"seq\"]) < json_depth(d) and wf_expr(d[\"idx\"]) and json_depth(d[\"idx\"]) < json_depth(d) or d[\"e\"] == \"Field\" and \"obj\" in d and \"name\" in d and wf_expr(d[\"obj\"]) and json_depth(d[\"obj\"]) < json_depth(d) or d[\"e\"] == \"Quant\" and \"kind\" in d and \"idx\" in d and \"lo\" in d and \"hi\" in d and \"body\" in d and wf_expr(d[\"lo\"]) and json_depth(d[\"lo\"]) < json_depth(d) and wf_expr(d[\"hi\"]) and json_depth(d[\"hi\"]) < json_depth(d) and wf_expr(d[\"body\"]) and json_depth(d[\"body\"]) < json_depth(d) and implies(\"seq\" in d and bool(d[\"seq\"]), wf_expr(d[\"seq\"]) and json_depth(d[\"seq\"]) < json_depth(d)) or d[\"e\"] == \"ListLit\" and \"elems\" in d and isinstance(d[\"elems\"], list) and all(wf_expr(a) and json_depth(a) < json_depth(d) for a in d[\"elems\"]) or d[\"e\"] == \"RecordLit\" and \"fields\" in d and isinstance(d[\"fields\"], list) and all(isinstance(f, list) and len(f) == 2 and wf_expr(f[1]) and json_depth(f[1]) < json_depth(d) for f in d[\"fields\"])))"
+      ],
+      "obligations": 0,
+      "status": "trusted"
+    },
+    "telic/frontend/typescript.py::wf_type": {
+      "claims": [
+        "ensures result == (isinstance(t, dict) and \"k\" in t and ( t[\"k\"] == \"int\" or t[\"k\"] == \"real\" or t[\"k\"] == \"bool\" or t[\"k\"] == \"str\" or t[\"k\"] == \"none\" or t[\"k\"] == \"opaque\" or t[\"k\"] == \"list\" and \"elem\" in t and wf_type(t[\"elem\"]) and json_depth(t[\"elem\"]) < json_depth(t) or t[\"k\"] == \"record\" and \"name\" in t and \"fields\" in t and isinstance(t[\"fields\"], list) and all(isinstance(f, list) and len(f) == 2 and wf_type(f[1]) and json_depth(f[1]) < json_depth(t) for f in t[\"fields\"]) or t[\"k\"] == \"option\" and \"inner\" in t and wf_type(t[\"inner\"]) and json_depth(t[\"inner\"]) < json_depth(t) or t[\"k\"] == \"dict\" and \"key\" in t and \"val\" in t and wf_type(t[\"key\"]) and wf_type(t[\"val\"]) and json_depth(t[\"key\"]) < json_depth(t) and json_depth(t[\"val\"]) < json_depth(t) or t[\"k\"] == \"class\" and \"name\" in t or t[\"k\"] == \"enum\" and \"name\" in t and \"members\" in t))"
+      ],
+      "obligations": 0,
+      "status": "trusted"
+    },
+    "telic/html.py::_line_status": {
+      "claims": [
+        "invariant all(worst[k] == \"refuted\" or worst[k] == \"open\" or worst[k] == \"proved\" for k in worst)"
+      ],
+      "obligations": 19,
+      "status": "proved"
+    },
+    "telic/ir.py::sum_of": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/ledger.py::compare": {
+      "claims": [
+        "requires \"aims\" in new and \"functions\" in new and \"mirrors\" in new"
+      ],
+      "obligations": 0,
+      "status": "error"
+    },
+    "telic/logic.py::ARRAY": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/logic.py::REC": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/logic.py::and_": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::eq": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::field": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::implies": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::le": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::lt": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::or_": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/logic.py::select": {
+      "obligations": 0,
+      "status": "unsupported"
+    },
+    "telic/program.py::FuncRef.key": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/program.py::Program.def_heap_keys": {
+      "obligations": 0,
+      "status": "error"
+    },
+    "telic/program.py::Program.ref": {
+      "claims": [
+        "requires key in self.funcs"
+      ],
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.__init__": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\"",
+        "requires lang == \"python\" or lang == \"typescript\" or lang == \"rust\""
+      ],
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.all_in": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.all_nonneg": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.eq": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.key_in": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.len": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.present": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 2,
+      "status": "proved"
+    },
+    "telic/propose.py::Syntax.self_name": {
+      "claims": [
+        "invariant self.lang == \"python\" or self.lang == \"typescript\" or self.lang == \"rust\""
+      ],
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/propose.py::ensures_candidates": {
+      "claims": [
+        "requires lang == \"python\" or lang == \"typescript\" or lang == \"rust\""
+      ],
+      "obligations": 0,
+      "status": "error"
+    },
+    "telic/propose.py::requires_candidates": {
+      "claims": [
+        "requires lang == \"python\" or lang == \"typescript\" or lang == \"rust\""
+      ],
+      "obligations": 6,
+      "status": "proved"
+    },
+    "telic/render.py::Paint._c": {
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/render.py::Paint.bold": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/render.py::Paint.dim": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/render.py::Paint.green": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/render.py::Paint.yellow": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/render.py::model_line": {
+      "claims": [
+        "requires \"states\" in m and \"transitions\" in m and (\"walks\" not in m or \"walk_length\" in m and \"agreed\" in m)"
+      ],
+      "obligations": 12,
+      "status": "refuted"
+    },
+    "telic/ui/check.py::_per_viewport": {
+      "obligations": 2,
+      "status": "refuted"
+    },
+    "telic/ui/check.py::combine": {
+      "claims": [
+        "requires len(outs) > 0"
+      ],
+      "obligations": 2,
+      "status": "open"
+    },
+    "telic/ui/run.py::_result": {
+      "claims": [
+        "requires \"status\" in d"
+      ],
+      "obligations": 1,
+      "status": "proved"
+    },
+    "telic/vcgen.py::VCGen.alloc_facts": {
+      "claims": [
+        "requires \"@alloc\" in env"
+      ],
+      "obligations": 3,
+      "status": "refuted"
+    },
+    "telic/vcgen.py::VCGen.apply_def": {
+      "claims": [
+        "requires callee.key in self.program.logic_names"
+      ],
+      "obligations": 0,
+      "status": "error"
+    },
+    "telic/vcgen.py::VCGen.is_init": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/vcgen.py::_sort_tag": {
+      "obligations": 1,
+      "status": "refuted"
+    },
+    "telic/vcgen.py::arity": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/vcgen.py::components": {
+      "obligations": 0,
+      "status": "open"
+    },
+    "telic/vcgen.py::field_sort": {
+      "obligations": 2,
+      "status": "refuted"
+    },
+    "telic/vcgen.py::flatten": {
+      "obligations": 0,
+      "status": "proved"
+    },
+    "telic/vcgen.py::lex_lt": {
+      "claims": [
+        "requires len(a) >= 1 and len(a) == len(b)"
+      ],
+      "obligations": 2,
+      "status": "open"
+    },
+    "telic/vcgen.py::pack": {
+      "claims": [
+        "requires len(comps) == arity(ty)"
+      ],
+      "obligations": 8,
+      "status": "proved"
+    },
+    "telic/vcgen.py::sort_of": {
+      "obligations": 2,
+      "status": "refuted"
+    }
+  },
+  "mirrors": {},
+  "problems": {
+    "telic/checker.py": [
+      "class ProofCache: class attributes other than annotated fields are not modelled"
+    ],
+    "telic/frontend/rust.py": [
+      "class ExprLowerer: class attributes other than annotated fields are not modelled",
+      "class _Shifted: __getattr__ changes what attribute access means; not modelled"
+    ],
+    "telic/frontend/swift_expr.py": [
+      "class _Loc: __getattr__ changes what attribute access means; not modelled"
+    ],
+    "telic/frontend/swift_lower.py": [
+      "class _Shifted: __getattr__ changes what attribute access means; not modelled"
+    ],
+    "telic/replay_harness.py": [
+      "class _Stub: __getattr__ changes what attribute access means; not modelled"
+    ],
+    "telic/ui/driver.py": [
+      "class Driver: class attributes other than annotated fields are not modelled"
+    ],
+    "telic/ui/ios.py": [
+      "class IosDriver: class attributes other than annotated fields are not modelled"
+    ],
+    "telic/ui/web.py": [
+      "class WebDriver: class attributes other than annotated fields are not modelled"
+    ]
+  },
+  "telic": "0.1.0",
+  "ui": {
+    "telic/ui/spec.py::dark-mode": "open",
+    "telic/ui/spec.py::escape": "open",
+    "telic/ui/spec.py::menu-visible": "open"
+  }
+}
