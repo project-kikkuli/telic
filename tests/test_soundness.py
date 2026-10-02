@@ -100,6 +100,7 @@ TRUE_HELPERS = {
     "cb1.tsx": {"pos", "Counter", "Thrower"},
     "cb1.rs": {"pos"},
     "cb1.swift": {"pos"},
+    "t45.py": {"Base.__init__", "Base.m"},
 }
 
 # Lifecycles whose claim across calls is true; every other one in these files is false.

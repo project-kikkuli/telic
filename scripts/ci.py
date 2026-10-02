@@ -21,7 +21,7 @@ PROOF_SETUP = [".github/constraints.txt", "pyproject.toml"]
 KERNEL = [f"telic/{name}.py" for name in (
     "__init__", "ir", "contracts", "program", "logic", "vcgen", "infer", "smt", "checker",
     "jobs", "slots", "irjson", "engine", "history", "lifecycle", "equiv", "replay", "replay_harness",
-    "lean", "prover",
+    "lean", "prover", "toolchain", "runtime", "aim", "render_expr", "gaps", "evidence",
 )] + ["telic/ui/spec.py"]
 KERNEL += ["lean-toolchain", "telic/lean/*"]
 FRONTENDS = {
@@ -37,10 +37,11 @@ GROUPS = {
     "corpus-typescript": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["typescript"] + ["tests/test_corpus.py", "tests/cases/corpus.ts"], "tests": ["tests/test_corpus.py::test_typescript_corpus"]},
     "corpus-rust": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["rust"] + ["tests/test_rust.py", "tests/cases/corpus.rs", "tests/cases/rust_crate/**/*"], "tests": [f"tests/test_rust.py::{name}" for name in ("test_rust_corpus", "test_rust_refutations_are_real_panics", "test_crate_across_files", "test_crate_file_alone_uses_its_crate", "test_crate_is_valid_rust_and_refutations_replay")]},
     "corpus-swift": {"inputs": KERNEL + FRONTENDS["python"] + FRONTENDS["swift"] + ["tests/test_swift.py", "tests/cases/corpus.swift"], "tests": ["tests/test_swift.py::test_swift_corpus", "tests/test_swift.py::test_swift_refutations_are_real_failures"]},
-    "soundness": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "tests/test_soundness.py", "tests/cases/soundness/**/*"], "tests": ["tests/test_soundness.py"], "native": True},
+    "soundness": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_soundness.py", "tests/cases/soundness/**/*"], "tests": ["tests/test_soundness.py"], "native": True},
     "semantics": {"inputs": KERNEL + ALL_FRONTENDS + ["tests/test_semantics.py", "tests/test_swift.py", "tests/test_rust.py", "tests/cases/corpus.rs"], "tests": ["tests/test_semantics.py", "tests/test_swift.py::test_swift_integer_semantics_match_swiftc", "tests/test_rust.py::test_proved_functions_hold_when_run"]},
     "engine": {"inputs": KERNEL + ALL_FRONTENDS + ["core/*.ml", "core/Makefile", "tests/test_engine.py", "tests/test_soundness.py", "tests/cases/**/*"], "tests": [f"tests/test_engine.py::{name}" for name in ("test_engine_agrees_with_python_core", "test_engine_proves_no_exploit", "test_a_field_telic_cannot_model_fails_only_what_touches_it")], "native": True},
     "lean": {"inputs": KERNEL + ALL_FRONTENDS + ["telic/lean/*", "tests/test_lean.py"], "tests": ["tests/test_lean.py"], "lean": True},
+    "cache": {"inputs": KERNEL + FRONTENDS["python"] + ["core/*.ml", "core/Makefile", "tests/test_cache.py"], "tests": ["tests/test_cache.py"], "native": True},
 }
 
 
