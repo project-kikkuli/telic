@@ -834,6 +834,16 @@ export function Wizard(){const [step,setStep]=useState(0);const current=steps[st
     assert got.status == "proved" and got.method == "source proof"
 
 
+@pytest.mark.parametrize("property", ['always reachable button "Next" from overlay', 'reachable dialog "Welcome to Notes"'])
+def test_source_ui_proves_the_real_notes_react_onboarding_flow(tmp_path, property):
+    _, _, why, got = _static_source_case(
+        tmp_path,
+        'import {useState} from "react"; import {Onboarding} from "./components/Onboarding"; export default function App(){const [visible,setVisible]=useState(true);return <main>{visible&&<Onboarding onFinish={()=>setVisible(false)}/>}</main>}',
+        property,
+    )
+    assert why is None and got.status == "proved" and got.method == "source proof"
+
+
 def test_source_ui_preserves_caller_children_through_imported_layouts(tmp_path):
     _, _, why, got = _static_source_case(
         tmp_path,

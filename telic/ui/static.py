@@ -594,6 +594,8 @@ def _execute(stmt: Any, captured: dict[str, Any], updated: dict[str, Any], defs:
     if op == "if":
         branch = stmt[2] if _truthy(_eval(stmt[1], captured)) else stmt[3]
         return _execute(branch, captured, updated, defs)
+    if op == "invoke":
+        return _execute(stmt[1], captured, updated, defs)
     if op == "set":
         name, update = stmt[1], stmt[2]
         if update[0] == "functional":
@@ -682,11 +684,54 @@ def _dom_hidden(props: dict[str, Any]) -> bool:
 def _accessible_name(node: dict[str, Any], props: dict[str, Any], state: dict[str, Any], role: str, model: dict[str, Any]) -> str:
     if role == "generic":
         return ""
+    references = _display(props.get("aria-labelledby", ""))
+    if references:
+        labels = _id_texts(model["render"], state, model)
+        if len(set(references.split())) != len(references.split()):
+            raise ValueError("aria-labelledby repeats an id outside the source name model")
+        return _display(" ".join(labels[x] for x in references.split() if x in labels))
     aria = _display(props.get("aria-label", ""))
     if aria:
         return aria
     text = "".join(_tree_text(c, state, model) for c in node.get("children", []))
     return _display(text or props.get("title", ""))
+
+
+def _id_texts(tree: dict[str, Any], state: dict[str, Any], model: dict[str, Any]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    def raw_text(node: dict[str, Any]) -> str:
+        kind = node["type"]
+        if kind == "text":
+            value = _eval(node["value"], state) if isinstance(node["value"], list) else node["value"]
+            if isinstance(value, (list, dict)):
+                raise ValueError("React object and array children need explicit child-node modeling")
+            return "" if value is None or isinstance(value, bool) else str(value)
+        if kind == "jsxText": return html_lib.unescape(node["value"])
+        if kind == "empty": return ""
+        if kind == "component": return raw_text(node["child"])
+        if kind == "group": return "".join(raw_text(c) for c in node["children"])
+        if kind == "branch": return raw_text(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
+        return "".join(raw_text(c) for c in node["children"])
+    def visit(node: dict[str, Any]) -> None:
+        kind = node["type"]
+        if kind == "branch":
+            visit(node["yes"] if _truthy(_eval(node["test"], state)) else node["no"])
+        elif kind == "group":
+            for child in node["children"]: visit(child)
+        elif kind == "component":
+            visit(node["child"])
+        elif kind == "element":
+            props = {k: _eval(v, state) for k, v in node["props"].items()}
+            key = props.get("id")
+            if key:
+                if not isinstance(key, str):
+                    raise ValueError("non-string ids affect aria-labelledby name resolution")
+                if key in labels:
+                    raise ValueError("duplicate ids affect aria-labelledby name resolution")
+                labels[key] = raw_text({"type": "group", "children": node["children"]})
+            for child in node["children"]: visit(child)
+    visit(tree)
+    return labels
 
 
 def _role(tag: str, props: dict[str, Any]) -> str:

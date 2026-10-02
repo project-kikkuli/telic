@@ -10,7 +10,7 @@ const strip = (e) => {
   while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isTypeAssertionExpression(e))) e = e.expression;
   return e;
 };
-const modeledAria = new Set(["aria-label", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
+const modeledAria = new Set(["aria-label", "aria-labelledby", "aria-modal", "aria-hidden", "aria-disabled", "aria-checked", "aria-expanded", "aria-pressed", "aria-selected"]);
 const modeledTags = new Set(["div", "span", "button", "main", "nav", "aside", "article", "p", "h1", "h2", "h3", "h4", "h5", "h6"]);
 const invalidStatic = Symbol("invalid static value");
 const lineOf = (sf, n) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
@@ -278,6 +278,8 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     }
     if (!ts.isExpressionStatement(st)) fail(sf, st, "event handler contains an unmodeled statement");
     const e = strip(st.expression);
+    if (ts.isConditionalExpression(e)) return ["if", enc(e.condition, localVars), statement(ts.factory.createExpressionStatement(e.whenTrue), localVars), statement(ts.factory.createExpressionStatement(e.whenFalse), localVars)];
+    if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && componentProps.handlers.has(e.expression.text) && e.arguments.length === 0) return ["invoke", componentProps.handlers.get(e.expression.text)];
     if (!ts.isCallExpression(e) || !ts.isIdentifier(e.expression) || !setters.has(e.expression.text) || e.arguments.length !== 1) fail(sf, e, "event handler performs an effect other than a useState update");
     const stateName = setters.get(e.expression.text);
     const arg = strip(e.arguments[0]);
