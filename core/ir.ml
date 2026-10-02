@@ -3,6 +3,7 @@
 type ty =
   | TInt
   | TReal
+  | TFloat32
   | TBool
   | TStr
   | TNone
@@ -107,6 +108,7 @@ let rec ty_of j =
   match to_str (member "k" j) with
   | "int" -> TInt
   | "real" -> TReal
+  | "float32" -> TFloat32
   | "bool" -> TBool
   | "str" -> TStr
   | "none" -> TNone
@@ -141,8 +143,8 @@ let rec expr_of j : expr =
         match member "value" j with
         | Null -> Lit LNone
         | Bool b -> Lit (LBool b)
-        | Int i -> ( match ty with TReal -> Lit (LFrac (string_of_int i, "1")) | _ -> Lit (LInt (string_of_int i)))
-        | BigInt t -> ( match ty with TReal -> Lit (LFrac (t, "1")) | _ -> Lit (LInt t))
+        | Int i -> ( match ty with TReal | TFloat32 -> Lit (LFrac (string_of_int i, "1")) | _ -> Lit (LInt (string_of_int i)))
+        | BigInt t -> ( match ty with TReal | TFloat32 -> Lit (LFrac (t, "1")) | _ -> Lit (LInt t))
         | Float f -> Lit (LInt (Printf.sprintf "%.0f" f))
         | String s -> Lit (LStr s)
         | _ -> raise (Error "literal")))

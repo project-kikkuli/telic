@@ -3,8 +3,11 @@ with the real interpreter on random expressions. If these fail, a proof could
 be about a program that does not exist."""
 
 import json
+import math
 import os
 import random
+import shutil
+import struct
 import subprocess
 from fractions import Fraction
 
@@ -34,6 +37,17 @@ def model_value(module, fname, a, b):
     enc = Z3Encoder([])
     v = z3.simplify(enc.term(t))
     return to_python(v)
+
+
+def model_value_one(module, fname, x, sort=L.FLOAT64):
+    program = Program.build([module])
+    ref = program.resolve(module, fname)
+    g = VCGen(program, ref, inputs={"x": L.fval(x, sort)})
+    g.definitional_mode = True
+    g.run()
+    (ex,) = [e for e in g.exits if e.value is not None]
+    enc = Z3Encoder([])
+    return to_python(z3.simplify(enc.term(ex.value)))
 
 
 def py_expr(rnd, depth=0):
@@ -142,6 +156,65 @@ def test_javascript_semantics_match_node(tmp_path):
     assert checked > 300
 
 
+@needs_node
+def test_javascript_decimal_literals_round_once_like_node(tmp_path):
+    from telic.frontend.typescript import lower_typescript
+
+    literal = "1.000000000000000300000000000000000000000000000000000000000000000000001"
+    source = f"export function f(): number {{ return {literal}; }}\n"
+    path = tmp_path / "wide_literal.ts"
+    path.write_text(source)
+    mod = lower_typescript(str(path), source, root=str(tmp_path))
+    program = Program.build([mod])
+    ref = program.resolve(mod, "f")
+    g = VCGen(program, ref)
+    g.definitional_mode = True
+    g.run()
+    (ex,) = [e for e in g.exits if e.value is not None]
+    actual = to_python(z3.simplify(Z3Encoder([]).term(ex.value)))
+    expected = float(subprocess.run(["node", "-e", f"console.log({literal})"], capture_output=True, text=True, check=True).stdout)
+    assert actual == expected == 1.0000000000000002
+
+
+@needs_node
+def test_javascript_math_rounding_matches_node(tmp_path):
+    from telic.frontend.typescript import lower_typescript_files
+
+    inputs = [-0.0, 0.0, -0.25, -0.5, -0.75, 0.25, 0.5, 0.75, -1.5, 1.5, 2**52 + 0.5, float("nan"), float("inf"), -float("inf")]
+    funcs = ["floor", "ceil", "trunc", "round"]
+    files = []
+    for name in funcs:
+        p = tmp_path / f"math_{name}.ts"
+        p.write_text(f"export function f(x: number): number {{ return Math.{name}(x); }}\n")
+        files.append(str(p))
+    mods = lower_typescript_files(files, str(tmp_path))
+    encoded_inputs = [
+        "NaN" if math.isnan(x) else "Infinity" if x == float("inf") else "-Infinity" if x == float("-inf")
+        else "-0" if x == 0.0 and math.copysign(1.0, x) < 0 else repr(x)
+        for x in inputs
+    ]
+    js = "const xs = [" + ", ".join(encoded_inputs) + "];\n"
+    js += "const enc = x => Number.isNaN(x) ? 'NaN' : x === Infinity ? '+Inf' : x === -Infinity ? '-Inf' : Object.is(x, -0) ? '-0' : String(x);\n"
+    js += "console.log(JSON.stringify(xs.map(x => [Math.floor(x), Math.ceil(x), Math.trunc(x), Math.round(x)].map(enc))));"
+    expected = json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+    for op_i, name in enumerate(funcs):
+        mod = mods[files[op_i]]
+        assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+        for value, row in zip(inputs, expected):
+            got = model_value_one(mod, "f", value)
+            want = row[op_i]
+            if want == "NaN":
+                assert math.isnan(got), (name, value, got, want)
+            elif want == "+Inf":
+                assert got == float("inf"), (name, value, got, want)
+            elif want == "-Inf":
+                assert got == float("-inf"), (name, value, got, want)
+            elif want == "-0":
+                assert got == 0.0 and math.copysign(1.0, got) < 0, (name, value, got, want)
+            else:
+                assert got == float(want), (name, value, got, want)
+
+
 def test_python_float_rounding_model():
     """round() is banker's rounding on exact halves; our model agrees."""
     src = "def f(a: int, b: int) -> int:\n    return round(a / b)\n"
@@ -151,21 +224,104 @@ def test_python_float_rounding_model():
             assert model_value(mod, "f", a, b) == round(a / b), (a, b)
 
 
-def test_python_none_list_values_match_cpython():
-    src = (
-        "def first_is_none() -> bool:\n"
-        "    values = [None]\n"
-        "    return values[0] is None\n\n"
-        "def empty_none_list() -> bool:\n"
-        "    values: list[None] = []\n"
-        "    return len(values) == 0\n"
+def test_python_float_sum_matches_target_interpreter():
+    vectors = (
+        [1e16, 1.0, -1e16], [1e16, -1e16, 1.0], [1.25, 2.5, -0.75],
+        [1e100, 1.0, -1e100], [1e308, 1e308], [1e308, -1e308], [-0.0],
     )
-    namespace = {}
-    exec(src, namespace)
-    module = lower_python("none_list.py", src)
-    for name in ("first_is_none", "empty_none_list"):
-        assert not module.functions[name].unsupported, module.functions[name].unsupported
-        assert model_value(module, name, 0, 0) == namespace[name]()
+    for xs in vectors:
+        literals = ", ".join(repr(x) for x in xs)
+        mod = lower_python("sum_float.py", f"def f() -> float:\n    return sum([{literals}])\n")
+        assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+        program = Program.build([mod])
+        ref = program.resolve(mod, "f")
+        from telic.checker import build_theory
+
+        theory, _ = build_theory(program, {})
+        g = VCGen(program, ref)
+        g.definitional_mode = True
+        g.run()
+        (ex,) = [e for e in g.exits if e.value is not None]
+        enc = Z3Encoder(list(theory.fundefs.values()))
+        actual = to_python(z3.simplify(enc.term(ex.value)))
+        expected = sum(xs)
+        assert (math.isnan(actual) if math.isnan(expected) else actual == expected), (xs, actual, expected)
+
+
+def test_python_mixed_sum_keeps_integer_prefix_exact():
+    vectors = (
+        [9007199254740992, 1, -9007199254740992, 0.0],
+        [10**400, -(10**400), 0.0],
+        [(1 << 1024) - (1 << 971) + 1, 0.0],
+        [1e16, 1, -1e16],
+        [1, 0.0, 1e16, 1, -1e16],
+        [1, 2, 0.5, 3],
+    )
+    for xs in vectors:
+        literals = ", ".join(repr(x) for x in xs)
+        mod = lower_python("sum_mixed.py", f"def f() -> float:\n    return sum([{literals}])\n")
+        assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+        program = Program.build([mod])
+        ref = program.resolve(mod, "f")
+        g = VCGen(program, ref)
+        g.definitional_mode = True
+        g.run()
+        (ex,) = [e for e in g.exits if e.value is not None]
+        actual = to_python(z3.simplify(Z3Encoder([]).term(ex.value)))
+        expected = sum(xs)
+        assert actual == expected, (xs, actual, expected)
+
+
+@pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not available")
+def test_rust_float_to_int_saturates_like_rustc(tmp_path):
+    from telic.frontend.rust import lower_rust
+
+    source = """pub fn f(x: f64) -> i32 { x as i32 }
+fn main() {
+    let xs: [f64; 8] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e40, -1e40, 3.9, -3.9, -0.0];
+    for x in xs { println!(\"{}\", f(x)); }
+}
+"""
+    path = tmp_path / "cast.rs"
+    path.write_text(source)
+    binary = tmp_path / "cast"
+    subprocess.run(["rustc", "--edition", "2021", str(path), "-o", str(binary)], capture_output=True, text=True, check=True)
+    expected = [int(x) for x in subprocess.run([str(binary)], capture_output=True, text=True, check=True).stdout.splitlines()]
+    mod = lower_rust(str(path), source, root=str(tmp_path))
+    assert not mod.functions["f"].unsupported, mod.functions["f"].unsupported
+    inputs = [float("nan"), float("inf"), -float("inf"), 1e40, -1e40, 3.9, -3.9, -0.0]
+    for x, want in zip(inputs, expected):
+        got = model_value_one(mod, "f", x)
+        assert got == want, (x, got, want)
+
+
+@pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not available")
+def test_rust_float_casts_round_and_widen_like_rustc(tmp_path):
+    from telic.frontend.rust import lower_rust
+
+    source = """pub fn narrow(x: f64) -> f32 { x as f32 }
+pub fn widen(x: f32) -> f64 { x as f64 }
+fn main() {
+    let xs: [f64; 6] = [16777217.0, 1e-50, -1e-50, 1e39, -1e39, -0.0];
+    for x in xs { println!(\"{:08x}\", narrow(x).to_bits()); }
+    let ys: [f32; 6] = [16777217.0, 1e-30, -1e-30, 1e30, -1e30, -0.0];
+    for x in ys { println!(\"{:016x}\", widen(x).to_bits()); }
+}
+"""
+    path = tmp_path / "float_cast.rs"
+    path.write_text(source)
+    binary = tmp_path / "float_cast"
+    subprocess.run(["rustc", "--edition", "2021", str(path), "-o", str(binary)], capture_output=True, text=True, check=True)
+    bits = subprocess.run([str(binary)], capture_output=True, text=True, check=True).stdout.splitlines()
+    mod = lower_rust(str(path), source, root=str(tmp_path))
+    xs = [16777217.0, 1e-50, -1e-50, 1e39, -1e39, -0.0]
+    ys = [16777217.0, 1e-30, -1e-30, 1e30, -1e30, -0.0]
+    for x, want in zip(xs, bits[:6]):
+        got = model_value_one(mod, "narrow", x)
+        assert struct.pack(">f", got).hex() == want, (x, got, want)
+    for x, want in zip(ys, bits[6:]):
+        got = model_value_one(mod, "widen", x, L.FLOAT32)
+        assert struct.pack(">d", got).hex() == want, (x, got, want)
 
 
 VALUE_IDIOMS = [
@@ -273,3 +429,22 @@ def test_python_built_lists_match_cpython(e):
             s.add(enc.term(f))
         s.add(z3.Not(enc.term(L.eq(ex.value, L.IntV(want)))))
         assert s.check() == z3.unsat, (e, a, b, want)
+
+
+@needs_node
+def test_javascript_safe_integer_boundary_matches_node(tmp_path):
+    from telic.frontend.typescript import lower_typescript_files
+
+    path = tmp_path / "safe_integer.ts"
+    path.write_text(
+        "export function add(a: number, b: number): number {\n"
+        "  //@ requires Number.isSafeInteger(a) && Number.isSafeInteger(b)\n"
+        "  return a + b;\n}\n"
+    )
+    module = lower_typescript_files([str(path)], str(tmp_path))[str(path)]
+    limit = 9007199254740991
+    pairs = [(limit - 1, 1), (limit, 1), (-limit, -1)]
+    js = "const pairs = " + json.dumps(pairs) + "; console.log(JSON.stringify(pairs.map(([a,b]) => a+b)));"
+    actual = json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+    for (a, b), expected in zip(pairs, actual):
+        assert model_value(module, "add", a, b) == expected

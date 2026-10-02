@@ -494,6 +494,10 @@ def wire(v: Any, tn: Any, h: Harness, seen: set) -> str:
             v = 0
         return f"i{int(v)}"
     if cat == "real":
+        if isinstance(v, dict) and "__float__" in v:
+            suffix = "Float" if str(d).strip().endswith("Float") else "Double"
+            special = {"NaN": "nan", "Infinity": "infinity", "-Infinity": "-infinity"}[v["__float__"]]
+            return f"{suffix}.{special}"
         if isinstance(v, dict) and "__real__" in v:
             n, den = v["__real__"]
         elif isinstance(v, Fraction):

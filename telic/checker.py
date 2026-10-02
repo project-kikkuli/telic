@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -676,7 +677,12 @@ def vacuity_checks(entries: list[tuple[FunctionReport, VCGen]], theory: Theory, 
 def build_theory(program: Program, measures: dict[str, ir.Expr]) -> tuple[Theory, list[tuple[str, str]]]:
     theory = Theory()
     problems: list[tuple[str, str]] = []
-    for d in (L.seqsum_def(L.INT), L.seqsum_def(L.REAL), L.seqcount_def(L.INT), L.seqcount_def(L.REAL), L.seqcount_def(L.BOOL), L.seqcount_def(L.STR)):
+    for d in (L.seqsum_def(L.INT), L.seqsum_def(L.REAL), L.seqsum_def(L.FLOAT32), L.seqsum_def(L.FLOAT64), L.seqcount_def(L.INT), L.seqcount_def(L.REAL), L.seqcount_def(L.BOOL), L.seqcount_def(L.STR)):
+        theory.fundefs[d.name] = d
+    if sys.version_info >= (3, 12):
+        for d in L.python_float_sum_defs(sys.version_info.major, sys.version_info.minor):
+            theory.fundefs[d.name] = d
+    for d in L.python_numeric_sum_defs(sys.version_info.major, sys.version_info.minor):
         theory.fundefs[d.name] = d
     for elem in (L.INT, L.REAL):
         theory.axioms.extend(L.theory_lemmas(elem))

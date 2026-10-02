@@ -186,8 +186,8 @@ class ExprLowerer:
             v = int(t, 0)
         except ValueError:
             raise self.err(f"unsupported integer literal {t}", x) from None
-        if expect == ir.REAL:
-            return ir.Lit(ir.REAL, self.loc(x), Fraction(v))
+        if isinstance(expect, ir.TReal):
+            return ir.Lit(expect, self.loc(x), Fraction(v))
         k = kind if kind else ("Int" if expect in (None, ir.INT) or isinstance(expect, (ir.TOpaque, ir.TOption)) else None)
         if not self.spec and k and not (int_range(k)[0] <= v <= int_range(k)[1]):
             raise self.err(f"integer literal {t} does not fit {k}", x)
@@ -199,7 +199,7 @@ class ExprLowerer:
             v = Fraction(t) if not t.lower().startswith("0x") else Fraction(float.fromhex(t))
         except (ValueError, ZeroDivisionError):
             raise self.err(f"unsupported floating-point literal {t}", x) from None
-        return ir.Lit(ir.REAL, self.loc(x), v)
+        return ir.Lit(expect if isinstance(expect, ir.TReal) else ir.REAL, self.loc(x), v)
 
     def x_bool(self, x: X, expect: Any, kind: Any) -> ir.Expr:
         return ir.Lit(ir.BOOL, self.loc(x), x.value)
@@ -290,8 +290,8 @@ class ExprLowerer:
                     raise self.err(f"integer literal {v} does not fit {k}", x)
                 return self.kinded(ir.Lit(lit.ty, loc, v), k)
             a = self.expr(x.e, expect, kind)
-            if a.ty == ir.REAL:
-                return ir.Unary(ir.REAL, loc, "neg", a)
+            if isinstance(a.ty, ir.TReal):
+                return ir.Unary(a.ty, loc, "neg", a)
             if a.ty != ir.INT:
                 raise self.err(f"cannot negate {a.ty}", x)
             return self.checked(ir.Unary(ir.INT, loc, "neg", a), self.kind_of(a) or "Int")
@@ -337,19 +337,19 @@ class ExprLowerer:
             e = ir.Binary(ir.BOOL, loc, "eq", a, self.fl.coerce(b, a.ty))
             return e if op == "===" else ir.Unary(ir.BOOL, loc, "not", e)
         a = self.expr(x.l, expect if op in ("+", "-", "*", "/", "%", "&+", "&-", "&*") else None, kind if op in ("+", "-", "*", "/", "%", "&+", "&-", "&*") else None)
-        b_expect = a.ty if a.ty in (ir.INT, ir.REAL) or op in ("==", "!=") else None
+        b_expect = a.ty if a.ty == ir.INT or isinstance(a.ty, ir.TReal) or op in ("==", "!=") else None
         b = self.expr(x.r, b_expect if not isinstance(a.ty, ir.TOpaque) else None, self.kind_of(a) if a.ty == ir.INT else None)
         if a.ty == ir.INT and b.ty == ir.INT and not self.kind_of(a) and self.kind_of(b) and isinstance(a, ir.Lit):
             self.kinded(a, self.kind_of(b))
-        if a.ty == ir.REAL and b.ty == ir.INT and isinstance(b, ir.Lit):
-            b = ir.Lit(ir.REAL, b.loc, Fraction(b.value))  # type: ignore[arg-type]
-        if b.ty == ir.REAL and a.ty == ir.INT and isinstance(a, ir.Lit):
-            a = ir.Lit(ir.REAL, a.loc, Fraction(a.value))  # type: ignore[arg-type]
+        if isinstance(a.ty, ir.TReal) and b.ty == ir.INT and isinstance(b, ir.Lit):
+            b = ir.Lit(a.ty, b.loc, Fraction(b.value))  # type: ignore[arg-type]
+        if isinstance(b.ty, ir.TReal) and a.ty == ir.INT and isinstance(a, ir.Lit):
+            a = ir.Lit(b.ty, a.loc, Fraction(a.value))  # type: ignore[arg-type]
         if op in ("==", "!="):
             e = self.equal(a, b, x)
             return e if op == "==" else ir.Unary(ir.BOOL, loc, "not", e)
         if op in ("<", "<=", ">", ">="):
-            if a.ty == b.ty and a.ty in (ir.INT, ir.REAL):
+            if a.ty == b.ty and (a.ty == ir.INT or isinstance(a.ty, ir.TReal)):
                 return ir.Binary(ir.BOOL, loc, BINOPS[op], a, b)
             if a.ty == b.ty == ir.STR:
                 return ir.Builtin(ir.BOOL, loc, "str_fn", (ir.Lit(ir.STR, loc, f"swift{op}"), a, b))
@@ -362,11 +362,11 @@ class ExprLowerer:
             ty = a.ty if a.ty.elem != ir.NONE else b.ty
             return self.elems_kinded(ir.Builtin(ty, loc, "list_concat", (self.fl.coerce(a, ty), self.fl.coerce(b, ty))), self.kind_of_elems(a) or self.kind_of_elems(b))
         if op in ("+", "-", "*", "/", "%"):
-            if a.ty != b.ty or a.ty not in (ir.INT, ir.REAL):
+            if a.ty != b.ty or not (a.ty == ir.INT or isinstance(a.ty, ir.TReal)):
                 if isinstance(a.ty, ir.TOpaque) or isinstance(b.ty, ir.TOpaque):
                     return self.opaque(op, [a, b], a.ty if not isinstance(a.ty, ir.TOpaque) else b.ty, loc)
                 raise self.err(f"'{op}' on {a.ty} and {b.ty}", x)
-            if a.ty == ir.REAL:
+            if isinstance(a.ty, ir.TReal):
                 if op == "/":  # division by zero gives an infinity or NaN, not a trap
                     nz = ir.Binary(ir.BOOL, loc, "ne", b, ir.Lit(ir.REAL, loc, Fraction(0)))
                     return ir.Ite(ir.REAL, loc, nz, ir.Binary(ir.REAL, loc, "rdiv", a, b), self.opaque("fdiv", [a, b], ir.REAL, loc))
@@ -739,8 +739,8 @@ class ExprLowerer:
             return ir.Lit(target, loc, target.members.index(x.name))
         if isinstance(target, ir.TRecord):
             return self.enum_case(self.pj.types[target.name], x.name, [], x)
-        if isinstance(target, (ir.TClass,)) or target in (ir.INT, ir.REAL):
-            tn = target.name if isinstance(target, ir.TClass) else ("Int" if target == ir.INT else "Double")
+        if isinstance(target, (ir.TClass,)) or target == ir.INT or isinstance(target, ir.TReal):
+            tn = target.name if isinstance(target, ir.TClass) else ("Int" if target == ir.INT else "Float" if target.bits == 32 else "Double")
             return self.static_member(TypeRef(tn, self.pj.types.get(tn)), x.name, x, expect)
         if not self.spec and (target is None or isinstance(target, ir.TOpaque)):
             return self.opaque(f"implicit.{x.name}", [], ir.TOpaque(x.name), loc)  # a member of a type telic does not know
@@ -848,11 +848,11 @@ class ExprLowerer:
             if self.spec:
                 raise self.err(f"Int.{name} in a specification", x)
             return self.ranged(self.opaque(f"Int.{name}", [b], ir.INT, loc), self.kind_of(b) or "Int")
-        if t == ir.REAL:
+        if isinstance(t, ir.TReal):
             if self.spec:
-                raise self.err(f"Double.{name} in a specification", x)
-            ty = ir.BOOL if name.startswith("is") else ir.REAL
-            return self.opaque(f"Double.{name}", [b], ty, loc)
+                raise self.err(f"{t}.{name} in a specification", x)
+            ty = ir.BOOL if name.startswith("is") else t
+            return self.opaque(f"{t}.{name}", [b], ty, loc)
         if isinstance(t, ir.TOpaque):
             if self.spec:
                 raise self.err(f"'.{name}' of an unchecked value in a specification", x)
@@ -1134,17 +1134,17 @@ class ExprLowerer:
         if name in ("min", "max") and len(args) >= 2:
             es = [self.expr(a, expect, kind) for a in vals()]
             ty = es[0].ty
-            if ty not in (ir.INT, ir.REAL) or any(e.ty != ty for e in es):
-                if all(e.ty in (ir.INT, ir.REAL) for e in es):
-                    es = [e if e.ty == ir.REAL else (ir.Lit(ir.REAL, e.loc, Fraction(e.value)) if isinstance(e, ir.Lit) else e) for e in es]  # type: ignore[arg-type]
-                    ty = ir.REAL
+            if not (ty == ir.INT or isinstance(ty, ir.TReal)) or any(e.ty != ty for e in es):
+                if all(e.ty == ir.INT or isinstance(e.ty, ir.TReal) for e in es):
+                    ty = next((e.ty for e in es if isinstance(e.ty, ir.TReal)), ir.REAL)
+                    es = [e if e.ty == ty else (ir.Lit(ty, e.loc, Fraction(e.value)) if isinstance(e, ir.Lit) else ir.Builtin(ty, e.loc, "to_real", (e,))) for e in es]  # type: ignore[arg-type]
                 if any(e.ty != ty for e in es):
                     raise self.err(f"{name} of {', '.join(str(e.ty) for e in es)}", x)
             return self.kinded(ir.Builtin(ty, loc, name, tuple(es)), next((self.kind_of(e) for e in es if self.kind_of(e)), None))
         if name == "abs" and len(args) == 1:
             a = self.expr(args[0][1], expect, kind)
-            if a.ty == ir.REAL:
-                return ir.Builtin(ir.REAL, loc, "abs", (a,))
+            if isinstance(a.ty, ir.TReal):
+                return ir.Builtin(a.ty, loc, "abs", (a,))
             if a.ty == ir.INT:
                 return self.checked(ir.Builtin(ir.INT, loc, "abs", (a,)), self.kind_of(a) or "Int")
         if self.spec:

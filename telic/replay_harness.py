@@ -44,6 +44,8 @@ def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return float(Fraction(n, d))
+    if isinstance(v, dict) and "__float__" in v:
+        return float(v["__float__"])
     if isinstance(v, dict) and "__record__" in v:
         cls = getattr(module, v["__record__"])
         return cls(**{k: decode(x, module, memo) for k, x in v["fields"].items()})

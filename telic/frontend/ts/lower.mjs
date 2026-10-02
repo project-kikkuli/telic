@@ -3,12 +3,8 @@
 // Usage: node lower.mjs <root> <file.ts>...   (prints one JSON document)
 //
 // Semantics are JavaScript's, stated explicitly:
-//   * `number` is an exact rational unless integrality is known. A value is an
-//     integer when the code guarantees it: integer literals, `.length`,
-//     Math.floor/ceil/trunc/round, int +,-,*,%, and parameters whose
-//     contract says `Number.isInteger(p)` (or whose type is an alias named
-//     `int`). Integrality of locals/returns is the greatest fixpoint of
-//     "every assignment is integer-valued".
+//   * `number` is IEEE binary64. Integer abstractions require a safe-integer
+//     refinement and range obligations for intermediate results.
 //   * `/` is real division; `%` truncates (sign of the dividend).
 //   * reading `xs[i]` out of bounds yields `undefined` -- telic treats it as
 //     an error and requires 0 <= i < xs.length.
@@ -151,8 +147,6 @@ function parseAim(cl) {
 // ---------------------------------------------------------------------------
 
 const JS_ASSUMPTIONS = [
-  "number is modelled as an exact rational (no NaN, Infinity, or rounding error)",
-  "integer-valued numbers stay within the safe range ±2^53",
   "distinct array arguments do not alias each other",
   "console.* calls have no effect on program state",
   "objects of interface and object-literal types are not changed by other code while checked code reads them",
@@ -624,7 +618,6 @@ class ModuleLowerer {
       }
       if (n === "Promise" && targs.length === 1) return this.typeOf(targs[0], intHint, depth + 1);
       if (n === "Readonly" && targs.length === 1) return this.typeOf(targs[0], intHint, depth + 1);
-      if (["int", "Int", "integer", "Integer"].includes(n) && this.aliases[n] && this.aliases[n].kind === K.NumberKeyword) return INT;
       if (this.module.records[n]) return this.module.records[n];
       if (this.classes[n]) return classOf(n);
       if (this.enums[n]) return this.enums[n];
@@ -763,9 +756,7 @@ class ModuleLowerer {
   signature(f) {
     const node = f.node;
     const cls = node ? this.functionContracts(f) : [];
-    // integrality hints from @requires: Number.isInteger(p) / isSafeInteger(p)
-    // Only a top-level conjunct `Number.isInteger(p)` makes p an integer:
-    // under `!` or `||` it guarantees nothing.
+    // Integrality is refined only by a top-level safe-integer precondition.
     const ints = new Set();
     for (const cl of cls) {
       if (cl.keyword !== "requires") continue;
@@ -778,7 +769,7 @@ class ModuleLowerer {
         return [e];
       };
       for (const c of conj(st.expression)) {
-        if (ts.isCallExpression(c) && c.arguments.length === 1 && ts.isIdentifier(c.arguments[0]) && ts.isPropertyAccessExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "Number" && ["isInteger", "isSafeInteger"].includes(c.expression.name.text)) ints.add(c.arguments[0].text);
+        if (ts.isCallExpression(c) && c.arguments.length === 1 && ts.isIdentifier(c.arguments[0]) && ts.isPropertyAccessExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "Number" && c.expression.name.text === "isSafeInteger") ints.add(c.arguments[0].text);
       }
     }
     const params = [];
@@ -2255,10 +2246,9 @@ class FunctionLowerer {
     if (ts.isParenthesizedExpression(n)) return this.expr(n.expression, expect);
     if (ts.isNumericLiteral(n)) {
       const txt = n.text;
-      if (/^\d+$/.test(txt)) return { e: "Lit", ty: INT, loc, value: Number(txt) };
       const f = decimalFraction(txt);
       if (!f) throw this.err(`unsupported numeric literal ${txt}`, this.nline(n));
-      if (f[1] === 1) return { e: "Lit", ty: INT, loc, value: f[0] };
+      if (f[1] === "1" && BigInt(f[0]) <= BigInt(Number.MAX_SAFE_INTEGER)) return { e: "Lit", ty: INT, loc, value: Number(f[0]) };
       return { e: "Lit", ty: REAL, loc, value: null, frac: f };
     }
     if (n.kind === K.TrueKeyword || n.kind === K.FalseKeyword) return { e: "Lit", ty: BOOL, loc, value: n.kind === K.TrueKeyword };
@@ -2699,17 +2689,10 @@ class FunctionLowerer {
       if (ts.isIdentifier(c.expression) && c.expression.text === "Math") {
         if (["floor", "ceil", "trunc", "round"].includes(m)) {
           if (args.length !== 1) throw this.err(`Math.${m} takes one argument`, this.nline(n));
-          // Math.floor(a / b) on integers is floor division.
-          const a0 = args[0];
-          const inner = ts.isParenthesizedExpression(a0) ? a0.expression : a0;
-          if (m === "floor" && ts.isBinaryExpression(inner) && inner.operatorToken.kind === ts.SyntaxKind.SlashToken) {
-            const l = this.expr(inner.left), r = this.expr(inner.right);
-            if (l.ty.k === "int" && r.ty.k === "int") return { e: "Binary", ty: INT, loc, op: "floordiv", left: l, right: r };
-          }
-          const x = this.expr(a0);
+          const x = this.expr(args[0]);
           if (x.ty.k === "int") return x;
           if (x.ty.k !== "real") throw this.err(`Math.${m} needs a number`, this.nline(n));
-          return { e: "Builtin", ty: INT, loc, name: m === "round" ? "round_up" : m, args: [x] };
+          return { e: "Builtin", ty: x.ty, loc, name: `js_${m}`, args: [x] };
         }
         if (["abs", "min", "max"].includes(m) && args.some((a) => this.expr(a).ty.k === "opaque")) return this.opaqueOp(`Math.${m}`, args.map((a) => this.expr(a)), opaque(""), loc);
         if (m === "abs") {
@@ -3310,13 +3293,13 @@ function decimalFraction(txt) {
   let num = BigInt((m[1] || "0") + (m[2] || ""));
   let den = 10n ** BigInt((m[2] || "").length);
   const exp = m[3] ? Number(m[3]) : 0;
+  if (Math.abs(exp) > 1000) return null;
   if (exp > 0) num *= 10n ** BigInt(exp);
   if (exp < 0) den *= 10n ** BigInt(-exp);
   const g = gcd(num, den);
   num /= g;
   den /= g;
-  if (num > BigInt(Number.MAX_SAFE_INTEGER) || den > BigInt(Number.MAX_SAFE_INTEGER)) return null;
-  return [Number(num), Number(den)];
+  return [num.toString(), den.toString()];
 }
 
 function gcd(a, b) {
@@ -3337,7 +3320,10 @@ function staticType(fl, e, ints, params) {
 function isIntExpr(fl, e, ints, params) {
   const K = ts.SyntaxKind;
   if (ts.isParenthesizedExpression(e)) return isIntExpr(fl, e.expression, ints, params);
-  if (ts.isNumericLiteral(e)) return /^\d+$/.test(e.text) || (decimalFraction(e.text) || [0, 2])[1] === 1;
+  if (ts.isNumericLiteral(e)) {
+    const f = decimalFraction(e.text);
+    return !!(f && f[1] === "1" && BigInt(f[0]) <= BigInt(Number.MAX_SAFE_INTEGER));
+  }
   if (ts.isIdentifier(e)) {
     if (params.has(e.text)) return params.get(e.text).k === "int";
     return ints.has(e.text);
@@ -3367,7 +3353,7 @@ function isIntExpr(fl, e, ints, params) {
     const c = e.expression;
     if (ts.isPropertyAccessExpression(c) && ts.isIdentifier(c.expression) && c.expression.text === "Math") {
       const m = c.name.text;
-      if (["floor", "ceil", "trunc", "round"].includes(m)) return true;
+      if (["floor", "ceil", "trunc", "round"].includes(m)) return false;
       if (["abs", "min", "max"].includes(m)) return e.arguments.every((a) => isIntExpr(fl, a, ints, params));
       return false;
     }

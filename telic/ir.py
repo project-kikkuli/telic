@@ -32,8 +32,10 @@ class TInt:
 
 @dataclass(frozen=True)
 class TReal:
+    bits: int = 64
+
     def __str__(self) -> str:
-        return "real"
+        return "real" if self.bits == 64 else f"float{self.bits}"
 
 
 @dataclass(frozen=True)
@@ -161,7 +163,7 @@ def reaches_object(t: Type) -> bool:
         return any(reaches_object(ft) for _, ft in t.fields)
     return False
 
-INT, REAL, BOOL, STR, NONE = TInt(), TReal(), TBool(), TStr(), TNone()
+INT, REAL, FLOAT32, BOOL, STR, NONE = TInt(), TReal(), TReal(32), TBool(), TStr(), TNone()
 
 
 def is_numeric(t: Type) -> bool:

@@ -548,3 +548,10 @@ export function reduceUnguarded(xs: number[]): number {
   const t = xs.reduce((acc, x) => acc + posNum(x), 0);
   return 0;
 }
+
+// expect: refuted
+export function safeIntegerOverflow(n: number): number {
+  //@ requires Number.isSafeInteger(n)
+  //@ ensures Number.isSafeInteger(result)
+  return n * 2;
+}

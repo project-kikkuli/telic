@@ -62,6 +62,10 @@ class _Values:
             suffix = rt if re.fullmatch(r"[iu](8|16|32|64|128|size)", rt) else ""
             return f"({v}{suffix})" if v < 0 else f"{v}{suffix}"
         if isinstance(ty, ir.TReal):
+            if isinstance(v, dict) and "__float__" in v:
+                special = {"NaN": "NAN", "Infinity": "INFINITY", "-Infinity": "NEG_INFINITY"}[v["__float__"]]
+                prefix = "f32" if rt == "f32" else "f64"
+                return f"{prefix}::{special}"
             if isinstance(v, dict) and "__real__" in v:
                 v = Fraction(*v["__real__"])
             f = float(v or 0)

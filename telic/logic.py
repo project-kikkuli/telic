@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+import math
+import struct
 from typing import Iterable
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,8 @@ class Sort:
 
 INT = Sort("Int")
 REAL = Sort("Real")
+FLOAT32 = Sort("Float32")
+FLOAT64 = Sort("Float64")
 BOOL = Sort("Bool")
 STR = Sort("Str")
 UNIT = Sort("None")
@@ -90,6 +94,61 @@ class IntV(Term):
 class RealV(Term):
     value: Fraction
     sort: Sort = REAL
+
+
+@dataclass(frozen=True, repr=False)
+class FloatV(Term):
+    bits: int
+    sort: Sort
+
+    @property
+    def value(self) -> float:
+        if self.sort == FLOAT32:
+            return struct.unpack("<f", struct.pack("<I", self.bits))[0]
+        return struct.unpack("<d", struct.pack("<Q", self.bits))[0]
+
+
+def fval(value: float, sort: Sort) -> FloatV:
+    if sort == FLOAT32:
+        try:
+            return FloatV(struct.unpack("<I", struct.pack("<f", value))[0], sort)
+        except OverflowError:
+            return FloatV(struct.unpack("<I", struct.pack("<f", math.copysign(math.inf, value)))[0], sort)
+    if sort == FLOAT64:
+        return FloatV(struct.unpack("<Q", struct.pack("<d", value))[0], sort)
+    raise TypeError(sort)
+
+
+def fval_fraction(value: Fraction, sort: Sort) -> FloatV:
+    if sort == FLOAT64:
+        try:
+            return fval(float(value), sort)
+        except OverflowError:
+            return fval(-math.inf if value < 0 else math.inf, sort)
+    if sort != FLOAT32:
+        raise TypeError(sort)
+    sign = value < 0
+    q = abs(value)
+    if q == 0:
+        bits = 0
+    else:
+        e = q.numerator.bit_length() - q.denominator.bit_length()
+        if e >= 0 and q < 2**e or e < 0 and q < Fraction(2**e):
+            e -= 1
+        scale = 149 if e < -126 else 23 - e
+        scaled = q * (2**scale if scale >= 0 else Fraction(1, 2**-scale))
+        n, rem = divmod(scaled.numerator, scaled.denominator)
+        twice = rem * 2
+        if twice > scaled.denominator or twice == scaled.denominator and n & 1:
+            n += 1
+        if e < -126:
+            bits = n if n < 2**23 else 1 << 23
+        else:
+            if n == 2**24:
+                n >>= 1
+                e += 1
+            bits = (0xFF << 23) if e > 127 else ((e + 127) << 23) | (n - (1 << 23))
+    return FloatV(bits | (int(sign) << 31), sort)
 
 
 @dataclass(frozen=True, repr=False)
@@ -159,6 +218,8 @@ def lit(v, sort: Sort) -> Term:
         return IntV(int(v))
     if sort == REAL:
         return RealV(Fraction(v))
+    if sort in (FLOAT32, FLOAT64):
+        return fval_fraction(Fraction(v), sort)
     if sort == BOOL:
         return BoolV(bool(v))
     if sort == STR:
@@ -166,7 +227,17 @@ def lit(v, sort: Sort) -> Term:
     raise TypeError(sort)
 
 
+def _float_pair(a: Term, b: Term) -> tuple[Term, Term] | None:
+    if a.sort not in (FLOAT32, FLOAT64) and b.sort not in (FLOAT32, FLOAT64):
+        return None
+    sort = FLOAT64 if FLOAT64 in (a.sort, b.sort) else FLOAT32
+    return to_float(a, sort), to_float(b, sort)
+
+
 def add(a: Term, b: Term) -> Term:
+    pair = _float_pair(a, b)
+    if pair is not None:
+        return fbin("fp.add", *pair)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x + y, a.sort)
@@ -183,6 +254,9 @@ def add(a: Term, b: Term) -> Term:
 
 
 def sub(a: Term, b: Term) -> Term:
+    pair = _float_pair(a, b)
+    if pair is not None:
+        return fbin("fp.sub", *pair)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x - y, a.sort)
@@ -200,6 +274,9 @@ def sub(a: Term, b: Term) -> Term:
 
 
 def mul(a: Term, b: Term) -> Term:
+    pair = _float_pair(a, b)
+    if pair is not None:
+        return fbin("fp.mul", *pair)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return lit(x * y, a.sort)
@@ -213,6 +290,8 @@ def mul(a: Term, b: Term) -> Term:
 
 
 def neg(a: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64):
+        return fneg(a)
     x = _num(a)
     if x is not None:
         return lit(-x, a.sort)
@@ -222,6 +301,9 @@ def neg(a: Term) -> Term:
 
 
 def rdiv(a: Term, b: Term) -> Term:
+    pair = _float_pair(a, b)
+    if pair is not None:
+        return fbin("fp.div", *pair)
     x, y = _num(a), _num(b)
     if x is not None and y is not None and y != 0:
         return RealV(Fraction(x) / Fraction(y))
@@ -263,6 +345,8 @@ def floor(a: Term) -> Term:
 
 
 def is_int(a: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64):
+        return and_(is_finite(a), is_int(fto_real(a)))
     if isinstance(a, RealV):
         return BoolV(a.value.denominator == 1)
     if isinstance(a, App) and a.op == "to_real":
@@ -271,6 +355,8 @@ def is_int(a: Term) -> Term:
 
 
 def lt(a: Term, b: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64) or b.sort in (FLOAT32, FLOAT64):
+        return fcmp("fp.lt", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return BoolV(x < y)
@@ -280,6 +366,8 @@ def lt(a: Term, b: Term) -> Term:
 
 
 def le(a: Term, b: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64) or b.sort in (FLOAT32, FLOAT64):
+        return fcmp("fp.leq", a, b)
     x, y = _num(a), _num(b)
     if x is not None and y is not None:
         return BoolV(x <= y)
@@ -297,6 +385,8 @@ def ge(a: Term, b: Term) -> Term:
 
 
 def eq(a: Term, b: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64) or b.sort in (FLOAT32, FLOAT64):
+        return fcmp("fp.eq", a, b)
     if a == b:
         return TRUE
     if isinstance(a, (IntV, RealV, BoolV, StrV)) and isinstance(b, (IntV, RealV, BoolV, StrV)):
@@ -436,7 +526,111 @@ def exists(vs: Iterable[Const], body: Term) -> Term:
 
 
 def abs_(a: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64):
+        if isinstance(a, FloatV):
+            return fval(abs(a.value), a.sort)
+        return App("fp.abs", (a,), a.sort)
     return ite(le(lit(0, a.sort), a), a, neg(a))
+
+
+def fbin(op: str, a: Term, b: Term) -> Term:
+    s = a.sort
+    if isinstance(a, FloatV) and isinstance(b, FloatV):
+        x, y = a.value, b.value
+        if op == "fp.add":
+            z = x + y
+            exact = Fraction(x) + Fraction(y) if s == FLOAT32 and math.isfinite(x) and math.isfinite(y) else None
+        elif op == "fp.sub":
+            z = x - y
+            exact = Fraction(x) - Fraction(y) if s == FLOAT32 and math.isfinite(x) and math.isfinite(y) else None
+        elif op == "fp.mul":
+            z = x * y
+            exact = Fraction(x) * Fraction(y) if s == FLOAT32 and math.isfinite(x) and math.isfinite(y) else None
+        elif op == "fp.div" and y != 0.0 and s != FLOAT32:
+            z = x / y
+            exact = None
+        else:
+            return App(op, (a, b), s)
+        if exact is not None and exact:
+            return fval_fraction(exact, s)
+        return fval(z, s)
+    return App(op, (a, b), s)
+
+
+def fneg(a: Term) -> Term:
+    if isinstance(a, FloatV):
+        return fval(-a.value, a.sort)
+    return App("fp.neg", (a,), a.sort)
+
+
+def fcmp(op: str, a: Term, b: Term) -> Term:
+    if a.sort in (FLOAT32, FLOAT64) and b.sort in (FLOAT32, FLOAT64):
+        if a.sort != b.sort:
+            b = to_float(b, a.sort)
+        def integer_cast(x: Term) -> Term | None:
+            if isinstance(x, App) and x.op in ("fp.from_int", "fp.of_int") and len(x.args) == 1 and x.args[0].sort == INT:
+                return x.args[0]
+            return None
+
+        def zero(x: Term) -> bool:
+            return isinstance(x, FloatV) and x.value == 0.0
+
+        cast = integer_cast(b)
+        if zero(a) and cast is not None:
+            return {"fp.lt": gt, "fp.leq": ge, "fp.eq": eq}[op](cast, IntV(0))
+        cast = integer_cast(a)
+        if cast is not None and zero(b):
+            return {"fp.lt": lt, "fp.leq": le, "fp.eq": eq}[op](cast, IntV(0))
+        if isinstance(a, FloatV) and isinstance(b, FloatV):
+            x, y = a.value, b.value
+            return BoolV(x < y if op == "fp.lt" else x <= y if op == "fp.leq" else x == y)
+        return App(op, (a, b), BOOL)
+    return xcmp(op, a, b)
+
+
+def fpred(op: str, a: Term) -> Term:
+    if isinstance(a, FloatV):
+        x = a.value
+        if op == "fp.isNegative":
+            return BoolV(math.copysign(1.0, x) < 0 and not math.isnan(x))
+        return BoolV(math.isnan(x) if op == "fp.isNaN" else math.isinf(x) if op == "fp.isInfinite" else x == 0.0)
+    return App(op, (a,), BOOL)
+
+
+def fto_real(a: Term) -> Term:
+    if isinstance(a, FloatV) and math.isfinite(a.value):
+        return RealV(Fraction(a.value))
+    return App("fp.to_real", (a,), REAL)
+
+
+def xcmp(op: str, a: Term, b: Term) -> Term:
+    flip = a.sort not in (FLOAT32, FLOAT64)
+    f, x = (b, a) if flip else (a, b)
+    xr = x if x.sort == REAL else to_real(x)
+    fr = fto_real(f)
+    nan, inf = fpred("fp.isNaN", f), fpred("fp.isInfinite", f)
+    pos = not_(fpred("fp.isNegative", f))
+    if op == "fp.eq":
+        return and_(not_(nan), not_(inf), eq(fr, xr))
+    exact = (lt(xr, fr) if op == "fp.lt" else le(xr, fr)) if flip else (lt(fr, xr) if op == "fp.lt" else le(fr, xr))
+    beyond = pos if flip else not_(pos)
+    return and_(not_(nan), ite(inf, beyond, exact))
+
+
+def is_finite(a: Term) -> Term:
+    if isinstance(a, FloatV):
+        return BoolV(math.isfinite(a.value))
+    return and_(not_(App("fp.isNaN", (a,), BOOL)), not_(App("fp.isInfinite", (a,), BOOL)))
+
+
+def to_float(a: Term, sort: Sort) -> Term:
+    if a.sort == sort:
+        return a
+    if isinstance(a, (IntV, RealV)):
+        return fval_fraction(Fraction(a.value), sort)
+    if a.sort in (FLOAT32, FLOAT64):
+        return App("fp.cast", (a,), sort)
+    return App("fp.from_int" if a.sort == INT else "fp.from_real", (a,), sort)
 
 
 def min_(a: Term, b: Term) -> Term:
@@ -540,6 +734,20 @@ _REBUILD = {
     "is_int": is_int,
     "select": select,
     "store": store,
+    "fp.add": lambda a, b: fbin("fp.add", a, b),
+    "fp.sub": lambda a, b: fbin("fp.sub", a, b),
+    "fp.mul": lambda a, b: fbin("fp.mul", a, b),
+    "fp.div": lambda a, b: fbin("fp.div", a, b),
+    "fp.neg": fneg,
+    "fp.lt": lambda a, b: fcmp("fp.lt", a, b),
+    "fp.leq": lambda a, b: fcmp("fp.leq", a, b),
+    "fp.eq": lambda a, b: fcmp("fp.eq", a, b),
+    "fp.to_real": fto_real,
+    "fp.abs": abs_,
+    "fp.isNaN": lambda a: fpred("fp.isNaN", a),
+    "fp.isInfinite": lambda a: fpred("fp.isInfinite", a),
+    "fp.isZero": lambda a: fpred("fp.isZero", a),
+    "fp.isNegative": lambda a: fpred("fp.isNegative", a),
 }
 
 
@@ -548,6 +756,8 @@ def rebuild(op: str, args: tuple[Term, ...], sort: Sort) -> Term:
         return and_(*args)
     if op == "or":
         return or_(*args)
+    if op in ("fp.from_int", "fp.from_real", "fp.cast"):
+        return to_float(args[0], sort)
     f = _REBUILD.get(op)
     if f is not None:
         return f(*args)
@@ -588,13 +798,152 @@ class Axiom:
 
 def seqsum_def(elem: Sort) -> FunDef:
     """``seqsum(a, lo, hi) = a[lo] + ... + a[hi-1]`` (0 when hi <= lo)."""
-    name = "seqsum" if elem == INT else "seqsum_r"
+    name = {INT: "seqsum", REAL: "seqsum_r", FLOAT32: "seqsum_f32", FLOAT64: "seqsum_f64"}.get(elem, "seqsum_r")
     a = Const("a", ARRAY(elem))
     lo = Const("lo", INT)
     hi = Const("hi", INT)
     rec = Fn(name, (a, lo, sub(hi, ONE)), elem)
     body = ite(le(hi, lo), lit(0, elem), add(rec, select(a, sub(hi, ONE))))
     return FunDef(name, (a, lo, hi), elem, body, recursive=True, measure=(sub(hi, lo),), doc="sum of a[lo:hi]")
+
+
+def seqsum_literal(a: Term, lo: Term, hi: Term, elem: Sort) -> Term | None:
+    if not isinstance(lo, IntV) or not isinstance(hi, IntV):
+        return None
+    total = lit(0, elem)
+    for i in range(lo.value, max(lo.value, hi.value)):
+        total = add(total, select(a, IntV(i)))
+    return total
+
+
+def python_float_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
+    """CPython 3.12+ Neumaier summation over binary64 list elements."""
+    state_name = f"py_sum_state_cpython_{major}_{minor}"
+    sum_name = f"seqsum_py_cpython_{major}_{minor}"
+    state_sort = REC(f"PySumState_cpython_{major}_{minor}", (("hi", FLOAT64), ("lo", FLOAT64)))
+    a = Const("a", ARRAY(FLOAT64))
+    lo, hi = Const("lo", INT), Const("hi", INT)
+    prev = Fn(state_name, (a, lo, sub(hi, ONE)), state_sort)
+    prev_hi, prev_lo = field(prev, "hi"), field(prev, "lo")
+    x = select(a, sub(hi, ONE))
+    next_hi, next_lo = _neumaier_step(prev_hi, prev_lo, x)
+    zero = fval(0.0, FLOAT64)
+    initial = mkrec(state_sort, (zero, zero))
+    step = mkrec(state_sort, (next_hi, next_lo))
+    state_body = ite(le(hi, lo), initial, step)
+    state_def = FunDef(state_name, (a, lo, hi), state_sort, state_body, recursive=True, measure=(sub(hi, lo),), doc="CPython compensated float sum state")
+    state = Fn(state_name, (a, lo, hi), state_sort)
+    total_hi, total_lo = field(state, "hi"), field(state, "lo")
+    body = ite(and_(ne(total_lo, zero), is_finite(total_lo)), add(total_hi, total_lo), total_hi)
+    sum_def = FunDef(sum_name, (a, lo, hi), FLOAT64, body, doc="CPython compensated float sum")
+    return state_def, sum_def
+
+
+def python_numeric_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
+    """CPython sum state for lists whose elements may be ints or binary64 floats."""
+    state_name = f"py_numeric_sum_state_cpython_{major}_{minor}"
+    sum_name = f"seqsum_py_numeric_cpython_{major}_{minor}"
+    state_sort = REC(
+        f"PyNumericSumState_cpython_{major}_{minor}",
+        (("in_float", BOOL), ("int_total", INT), ("fast", BOOL), ("ordinary", FLOAT64), ("hi", FLOAT64), ("lo", FLOAT64)),
+    )
+    tags, ints, floats = (Const(n, ARRAY(s)) for n, s in (("tags", BOOL), ("ints", INT), ("floats", FLOAT64)))
+    lo, hi = Const("lo", INT), Const("hi", INT)
+    prev = Fn(state_name, (tags, ints, floats, lo, sub(hi, ONE)), state_sort)
+    in_float = field(prev, "in_float")
+    int_total = field(prev, "int_total")
+    fast = field(prev, "fast")
+    ordinary = field(prev, "ordinary")
+    comp_hi = field(prev, "hi")
+    comp_lo = field(prev, "lo")
+    idx = sub(hi, ONE)
+    is_int = select(tags, idx)
+    i = select(ints, idx)
+    x = select(floats, idx)
+    i_float = to_float(i, FLOAT64)
+    entered = ite(is_int, i_float, x)
+    start_int = and_(not_(in_float), is_int)
+    start_float = and_(not_(in_float), not_(is_int))
+    next_ordinary = ite(in_float, add(ordinary, entered), add(to_float(int_total, FLOAT64), entered))
+    neumaier_hi, neumaier_lo = _neumaier_step(comp_hi, comp_lo, entered)
+    zero = fval(0.0, FLOAT64)
+    long_min, long_max = IntV(-(1 << 63)), IntV((1 << 63) - 1)
+    next_int_total = add(int_total, i)
+    next_fast = and_(fast, le(long_min, i), le(i, long_max), le(long_min, next_int_total), le(next_int_total, long_max))
+    step_state = mkrec(
+        state_sort,
+        (
+            not_(start_int),
+            ite(start_int, next_int_total, int_total),
+            ite(start_int, next_fast, fast),
+            ite(start_int, ordinary, next_ordinary),
+            ite(start_int, comp_hi, ite(start_float, next_ordinary, neumaier_hi)),
+            ite(start_int, comp_lo, ite(start_float, zero, neumaier_lo)),
+        ),
+    )
+    initial = mkrec(state_sort, (FALSE, ZERO, TRUE, zero, zero, zero))
+    state_body = ite(le(hi, lo), initial, step_state)
+    state_def = FunDef(state_name, (tags, ints, floats, lo, hi), state_sort, state_body, recursive=True, measure=(sub(hi, lo),), doc="CPython mixed numeric sum state")
+    state = Fn(state_name, (tags, ints, floats, lo, hi), state_sort)
+    corrected = ite(and_(ne(field(state, "lo"), zero), is_finite(field(state, "lo"))), add(field(state, "hi"), field(state, "lo")), field(state, "hi"))
+    result = ite(field(state, "fast"), corrected, field(state, "ordinary")) if (major, minor) >= (3, 12) else field(state, "ordinary")
+    sum_def = FunDef(sum_name, (tags, ints, floats, lo, hi), FLOAT64, result, doc="CPython mixed numeric sum")
+    return state_def, sum_def
+
+
+def _neumaier_step(hi: Term, lo: Term, x: Term) -> tuple[Term, Term]:
+    total = add(hi, x)
+    correction = ite(
+        le(abs_(x), abs_(hi)),
+        add(lo, add(sub(hi, total), x)),
+        add(lo, add(sub(x, total), hi)),
+    )
+    return total, correction
+
+
+def python_float_sum(a: Term, lo: Term, hi: Term, major: int, minor: int) -> Term:
+    zero = fval(0.0, FLOAT64)
+    if isinstance(lo, IntV) and isinstance(hi, IntV):
+        total_hi, total_lo = zero, zero
+        for i in range(lo.value, max(lo.value, hi.value)):
+            total_hi, total_lo = _neumaier_step(total_hi, total_lo, select(a, IntV(i)))
+    else:
+        state_sort = REC(f"PySumState_cpython_{major}_{minor}", (("hi", FLOAT64), ("lo", FLOAT64)))
+        state = Fn(f"py_sum_state_cpython_{major}_{minor}", (a, lo, hi), state_sort)
+        total_hi, total_lo = field(state, "hi"), field(state, "lo")
+    return ite(and_(ne(total_lo, zero), is_finite(total_lo)), add(total_hi, total_lo), total_hi)
+
+
+def python_numeric_sum_literal(tags: Term, ints: Term, floats: Term, lo: int, hi: int, major: int, minor: int) -> Term:
+    """Unroll CPython's mixed int/float sum for a statically sized list."""
+    in_float = FALSE
+    int_total = ZERO
+    fast = TRUE
+    ordinary = hi_sum = lo_sum = fval(0.0, FLOAT64)
+    zero = fval(0.0, FLOAT64)
+    long_min, long_max = IntV(-(1 << 63)), IntV((1 << 63) - 1)
+    for index in range(lo, max(lo, hi)):
+        is_int = select(tags, IntV(index))
+        int_value = select(ints, IntV(index))
+        float_value = select(floats, IntV(index))
+        was_in_float = in_float
+        start_int = and_(not_(was_in_float), is_int)
+        start_float = and_(not_(was_in_float), not_(is_int))
+        entered = ite(is_int, to_float(int_value, FLOAT64), float_value)
+        next_int_total = add(int_total, int_value)
+        next_fast = and_(fast, le(long_min, int_value), le(int_value, long_max), le(long_min, next_int_total), le(next_int_total, long_max))
+        next_ordinary = ite(was_in_float, add(ordinary, entered), add(to_float(int_total, FLOAT64), entered))
+        next_hi, next_lo = _neumaier_step(hi_sum, lo_sum, entered)
+        ordinary = ite(start_int, ordinary, next_ordinary)
+        hi_sum = ite(start_int, hi_sum, ite(start_float, next_ordinary, next_hi))
+        lo_sum = ite(start_int, lo_sum, ite(start_float, zero, next_lo))
+        fast = ite(start_int, next_fast, fast)
+        int_total = ite(start_int, next_int_total, int_total)
+        in_float = or_(was_in_float, not_(is_int))
+    if (major, minor) >= (3, 12):
+        corrected = ite(and_(ne(lo_sum, zero), is_finite(lo_sum)), add(hi_sum, lo_sum), hi_sum)
+        return ite(fast, corrected, ordinary)
+    return ordinary
 
 
 def theory_lemmas(elem: Sort) -> list[Axiom]:
@@ -718,6 +1067,8 @@ def show(t: Term, prec: int = -1) -> str:
     if isinstance(t, RealV):
         v = t.value
         return str(v.numerator) if v.denominator == 1 else f"{v.numerator}/{v.denominator}"
+    if isinstance(t, FloatV):
+        return repr(t.value)
     if isinstance(t, BoolV):
         return "true" if t.value else "false"
     if isinstance(t, StrV):
@@ -770,6 +1121,8 @@ def canonical(t: Term) -> str:
         return repr(t.value)
     if isinstance(t, RealV):
         return f"{t.value.numerator}/{t.value.denominator}"
+    if isinstance(t, FloatV):
+        return f"f{t.bits:x}:{t.sort}"
     if isinstance(t, Quant):
         return f"({t.kind} ({' '.join(canonical(v) for v in t.vars)}) {canonical(t.body)})"
     if isinstance(t, Fn):

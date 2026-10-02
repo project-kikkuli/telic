@@ -52,7 +52,7 @@ def _differential(path: Path):
     return compared, diffs
 
 
-DIFF_CASES = ["corpus.py", "corpus.ts", "corpus.rs", "corpus.swift"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
+DIFF_CASES = ["corpus.py", "corpus.ts", "corpus.rs", "corpus.swift", "soundness/t45.py", "soundness/t46.py", "soundness/t47.py", "soundness/t48.ts", "soundness/t49.py", "soundness/t50.py", "soundness/t51.py", "soundness/t53.py", "soundness/t54.py"] + sorted(f"objects/{p.name}" for p in (CASES / "objects").iterdir() if p.suffix in (".py", ".ts"))
 
 
 @pytest.mark.parametrize("name", DIFF_CASES)
@@ -64,7 +64,7 @@ def test_engine_agrees_with_python_core(name):
     if name.endswith(".swift"):
         pytest.importorskip("tree_sitter_swift")
     compared, diffs = _differential(CASES / name)
-    assert compared > 20
+    assert compared > (0 if name.startswith("soundness/") else 20)
     assert not diffs, "\n".join(diffs)
 
 
@@ -173,3 +173,17 @@ def test_a_binary_built_from_other_sources_is_refused(monkeypatch):
     monkeypatch.setattr(engine, "source_hash", lambda: "not-these-sources")
     with pytest.raises(RuntimeError, match="stale.*make -C"):
         engine.binary()
+
+
+@pytest.mark.parametrize("engine_name", ["python", "ox"])
+def test_engine_rounds_wide_float_literals_from_exact_rationals(tmp_path, engine_name):
+    literal = "1.000000000000000300000000000000000000000000000000000000000000000000001"
+    path = tmp_path / "wide_literal.ts"
+    path.write_text(
+        "export function f(): number {\n"
+        "  //@ ensures result == 1.0000000000000002\n"
+        f"  return {literal};\n"
+        "}\n"
+    )
+    rep = check([str(path)], CheckOptions(cache_path=None, lean=False, replay=False, engine=engine_name), root=str(tmp_path))
+    assert {f.status for f in rep.functions} == {"proved"}

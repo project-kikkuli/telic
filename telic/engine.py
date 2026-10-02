@@ -104,7 +104,8 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
     tw = irjson.TermWriter()
     fundefs = []
     for name, fd in theory.fundefs.items():
-        fundefs.append({"name": name, "params": [tw.term(p) for p in fd.params], "body": tw.term(fd.body) if fd.body is not None else None, "sort": tw.term(L.Const("sort!", fd.sort))})
+        has_float = fd.sort in (L.FLOAT32, L.FLOAT64) or any(p.sort in (L.FLOAT32, L.FLOAT64) for p in fd.params)
+        fundefs.append({"name": name, "params": [tw.term(p) for p in fd.params], "body": tw.term(fd.body) if fd.body is not None else None, "sort": tw.term(L.Const("sort!", fd.sort)), "expands": has_float and not fd.recursive})
     axioms = [{"name": a.name, "formula": tw.term(a.formula), "about": a.about, "symbol": a.symbol} for a in theory.axioms]
     # Every name any module can call, resolved from every module: the engine
     # resolves callee contracts and class invariants where they live.

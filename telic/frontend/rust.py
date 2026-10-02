@@ -44,7 +44,7 @@ from ..lifecycle import build as build_lifecycle
 from .rust_crate import ModPath, Res
 
 RUST_ASSUMPTIONS = [
-    "f32/f64 are modelled as exact rational arithmetic (rounding, NaN and infinities ignored)",
+    "f32 and f64 use IEEE 754 binary32 and binary64 semantics",
     "integer overflow panics (debug build semantics); release builds wrap instead",
     "println!/eprintln!/dbg! and logging have no effect on program state",
 ]
@@ -603,7 +603,9 @@ class RustFrontend:
         if k == "primitive_type":
             if txt in INT_KINDS:
                 return ir.INT, txt
-            if txt in ("f32", "f64"):
+            if txt == "f32":
+                return ir.FLOAT32, None
+            if txt == "f64":
                 return ir.REAL, None
             if txt == "bool":
                 return ir.BOOL, None
@@ -1789,13 +1791,13 @@ class ExprLowerer:
             raise self.err(f"unsupported integer literal {t}", n)
         v = int(m.group(1), 0)
         k = m.group(2) or kind
-        if expect == ir.REAL:
-            return ir.Lit(ir.REAL, self.loc(n), Fraction(v))
+        if isinstance(expect, ir.TReal):
+            return ir.Lit(expect, self.loc(n), Fraction(v))
         return self.kinded(ir.Lit(ir.INT, self.loc(n), v), k)
 
     def x_float_literal(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         t = re.sub(r"f(32|64)$", "", _text(n).replace("_", ""))
-        return ir.Lit(ir.REAL, self.loc(n), Fraction(t))
+        return ir.Lit(expect if isinstance(expect, ir.TReal) else ir.REAL, self.loc(n), Fraction(t))
 
     def x_boolean_literal(self, n: Any, expect: Any, kind: Any) -> ir.Expr:
         return ir.Lit(ir.BOOL, self.loc(n), _text(n) == "true")
@@ -1885,7 +1887,7 @@ class ExprLowerer:
                 lit = self.expr(arg, expect, kind)
                 return self.kinded(ir.Lit(lit.ty, loc, -lit.value), self.kind_of(lit))  # type: ignore[operator]
             a = self.expr(arg, expect, kind)
-            if a.ty == ir.REAL:
+            if isinstance(a.ty, ir.TReal):
                 return ir.Unary(ir.REAL, loc, "neg", a)
             if a.ty != ir.INT:
                 raise self.err(f"cannot negate {a.ty}", n)
@@ -1920,19 +1922,20 @@ class ExprLowerer:
                     return self.kinded(ir.Binary(ir.INT, loc, "fmod", v, m), tt)  # truncation to the low bits
                 h = ir.Lit(ir.INT, loc, 1 << (bits - 1))
                 return self.kinded(ir.Binary(ir.INT, loc, "sub", ir.Binary(ir.INT, loc, "fmod", ir.Binary(ir.INT, loc, "add", v, h), m), h), tt)
-            if v.ty == ir.REAL:
+            if isinstance(v.ty, ir.TReal):
                 lo, hi = int_range(tt)
-                t = ir.Builtin(ir.INT, loc, "trunc", (v,))
+                t = ir.Builtin(ir.INT, loc, "trunc_sat", (v, ir.Lit(ir.INT, loc, lo), ir.Lit(ir.INT, loc, hi)))
                 return self.kinded(ir.Builtin(ir.INT, loc, "min", (ir.Builtin(ir.INT, loc, "max", (t, ir.Lit(ir.INT, loc, lo))), ir.Lit(ir.INT, loc, hi))), tt)  # saturating
             if v.ty == ir.BOOL:
                 return self.kinded(ir.Ite(ir.INT, loc, v, ir.Lit(ir.INT, loc, 1), ir.Lit(ir.INT, loc, 0)), tt)
             if isinstance(v.ty, ir.TEnum):
                 return self.kinded(self.opaque("enum_discriminant", [v], ir.INT, loc), tt)
         if tt in ("f32", "f64"):
+            target = ir.FLOAT32 if tt == "f32" else ir.REAL
             if v.ty == ir.INT:
-                return ir.Builtin(ir.REAL, loc, "to_real", (v,))
-            if v.ty == ir.REAL:
-                return v
+                return ir.Builtin(target, loc, "to_real", (v,))
+            if isinstance(v.ty, ir.TReal):
+                return v if v.ty == target else ir.Builtin(target, loc, "to_real", (v,))
         if tt == "char" and v.ty == ir.INT:
             return self.opaque("as_char", [v], ir.STR, loc)
         raise self.err(f"unsupported cast from {v.ty} to {tt}", n)
@@ -1957,24 +1960,24 @@ class ExprLowerer:
             self.pre.append(ir.If(loc, guard, tuple(s.pre) + (ir.Assign(loc, t, b),), ()))
             return tv
         a = self.expr(ln, None, kind)
-        b = self.expr(rn, a.ty if a.ty in (ir.INT, ir.REAL) else None, self.kind_of(a) or kind)
+        b = self.expr(rn, a.ty if a.ty == ir.INT or isinstance(a.ty, ir.TReal) else None, self.kind_of(a) or kind)
         if op not in ("==", "!=") and not self.spec:
             # a value from unchecked code in arithmetic has the other operand's type
-            if isinstance(a.ty, ir.TOpaque) and (b.ty == ir.REAL or b.ty == ir.INT and self.kind_of(b)):
+            if isinstance(a.ty, ir.TOpaque) and (isinstance(b.ty, ir.TReal) or b.ty == ir.INT and self.kind_of(b)):
                 a = self._opaque_as(a, b.ty, self.kind_of(b))
-            elif isinstance(b.ty, ir.TOpaque) and (a.ty == ir.REAL or a.ty == ir.INT and self.kind_of(a)):
+            elif isinstance(b.ty, ir.TOpaque) and (isinstance(a.ty, ir.TReal) or a.ty == ir.INT and self.kind_of(a)):
                 b = self._opaque_as(b, a.ty, self.kind_of(a))
         if a.ty == ir.INT and b.ty == ir.INT and not self.kind_of(a) and self.kind_of(b):
             self.kinded(a, self.kind_of(b))
         k = self.kind_of(a) or self.kind_of(b)
-        if a.ty == ir.REAL and b.ty == ir.INT and isinstance(b, ir.Lit):
-            b = ir.Lit(ir.REAL, b.loc, Fraction(b.value))  # type: ignore[arg-type]
-        if b.ty == ir.REAL and a.ty == ir.INT and isinstance(a, ir.Lit):
-            a = ir.Lit(ir.REAL, a.loc, Fraction(a.value))  # type: ignore[arg-type]
+        if isinstance(a.ty, ir.TReal) and b.ty == ir.INT and isinstance(b, ir.Lit):
+            b = ir.Lit(a.ty, b.loc, Fraction(b.value))  # type: ignore[arg-type]
+        if isinstance(b.ty, ir.TReal) and a.ty == ir.INT and isinstance(a, ir.Lit):
+            a = ir.Lit(b.ty, a.loc, Fraction(a.value))  # type: ignore[arg-type]
         if op in ("==", "!="):
             return self._eq(a, b, n, BINOPS[op])
         if op in ("<", "<=", ">", ">="):
-            if not (a.ty == b.ty and a.ty in (ir.INT, ir.REAL, ir.STR)):
+            if not (a.ty == b.ty and (a.ty in (ir.INT, ir.STR) or isinstance(a.ty, ir.TReal))):
                 raise self.err(f"cannot compare {a.ty} and {b.ty}", n)
             if a.ty == ir.STR:
                 return ir.Builtin(ir.BOOL, loc, "str_lt" if op in ("<", ">") else "str_le", (a, b) if op in ("<", "<=") else (b, a))
@@ -1982,15 +1985,14 @@ class ExprLowerer:
         if op in ("+", "-", "*", "/", "%"):
             if a.ty == ir.STR and op == "+":
                 return ir.Builtin(ir.STR, loc, "str_concat", (a, b))
-            if a.ty != b.ty or a.ty not in (ir.INT, ir.REAL):
+            if a.ty != b.ty or not (a.ty == ir.INT or isinstance(a.ty, ir.TReal)):
                 raise self.err(f"'{op}' on {a.ty} and {b.ty}", n)
-            if a.ty == ir.REAL:
-                if op == "/":  # float division by zero is inf/NaN, not a panic
-                    nz = ir.Binary(ir.BOOL, loc, "ne", b, ir.Lit(ir.REAL, loc, Fraction(0)))
-                    return ir.Ite(ir.REAL, loc, nz, ir.Binary(ir.REAL, loc, "rdiv", a, b), self.opaque("fdiv", [a, b], ir.REAL, loc))
+            if isinstance(a.ty, ir.TReal):
+                if op == "/":
+                    return ir.Binary(a.ty, loc, "rdiv", a, b)
                 if op == "%":
-                    return self.opaque("fmod", [a, b], ir.REAL, loc)
-                return ir.Binary(ir.REAL, loc, BINOPS[op], a, b)
+                    return ir.Binary(a.ty, loc, "fmod", a, b)
+                return ir.Binary(a.ty, loc, BINOPS[op], a, b)
             name = {"+": "add", "-": "sub", "*": "mul", "/": "tdiv", "%": "tmod"}[op]
             # an integer whose type nothing fixes is an i32 in Rust
             kk = k or kind or "i32"
@@ -3019,7 +3021,7 @@ class ExprLowerer:
         k = self.kind_of(recv)
         if t == ir.INT:
             return self.int_method(recv, m, argn, n, k)
-        if t == ir.REAL:
+        if isinstance(t, ir.TReal):
             if m in ("abs", "floor", "ceil", "sqrt", "round", "trunc", "min", "max", "powi", "powf") and not self.spec:
                 args = [self.expr(a, ir.REAL) for a in argn]
                 if m == "abs":
@@ -3459,7 +3461,7 @@ class ExprLowerer:
             return self.kinded(ir.Builtin(ir.INT, loc, "len", (cur_seq,)), "usize")
         if m == "sum":
             elem = cur_seq.ty.elem  # type: ignore[union-attr]
-            if elem not in (ir.INT, ir.REAL):
+            if elem != ir.INT and not isinstance(elem, ir.TReal):
                 return None
             total = ir.sum_of(cur_seq, loc)
             return self.checked(total, ek) if elem == ir.INT else total
@@ -3932,7 +3934,7 @@ def _deref_target(n: Any) -> Any:
 def _default(t: ir.Type, loc: ir.Loc) -> ir.Expr | None:
     if t == ir.INT:
         return ir.Lit(ir.INT, loc, 0)
-    if t == ir.REAL:
+    if isinstance(t, ir.TReal):
         return ir.Lit(ir.REAL, loc, Fraction(0))
     if t == ir.BOOL:
         return ir.Lit(ir.BOOL, loc, False)

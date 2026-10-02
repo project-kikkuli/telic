@@ -42,11 +42,19 @@ from .program import FuncRef, Program, in_place, reaches_unchecked, unchecked_co
 
 
 @dataclass(frozen=True)
+class PyNumericList:
+    tags: L.Term
+    ints: L.Term
+    floats: L.Term
+
+
+@dataclass(frozen=True)
 class ListVal:
     arr: L.Term
     off: L.Term
     len: L.Term
     ty: ir.TList
+    py_numeric: PyNumericList | None = None
 
     def at(self, i: L.Term) -> L.Term:
         return L.select(self.arr, L.add(self.off, i))
@@ -57,7 +65,7 @@ class OptVal:
     """An optional: present iff ``some``; ``val`` is meaningful only then."""
 
     some: L.Term
-    val: "Val"
+    val: L.Term
     ty: ir.TOption
 
 
@@ -92,7 +100,7 @@ class TypedView:
 
 
 Val = Union[L.Term, ListVal, OptVal, DictVal]
-NONE_V = L.Const("None", L.UNIT)
+NONE_V = L.Const("None", L.Sort("None"))
 # the objects of a class a function has written a field of (a ghost set, not heap:
 # callees and other tasks do not add to it)
 WRITTEN = "%written."
@@ -110,12 +118,14 @@ def suspends(e: ir.Expr) -> bool:
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     """How a value of ``ty`` is represented in logic, as named components."""
     if isinstance(ty, ir.TList):
-        return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT)]
-    if isinstance(ty, ir.TOption):
-        return [("some", L.BOOL)] + [
-            (f"val.{name}" if name else "val", sort)
-            for name, sort in components(ty.inner)
+        return [
+            ("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT),
+            ("py_tags", L.ARRAY(L.BOOL)), ("py_ints", L.ARRAY(L.INT)), ("py_floats", L.ARRAY(L.FLOAT64)),
         ]
+    if isinstance(ty, ir.TOption):
+        if isinstance(ty.inner, (ir.TList, ir.TDict, ir.TOption)):
+            raise VCError(f"optional {ty.inner} is not supported yet")
+        return [("some", L.BOOL), ("val", sort_of(ty.inner))]
     if isinstance(ty, ir.TDict):
         if isinstance(ty.val, (ir.TList, ir.TDict, ir.TOption)):
             raise VCError(f"dict values of type {ty.val} are not supported yet")
@@ -127,10 +137,8 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
 def arity(ty: ir.Type) -> int:
     """How many logical components a value of ``ty`` has."""
     if isinstance(ty, ir.TList):
-        return 3
-    if isinstance(ty, ir.TOption):
-        return len(components(ty))
-    if isinstance(ty, ir.TDict):
+        return 6
+    if isinstance(ty, (ir.TOption, ir.TDict)):
         return 2
     return 1
 
@@ -138,12 +146,38 @@ def arity(ty: ir.Type) -> int:
 def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
     #@ requires len(comps) == arity(ty)
     if isinstance(ty, ir.TList):
-        return ListVal(comps[0], comps[1], comps[2], ty)
+        return ListVal(comps[0], comps[1], comps[2], ty, PyNumericList(comps[3], comps[4], comps[5]))
     if isinstance(ty, ir.TOption):
-        return OptVal(comps[0], pack(ty.inner, comps[1:]), ty)
+        return OptVal(comps[0], comps[1], ty)
     if isinstance(ty, ir.TDict):
         return DictVal(comps[0], comps[1], ty)
     return comps[0]
+
+
+def py_numeric_state(v: ListVal) -> PyNumericList:
+    if v.py_numeric is not None:
+        return v.py_numeric
+    if isinstance(v.ty.elem, ir.TInt):
+        return PyNumericList(L.const_array(L.ARRAY(L.BOOL), L.TRUE), v.arr, L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64)))
+    if isinstance(v.ty.elem, ir.TReal) and v.ty.elem.bits == 64:
+        return PyNumericList(L.const_array(L.ARRAY(L.BOOL), L.FALSE), L.const_array(L.ARRAY(L.INT), L.ZERO), v.arr)
+    return PyNumericList(L.const_array(L.ARRAY(L.BOOL), L.FALSE), L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64)))
+
+
+def py_numeric_store(v: ListVal, index: L.Term, value: L.Term) -> tuple[L.Term, PyNumericList]:
+    """Update the Python numeric-list view at the same physical array index."""
+    state = py_numeric_state(v)
+    if not isinstance(v.ty.elem, ir.TReal) or v.ty.elem.bits != 64:
+        return L.store(v.arr, index, value), state
+    if value.sort == L.INT:
+        return (
+            L.store(v.arr, index, L.to_float(value, L.FLOAT64)),
+            PyNumericList(L.store(state.tags, index, L.TRUE), L.store(state.ints, index, value), state.floats),
+        )
+    return (
+        L.store(v.arr, index, L.to_float(value, L.FLOAT64)),
+        PyNumericList(L.store(state.tags, index, L.FALSE), state.ints, L.store(state.floats, index, L.to_float(value, L.FLOAT64))),
+    )
 
 
 def val_type(v: Val) -> ir.Type | None:
@@ -154,13 +188,11 @@ def sort_of(ty: ir.Type) -> L.Sort:
     if isinstance(ty, ir.TInt):
         return L.INT
     if isinstance(ty, ir.TReal):
-        return L.REAL
+        return L.FLOAT32 if ty.bits == 32 else L.FLOAT64
     if isinstance(ty, ir.TBool):
         return L.BOOL
     if isinstance(ty, ir.TStr):
         return L.STR
-    if isinstance(ty, ir.TNone):
-        return L.UNIT
     if isinstance(ty, ir.TRecord):
         return L.REC(ty.name, tuple((n, field_sort(t)) for n, t in ty.fields))
     if isinstance(ty, ir.TList):
@@ -193,9 +225,10 @@ def _sort_tag(s: L.Sort) -> str:
 
 def flatten(v: Val) -> tuple[L.Term, ...]:
     if isinstance(v, ListVal):
-        return (v.arr, v.off, v.len)
+        p = py_numeric_state(v)
+        return (v.arr, v.off, v.len, p.tags, p.ints, p.floats)
     if isinstance(v, OptVal):
-        return (v.some, *flatten(v.val))
+        return (v.some, v.val)
     if isinstance(v, DictVal):
         return (v.vals, v.has)
     return (v,)
@@ -223,14 +256,12 @@ def rec_equal(a: L.Term, b: L.Term) -> L.Term:
 def default_term(s: L.Sort) -> L.Term:
     if s == L.INT:
         return L.ZERO
-    if s == L.REAL:
-        return L.RealV(Fraction(0))
+    if s in (L.FLOAT32, L.FLOAT64):
+        return L.fval(0.0, s)
     if s == L.BOOL:
         return L.FALSE
     if s == L.STR:
         return L.StrV("")
-    if s == L.UNIT:
-        return NONE_V
     if s.name == "Array":
         assert s.elem is not None
         return L.const_array(s, default_term(s.elem))
@@ -241,39 +272,19 @@ def default_term(s: L.Sort) -> L.Term:
     raise VCError(f"no default value for {s}")
 
 
-def default_val(ty: ir.Type) -> Val:
-    if isinstance(ty, ir.TList):
-        elem = sort_of(ty.elem)
-        return ListVal(L.const_array(L.ARRAY(elem), default_term(elem)), L.ZERO, L.ZERO, ty)
-    if isinstance(ty, ir.TDict):
-        key, val = sort_of(ty.key), sort_of(ty.val)
-        return DictVal(L.const_array(L.ARRAY(val, key), default_term(val)), L.const_array(L.ARRAY(L.BOOL, key), L.FALSE), ty)
-    if isinstance(ty, ir.TOption):
-        return OptVal(L.FALSE, default_val(ty.inner), ty)
-    return default_term(sort_of(ty))
-
-
-def valid_container_facts(v: Val, ty: ir.Type) -> list[L.Term]:
-    if isinstance(ty, ir.TList) and isinstance(v, ListVal):
-        return [L.le(L.ZERO, v.len)]
-    if isinstance(ty, ir.TOption) and isinstance(v, OptVal):
-        return [L.implies(v.some, L.and_(*valid_container_facts(v.val, ty.inner)))] if valid_container_facts(v.val, ty.inner) else []
-    return []
-
-
 def coerce(v: Val, ty: ir.Type | None) -> Val:
     """Lift a plain value into an optional slot (``None`` -> absent, ``x`` ->
     present ``x``). Frontends need not insert the wrapping themselves. An
     empty literal (``[]``, ``{}``) takes the type of the variable it is
     stored in."""
-    if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList):
+    if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList) and ty.elem != ir.NONE:
         return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty)
     if isinstance(v, DictVal) and v.ty.key == ir.NONE and isinstance(ty, ir.TDict) and ty.key != ir.NONE:
         ks, vs = sort_of(ty.key), sort_of(ty.val)
         return DictVal(L.const_array(L.ARRAY(vs, ks), default_term(vs)), L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE), ty)
     if isinstance(ty, ir.TOption) and not isinstance(v, OptVal):
         if v is NONE_V:
-            return OptVal(L.FALSE, default_val(ty.inner), ty)
+            return OptVal(L.FALSE, default_term(sort_of(ty.inner)), ty)
         return OptVal(L.TRUE, v, ty)  # type: ignore[arg-type]
     return v
 
@@ -470,22 +481,32 @@ class VCGen:
 
     def fresh(self, base: str, ty: ir.Type, len_: L.Term | None = None) -> Val:
         n = next(self.counter)
-        if isinstance(ty, ir.TNone):
-            return NONE_V
         if isinstance(ty, ir.TList):
             arr = L.Const(f"{base}@{n}.arr", sort_of(ty))
             ln = len_ if len_ is not None else L.Const(f"{base}@{n}.len", L.INT)
-            return ListVal(arr, L.ZERO, ln, ty)
+            return ListVal(
+                arr, L.ZERO, ln, ty,
+                PyNumericList(
+                    L.Const(f"{base}@{n}.py_tags", L.ARRAY(L.BOOL)),
+                    L.Const(f"{base}@{n}.py_ints", L.ARRAY(L.INT)),
+                    L.Const(f"{base}@{n}.py_floats", L.ARRAY(L.FLOAT64)),
+                ),
+            )
         comps = components(ty)
         if len(comps) == 1:
             return L.Const(f"{base}@{n}", comps[0][1])
         return pack(ty, [L.Const(f"{base}@{n}.{suffix}", srt) for suffix, srt in comps])
 
     def param_val(self, name: str, ty: ir.Type) -> Val:
-        if isinstance(ty, ir.TNone):
-            return NONE_V
         if isinstance(ty, ir.TList):
-            return ListVal(L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty)
+            return ListVal(
+                L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty,
+                PyNumericList(
+                    L.Const(f"{name}.py_tags", L.ARRAY(L.BOOL)),
+                    L.Const(f"{name}.py_ints", L.ARRAY(L.INT)),
+                    L.Const(f"{name}.py_floats", L.ARRAY(L.FLOAT64)),
+                ),
+            )
         comps = components(ty)
         if len(comps) == 1:
             return L.Const(name, comps[0][1])
@@ -682,6 +703,35 @@ class VCGen:
 
     # -- obligations ------------------------------------------------------
 
+    def js_safe_integer(self, value: L.Term) -> L.Term:
+        limit = L.IntV(9007199254740991)
+        return L.and_(L.le(L.neg(limit), value), L.le(value, limit))
+
+    def require_js_safe_value(self, value: Val, ty: ir.Type, ctx: Ctx, loc: ir.Loc, message: str) -> None:
+        if self.module.language != "typescript":
+            return
+        if isinstance(ty, ir.TInt):
+            assert isinstance(value, L.Term)
+            self.oblige("integer", ctx, self.js_safe_integer(value), loc, message)
+        elif isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TInt):
+            assert isinstance(value, ListVal)
+            i = L.Const(f"safe!{next(self.counter)}", L.INT)
+            within = L.and_(L.le(L.ZERO, i), L.lt(i, value.len))
+            self.oblige("integer", ctx, L.forall([i], L.implies(within, self.js_safe_integer(value.at(i)))), loc, message)
+        elif isinstance(ty, ir.TRecord):
+            assert isinstance(value, L.Term)
+            for name, field_ty in ty.fields:
+                if isinstance(field_ty, ir.TInt):
+                    self.require_js_safe_value(L.field(value, name), field_ty, ctx, loc, message)
+        elif isinstance(ty, ir.TOption) and isinstance(ty.inner, ir.TInt):
+            assert isinstance(value, OptVal)
+            self.oblige("integer", ctx, L.implies(value.some, self.js_safe_integer(value.val)), loc, message)
+        elif isinstance(ty, ir.TDict) and isinstance(ty.val, ir.TInt):
+            assert isinstance(value, DictVal)
+            key = L.Const(f"safe!{next(self.counter)}", sort_of(ty.key))
+            has = L.select(value.has, key)
+            self.oblige("integer", ctx, L.forall([key], L.implies(has, self.js_safe_integer(L.select(value.vals, key)))), loc, message)
+
     def oblige(
         self,
         kind: str,
@@ -754,9 +804,19 @@ class VCGen:
                 env[WRITTEN + cname] = NO_WRITES
         for p in fn.params:
             v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
+            if isinstance(p.ty, ir.TReal) and isinstance(v, L.Term) and v.sort == L.INT:
+                v = L.to_float(v, sort_of(p.ty))
             env[p.name] = v
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
-            facts.extend(valid_container_facts(v, p.ty))
+            if isinstance(v, ListVal):
+                facts.append(L.le(L.ZERO, v.len))
+                if self.module.language == "python" and isinstance(p.ty, ir.TList) and isinstance(p.ty.elem, ir.TReal) and p.ty.elem.bits == 64:
+                    numeric = py_numeric_state(v)
+                    i = L.Const(f"{p.name}.numeric_index", L.INT)
+                    expected = L.ite(L.select(numeric.tags, i), L.to_float(L.select(numeric.ints, i), L.FLOAT64), L.select(numeric.floats, i))
+                    facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), L.eq(L.select(v.arr, i), expected)), patterns=((L.select(v.arr, i),),)))
+                if self.module.language == "typescript":
+                    facts.append(L.le(v.len, L.IntV(4294967295)))
             facts.extend(self.alloc_facts(v, p.ty, env))
         self.entry = dict(env)
         if any(suspends(x) for st_ in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st_) for x in ir.walk_expr(e)):
@@ -776,6 +836,10 @@ class VCGen:
             # Preconditions must be well-defined given the earlier ones.
             t = self.ev(r.expr, ctx.sub(label="requires"))
             st.facts.append(t)
+        if self.module.language == "typescript":
+            ctx = self.ctx(st)
+            for p in fn.params:
+                self.require_js_safe_value(env[p.name], p.ty, ctx, fn.loc, f"parameter '{p.name}' is a safe integer")
         self.entry_facts = list(st.facts) + self.relevant_lemmas(st.facts)
         return st
 
@@ -1010,7 +1074,8 @@ class VCGen:
             ctx = self.ctx(st)
             i = self.index_of(lst, self.ev(s.idx, ctx), s.wrap, ctx, s.loc, s.name)
             v = self.ev(s.value, ctx)
-            st.env[s.name] = ListVal(L.store(lst.arr, L.add(lst.off, i), v), lst.off, lst.len, lst.ty)
+            arr, numeric = py_numeric_store(lst, L.add(lst.off, i), v)
+            st.env[s.name] = ListVal(arr, lst.off, lst.len, lst.ty, numeric)
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.Append):
@@ -1018,7 +1083,8 @@ class VCGen:
             assert isinstance(lst, ListVal)
             ctx = self.ctx(st)
             v = self.ev(s.value, ctx)
-            st.env[s.name] = ListVal(L.store(lst.arr, L.add(lst.off, lst.len), v), lst.off, L.add(lst.len, L.ONE), lst.ty)
+            arr, numeric = py_numeric_store(lst, L.add(lst.off, lst.len), v)
+            st.env[s.name] = ListVal(arr, lst.off, L.add(lst.len, L.ONE), lst.ty, numeric)
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.If):
@@ -1429,6 +1495,8 @@ class VCGen:
             if not it_end.alive:
                 continue
             k1 = L.add(k, L.ONE)
+            if self.module.language == "typescript":
+                self.oblige("integer", self.ctx(it_end), self.js_safe_integer(k1), s.loc, "counted-loop increment is within JavaScript's safe integer range")
             it_end.env[counter] = k1
             self.check_invs(invs, it_end, "inv.step", s.loc, {idx: k1})
             self.check_written(wrote, it_end, s.loc, entry=False)
@@ -1441,6 +1509,9 @@ class VCGen:
         ctx = self.ctx(st)
         lo_v = self.ev(s.lo, ctx)
         hi_v = self.ev(s.hi, ctx)
+        if self.module.language == "typescript":
+            self.require_js_safe_value(lo_v, s.lo.ty, ctx, s.loc, "loop start is within JavaScript's safe integer range")
+            self.require_js_safe_value(hi_v, s.hi.ty, ctx, s.loc, "loop bound is within JavaScript's safe integer range")
         prior = st.env.get(s.var)
 
         def bind(body_st: State, k: L.Term) -> None:
@@ -1454,8 +1525,9 @@ class VCGen:
             out.env.pop(s.var, None)  # bound only if the loop ran: reading it is an error
         elif _has_break(s.body) or s.var in ir.assigned_names(s.body):
             out.env[s.var] = self.fresh(s.var, ir.INT)
+        elif s.reeval:
+            out.env[s.var] = L.ite(L.lt(lo_v, hi_v), hi_v, lo_v)
         else:
-            # After a completed range loop the variable holds hi - 1 (Python).
             out.env[s.var] = L.ite(L.lt(lo_v, hi_v), L.sub(hi_v, L.ONE), prior)
         return out
 
@@ -1491,6 +1563,7 @@ class VCGen:
         before = set(st.env)
 
         def bind(body_st: State, k: L.Term) -> None:
+            self.require_python_float_element(seq, k, self.ctx(body_st), s.loc)
             body_st.env[s.elem] = seq.at(k)
             body_st.env[s.idx] = k
             self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
@@ -1515,6 +1588,8 @@ class VCGen:
 
     def index_of(self, lst: ListVal, i: L.Term, wrap: bool, ctx: Ctx, loc: ir.Loc, what: str) -> L.Term:
         n = lst.len
+        if self.module.language == "typescript" and i.sort == L.INT:
+            self.oblige("integer", ctx, self.js_safe_integer(i), loc, "array index is within JavaScript's safe integer range")
         if wrap:
             ok = L.and_(L.le(L.neg(n), i), L.lt(i, n))
             self.oblige("index", ctx, ok, loc, f"index into '{what}' is within -len..len-1")
@@ -1524,6 +1599,13 @@ class VCGen:
         ok = L.and_(L.le(L.ZERO, i), L.lt(i, n))
         self.oblige("index", ctx, ok, loc, f"index into '{what}' is within 0..len-1")
         return i
+
+    def require_python_float_element(self, xs: ListVal, i: L.Term, ctx: Ctx, loc: ir.Loc) -> None:
+        if self.module.language != "python" or not isinstance(xs.ty.elem, ir.TReal) or xs.ty.elem.bits != 64:
+            return
+        numeric = py_numeric_state(xs)
+        tag = L.select(numeric.tags, L.add(xs.off, i))
+        self.oblige("numeric", ctx, L.not_(tag), loc, "Python list element is a float, not an integer")
 
     def ev(self, e: ir.Expr, ctx: Ctx) -> Val:
         m = getattr(self, "ev_" + type(e).__name__)
@@ -1537,16 +1619,19 @@ class VCGen:
             return L.BoolV(v)
         if isinstance(v, int):
             if isinstance(e.ty, ir.TReal):
-                return L.RealV(Fraction(v))
+                return L.to_float(L.IntV(v), sort_of(e.ty))
             return L.IntV(v)
         if isinstance(v, Fraction):
-            return L.RealV(v)
+            return L.to_float(L.RealV(v), sort_of(e.ty))
         if isinstance(v, str):
             return L.StrV(v)
         raise VCError(f"unsupported literal {v!r}", e.loc)
 
     def ev_Var(self, e: ir.Var, ctx: Ctx) -> Val:
-        return self.lookup(e.name, ctx, e.loc)
+        value = self.lookup(e.name, ctx, e.loc)
+        if self.module.language == "typescript" and isinstance(value, L.Term) and value.sort == L.INT:
+            self.oblige("integer", ctx, self.js_safe_integer(value), e.loc, "integer value is within JavaScript's safe range")
+        return value
 
     def ev_Result(self, e: ir.Result, ctx: Ctx) -> Val:
         if ctx.result is None:
@@ -1577,16 +1662,30 @@ class VCGen:
             return {"and": L.and_, "or": L.or_}[op](a, b) if op != "implies" else L.implies(a, b)
         a = self.ev(e.left, ctx)
         b = self.ev(e.right, ctx)
+        if self.module.language == "typescript":
+            if isinstance(a, L.Term) and a.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(a), e.left.loc, "integer operand is within JavaScript's safe range")
+            if isinstance(b, L.Term) and b.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(b), e.right.loc, "integer operand is within JavaScript's safe range")
         if op in ("eq", "ne"):
             r = self.equal(a, b)
             return r if op == "eq" else L.not_(r)
         assert not isinstance(a, ListVal) and not isinstance(b, ListVal)
         if op == "add":
-            return L.add(a, b)
+            result = L.add(a, b)
+            if self.module.language == "typescript" and result.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(result), e.loc, "integer result is within JavaScript's safe range")
+            return result
         if op == "sub":
-            return L.sub(a, b)
+            result = L.sub(a, b)
+            if self.module.language == "typescript" and result.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(result), e.loc, "integer result is within JavaScript's safe range")
+            return result
         if op == "mul":
-            return L.mul(a, b)
+            result = L.mul(a, b)
+            if self.module.language == "typescript" and result.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(result), e.loc, "integer result is within JavaScript's safe range")
+            return result
         if op == "lt":
             return L.lt(a, b)
         if op == "le":
@@ -1595,14 +1694,24 @@ class VCGen:
             return L.gt(a, b)
         if op == "ge":
             return L.ge(a, b)
-        if op in ("rdiv", "floordiv", "fmod", "tmod", "tdiv"):
+        if op in ("rdiv", "py_rdiv", "floordiv", "fmod", "tmod", "tdiv"):
             zero = L.lit(0, b.sort)
-            sym = {"rdiv": "/", "floordiv": "//", "fmod": "%", "tmod": "%", "tdiv": "/"}[op]
-            self.oblige("div", ctx, L.ne(b, zero), e.loc, f"divisor of '{sym}' is non-zero")
-            if not (ctx.quiet or ctx.spec):
-                ctx.assume(L.ne(b, zero))  # past this point it was not: the program would have failed
-            if op == "rdiv":
+            sym = {"rdiv": "/", "py_rdiv": "/", "floordiv": "//", "fmod": "%", "tmod": "%", "tdiv": "/"}[op]
+            if op == "py_rdiv" or (op != "rdiv" and op != "py_rdiv") or a.sort not in (L.FLOAT32, L.FLOAT64):
+                self.oblige("div", ctx, L.ne(b, zero), e.loc, f"divisor of '{sym}' is non-zero")
+                if not (ctx.quiet or ctx.spec):
+                    ctx.assume(L.ne(b, zero))
+            if op in ("rdiv", "py_rdiv"):
                 return L.rdiv(a, b)
+            if a.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.and_(L.is_finite(a), L.is_finite(b)), e.loc, "floating remainder operands are finite")
+                ar = L.App("fp.to_real", (a,), L.REAL)
+                br = L.App("fp.to_real", (b,), L.REAL)
+                q = L.rdiv(ar, br)
+                qi = L.floor(q) if op in ("fmod", "floordiv") else L.ite(L.le(L.RealV(Fraction(0)), q), L.floor(q), L.neg(L.floor(L.neg(q))))
+                if op == "floordiv":
+                    return L.to_float(L.to_real(qi), a.sort)
+                return L.to_float(L.sub(ar, L.mul(br, L.to_real(qi))), a.sort)
             if a.sort == L.REAL:
                 # % on reals: fmod floors the quotient, tmod truncates it
                 q = L.rdiv(a, b)
@@ -1611,12 +1720,19 @@ class VCGen:
                     return L.to_real(qi)
                 return L.sub(a, L.mul(b, L.to_real(qi)))
             if op == "floordiv":
-                return floordiv(a, b)
+                result = floordiv(a, b)
+                if self.module.language == "typescript" and result.sort == L.INT:
+                    self.oblige("integer", ctx, self.js_safe_integer(result), e.loc, "integer result is within JavaScript's safe range")
+                return result
             if op == "tdiv":  # integer division truncating toward zero (Rust, C)
                 return truncdiv(a, b)
             if op == "fmod":
-                return L.sub(a, L.mul(b, floordiv(a, b)))
-            return L.sub(a, L.mul(b, truncdiv(a, b)))
+                result = L.sub(a, L.mul(b, floordiv(a, b)))
+            else:
+                result = L.sub(a, L.mul(b, truncdiv(a, b)))
+            if self.module.language == "typescript" and result.sort == L.INT:
+                self.oblige("integer", ctx, self.js_safe_integer(result), e.loc, "integer result is within JavaScript's safe range")
+            return result
         raise VCError(f"unknown operator {op}", e.loc)
 
     def equal(self, a: Val, b: Val) -> L.Term:
@@ -1632,8 +1748,8 @@ class VCGen:
             if b is NONE_V:
                 return L.not_(a.some)
             if isinstance(b, OptVal):
-                return L.and_(L.eq(a.some, b.some), L.implies(a.some, self.equal(a.val, b.val)))
-            return L.and_(a.some, self.equal(a.val, b))
+                return L.and_(L.eq(a.some, b.some), L.implies(a.some, L.eq(a.val, b.val)))
+            return L.and_(a.some, L.eq(a.val, b))  # type: ignore[arg-type]
         if isinstance(a, DictVal) or isinstance(b, DictVal):
             raise VCError("comparing whole dicts with == is not supported")
         return rec_equal(a, b)  # type: ignore[arg-type]
@@ -1652,13 +1768,16 @@ class VCGen:
             self.oblige("key", ctx, L.select(seq.has, k), e.loc, f"key looked up in '{_expr_name(e.seq)}' is present")  # type: ignore[arg-type]
             v = L.select(seq.vals, k)  # type: ignore[arg-type]
             self.assume_held(v, e.ty, ctx)
+            self.require_js_safe_value(v, e.ty, ctx, e.loc, "dictionary value is a safe integer")
             return v
         assert isinstance(seq, ListVal)
         i = self.ev(e.idx, ctx)
         assert not isinstance(i, ListVal)
         j = self.index_of(seq, i, e.wrap, ctx, e.loc, _expr_name(e.seq))
+        self.require_python_float_element(seq, j, ctx, e.loc)
         x = seq.at(j)
         self.assume_held(x, e.ty, ctx)
+        self.require_js_safe_value(x, e.ty, ctx, e.loc, "array element is a safe integer")
         return x
 
     def ev_Field(self, e: ir.Field, ctx: Ctx) -> Val:
@@ -1667,13 +1786,17 @@ class VCGen:
         if isinstance(e.obj.ty, ir.TClass):
             env = ctx.env if ctx.state is None else ctx.state.env
             v = self.heap_read(env, e.obj.ty.name, e.name, obj)
+            self.require_js_safe_value(v, e.ty, ctx, e.loc, f"field '{e.name}' is a safe integer")
             if ctx.state is not None and (isinstance(e.ty, ir.TClass) or isinstance(e.ty, ir.TOption) and isinstance(e.ty.inner, ir.TClass)):
                 for fact in self.alloc_facts(v, e.ty, ctx.state.env):  # the heap holds only allocated objects
                     ctx.assume(fact)
             return v
         raw = L.field(obj, e.name)
         if isinstance(e.ty, ir.TOption):
-            return OptVal(L.field(raw, "some"), L.field(raw, "val"), e.ty)
+            value = OptVal(L.field(raw, "some"), L.field(raw, "val"), e.ty)
+            self.require_js_safe_value(value, e.ty, ctx, e.loc, f"field '{e.name}' is a safe integer")
+            return value
+        self.require_js_safe_value(raw, e.ty, ctx, e.loc, f"field '{e.name}' is a safe integer")
         return raw
 
     def ev_RecordLit(self, e: ir.RecordLit, ctx: Ctx) -> Val:
@@ -1690,7 +1813,7 @@ class VCGen:
     def ev_ListLit(self, e: ir.ListLit, ctx: Ctx) -> Val:
         assert isinstance(e.ty, ir.TList)
         # an empty [] of unknown type is a placeholder until it is stored (see coerce)
-        ty = ir.TList(ir.INT) if not e.elems and e.ty.elem == ir.NONE else e.ty
+        ty = ir.TList(ir.INT) if e.ty.elem == ir.NONE else e.ty
         base = self.fresh("lit", ty, len_=L.ZERO)
         assert isinstance(base, ListVal)
         if e.ty.elem == ir.NONE:
@@ -1728,6 +1851,7 @@ class VCGen:
         if e.seq is not None and e.elem is not None:
             seq = self.ev(e.seq, ctx)
             assert isinstance(seq, ListVal)
+            self.require_python_float_element(seq, i, sub, e.loc)
             sub.bound[e.elem] = seq.at(i)
         body = self.ev(e.body, sub)
         assert not isinstance(body, ListVal)
@@ -1759,6 +1883,23 @@ class VCGen:
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
             return DictVal(vals, has, e.ty)
         args = [self.ev(a, ctx) for a in e.args]
+        if name == "py_mixed_list":
+            assert isinstance(e.ty, ir.TList) and isinstance(e.ty.elem, ir.TReal) and e.ty.elem.bits == 64
+            arr: L.Term = L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64))
+            tags: L.Term = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
+            ints: L.Term = L.const_array(L.ARRAY(L.INT), L.ZERO)
+            floats: L.Term = L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64))
+            for i, value in enumerate(args):
+                assert isinstance(value, L.Term)
+                idx = L.IntV(i)
+                if value.sort == L.INT:
+                    arr = L.store(arr, idx, L.to_float(value, L.FLOAT64))
+                    tags = L.store(tags, idx, L.TRUE)
+                    ints = L.store(ints, idx, value)
+                else:
+                    arr = L.store(arr, idx, L.to_float(value, L.FLOAT64))
+                    floats = L.store(floats, idx, L.to_float(value, L.FLOAT64))
+            return ListVal(arr, L.ZERO, L.IntV(len(args)), e.ty, PyNumericList(tags, ints, floats))
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
@@ -1779,6 +1920,7 @@ class VCGen:
                     raise VCError("value is always None here", e.loc)
                 return o
             self.oblige("none", ctx, o.some, e.loc, f"'{_expr_name(e.args[0])}' is not None here")
+            self.require_js_safe_value(o.val, e.ty, ctx, e.loc, "optional value is a safe integer")
             return o.val
         if name == "from_opaque":
             # A value from unchecked code, used at a checked type.
@@ -1907,18 +2049,29 @@ class VCGen:
         if name == "same_len":  # r's elements, xs's length (Array.map with an unchecked callback)
             xs, r = args
             assert isinstance(xs, ListVal) and isinstance(r, ListVal)
-            return ListVal(r.arr, r.off, xs.len, r.ty)
+            return ListVal(r.arr, r.off, xs.len, r.ty, r.py_numeric)
         if name == "list_concat":
             xs, ys = args
             assert isinstance(xs, ListVal) and isinstance(ys, ListVal)
             n = next(self.counter)
             arr = L.Const(f"cat@{n}.arr", sort_of(xs.ty))
+            px, py = py_numeric_state(xs), py_numeric_state(ys)
+            tags = L.Const(f"cat@{n}.py_tags", L.ARRAY(L.BOOL))
+            ints = L.Const(f"cat@{n}.py_ints", L.ARRAY(L.INT))
+            floats = L.Const(f"cat@{n}.py_floats", L.ARRAY(L.FLOAT64))
             ln = L.add(xs.len, ys.len)
             i = L.Const(f"i!{n}", L.INT)
             k = L.Const(f"k!{n}", L.INT)
             ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(arr, i), xs.at(i))), patterns=((L.select(arr, i),),)))
             ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(xs.len, k), L.lt(k, ln)), L.eq(L.select(arr, k), ys.at(L.sub(k, xs.len)))), patterns=((L.select(arr, k),),)))
-            return ListVal(arr, L.ZERO, ln, xs.ty)
+            for out, ax, ay in ((tags, px.tags, py.tags), (ints, px.ints, py.ints), (floats, px.floats, py.floats)):
+                i = L.Const(f"i!{n}.{out.name.rsplit('.', 1)[-1]}", L.INT)
+                k = L.Const(f"k!{n}.{out.name.rsplit('.', 1)[-1]}", L.INT)
+                left = L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(out, i), L.select(ax, L.add(xs.off, i))))
+                right = L.implies(L.and_(L.le(xs.len, k), L.lt(k, ln)), L.eq(L.select(out, k), L.select(ay, L.add(ys.off, L.sub(k, xs.len)))))
+                ctx.assume(L.Quant("forall", (i,), left, patterns=((L.select(out, i),),)))
+                ctx.assume(L.Quant("forall", (k,), right, patterns=((L.select(out, k),),)))
+            return ListVal(arr, L.ZERO, ln, xs.ty, PyNumericList(tags, ints, floats))
         if name == "range_list":
             lo, hi = args
             n = next(self.counter)
@@ -1933,21 +2086,34 @@ class VCGen:
             width = len(e.args[0].elems)
             n = next(self.counter)
             arr, assume = self.defined_symbol(ctx, f"rep@{n}.arr", sort_of(xs.ty))
+            state = py_numeric_state(xs)
+            tags, assume_tags = self.defined_symbol(ctx, f"rep@{n}.py_tags", L.ARRAY(L.BOOL))
+            ints, assume_ints = self.defined_symbol(ctx, f"rep@{n}.py_ints", L.ARRAY(L.INT))
+            floats, assume_floats = self.defined_symbol(ctx, f"rep@{n}.py_floats", L.ARRAY(L.FLOAT64))
             i = L.Const(f"i!{n}", L.INT)
             ln = L.mul(L.IntV(width), L.max_(k, L.ZERO))  # type: ignore[arg-type]
             assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), xs.at(L.App("emod", (i, L.IntV(width)), L.INT)))), patterns=((L.select(arr, i),),)))
-            return ListVal(arr, L.ZERO, ln, xs.ty)
+            for out, src, assume in ((tags, state.tags, assume_tags), (ints, state.ints, assume_ints), (floats, state.floats, assume_floats)):
+                relation = L.eq(L.select(out, i), L.select(src, L.add(xs.off, L.App("emod", (i, L.IntV(width)), L.INT))))
+                assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), relation), patterns=((L.select(out, i),),)))
+            return ListVal(arr, L.ZERO, ln, xs.ty, PyNumericList(tags, ints, floats))
         if name == "dict_copy":
             return args[0]  # dicts are values in the model; aliasing is excluded
         if name == "list_append":
             xs, v = args
             assert isinstance(xs, ListVal)
-            return ListVal(L.store(xs.arr, L.add(xs.off, xs.len), v), xs.off, L.add(xs.len, L.ONE), xs.ty)  # type: ignore[arg-type]
+            arr, numeric = py_numeric_store(xs, L.add(xs.off, xs.len), v)  # type: ignore[arg-type]
+            return ListVal(arr, xs.off, L.add(xs.len, L.ONE), xs.ty, numeric)
         if name == "list_set":
             xs, i, v = args
             assert isinstance(xs, ListVal)
             j = self.index_of(xs, i, True, ctx, e.loc, _expr_name(e.args[0]))  # type: ignore[arg-type]
-            return ListVal(L.store(xs.arr, L.add(xs.off, j), v), xs.off, xs.len, xs.ty)  # type: ignore[arg-type]
+            arr, numeric = py_numeric_store(xs, L.add(xs.off, j), v)  # type: ignore[arg-type]
+            return ListVal(arr, xs.off, xs.len, xs.ty, numeric)
+        if name == "list_copy":
+            (xs,) = args
+            assert isinstance(xs, ListVal)
+            return ListVal(xs.arr, xs.off, xs.len, xs.ty, xs.py_numeric)
         if name == "dict_set":
             d, k, v = args
             assert isinstance(d, DictVal)
@@ -1985,12 +2151,94 @@ class VCGen:
             for a in args[1:]:
                 out = f(out, a)  # type: ignore[arg-type]
             return out
-        if name == "sum":
+        if name.startswith("py_sum_mixed_cpython_"):
+            major, minor = (int(x) for x in name.removeprefix("py_sum_mixed_cpython_").split("_", 1))
+            compensated = (major, minor) >= (3, 12)
+            total: L.Term = L.ZERO
+            in_float = False
+            int_total: L.Term = L.ZERO
+            int_fast: L.Term = L.TRUE
+            hi = L.fval(0.0, L.FLOAT64)
+            lo = hi
+            for item in args:
+                assert isinstance(item, L.Term)
+                was_in_float = in_float
+                if item.sort in (L.FLOAT32, L.FLOAT64):
+                    in_float = True
+                elif not in_float and item.sort == L.INT:
+                    int_total = L.add(int_total, item)
+                    long_min, long_max = L.IntV(-(1 << 63)), L.IntV((1 << 63) - 1)
+                    int_fast = L.and_(int_fast, L.le(long_min, item), L.le(item, long_max), L.le(long_min, int_total), L.le(int_total, long_max))
+                if in_float:
+                    max_float_integer = L.IntV((1 << 1024) - (1 << 970) - 1)
+                    if item.sort == L.INT:
+                        self.oblige("overflow", ctx, L.le(L.abs_(item), max_float_integer), e.loc, "integer converted by sum fits in a float")
+                    if not was_in_float and total.sort == L.INT:
+                        self.oblige("overflow", ctx, L.le(L.abs_(total), max_float_integer), e.loc, "integer total converted by sum fits in a float")
+                    x = L.to_float(item, L.FLOAT64)
+                    total = L.add(L.to_float(total, L.FLOAT64), x)
+                    if compensated:
+                        if not was_in_float:
+                            hi, lo = total, L.fval(0.0, L.FLOAT64)
+                        else:
+                            hi, lo = L._neumaier_step(hi, lo, x)
+                else:
+                    total = L.add(total, item)
+            if compensated:
+                zero = L.fval(0.0, L.FLOAT64)
+                corrected = L.ite(L.and_(L.ne(lo, zero), L.is_finite(lo)), L.add(hi, lo), hi)
+                return L.ite(int_fast, corrected, L.to_float(total, L.FLOAT64))
+            return L.to_float(total, L.FLOAT64)
+        if name == "sum" or name.startswith("py_sum_"):
             (xs,) = args
             assert isinstance(xs, ListVal)
-            fd = "seqsum" if xs.ty.elem == ir.INT else "seqsum_r"
+            es = sort_of(xs.ty.elem)
+            if name.startswith("py_sum_cpython_") and self.module.language == "python" and es == L.FLOAT64:
+                major, minor = (int(x) for x in name.removeprefix("py_sum_cpython_").split("_", 1))
+                numeric = py_numeric_state(xs)
+                start, end = xs.off, L.add(xs.off, xs.len)
+                state_name = f"py_numeric_sum_state_cpython_{major}_{minor}"
+                sum_name = f"seqsum_py_numeric_cpython_{major}_{minor}"
+                state_sort = L.REC(
+                    f"PyNumericSumState_cpython_{major}_{minor}",
+                    (("in_float", L.BOOL), ("int_total", L.INT), ("fast", L.BOOL), ("ordinary", L.FLOAT64), ("hi", L.FLOAT64), ("lo", L.FLOAT64)),
+                )
+                state = L.Fn(state_name, (numeric.tags, numeric.ints, numeric.floats, start, end), state_sort)
+                max_float_integer = L.IntV((1 << 1024) - (1 << 970) - 1)
+                i = L.Const(f"{e.loc.line}.sum_index!{next(self.counter)}", L.INT)
+                prefix = L.Fn(state_name, (numeric.tags, numeric.ints, numeric.floats, start, i), state_sort)
+                safe_prefix = L.Quant(
+                    "forall", (i,),
+                    L.implies(
+                        L.and_(L.le(start, i), L.le(i, end), L.not_(L.field(prefix, "in_float"))),
+                        L.le(L.abs_(L.field(prefix, "int_total")), max_float_integer),
+                    ),
+                    patterns=((L.field(prefix, "int_total"),),),
+                )
+                safe_items = L.Quant(
+                    "forall", (i,),
+                    L.implies(
+                        L.and_(L.le(start, i), L.lt(i, end), L.select(numeric.tags, i)),
+                        L.le(L.abs_(L.select(numeric.ints, i)), max_float_integer),
+                    ),
+                    patterns=((L.select(numeric.ints, i),),),
+                )
+                self.oblige("overflow", ctx, L.and_(safe_prefix, safe_items), e.loc, "integer values converted by sum fit in a float")
+                if isinstance(start, L.IntV) and isinstance(xs.len, L.IntV):
+                    return L.python_numeric_sum_literal(numeric.tags, numeric.ints, numeric.floats, start.value, start.value + xs.len.value, major, minor)
+                self.theory_fns.add(state_name)
+                self.theory_fns.add(sum_name)
+                return L.Fn(sum_name, (numeric.tags, numeric.ints, numeric.floats, start, end), L.FLOAT64)
+            if name.startswith("py_sum_cpython_") and es == L.FLOAT64:
+                major, minor = (int(x) for x in name.removeprefix("py_sum_cpython_").split("_", 1))
+                if (major, minor) >= (3, 12):
+                    fd = "seqsum_py_cpython_" + name.removeprefix("py_sum_cpython_")
+                    self.theory_fns.add(fd)
+                    return L.python_float_sum(xs.arr, xs.off, L.add(xs.off, xs.len), major, minor)
+            fd = {L.INT: "seqsum", L.REAL: "seqsum_r", L.FLOAT32: "seqsum_f32", L.FLOAT64: "seqsum_f64"}[es]
             self.theory_fns.add(fd)
-            total = L.Fn(fd, (xs.arr, xs.off, L.add(xs.off, xs.len)), sort_of(xs.ty.elem))
+            end = L.add(xs.off, xs.len)
+            total = L.seqsum_literal(xs.arr, xs.off, end, es) or L.Fn(fd, (xs.arr, xs.off, end), es)
             self.comp_sum(xs, total)
             return total
         if name == "count":
@@ -2019,20 +2267,61 @@ class VCGen:
                 return xs
             lo2 = norm(lo, L.ZERO)
             hi2 = norm(hi, n)
-            return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty)
+            return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty, xs.py_numeric)
         (x,) = args[:1]
         assert not isinstance(x, ListVal)
+        if name in ("js_floor", "js_ceil", "js_trunc", "js_round"):
+            real_x = L.App("fp.to_real", (x,), L.REAL)
+            if name == "js_floor":
+                rounded = L.floor(real_x)
+            elif name == "js_ceil":
+                rounded = L.neg(L.floor(L.neg(real_x)))
+            elif name == "js_trunc":
+                rounded = L.ite(L.le(L.RealV(Fraction(0)), real_x), L.floor(real_x), L.neg(L.floor(L.neg(real_x))))
+            else:
+                rounded = L.floor(L.add(real_x, L.RealV(Fraction(1, 2))))
+            result = L.to_float(rounded, x.sort)
+            negative_zero = L.and_(L.App("fp.isNegative", (x,), L.BOOL), L.eq(rounded, L.ZERO))
+            result = L.ite(negative_zero, L.fneg(L.fval(0.0, x.sort)), result)
+            return L.ite(L.is_finite(x), result, x)
         if name == "to_real":
-            return L.to_real(x)
+            return L.to_float(x, sort_of(e.ty))
         if name == "floor":
+            if x.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.is_finite(x), e.loc, "number is finite where it is rounded to an integer")
+                x = L.App("fp.to_real", (x,), L.REAL)
             return L.floor(x)
         if name == "ceil":
+            if x.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.is_finite(x), e.loc, "number is finite where it is rounded to an integer")
+                x = L.App("fp.to_real", (x,), L.REAL)
             return L.neg(L.floor(L.neg(x)))
         if name == "trunc":
+            if x.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.is_finite(x), e.loc, "number is finite where it is rounded to an integer")
+                x = L.App("fp.to_real", (x,), L.REAL)
             return L.ite(L.le(L.RealV(Fraction(0)), x), L.floor(x), L.neg(L.floor(L.neg(x))))
+        if name == "trunc_sat":
+            lo, hi = args[1:3]
+            assert not isinstance(lo, ListVal) and not isinstance(hi, ListVal)
+            if x.sort not in (L.FLOAT32, L.FLOAT64):
+                raise VCError("trunc_sat requires an IEEE float", e.loc)
+            exact = L.App("fp.to_real", (x,), L.REAL)
+            truncated = L.ite(L.le(L.RealV(Fraction(0)), exact), L.floor(exact), L.neg(L.floor(L.neg(exact))))
+            return L.ite(
+                L.App("fp.isNaN", (x,), L.BOOL),
+                L.ZERO,
+                L.ite(L.le(x, L.to_float(lo, x.sort)), lo, L.ite(L.le(L.to_float(hi, x.sort), x), hi, truncated)),
+            )
         if name == "round_even":
+            if x.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.is_finite(x), e.loc, "number is finite where it is rounded to an integer")
+                x = L.App("fp.to_real", (x,), L.REAL)
             return round_even(x)
         if name == "round_up":
+            if x.sort in (L.FLOAT32, L.FLOAT64):
+                self.oblige("finite", ctx, L.is_finite(x), e.loc, "number is finite where it is rounded to an integer")
+                x = L.App("fp.to_real", (x,), L.REAL)
             return L.floor(L.add(x, L.RealV(Fraction(1, 2))))
         if name == "is_int":
             return L.is_int(x)
@@ -2093,13 +2382,14 @@ class VCGen:
         py = name.startswith("py_")
         real = name != "py_int_parse"
         tail = L.App("str.substr", (s, L.ONE, L.sub(L.App("str.len", (s,), L.INT), L.ONE)), L.STR)
-        other = L.Fn(name, (s,), L.REAL if real else L.INT)
+        other = L.Fn(name, (s,), L.FLOAT64 if real else L.INT)
         exact = L.ite(L.in_re(s, "digits"), L.str_to_int(s), L.ite(L.in_re(s, "neg_digits"), L.neg(L.str_to_int(tail)), L.str_to_int(tail)))
         known = L.or_(L.in_re(s, "digits"), L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits"))
         # (Z3 does not find these itself: digits spell a number >= 0)
         ctx.assume(L.implies(L.in_re(s, "digits"), L.le(L.ZERO, L.str_to_int(s))))
         ctx.assume(L.implies(L.or_(L.in_re(s, "neg_digits"), L.in_re(s, "pos_digits")), L.le(L.ZERO, L.str_to_int(tail))))
-        v = L.ite(known, L.to_real(exact) if real else exact, other)
+        parsed = L.to_float(L.to_real(exact), sort_of(e.ty)) if real else exact
+        v = L.ite(known, parsed, other)
         what = {"py_int_parse": "int()", "py_float_parse": "float()", "js_parse_int": "parseInt", "js_parse_float": "parseFloat"}[name]
         if py:
             ok = L.in_re(s, "py_int" if name == "py_int_parse" else "py_float")
@@ -2291,6 +2581,7 @@ class VCGen:
             if e.seq is not None and e.elem is not None:
                 seq = self.ev(e.seq, ctx)
                 assert isinstance(seq, ListVal)
+                self.require_python_float_element(seq, i, ctx, e.loc)
                 binds[e.elem] = seq.at(i)
             self.run_each(e.loc, e.seq, L.and_(L.le(lo, i), L.lt(i, hi)), binds, e.body, None, ctx)  # type: ignore[arg-type]
         return L.Const(f"{e.kind}@{n}", L.BOOL)
@@ -2509,9 +2800,6 @@ class VCGen:
             if p.name in muts and not isinstance(a_e, ir.Var) and not _fresh_expr(a_e):
                 raise VCError(f"'{fn.name}' mutates its list parameter '{p.name}'; pass a variable (or a copy) so the change is tracked", loc)
         pmap: dict[str, Val] = {p.name: a for p, a in zip(fn.params, args)}
-        for p, a in zip(fn.params, args):
-            for fact in valid_container_facts(a, p.ty):
-                ctx.assume(fact)
         heap_pre = self.heap_env(ctx.env) if ctx.state is None else self.heap_env(ctx.state.env)
         predicate = callee.key in self.program.predicates
         definitional = callee.key in self.program.definitional or predicate
@@ -3064,8 +3352,8 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
 def default_value(s: L.Sort) -> L.Term:
     if s == L.INT:
         return L.ZERO
-    if s == L.REAL:
-        return L.RealV(Fraction(0))
+    if s in (L.FLOAT32, L.FLOAT64):
+        return L.fval(0.0, s)
     if s == L.BOOL:
         return L.FALSE
     if s == L.STR:
