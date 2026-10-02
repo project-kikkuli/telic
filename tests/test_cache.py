@@ -148,13 +148,62 @@ def test_unknown_solver_results_are_not_persisted_as_math_receipts(tmp_path, mon
     assert all(value.get("method") != "unknown" for value in checker.ProofCache(str(cache_path)).data.values())
 
 
-def test_lean_receipts_have_a_separate_statement_and_solver_key():
+def test_lean_receipt_key_binds_full_rendered_input_and_identity():
     from telic.lean import _lean_receipt_key
 
-    first = _lean_receipt_key("statement-a", ("Lean 4", "binary-a"))
-    assert first.startswith("lean:")
-    assert first != _lean_receipt_key("statement-b", ("Lean 4", "binary-a"))
-    assert first != _lean_receipt_key("statement-a", ("Lean 4", "binary-b"))
+    key = _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", ("Lean 4", "binary-a"))
+    assert key.startswith("lean:")
+    assert key != _lean_receipt_key("def x := 2", " : True", "vc_f_1", "simp", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : False", "vc_f_1", "simp", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "omega", ("Lean 4", "binary-a"))
+    assert key != _lean_receipt_key("def x := 1", " : True", "vc_f_1", "simp", ("Lean 4", "binary-b"))
+
+
+def test_lean_sidecar_receipts_miss_when_proof_is_changed_removed_or_lean_changes(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import telic.lean as lean
+    from telic.checker import ProofCache
+
+    source = tmp_path / "m.py"
+    source.write_text("")
+    sidecar = Path(str(source) + ".proof.lean")
+    cache_path = tmp_path / ".telic/cache.json"
+    statement = " : True"
+    definitions = "def x : Nat := 0"
+    stmt_hash = lean.statement_hash(statement, definitions)
+    calls = []
+    monkeypatch.setattr(lean, "find_lean", lambda: "/fake/lean")
+    monkeypatch.setattr(lean, "build_context", lambda *args: (definitions, statement))
+    monkeypatch.setattr(lean, "check_attempts", lambda _lean, _defs, attempts: (calls.append([a.proof for a in attempts]) or [lean.AttemptResult(True) for _ in attempts], None))
+    monkeypatch.setattr(lean, "_def_tactics", lambda *_args: [])
+    monkeypatch.setattr("telic.toolchain.lean", lambda: ("Lean 4", "binary-a"))
+
+    def check(proof="simp", identity=None):
+        if proof is None:
+            sidecar.unlink(missing_ok=True)
+        else:
+            lean.write_sidecar(str(sidecar), "m.py", {"f/1": (stmt_hash, "vc_f_1", statement, proof)})
+        if identity is not None:
+            monkeypatch.setattr("telic.toolchain.lean", lambda: identity)
+        ob = SimpleNamespace(id="f/1")
+        verdict = SimpleNamespace(ob=ob, status="unknown", method="", reason="", lean=None)
+        report = SimpleNamespace(verdicts=[verdict], ref=SimpleNamespace(module=SimpleNamespace(path="m.py")))
+        cache = ProofCache(str(cache_path))
+        lean.escalate(SimpleNamespace(root=str(tmp_path)), None, report, cache, root=str(tmp_path))
+        cache.save()
+        return verdict
+
+    assert check().status == "proved"
+    assert len(calls) == 1
+    assert check().method == "cache"
+    assert len(calls) == 1
+    assert check("omega").status == "proved"
+    assert len(calls) == 2
+    assert check(None).status == "proved"
+    assert len(calls) == 3
+    assert check("simp", ("Lean 4", "binary-b")).status == "proved"
+    assert len(calls) == 4
 
 
 @pytest.mark.parametrize("variable", ["TELIC_Z3", "TELIC_LEAN", "TELIC_CORE"])

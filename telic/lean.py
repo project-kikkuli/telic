@@ -588,10 +588,16 @@ class LeanOutcome:
     errors: list[str] = field(default_factory=list)
 
 
-def _lean_receipt_key(statement: str, identity: Any) -> str:
-    source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    payload = json.dumps([statement, identity, source], sort_keys=True)
-    return "lean:" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+def _lean_receipt_key(context: str, statement: str, theorem: str, proof: str | None, identity: Any) -> str:
+    renderer = hashlib.sha256()
+    for path in (Path(__file__), Path(__file__).with_name("toolchain.py")):
+        renderer.update(path.name.encode())
+        renderer.update(path.read_bytes())
+    payload = json.dumps(
+        [PRELUDE.format(heartbeats=HEARTBEATS), context, theorem, statement, proof, identity, renderer.hexdigest()],
+        sort_keys=True,
+    )
+    return "lean:" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto: bool = True) -> None:
@@ -622,7 +628,7 @@ def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto:
             v.lean = LeanOutcome("unsupported", f"cannot express in Lean: {e}")
             continue
         h = statement_hash(stmt, defs_text)
-        k = _lean_receipt_key(h, identity)
+        rendered_defs = validated_defs(lean, defs_text)
         sp = stored.get(v.ob.id)
         if sp is None or sp.hash != h:
             # The obligation id carries line numbers; a proof whose statement
@@ -631,9 +637,12 @@ def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto:
             moved = [x for x in stored.values() if x.hash == h and x.id.startswith(fn_prefix)]
             if moved:
                 sp = moved[0]
+        has_sidecar_proof = sp is not None and sp.hash == h
+        proof = sp.proof if has_sidecar_proof else None
+        k = _lean_receipt_key(rendered_defs, stmt, theorem_name(v.ob), proof, identity)
         hit = cache.get(k)
         valid = hit is not None and hit.get("method") == "lean:auto"
-        valid = valid or hit is not None and hit.get("method") == "lean:proof" and sp is not None and sp.hash == h and hit.get("proof_hash") == _phash(sp.proof)
+        valid = valid or hit is not None and hit.get("method") == "lean:proof" and has_sidecar_proof and hit.get("proof_hash") == _phash(sp.proof)
         if valid:
             v.status = "proved"
             v.method = "cache"
@@ -651,10 +660,10 @@ def escalate(program, theory: Theory, rep, cache, root: str | None = None, auto:
                 continue
             tactics = "first\n  | " + "\n  | ".join(AUTO_TACTICS + _def_tactics(theory, v.ob))
             attempts.append((v, Attempt(name, stmt, tactics), h, "auto", k))
-        groups.setdefault(defs_text, []).append(len(attempts) - 1)
+        groups.setdefault(rendered_defs, []).append(len(attempts) - 1)
     for defs_text, idxs in groups.items():
         batch = [attempts[i][1] for i in idxs]
-        results, _ = check_attempts(lean, validated_defs(lean, defs_text), batch)
+        results, _ = check_attempts(lean, defs_text, batch)
         for i, res in zip(idxs, results):
             v, at, h, how, k = attempts[i]
             if res.ok:
