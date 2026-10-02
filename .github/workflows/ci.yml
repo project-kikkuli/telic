@@ -5,121 +5,86 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  evidence:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: ui-budget-1
-            tests: "'tests/test_ui.py::test_concurrent_browsers_never_exceed_the_machine_budget[1]'"
-          - group: ui-budget-2
-            tests: "'tests/test_ui.py::test_concurrent_browsers_never_exceed_the_machine_budget[2]'"
-          - group: ui-fixture
-            tests: tests/test_ui.py -k test_fixture_app_keeps_every_promise
-          - group: ui-bugs
-            tests: tests/test_ui.py -k "test_a_banner_that_covers_the_menu or test_fixture_bugs_are_found"
-          - group: ui-rest
-            tests: >-
-              tests/test_ui.py -k "not machine_budget and not test_fixture_app_keeps_every_promise
-              and not test_a_banner_that_covers_the_menu and not test_fixture_bugs_are_found"
-          - group: engine-cache
-            tests: tests/test_engine.py -k test_engine_reuses_the_obligation_cache
-          - group: engine-agree
-            tests: tests/test_engine.py -k test_engine_agrees_with_python_core
-          - group: engine-rest
-            tests: tests/test_engine.py -k "not test_engine_reuses_the_obligation_cache and not test_engine_agrees_with_python_core"
-          - group: corpus
-            tests: tests/test_corpus.py tests/test_cli.py tests/test_cache.py
-          - group: frontends
-            tests: tests/test_rust.py tests/test_swift.py tests/test_ts_classes.py tests/test_ts_untyped.py tests/test_semantics.py tests/test_fidelity.py tests/test_frontend.py tests/test_containers.py tests/test_objects.py tests/test_json_contracts.py
-          - group: core
-            tests: >-
-              tests --ignore=tests/test_ui.py --ignore=tests/test_engine.py --ignore=tests/test_corpus.py --ignore=tests/test_cli.py --ignore=tests/test_cache.py
-              --ignore=tests/test_rust.py --ignore=tests/test_swift.py --ignore=tests/test_ts_classes.py --ignore=tests/test_ts_untyped.py --ignore=tests/test_semantics.py
-              --ignore=tests/test_fidelity.py --ignore=tests/test_frontend.py --ignore=tests/test_containers.py --ignore=tests/test_objects.py --ignore=tests/test_json_contracts.py
-    name: test (${{ matrix.group }})
+    env:
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
       - uses: actions/checkout@v4
-      # A passing verdict is reused while every input it read is unchanged: all tracked files but docs/ and top-level
-      # *.md, the pinned Python packages (constraints.txt), the runner image (Python, Node, Swift) and the apt z3.
-      - name: Verdict key
-        id: key
-        run: |
-          sum=$({
-            echo '${{ matrix.group }} ${{ matrix.tests }}'
-            echo "$ImageVersion"
-            apt-cache policy z3 | grep Candidate
-            git ls-files -s -- . ':(exclude)docs' ':(exclude,glob)*.md'
-          } | sha256sum | cut -c1-40)
-          echo "key=verdict-${{ matrix.group }}-$sum" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v4
-        id: verdict
         with:
-          path: .verdict
-          key: ${{ steps.key.outputs.key }}
-          lookup-only: true
-      - if: steps.verdict.outputs.cache-hit == 'true'
-        run: echo "Passed before on identical inputs (${{ steps.key.outputs.key }})"
-      - if: steps.verdict.outputs.cache-hit != 'true'
+          fetch-depth: 0
+      - name: Toolchain identity
+        run: |
+          echo "TELIC_CI_ID=$ImageVersion python=3.11 node=22 ocaml=5.2 $(apt-cache policy z3 | sed -n 's/ *Candidate: /z3=/p')" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@v4
+        with:
+          path: .telic
+          key: evidence-v1-${{ runner.os }}-${{ github.sha }}
+          restore-keys: evidence-v1-${{ runner.os }}-
+      - name: Select changed evidence
+        id: plan
+        run: python3 scripts/ci.py --plan
+      - if: steps.plan.outputs.needed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - if: steps.verdict.outputs.cache-hit != 'true'
+      - if: steps.plan.outputs.needed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - if: steps.verdict.outputs.cache-hit != 'true'
+      - if: steps.plan.outputs.needed == 'true'
+        uses: astral-sh/setup-uv@v6
+      - name: Install verifier
+        if: steps.plan.outputs.needed == 'true'
+        run: |
+          uv venv .venv
+          uv pip install -e '.[test]' -c .github/constraints.txt
+          npm ci --prefix telic/frontend/ts
+      - if: steps.plan.outputs.native == 'true'
+        uses: actions/cache@v4
+        id: native
+        with:
+          path: core/telic-core
+          key: core-${{ runner.os }}-${{ env.TELIC_CI_ID }}-${{ hashFiles('core/*.ml', 'core/Makefile') }}
+      - if: steps.plan.outputs.native == 'true' && steps.native.outputs.cache-hit != 'true'
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2"
+      - name: Install native solver
+        if: steps.plan.outputs.native == 'true'
+        run: sudo apt-get install -y z3
+      - name: Build native engine
+        if: steps.plan.outputs.native == 'true' && steps.native.outputs.cache-hit != 'true'
+        run: opam exec -- make -C core
+      - if: steps.plan.outputs.lean == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.elan
           key: elan-${{ runner.os }}-${{ hashFiles('telic/lean/lean-toolchain') }}
-      - name: Install Lean 4 (the toolchain pinned in telic/lean/lean-toolchain)
-        if: steps.verdict.outputs.cache-hit != 'true'
+      - name: Install pinned Lean
+        if: steps.plan.outputs.lean == 'true'
         run: |
           test -x ~/.elan/bin/elan || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none --no-modify-path
           ~/.elan/bin/elan toolchain install "$(cat telic/lean/lean-toolchain)"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: Install
-        if: steps.verdict.outputs.cache-hit != 'true'
+      - name: Check proofs and changed verifier semantics
+        if: steps.plan.outputs.needed == 'true'
         run: |
-          pip install -e '.[test]' -c .github/constraints.txt
-          (cd telic/frontend/ts && npm ci)
-          sudo apt-get install -y z3
-      - if: steps.verdict.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
-        id: pw-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('.github/constraints.txt') }}
-      - name: Install Chromium for the UI tests
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: |
-          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = true ]; then python -m playwright install-deps chromium; else python -m playwright install --with-deps chromium; fi
-      - if: steps.verdict.outputs.cache-hit != 'true'
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.2"
-      - name: Build the native engine
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: opam exec -- make -C core
-      - name: Use every core
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: echo "TELIC_JOBS=$(nproc)" >> "$GITHUB_ENV" && echo "TELIC_MAX_JOBS=$(nproc)" >> "$GITHUB_ENV"
-      - name: Swift toolchain (the runner image ships one; replay tests skip without it)
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: swiftc --version || echo "no swiftc on this runner"
-      - name: Test
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: pytest -q -rs --durations=25 ${{ matrix.tests }}
-        env:
-          TELIC_UI_SLOTS: "2"
-      - name: Record the verdict
-        if: steps.verdict.outputs.cache-hit != 'true'
-        run: mkdir -p .verdict && echo "${{ github.sha }}" > .verdict/passed
-      - if: steps.verdict.outputs.cache-hit != 'true'
+          TELIC_JOBS=$(nproc)
+          TELIC_MAX_JOBS=$TELIC_JOBS
+          export TELIC_JOBS TELIC_MAX_JOBS
+          .venv/bin/python scripts/ci.py --since "$BASE"
+      - name: Preserve evidence
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
-          path: .verdict
-          key: ${{ steps.key.outputs.key }}
+          path: .telic
+          key: evidence-v1-${{ runner.os }}-${{ github.sha }}

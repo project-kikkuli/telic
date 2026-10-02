@@ -30,27 +30,21 @@ verdict semantics are in [contracts.md](contracts.md); the architecture is in
 ## CI
 
 Principle: telic replaces test batteries with reused proofs. CI for telic
-should be `telic ci` over telic's own ledger, the corpus verdict pins, the
-soundness exploits and the differential semantics cases, each rerun only when
-its inputs change. Goal: 30 seconds when nothing relevant changed.
+uses `scripts/ci.py` over telic's own ledger, the corpus verdict pins, the
+soundness exploits and differential semantics cases. Each evidence group
+has its own content key. Main publishes `.telic/` receipts; pull requests
+read them. Unchanged evidence skips installation and checking.
 
-Now: `.github/workflows/ci.yml` runs 11 parallel jobs over the existing
-pytest suite. Each hashes its inputs (every tracked file except `docs/` and
-top-level `*.md`, the pins in `.github/constraints.txt`, the runner image
-version and the apt z3 version) and skips everything after checkout when a
-passing verdict for that hash is in the Actions cache. Latest runs:
-`gh run list -R project-kikkuli/telic`.
+The proof gate selects declared contracts, class invariants and lifecycles
+and their dependencies. Invariant and recursion-measure search and Lean
+tactic search belong to implementation; CI reuses valid inference receipts
+and checks stored Lean proofs. Conditional proofs remain open in the ledger.
+The ledger records existing gaps honestly and rejects regressions, lost
+claims and new unproved claims.
 
-Open:
-
-- The key is coarse: any code change reruns every job, and the slowest UI
-  tests (`test_concurrent_browsers_never_exceed_the_machine_budget`, about
-  7 minutes) set the wall time.
-- There is no `telic.ledger.json` for telic itself. `telic ledger telic`
-  ran over 10 minutes locally without finishing; find the slow functions
-  before making `telic ci` the main CI job.
-- Tests and the demo run in temporary directories, so telic's obligation
-  store (`.telic/`) is not reused across CI runs.
+The full test battery, including browser exploration, remains available in
+the manual `.github/workflows/validation.yml` workflow. It does not run on
+push or pull request. See [ci.md](ci.md) for the mechanism and commands.
 
 Removed as duplicates or change detectors: the CI `telic demo` step
 (`tests/test_cli.py::test_demo_runs_green` runs it) and the exact-string
@@ -119,9 +113,10 @@ should not.
    show `…` and do not replay them.
 3. 70 open: facts about objects and dicts held in fields, callee contracts,
    and termination measures over ASTs (opaque). Few are loop invariants.
-4. Put contracts and aims on the pure helpers (`telic/phrase.py`,
-   `ears_problems`, `ears_conditions`, `split_by`, `oracle._one`), then add a
-   CI job that ratchets `telic.ledger.json` for telic itself.
+4. Strengthen the self-verification baseline with contracts and aims on the
+   pure helpers (`telic/phrase.py`, `ears_problems`, `ears_conditions`,
+   `split_by`, `oracle._one`). The automatic proof gate ratchets the current
+   declared claims and their dependencies.
 5. Replaying telic's own counterexamples fails on relative imports inside
    the `telic` package ("could not run").
 

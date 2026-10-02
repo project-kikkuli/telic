@@ -588,7 +588,7 @@ class LeanOutcome:
     errors: list[str] = field(default_factory=list)
 
 
-def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = None) -> None:
+def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = None, auto: bool = True) -> None:
     """Try Lean on every 'unknown' verdict of one function report."""
     lean = find_lean()
     unknown = [v for v in rep.verdicts if v.status == "unknown"]
@@ -602,6 +602,8 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
     src = rep.ref.module.path
     side = sidecar_path(os.path.join(root, src) if not os.path.isabs(src) else src)
     stored = read_sidecar(side)
+    if not auto and not stored:
+        return
     attempts: list[tuple[Any, Attempt, str, str]] = []  # (verdict, attempt, hash, source)
     groups: dict[str, list] = {}
     for v in unknown:
@@ -634,8 +636,10 @@ def escalate(program, theory: Theory, rep, cache, key_fn, root: str | None = Non
         if sp is not None and sp.hash == h:
             attempts.append((v, Attempt(name, stmt, sp.proof), h, "sidecar"))
         else:
-            auto = "first\n  | " + "\n  | ".join(AUTO_TACTICS + _def_tactics(theory, v.ob))
-            attempts.append((v, Attempt(name, stmt, auto), h, "auto"))
+            if not auto:
+                continue
+            tactics = "first\n  | " + "\n  | ".join(AUTO_TACTICS + _def_tactics(theory, v.ob))
+            attempts.append((v, Attempt(name, stmt, tactics), h, "auto"))
         groups.setdefault(defs_text, []).append(len(attempts) - 1)
     for defs_text, idxs in groups.items():
         batch = [attempts[i][1] for i in idxs]

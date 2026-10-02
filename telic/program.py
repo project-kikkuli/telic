@@ -127,6 +127,33 @@ class Program:
         walk(cls)
         return out
 
+    def claimed(self) -> set[str]:
+        classes = {n for n in self.classes if any(self.classes[c].invariants or self.classes[c].lifecycles for c in self.mro(n))}
+        selected = {
+            k for k, r in self.funcs.items()
+            if not r.module.context and (
+                r.fn.has_contract or r.fn.decreases or r.fn.aims or r.fn.mirrors
+                or any(r.fn.name.startswith(c + ".") for c in classes)
+                or any(isinstance(s, ir.FieldAssign) and s.cls in classes for s in ir.walk_stmts(r.fn.body))
+                or any(isinstance(e, ir.New) and e.cls in classes for s in ir.walk_stmts(r.fn.body) for value in ir.stmt_exprs(s) for e in ir.walk_expr(value))
+            )
+        }
+        pending = list(selected)
+        seen = set(selected)
+        while pending:
+            k = pending.pop()
+            if k in self.funcs and self.funcs[k].fn.unsupported:
+                continue
+            for dep in self.callees.get(k, set()) | self.dispatch.get(k, set()) | self.later.get(k, set()):
+                if dep == ANY:
+                    continue
+                if dep not in seen:
+                    seen.add(dep)
+                    pending.append(dep)
+                    if dep in self.funcs:
+                        selected.add(dep)
+        return selected
+
     def member(self, cls: str, meth: str) -> "FuncRef | None":
         """``cls.meth``, its own or inherited (constructors included)."""
         for c in self.mro(cls):

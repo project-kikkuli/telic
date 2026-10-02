@@ -73,7 +73,17 @@ def snapshot(rep: Report) -> dict[str, Any]:
     functions = {}
     for f in rep.functions:
         lean = sum(1 for v in f.verdicts if v.method.startswith("lean") or v.reason.startswith("lean"))
-        functions[f.ref.key] = {"status": f.status, "obligations": len(f.verdicts), **({"lean": lean} if lean else {}), **({"timeout": True} if f.ref.key in undecided else {})}
+        status = "open" if f.status == "proved" and f.open_deps else f.status
+        claims = [f"{c.kind} {c.text}" for c in f.fn.requires + f.fn.ensures + f.fn.raises + ([f.fn.decreases] if f.fn.decreases else [])]
+        owner = f.fn.name.rpartition(".")[0]
+        if owner in rep.program.classes:
+            if status == "proved" and any(lc.cls in rep.program.mro(owner) and lc.status != "proved" for lc in rep.lifecycles):
+                status = "open"
+            for name in rep.program.mro(owner):
+                decl = rep.program.classes[name]
+                claims += [f"invariant {c.text}" for c in decl.invariants]
+                claims += [f"lifecycle {lc.clause.text}" for lc in decl.lifecycles]
+        functions[f.ref.key] = {"status": status, "obligations": len(f.verdicts), **({"claims": sorted(set(claims))} if claims else {}), **({"lean": lean} if lean else {}), **({"timeout": True} if f.ref.key in undecided else {})}
     mirrors = {f"{m.a.key} ~ {m.b.key}": m.status for m in rep.mirrors}
     ui = {f"{r.lemma.path}::{r.lemma.name}": r.status for r in rep.ui.results} if rep.ui is not None else {}
     from . import __version__
@@ -168,18 +178,25 @@ def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) ->
         if not scoped(key):
             continue
         n = new["functions"].get(key)
-        if n is not None and n.get("timeout"):
-            continue
         if n is None:
-            out.append(Change(key, "removed", f"{key} no longer exists", key.split("::")[0]))
+            kind = "regression" if o.get("claims") else "removed"
+            out.append(Change(key, kind, f"{key} no longer exists", key.split("::")[0]))
+            continue
+        for clause in sorted(set(o.get("claims", [])) - set(n.get("claims", []))):
+            aimed = [iid for iid, aim in old.get("aims", {}).items() if key in aim.get("functions", []) and f"{key.split('::')[-1]}: {clause}" in aim.get("clauses", [])]
+            if not aimed:
+                out.append(Change(key, "regression", f"{key} lost a clause: {clause}", key.split("::")[0]))
+        if n.get("timeout"):
             continue
         if RANK.get(n["status"], 0) < RANK.get(o["status"], 0):
             out.append(Change(key, "regression", f"{key}: {o['status']} → {n['status']}", key.split("::")[0]))
         elif RANK.get(n["status"], 0) > RANK.get(o["status"], 0):
             out.append(Change(key, "improvement", f"{key}: {o['status']} → {n['status']}", key.split("::")[0]))
+        if set(n.get("claims", [])) - set(o.get("claims", [])) and n["status"] not in ("proved", "trusted"):
+            out.append(Change(key, "regression", f"{key} has new unproved claims", key.split("::")[0]))
     for key, n in new["functions"].items():
         if key not in old.get("functions", {}):
-            kind = "regression" if n["status"] in ("refuted", "error") else "new"
+            kind = "regression" if n["status"] in ("refuted", "error") or n.get("claims") and n["status"] not in ("proved", "trusted") else "new"
             out.append(Change(key, kind, f"{key} is new ({n['status']})", key.split("::")[0]))
     for key, o in old.get("mirrors", {}).items():
         n = new["mirrors"].get(key)

@@ -69,13 +69,16 @@ branches and blockers.
 ## Checks
 
 ```bash
-pip install -e '.[test]'
+uv pip install -e '.[test]' -c .github/constraints.txt
 pytest -q tests/test_corpus.py tests/test_soundness.py tests/test_semantics.py   # the pins you touched
 telic demo --no-pause               # the end-to-end story must stay green
 make -C core                        # native engine; any OCaml >= 5.1 (OxCaml 5.2.0+ox adds flambda2)
 ```
 
-`tests/test_ui.py` starts many browsers and takes about half an hour; leave it
-to CI. CI (`.github/workflows/ci.yml`) runs 11 parallel jobs and skips a job
-whose inputs match an earlier passing run; pins are in
-`.github/constraints.txt`.
+Automatic CI runs `scripts/ci.py`: ratchet telic's declared claims against
+`telic.ledger.json`, reuse proof receipts, and audit corpus, soundness,
+semantics, native-engine and Lean evidence only when their inputs change.
+Construct invariants, measures and Lean proofs during implementation; CI
+checks supplied evidence without searching for it. `tests/test_ui.py` and
+the broader test battery run only through the manual `validation` workflow.
+Pins are in `.github/constraints.txt`; see [docs/ci.md](docs/ci.md).

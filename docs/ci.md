@@ -57,7 +57,48 @@ worse.
 - a pre-push hook that runs the same check locally and keeps the ledger current.
   A regression caught before push costs seconds instead of a CI round trip.
 
-## Measured cost
+## This repository's automatic gate
+
+`.github/workflows/ci.yml` runs `scripts/ci.py`. Its proof gate compares telic's
+declared contracts, class invariants, lifecycles and their dependencies with
+the committed `telic.ledger.json`. Existing unsupported or open claims remain
+visible; the baseline does not certify the entire verifier. A conditional
+proof is open. Removing an untagged claim, weakening an aim or adding an
+unproved claim fails the ratchet unless explicitly accepted.
+
+Proof construction belongs to implementation. Use normal `telic check` to
+infer invariants and measures, and `telic prove` to create Lean sidecars.
+CI uses `--claims-only --no-infer-auto --no-lean-auto --no-replay --no-ui`:
+it reuses valid inference receipts, checks stored Lean proofs and solves
+changed obligations, without searching for new annotations or tactics.
+Loops need explicit invariants and measures when no valid receipt exists.
+Lean sidecars travel with the source. A timeout cannot establish a CI receipt.
+
+The corpus pins for each language, soundness exploits, differential semantics,
+native-engine agreement and Lean theory proofs are separate evidence groups.
+Their keys include relevant sources, fixtures, commands, dependency pins and
+runner toolchain identity. A Python frontend edit invalidates Python evidence
+and shared checks; a documentation edit invalidates none. These audits test
+the verifier's modelling boundary. They are not repeated application tests.
+
+Main publishes `.telic/`, including obligation receipts and passing group
+verdicts. Pull requests only read it. Scoped checks preserve receipts for
+other functions. The gate reads its ratchet baseline from the base commit;
+editing the proposed ledger cannot silently lower that baseline. When all
+groups match, installation, engine builds and audits are skipped.
+
+```bash
+python scripts/ci.py --plan
+uv run python scripts/ci.py --since origin/main
+uv run python scripts/ci.py --group proof --since origin/main
+```
+
+`scripts/ci.py --record` explicitly establishes the initial baseline. Later
+ledger changes remain reviewable against the base commit. The full historical
+test battery, including browser exploration, runs only when the manual
+`validation` workflow is dispatched.
+
+## Synthetic cost measurements
 
 `python scripts/bench_ci.py` builds a synthetic repository (40 Python + 20
 TypeScript modules, 320 functions, 1,780 obligations) and times what CI actually

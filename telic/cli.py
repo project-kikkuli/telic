@@ -39,6 +39,9 @@ def _options(args: argparse.Namespace, root: str) -> CheckOptions:
         jobs=getattr(args, "jobs", None),
         engine=getattr(args, "engine", None) or os.environ.get("TELIC_ENGINE", "python"),
         ui=not getattr(args, "no_ui", False),
+        claims_only=getattr(args, "claims_only", False),
+        lean_auto=not getattr(args, "no_lean_auto", False),
+        infer_auto=not getattr(args, "no_infer_auto", False),
     )
 
 
@@ -54,6 +57,9 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("-j", "--jobs", type=int, default=None, help="solver workers (default: TELIC_JOBS, else min(4, cores // 2)); all telic runs share TELIC_MAX_JOBS (default cores // 2)")
     ap.add_argument("--engine", choices=["python", "ox"], default=None, help="'ox': the native OxCaml engine (core/), where it applies")
     ap.add_argument("--no-ui", action="store_true", help="do not run ui lemmas against the app (cached verdicts still show)")
+    ap.add_argument("--claims-only", action="store_true", help="verify declared contracts, class invariants and lifecycles, and the code their proofs depend on")
+    ap.add_argument("--no-lean-auto", action="store_true", help="check stored Lean proofs without searching for new tactic proofs")
+    ap.add_argument("--no-infer-auto", action="store_true", help="reuse verified inference receipts without searching for new invariants or measures")
 
 
 def report_json(rep: Report) -> dict[str, Any]:

@@ -299,8 +299,7 @@ class ProofCache:
         if not self.path:
             return
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        keep = {k: v for k, v in self.data.items() if k in self.used}
-        Path(self.path).write_text(json.dumps({"version": self.VERSION, "proofs": keep}, indent=1, sort_keys=True))
+        Path(self.path).write_text(json.dumps({"version": self.VERSION, "proofs": self.data}, indent=1, sort_keys=True))
 
 
 def make_receipt(rep: "FunctionReport") -> dict[str, Any]:
@@ -402,7 +401,7 @@ def toolchain_id() -> str:
             if f.suffix in (".py", ".mjs", ".lean") and "node_modules" not in f.parts and "demo" not in f.parts:
                 h.update(f.relative_to(pkg).as_posix().encode())
                 h.update(f.read_bytes())
-        for f in sorted((pkg.parent / "core").glob("*.ml")):  # the native engine, where it is used
+        for f in sorted(f for f in (pkg.parent / "core").glob("*.ml") if f.name != "source_hash.ml"):
             h.update(f.name.encode())
             h.update(f.read_bytes())
         _TOOLCHAIN = h.hexdigest()[:16]
@@ -515,6 +514,9 @@ class CheckOptions:
     # "ox": the native engine (core/), where it applies
     engine: str = field(default_factory=lambda: os.environ.get("TELIC_ENGINE", "python"))
     ui: bool = True  # run ui lemmas against the app (cached verdicts are shown either way)
+    claims_only: bool = False
+    lean_auto: bool = True
+    infer_auto: bool = True
 
 
 _POOL: dict[str, Any] = {}
@@ -709,6 +711,7 @@ def check(paths: list[str], opts: CheckOptions | None = None, root: str | None =
 def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None = None, root: str | None = None, ui: Any = None) -> Report:
     t0 = t0 or time.perf_counter()
     program = Program.build([m for m in modules if m.language != "aims"])
+    selected = program.claimed() if opts.claims_only else set(program.funcs)
     _sidecars.clear()
     program.root = root or os.getcwd()  # type: ignore[attr-defined]
     cache = ProofCache(opts.cache_path)
@@ -723,7 +726,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     todo_inf = [
         (key, ref)
         for key, ref in program.funcs.items()
-        if opts.infer and not (opts.only and ref.fn.name not in opts.only) and not (ref.fn.unsupported or ref.fn.trusted or ref.module.context)
+        if key in selected and opts.infer and (opts.infer_auto or (cache.get(inference_key(program, key, opts.rlimit)) or {}).get("method") == "inference") and not (opts.only and ref.fn.name not in opts.only) and not (ref.fn.unsupported or ref.fn.trusted or ref.module.context)
     ]
 
     def infer_one(item):
@@ -742,7 +745,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
     if use_engine:
         # Cached inferences are rebuilt locally; the rest run in the engine,
         # and whatever it cannot decide falls back to Python.
-        fresh = [(k, r) for k, r in todo_inf if (cache.get(inference_key(program, k, opts.rlimit)) or {}).get("method") != "inference" and not program.python_only(k)]
+        fresh = [(k, r) for k, r in todo_inf if opts.infer_auto and (cache.get(inference_key(program, k, opts.rlimit)) or {}).get("method") != "inference" and not program.python_only(k)]
         by_engine = _engine.infer(program, theory, [r for _, r in fresh], opts.timeout_ms, infer_rlimit(opts.rlimit), opts.jobs)
         inf_results = [(k, inference_key(program, k, opts.rlimit), by_engine[k]) for k, _ in fresh if by_engine.get(k) is not None]
         done = {k for k, _, _ in inf_results}
@@ -766,9 +769,9 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if set(members) != set(keys) or any(program.ref(k).fn.decreases is not None for k in members):
             continue
         hit = cached_measures(program, members, inferred)
-        if hit is None:
+        if hit is None and opts.infer_auto:
             todo_groups.append(members)
-        else:
+        elif hit is not None:
             for k in members:
                 inferred[k].options.measures.update(hit)
 
@@ -857,6 +860,8 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
 
     for key, ref in program.funcs.items():
         fn = ref.fn
+        if key not in selected:
+            continue
         if opts.only and fn.name not in opts.only:
             continue
         if ref.module.context:
@@ -973,7 +978,7 @@ def check_modules(modules: list[ir.Module], opts: CheckOptions, t0: float | None
         if opts.lean and any(v.status == "unknown" for v in rep.verdicts):
             from .lean import escalate
 
-            escalate(program, theory, rep, cache, lambda ob, th: obligation_key(ob, th, opts.rlimit), root=root)
+            escalate(program, theory, rep, cache, lambda ob, th: obligation_key(ob, th, opts.rlimit), root=root, auto=opts.lean_auto)
         if any(v.status == "refuted" for v in rep.verdicts):
             rep.status = "refuted"
         elif ref.key in vacuous:
