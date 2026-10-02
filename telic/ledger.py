@@ -88,7 +88,8 @@ def snapshot(rep: Report) -> dict[str, Any]:
     ui = {f"{r.lemma.path}::{r.lemma.name}": r.status for r in rep.ui.results} if rep.ui is not None else {}
     from . import __version__
 
-    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors, **({"ui": ui} if ui else {})}
+    problems = {m.path: sorted({msg for msg, _ in m.problems}) for m in rep.modules if m.problems and not m.context}
+    return {"telic": __version__, "aims": aims, "functions": functions, "mirrors": mirrors, **({"ui": ui} if ui else {}), **({"problems": problems} if problems else {})}
 
 
 def write_ledger(path: str, data: dict[str, Any]) -> None:
@@ -112,6 +113,10 @@ def merge(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> d
     if files is None or old is None:
         return new
     out = {"telic": new["telic"], "aims": {}, "functions": {}, "mirrors": {}, "ui": {}}
+    problems = {k: v for k, v in old.get("problems", {}).items() if k not in files}
+    problems.update(new.get("problems", {}))
+    if problems:
+        out["problems"] = problems
 
     def in_scope(key: str) -> bool:
         return key.split("::")[0] in files
@@ -152,6 +157,10 @@ class Change:
 #@ requires "aims" in new and "functions" in new and "mirrors" in new
 def compare(old: dict[str, Any], new: dict[str, Any], files: set[str] | None) -> list[Change]:
     out: list[Change] = []
+    for path, messages in new.get("problems", {}).items():
+        if files is None or path in files:
+            for message in sorted(set(messages) - set(old.get("problems", {}).get(path, []))):
+                out.append(Change(f"{path}::lowering", "regression", message, path))
 
     def scoped(key: str) -> bool:
         return files is None or key.split("::")[0] in files

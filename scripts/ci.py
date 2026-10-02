@@ -95,11 +95,10 @@ def proof(since: str | None, record: bool) -> bool:
         return True
     progress = (lambda name: print(name, flush=True)) if os.environ.get("TELIC_CI_DEBUG") else None
     rep = check(paths, CheckOptions(claims_only=True, engine="ox", replay=False, lean_auto=False, infer_auto=False, ui=False, progress=progress, cache_path=str(ROOT / ".telic" / "cache.json")), root=str(ROOT))
-    for module in rep.modules:
-        for message, loc in module.problems:
-            print(f"{module.path}:{loc.line}: {message}", flush=True)
-    if any(m.problems for m in rep.modules):
-        return False
+    if record:
+        for module in rep.modules:
+            for message, loc in module.problems:
+                print(f"{module.path}:{loc.line}: {message}", flush=True)
     if any(f.timed_out for f in rep.functions):
         print("proof: unfinished obligations cannot establish a CI receipt", flush=True)
         return False

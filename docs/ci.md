@@ -62,7 +62,8 @@ worse.
 `.github/workflows/ci.yml` runs `scripts/ci.py`. Its proof gate compares telic's
 declared contracts, class invariants, lifecycles and their dependencies with
 the committed `telic.ledger.json`. Existing unsupported or open claims remain
-visible; the baseline does not certify the entire verifier. A conditional
+visible, including module lowering diagnostics; the baseline does not certify
+the entire verifier. New lowering diagnostics fail the ratchet. A conditional
 proof is open. Removing an untagged claim, weakening an aim or adding an
 unproved claim fails the ratchet unless explicitly accepted.
 
