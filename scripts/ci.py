@@ -125,11 +125,11 @@ def main() -> int:
     ap.add_argument("--group", action="append", choices=GROUPS)
     args = ap.parse_args()
     os.chdir(ROOT)
-    if args.record:
+    if args.record and not args.plan:
         return 0 if proof(None, True) else 1
     receipts = json.loads(RECEIPTS.read_text()) if RECEIPTS.exists() else {}
-    keys = {name: key(name, args.since) for name in args.group or GROUPS}
-    pending = [name for name, digest in keys.items() if receipts.get(name) != digest]
+    keys = {name: key(name, args.since) for name in args.group or (["proof"] if args.record else GROUPS)}
+    pending = [name for name, digest in keys.items() if args.record or receipts.get(name) != digest]
     if args.plan:
         sidecars = any("demo" not in p.relative_to(ROOT).parts for p in (ROOT / "telic").rglob("*.proof.lean"))
         outputs = {"needed": bool(pending), "native": any(GROUPS[n].get("native") for n in pending), "lean": any(GROUPS[n].get("lean") for n in pending) or "proof" in pending and sidecars}

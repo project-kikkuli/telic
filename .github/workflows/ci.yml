@@ -40,7 +40,7 @@ jobs:
         id: plan
         run: |
           if [ "$RECORD" = true ]; then
-            python3 scripts/ci.py --plan --group proof
+            python3 scripts/ci.py --plan --record
           else
             python3 scripts/ci.py --plan
           fi
