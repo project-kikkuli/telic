@@ -187,6 +187,75 @@ def _css_model(texts: list[str]) -> tuple[list[dict[str, Any]], bool]:
     return rules, layout_sensitive
 
 
+def _storage_model(files: list[dict[str, str]]) -> dict[str, Any]:
+    reads: list[dict[str, Any]] = []
+    writes: list[dict[str, Any]] = []
+    hook_keys: list[dict[str, Any]] = []
+    for item in files:
+        path, text = item["path"], item["text"]
+        if not re.search(r"\.(?:[cm]?[jt]sx?)$", path):
+            continue
+        for match in re.finditer(r"\blocalStorage\.(getItem|setItem)\s*\(", text):
+            record = {"path": path, "line": text.count("\n", 0, match.start()) + 1, "operation": match.group(1)}
+            (reads if match.group(1) == "getItem" else writes).append(record)
+        for match in re.finditer(r"\buseLocalStorage(?:\s*<[^>]*>)?\s*\(\s*(['\"])(.*?)\1", text, re.S):
+            hook_keys.append({"path": path, "line": text.count("\n", 0, match.start()) + 1, "key": match.group(2)})
+    if not reads and not writes and not hook_keys:
+        return {"reads": [], "writes": [], "keys": [], "reload": "no source-linked localStorage operation found"}
+    return {
+        "reads": reads,
+        "writes": writes,
+        "keys": hook_keys,
+        "initializer_domain": ["missing key", "empty raw string", "arbitrary raw string", "getItem throws", "JSON.parse returns any JSON value", "JSON.parse throws"],
+        "parse_catch": "source-defined only when present in the resolved hook body",
+        "write_domain": ["setItem succeeds", "setItem throws"],
+        "effect_schedule": "writes occur only when the source effect is committed and delivered",
+        "reload": "remount re-runs the lazy initializer over the persisted storage relation",
+        "typed_annotation_validates_storage": False,
+    }
+
+
+def _context_model(files: list[dict[str, str]], wrappers: list[dict[str, Any]]) -> dict[str, Any]:
+    declarations: dict[str, dict[str, Any]] = {}
+    provider_uses: list[dict[str, Any]] = []
+    consumers: list[dict[str, Any]] = []
+    sources = {item["path"]: item["text"] for item in files if re.search(r"\.(?:[cm]?[jt]sx?)$", item["path"])}
+    for path, text in sources.items():
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:React\.)?createContext(?:\s*<[^>]*>)?\s*\(", text):
+            context_id = f"{path}#{match.group(1)}"
+            declarations[match.group(1)] = {"id": context_id, "path": path, "line": text.count("\n", 0, match.start()) + 1}
+        for match in re.finditer(r"<([A-Za-z_$][\w$]*)\.Provider\b", text):
+            declaration = declarations.get(match.group(1))
+            provider_uses.append({
+                "context": declaration["id"] if declaration and declaration["path"] == path else f"{path}#{match.group(1)}?",
+                "path": path,
+                "line": text.count("\n", 0, match.start()) + 1,
+                "value_resolved": False,
+            })
+        for match in re.finditer(r"\buseContext\s*\(\s*([A-Za-z_$][\w$]*)", text):
+            declaration = declarations.get(match.group(1))
+            consumers.append({
+                "context": declaration["id"] if declaration and declaration["path"] == path else f"{path}#{match.group(1)}?",
+                "path": path,
+                "line": text.count("\n", 0, match.start()) + 1,
+            })
+    frames = []
+    for wrapper in wrappers:
+        if wrapper["kind"] != "source-component":
+            continue
+        provided = [item["context"] for item in provider_uses if item["path"] == wrapper["path"]]
+        if provided:
+            frames.append({"instance": wrapper["site"], "parent": wrapper.get("parentSite"), "contexts": provided})
+    return {
+        "symbols": sorted(declarations.values(), key=lambda item: (item["path"], item["line"])),
+        "provider_uses": provider_uses,
+        "consumers": consumers,
+        "mounted_frames": frames,
+        "consumer_resolution": "context symbols retain module identity; hook return-value/dataflow is not modeled",
+        "value_propagation": "open until provider value expressions and consumer re-renders are modeled",
+    }
+
+
 @dataclass
 class StaticOutcome:
     status: str
@@ -416,10 +485,11 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
         return None, identity, f"expected one exported React app component in the source closure, found {len(models)}"
     if parsed.get("errors"):
         return None, identity, "; ".join(parsed["errors"])
+    css_reason = None
     try:
         styles, layout_sensitive = _css_model(css_texts)
     except ValueError as e:
-        return None, identity, str(e)
+        styles, layout_sensitive, css_reason = [], True, str(e)
     if any(rule["tag"] in ("html", "body") for rule in styles):
         return None, identity, "HTML or body visibility styles affect the app outside the rendered source tree"
     def decode_jsx(node: Any) -> None:
@@ -480,6 +550,10 @@ def extract(top: str, root: str, html_entry: str = "index.html", pipeline: str |
     models[0]["assumptions"] = ["configured Vite plugin resolver selected each analyzed local module", "installed Vite, React plugin, React, React DOM, and transitive package contents match the hashed toolchain identity", "the finite React and browser accessibility semantics implemented by this extractor match the selected runtime behavior"] if pipeline == "vite-react" else []
     models[0]["styles"] = styles
     models[0]["layout_sensitive"] = layout_sensitive
+    models[0]["storage_relation"] = _storage_model(entries)
+    models[0]["context_model"] = _context_model(entries, models[0].get("mountWrappers", []))
+    if css_reason:
+        models[0]["layoutOpen"] = css_reason
     return models[0], identity, None
 
 
@@ -488,11 +562,26 @@ def check(model: dict[str, Any], identity: str, lem: UiLemma) -> StaticOutcome:
         return StaticOutcome("open", "source model", "the UI property could not be parsed")
     if model.get("pipeline") != "vite-react":
         return StaticOutcome("open", "source model", "the source model is not tied to a verified compiler and configured app")
+    prop = lem.prop
+    if prop.kind == "persists":
+        storage = model.get("storage_relation", {})
+        keys = ", ".join(f"{item['key']!r} at {item['path']}:{item['line']}" for item in storage.get("keys", [])) or "no resolved storage key"
+        return StaticOutcome("open", "source model", f"persistence is source-linked to {keys}; arbitrary or malformed stored JSON, write exceptions, and passive-effect/reload ordering remain symbolic")
+    if prop.kind == "unobscured" and model.get("layoutOpen"):
+        return StaticOutcome("open", "source model", f"{model['layoutOpen']}; physical visibility and hit testing are outside the current source model")
+    if model.get("sourceOpen"):
+        return StaticOutcome("open", "source model", f"{model['sourceOpen']}; mounted providers, custom hooks, and effects remain in the source dependency closure")
+    if model.get("routerRequired") and not model.get("mountRouterContext"):
+        return StaticOutcome("open", "source model", "React Router behavior has no verified mounted BrowserRouter provider")
+    wrappers = model.get("mountWrappers", [])
+    unsupported = [wrapper for wrapper in wrappers if wrapper["kind"] not in ("router",)]
+    if unsupported:
+        wrapper = unsupported[0]
+        return StaticOutcome("open", "source model", f"mounted {wrapper['name']} at {wrapper.get('path', model['path'])}:{wrapper['line']} has render or lifecycle behavior outside this source model")
     try:
         states, edges, snaps = _graph(model)
     except ValueError as e:
         return StaticOutcome("open", "source model", str(e))
-    prop = lem.prop
     if prop.kind in ("unobscured", "persists"):
         return StaticOutcome("open", "source model", f"{prop.kind} needs {('CSS/layout geometry' if prop.kind == 'unobscured' else 'a storage/reopen model')}; it is not inferred from rendered roles")
     if model.get("layout_sensitive"):

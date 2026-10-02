@@ -444,7 +444,63 @@ def test_cached_ui_evidence_keeps_its_level(property, status, method, want):
         assert "proved" not in got.detail
 
 
-def _static_source_case(tmp_path, app, property, stylesheet="", modules=None):
+def test_notes_source_mount_and_storage_relation_keep_provider_identity_symbolic():
+    from telic.ui.config import load
+    from telic.ui.spec import UiLemma, parse_prop
+    from telic.ui.static import check as check_source, extract
+
+    root = Path(__file__).parents[1]
+    project = root / "examples" / "ui" / "notes-react"
+    config = project / "telic.toml"
+    if not (project / "node_modules").is_dir():
+        pytest.skip("source UI cases need the installed, locked notes-react Vite toolchain")
+    cfg = load(str(config), str(root))
+    model, identity, why = extract(
+        str(project), str(root), pipeline="vite-react", config_path=str(config),
+        command=cfg.command, config_digest=cfg.digest(),
+    )
+    assert why is None and model is not None
+    assert [item["name"] for item in model["mountWrappers"]] == [
+        "React.StrictMode", "BrowserRouter", "SettingsProvider", "AuthProvider", "ToastProvider", "NotesProvider",
+    ]
+    wrappers = model["mountWrappers"]
+    assert len({item["site"] for item in wrappers}) == len(wrappers)
+    assert [item["parentSite"] for item in wrappers[1:]] == [item["site"] for item in wrappers[:-1]]
+    assert model["mountTarget"]["parentSite"] == wrappers[-1]["site"]
+    assert model["mountRouterContext"] is True
+    storage = model["storage_relation"]
+    assert {item["key"] for item in storage["keys"]} >= {"notes.settings", "notes.user", "notes.items", "notes.onboarded"}
+    assert storage["typed_annotation_validates_storage"] is False
+    assert "arbitrary raw string" in storage["initializer_domain"]
+    assert "setItem throws" in storage["write_domain"]
+    contexts = model["context_model"]
+    assert {item["id"].rsplit("#", 1)[-1] for item in contexts["symbols"]} >= {
+        "SettingsContext", "AuthContext", "ToastContext", "NotesContext",
+    }
+    assert {item["instance"] for item in contexts["mounted_frames"]} == {item["site"] for item in wrappers if item["name"].endswith("Provider")}
+    assert contexts["value_propagation"].startswith("open")
+    claims = [
+        'always reachable screen "/" and not overlay from overlay',
+        'reachable radio "Dark" is enabled',
+        'persists radio "Dark"',
+        'persists checkbox "Autosave notes while typing"',
+        'persists combobox "Font size"',
+        'unobscured button "Menu"',
+        'unobscured button "Close"',
+    ]
+    outcomes = []
+    for index, claim in enumerate(claims):
+        prop, problem = parse_prop(claim)
+        assert problem is None and prop is not None
+        lemma = UiLemma(f"claim-{index}", "examples/ui/notes-react/src/App.tsx", 1, claim, (), prop=prop)
+        outcomes.append(check_source(model, identity, lemma))
+    assert all(outcome.status == "open" for outcome in outcomes)
+    assert "arbitrary or malformed stored JSON" in outcomes[2].detail
+    assert "CSS at-rules" in outcomes[5].detail
+    assert "mounted providers" in outcomes[0].detail
+
+
+def _static_source_case(tmp_path, app, property, stylesheet="", modules=None, entry_source=None):
     from telic.ui.config import load
     from telic.ui.run import run
     from telic.ui.static import extract
@@ -462,12 +518,12 @@ def _static_source_case(tmp_path, app, property, stylesheet="", modules=None):
         target = project / "src" / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
-    (project / "src" / "main.tsx").write_text(
+    (project / "src" / "main.tsx").write_text(entry_source or (
         'import { createRoot } from "react-dom/client";\n'
         'import App from "./App";\n'
         'import "./index.css";\n'
         'createRoot(document.getElementById("root")!).render(<App />);\n'
-    )
+    ))
     (project / "src" / "index.css").write_text(stylesheet)
     (project / "index.html").write_text('<!doctype html><html><head><title>Source UI</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>')
     scan = Scan()
@@ -789,11 +845,33 @@ export default function App(){
         + '''</Routes>{settings && <p>Current settings</p>}</main>;
 }''',
         property,
+        entry_source=(
+            'import { createRoot } from "react-dom/client";\n'
+            'import { BrowserRouter } from "react-router-dom";\n'
+            'import App from "./App";\n'
+            'import "./index.css";\n'
+            'createRoot(document.getElementById("root")!).render(<BrowserRouter><App /></BrowserRouter>);\n'
+        ),
     )
     assert why is None, why
     assert got.status == status and got.method == "source proof", got.detail
     assert got.replay and got.replay["receipt"]["assumptions"]
     assert any(source.endswith("App.tsx:6") for source in got.replay["source"])
+
+
+def test_source_ui_does_not_prove_router_hooks_without_mounted_browser_router(tmp_path):
+    model, identity, why, _ = _static_source_case(
+        tmp_path,
+        '''import {useNavigate, Routes, Route} from "react-router-dom";
+export default function App(){const navigate=useNavigate();return <><button onClick={()=>navigate("/settings")}>Settings</button><Routes><Route path="/settings" element={<h1>Settings</h1>} /></Routes></>}''',
+        'reachable heading "Settings"',
+    )
+    assert model is not None and why is None
+    from telic.ui.static import check as check_source
+    from telic.ui.spec import UiLemma
+
+    outcome = check_source(model, identity, UiLemma("source", "vite-app/src/App.tsx", 1, 'reachable heading "Settings"', (), parse_prop('reachable heading "Settings"')[0]))
+    assert outcome.status == "open" and "BrowserRouter" in outcome.detail
 
 
 def test_source_ui_binds_imported_component_props_and_handlers(tmp_path):

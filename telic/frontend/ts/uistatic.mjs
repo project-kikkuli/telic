@@ -135,6 +135,8 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   const namedHooks = new Set();
   const reactObjects = new Set();
   const routerHooks = new Map();
+  const routerComponents = new Map();
+  const routerUses = new Set();
   const customHooks = new Map();
   for (const s of sf.statements) {
     if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
@@ -148,7 +150,9 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
           for (const specifier of clause.namedBindings.elements) {
             const imported = (specifier.propertyName || specifier.name).text;
-            if (["useNavigate", "useLocation"].includes(imported) && !specifier.isTypeOnly) routerHooks.set(specifier.name.text, imported);
+            if (specifier.isTypeOnly || clause.isTypeOnly) continue;
+            if (["useNavigate", "useLocation"].includes(imported)) routerHooks.set(specifier.name.text, imported);
+            if (["Routes", "Route"].includes(imported)) routerComponents.set(specifier.name.text, imported);
           }
         }
         continue;
@@ -218,6 +222,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
         if (hook === "useNavigate" && init.arguments.length === 0) navigateBindings.add(d.name.text);
         else if (hook === "useLocation" && init.arguments.length === 0) locationBindings.add(d.name.text);
         else fail(sf, init, `${hook} call is outside the route model`);
+        routerUses.add(hook);
         modeledHooks.add(init);
         continue;
       }
@@ -360,7 +365,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   const render = (e, conditionalMount = false) => {
     e = strip(e);
     if (e.kind === ts.SyntaxKind.NullKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return { type: "empty" };
-    if (ts.isJsxElement(e) && ts.isIdentifier(e.openingElement.tagName) && e.openingElement.tagName.text === "Routes") return renderRoutes(e, conditionalMount);
+    if (ts.isJsxElement(e) && ts.isIdentifier(e.openingElement.tagName) && routerComponents.get(e.openingElement.tagName.text) === "Routes") return renderRoutes(e, conditionalMount);
     if (ts.isJsxElement(e)) return componentElement(e.openingElement, e.children, e, conditionalMount) || element(e.openingElement, e.children, e, conditionalMount);
     if (ts.isJsxSelfClosingElement(e)) return componentElement(e, [], e, conditionalMount) || element(e, [], e, conditionalMount);
     if (ts.isIdentifier(e) && e.text === "children" && componentProps.children) {
@@ -377,11 +382,14 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
   };
 
   function renderRoutes(e, conditionalMount) {
+    const routesName = e.openingElement.tagName.text;
+    if (routerComponents.get(routesName) !== "Routes" || shadows.has(routesName)) fail(sf, e.openingElement.tagName, "Routes must resolve to the runtime react-router-dom export in the mounted component");
+    routerUses.add("Routes");
     const routes = [];
     for (const child of e.children) {
       if (!ts.isJsxSelfClosingElement(child) && !ts.isJsxElement(child)) continue;
       const open = ts.isJsxSelfClosingElement(child) ? child : child.openingElement;
-      if (!ts.isIdentifier(open.tagName) || open.tagName.text !== "Route") fail(sf, child, "Routes accepts only explicit Route children");
+      if (!ts.isIdentifier(open.tagName) || routerComponents.get(open.tagName.text) !== "Route" || shadows.has(open.tagName.text)) fail(sf, child, "Route must resolve to the runtime react-router-dom export");
       let routePath = null, routeElement = null;
       for (const attr of open.attributes.properties) {
         if (!ts.isJsxAttribute(attr) || !ts.isIdentifier(attr.name)) fail(sf, attr, "Route attributes must use explicit path and element expressions");
@@ -529,7 +537,7 @@ function scanComponent(path, text, sf, component, asChild = false, componentProp
     return into;
   };
   statefulComponents(renderTree);
-  return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values(), ...childStates], render: renderTree };
+  return { path, component: component.name ? component.name.text : "default", line: lineOf(sf, component), states: [...states.values(), ...childStates], render: renderTree, routerRequired: routerUses.size > 0 };
 }
 
 function componentCandidates(path, text) {
@@ -745,6 +753,8 @@ function resolveComponent(fromPath, sf, name, current) {
 }
 
 function mountedComponent(target, files) {
+  const sameTarget = (resolved) => resolved && resolved.path === target.path
+    && resolved.node.getStart(resolved.sf) === target.node.getStart(target.sf);
   const rootLookup = (e) => {
     e = strip(e);
     if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression) || !ts.isIdentifier(e.expression.expression) || e.expression.expression.text !== "document" || e.arguments.length !== 1 || !ts.isStringLiteralLike(e.arguments[0])) return false;
@@ -752,43 +762,119 @@ function mountedComponent(target, files) {
     const match = e.expression.name.text === "querySelector" && e.arguments[0].text.match(/^#([A-Za-z_][\w-]*)$/);
     return match ? match[1] : false;
   };
+  const jsxTag = (e) => ts.isJsxSelfClosingElement(e) ? e.tagName : ts.isJsxElement(e) ? e.openingElement.tagName : null;
   for (const f of files) {
     const kind = /\.(tsx|jsx)$/.test(f.path) ? ts.ScriptKind.TSX : /\.(jsx|js|mjs|cjs)$/.test(f.path) ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
     const sf = ts.createSourceFile(f.path, f.text, ts.ScriptTarget.Latest, true, kind);
     const roots = new Set();
-    let targetBinding = null;
-    let importsOnlyExpected = true;
+    const reactDomObjects = new Set();
+    const targetBindings = new Set();
+    const routerBindings = new Map();
+    const reactNamespaces = new Set();
+    const sourceComponents = new Map();
+    let importsAllowed = true;
     for (const s of sf.statements) {
       if (!ts.isImportDeclaration(s) || !ts.isStringLiteralLike(s.moduleSpecifier)) continue;
       const from = s.moduleSpecifier.text;
       const clause = s.importClause;
-      if (from === "react-dom/client" && clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-        for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
-      } else if (from.startsWith(".")) {
+      if (from === "react-dom/client" && clause) {
+        if (!clause.isTypeOnly && clause.name) reactDomObjects.add(clause.name.text);
+        if (!clause.isTypeOnly && clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) reactDomObjects.add(clause.namedBindings.name.text);
+        if (!clause.isTypeOnly && clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+          for (const item of clause.namedBindings.elements) if (!item.isTypeOnly && (item.propertyName || item.name).text === "createRoot") roots.add(item.name.text);
+        }
+        continue;
+      }
+      if (from === "react" && clause) {
+        if (clause.name && !clause.isTypeOnly) reactNamespaces.add(clause.name.text);
+        if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings) && !clause.isTypeOnly) reactNamespaces.add(clause.namedBindings.name.text);
+        continue;
+      }
+      if (from === "react-router-dom" && clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        for (const item of clause.namedBindings.elements) if (!clause.isTypeOnly && !item.isTypeOnly && (item.propertyName || item.name).text === "BrowserRouter") routerBindings.set(item.name.text, "BrowserRouter");
+        continue;
+      }
+      if (from.startsWith(".")) {
         const importedPath = resolveModule(f.path, from);
-        if (from.endsWith(".css") && importedPath) continue;
-        if (importedPath === target.path && clause) {
-          if (target.defaultExport && clause.name) targetBinding = clause.name.text;
-          if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-            for (const item of clause.namedBindings.elements) if ((item.propertyName || item.name).text === target.name) targetBinding = item.name.text;
-          }
-        } else importsOnlyExpected = false;
-      } else importsOnlyExpected = false;
+        if (from.endsWith(".css") && importedPath && !clause) continue;
+        if (!importedPath || !clause) { importsAllowed = false; continue; }
+        if (clause.name && !clause.isTypeOnly) {
+          const resolved = resolveNamedExport(importedPath, "default");
+          if (sameTarget(resolved)) targetBindings.add(clause.name.text);
+          else if (resolved) sourceComponents.set(clause.name.text, { path: resolved.path, name: resolved.name });
+          else importsAllowed = false;
+        }
+        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) for (const item of clause.namedBindings.elements) {
+          if (clause.isTypeOnly || item.isTypeOnly) continue;
+          const exportedName = (item.propertyName || item.name).text;
+          const resolved = resolveNamedExport(importedPath, exportedName);
+          if (sameTarget(resolved)) targetBindings.add(item.name.text);
+          else if (resolved) sourceComponents.set(item.name.text, { path: resolved.path, name: resolved.name });
+          else importsAllowed = false;
+        }
+        continue;
+      }
+      importsAllowed = false;
     }
-    if (!importsOnlyExpected || !targetBinding || !roots.size) continue;
+    if (!importsAllowed || !targetBindings.size || (!roots.size && !reactDomObjects.size)) continue;
     const executable = sf.statements.filter((s) => !ts.isImportDeclaration(s) && !(ts.isExpressionStatement(s) && ts.isStringLiteral(s.expression)));
     if (executable.length !== 1 || !ts.isExpressionStatement(executable[0])) continue;
     const mount = strip(executable[0].expression);
     if (!ts.isCallExpression(mount) || !ts.isPropertyAccessExpression(mount.expression) || mount.expression.name.text !== "render" || mount.arguments.length !== 1) continue;
     const create = strip(mount.expression.expression);
-    if (!ts.isCallExpression(create) || !ts.isIdentifier(create.expression) || !roots.has(create.expression.text) || create.arguments.length !== 1) continue;
+    if (!ts.isCallExpression(create) || create.arguments.length !== 1) continue;
+    const createRootCall = ts.isIdentifier(create.expression) && roots.has(create.expression.text)
+      || ts.isPropertyAccessExpression(create.expression) && create.expression.name.text === "createRoot" && ts.isIdentifier(create.expression.expression) && reactDomObjects.has(create.expression.expression.text);
+    if (!createRootCall) continue;
     const root = rootLookup(create.arguments[0]);
     if (!root) continue;
-    const app = strip(mount.arguments[0]);
-    const tag = ts.isJsxSelfClosingElement(app) ? app.tagName : ts.isJsxElement(app) ? app.openingElement.tagName : null;
-    const attributes = ts.isJsxSelfClosingElement(app) ? app.attributes.properties : ts.isJsxElement(app) ? app.openingElement.attributes.properties : [];
-    const children = ts.isJsxElement(app) ? app.children : [];
-    if (tag && ts.isIdentifier(tag) && tag.text === targetBinding && attributes.length === 0 && children.length === 0) return { root, entry: f.path };
+    const wrapperChain = [];
+    let routerContext = false;
+    let targetCount = 0;
+    let invalidMount = false;
+    let mountedTarget = null;
+    const inspect = (node, parentSite = null) => {
+      node = strip(node);
+      if (ts.isJsxFragment(node)) {
+        for (const child of node.children) {
+          if (ts.isJsxText(child) && !child.text.trim()) continue;
+          if (ts.isJsxExpression(child) && child.expression) { inspect(child.expression, parentSite); continue; }
+          if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) { inspect(child, parentSite); continue; }
+          invalidMount = true;
+        }
+        return;
+      }
+      if (!ts.isJsxElement(node) && !ts.isJsxSelfClosingElement(node)) { invalidMount = true; return; }
+      const tag = jsxTag(node);
+      const props = ts.isJsxSelfClosingElement(node) ? node.attributes.properties : node.openingElement.attributes.properties;
+      const children = ts.isJsxElement(node) ? node.children : [];
+      if (ts.isIdentifier(tag) && targetBindings.has(tag.text)) {
+        if (props.length || children.length) invalidMount = true;
+        mountedTarget = { path: target.path, symbol: target.name, site: `${f.path}#mount-target-${targetCount + 1}`, parentSite, line: lineOf(sf, node) };
+        targetCount++;
+        return;
+      }
+      const site = `${f.path}#mount-${wrapperChain.length + 1}`;
+      if (ts.isIdentifier(tag) && routerBindings.get(tag.text) === "BrowserRouter") {
+        if (props.length) invalidMount = true;
+        routerContext = true;
+        wrapperChain.push({ kind: "router", name: "BrowserRouter", site, parentSite, line: lineOf(sf, node) });
+      } else if (ts.isPropertyAccessExpression(tag) && ts.isIdentifier(tag.expression) && reactNamespaces.has(tag.expression.text) && tag.name.text === "StrictMode") {
+        if (props.length) invalidMount = true;
+        wrapperChain.push({ kind: "strict-mode", name: "React.StrictMode", site, parentSite, line: lineOf(sf, node) });
+      } else if (ts.isIdentifier(tag) && sourceComponents.has(tag.text)) {
+        const component = sourceComponents.get(tag.text);
+        wrapperChain.push({ kind: "source-component", name: tag.text, path: component.path, symbol: component.name, site, parentSite, line: lineOf(sf, node) });
+      } else { invalidMount = true; return; }
+      for (const child of children) {
+        if (ts.isJsxText(child) && !child.text.trim()) continue;
+        if (ts.isJsxExpression(child) && child.expression) { inspect(child.expression, site); continue; }
+        if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) { inspect(child, site); continue; }
+        invalidMount = true;
+      }
+    };
+    inspect(mount.arguments[0]);
+    if (!invalidMount && targetCount === 1) return { root, entry: f.path, routerContext, wrapperChain, mountedTarget };
   }
   return false;
 }
@@ -805,11 +891,37 @@ for (const f of input.files) {
     const exported = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
     if (!exported) continue;
     const defaultExport = c.name === "default" || ownMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword) || exportMods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
-    const mountRoot = mountedComponent({ path: f.path, name: c.name, defaultExport }, input.files);
+    let mountRoot;
+    try { mountRoot = mountedComponent({ path: f.path, name: c.name, defaultExport, sf: c.sf, node: c.node }, input.files); }
+    catch (e) { errors.push(String(e && e.message || e).split("\n")[0]); continue; }
     if (!mountRoot) continue;
     connected = true;
-    try { models.push({ ...scanComponent(f.path, f.text, c.sf, c.node), mountRoot: mountRoot.root, mountEntry: mountRoot.entry }); }
-    catch (e) { errors.push(String(e && e.message || e).split("\n")[0]); }
+    try {
+      models.push({
+        ...scanComponent(f.path, f.text, c.sf, c.node),
+        mountRoot: mountRoot.root,
+        mountEntry: mountRoot.entry,
+        mountRouterContext: mountRoot.routerContext,
+        mountWrappers: mountRoot.wrapperChain,
+        mountTarget: mountRoot.mountedTarget,
+      });
+    }
+    catch (e) {
+      const reason = String(e && e.message || e).split("\n")[0];
+      models.push({
+        path: f.path,
+        component: c.name,
+        line: lineOf(c.sf, c.node),
+        states: [],
+        render: { type: "opaque-component", path: f.path, line: lineOf(c.sf, c.node), reason },
+        sourceOpen: reason,
+        mountRoot: mountRoot.root,
+        mountEntry: mountRoot.entry,
+        mountRouterContext: mountRoot.routerContext,
+        mountWrappers: mountRoot.wrapperChain,
+        mountTarget: mountRoot.mountedTarget,
+      });
+    }
   }
 }
 if (!connected) errors.push("no exported JSX component is connected to a verified React createRoot(...).render(...) entry");
