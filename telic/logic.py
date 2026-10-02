@@ -847,9 +847,10 @@ def python_numeric_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
         f"PyNumericSumState_cpython_{major}_{minor}",
         (("in_float", BOOL), ("int_total", INT), ("fast", BOOL), ("ordinary", FLOAT64), ("hi", FLOAT64), ("lo", FLOAT64)),
     )
-    tags, ints, floats = (Const(n, ARRAY(s)) for n, s in (("tags", BOOL), ("ints", INT), ("floats", FLOAT64)))
+    number_sort = REC("PythonNumber", (("is_int", BOOL), ("integer", INT), ("floating", FLOAT64)))
+    values = Const("values", ARRAY(number_sort))
     lo, hi = Const("lo", INT), Const("hi", INT)
-    prev = Fn(state_name, (tags, ints, floats, lo, sub(hi, ONE)), state_sort)
+    prev = Fn(state_name, (values, lo, sub(hi, ONE)), state_sort)
     in_float = field(prev, "in_float")
     int_total = field(prev, "int_total")
     fast = field(prev, "fast")
@@ -857,9 +858,10 @@ def python_numeric_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
     comp_hi = field(prev, "hi")
     comp_lo = field(prev, "lo")
     idx = sub(hi, ONE)
-    is_int = select(tags, idx)
-    i = select(ints, idx)
-    x = select(floats, idx)
+    item = select(values, idx)
+    is_int = field(item, "is_int")
+    i = field(item, "integer")
+    x = field(item, "floating")
     i_float = to_float(i, FLOAT64)
     entered = ite(is_int, i_float, x)
     start_int = and_(not_(in_float), is_int)
@@ -883,11 +885,13 @@ def python_numeric_sum_defs(major: int, minor: int) -> tuple[FunDef, FunDef]:
     )
     initial = mkrec(state_sort, (FALSE, ZERO, TRUE, zero, zero, zero))
     state_body = ite(le(hi, lo), initial, step_state)
-    state_def = FunDef(state_name, (tags, ints, floats, lo, hi), state_sort, state_body, recursive=True, measure=(sub(hi, lo),), doc="CPython mixed numeric sum state")
-    state = Fn(state_name, (tags, ints, floats, lo, hi), state_sort)
+    state_def = FunDef(state_name, (values, lo, hi), state_sort, state_body, recursive=True, measure=(sub(hi, lo),), doc="CPython mixed numeric sum state")
+    state = Fn(state_name, (values, lo, hi), state_sort)
     corrected = ite(and_(ne(field(state, "lo"), zero), is_finite(field(state, "lo"))), add(field(state, "hi"), field(state, "lo")), field(state, "hi"))
     result = ite(field(state, "fast"), corrected, field(state, "ordinary")) if (major, minor) >= (3, 12) else field(state, "ordinary")
-    sum_def = FunDef(sum_name, (tags, ints, floats, lo, hi), FLOAT64, result, doc="CPython mixed numeric sum")
+    number_sort = REC("PythonNumber", (("is_int", BOOL), ("integer", INT), ("floating", FLOAT64)))
+    tagged_result = mkrec(number_sort, (not_(field(state, "in_float")), field(state, "int_total"), result))
+    sum_def = FunDef(sum_name, (values, lo, hi), number_sort, tagged_result, doc="CPython mixed numeric sum")
     return state_def, sum_def
 
 
@@ -914,7 +918,7 @@ def python_float_sum(a: Term, lo: Term, hi: Term, major: int, minor: int) -> Ter
     return ite(and_(ne(total_lo, zero), is_finite(total_lo)), add(total_hi, total_lo), total_hi)
 
 
-def python_numeric_sum_literal(tags: Term, ints: Term, floats: Term, lo: int, hi: int, major: int, minor: int) -> Term:
+def python_numeric_sum_literal(values: Term, lo: int, hi: int, major: int, minor: int) -> Term:
     """Unroll CPython's mixed int/float sum for a statically sized list."""
     in_float = FALSE
     int_total = ZERO
@@ -923,9 +927,10 @@ def python_numeric_sum_literal(tags: Term, ints: Term, floats: Term, lo: int, hi
     zero = fval(0.0, FLOAT64)
     long_min, long_max = IntV(-(1 << 63)), IntV((1 << 63) - 1)
     for index in range(lo, max(lo, hi)):
-        is_int = select(tags, IntV(index))
-        int_value = select(ints, IntV(index))
-        float_value = select(floats, IntV(index))
+        item = select(values, IntV(index))
+        is_int = field(item, "is_int")
+        int_value = field(item, "integer")
+        float_value = field(item, "floating")
         was_in_float = in_float
         start_int = and_(not_(was_in_float), is_int)
         start_float = and_(not_(was_in_float), not_(is_int))
@@ -942,8 +947,11 @@ def python_numeric_sum_literal(tags: Term, ints: Term, floats: Term, lo: int, hi
         in_float = or_(was_in_float, not_(is_int))
     if (major, minor) >= (3, 12):
         corrected = ite(and_(ne(lo_sum, zero), is_finite(lo_sum)), add(hi_sum, lo_sum), hi_sum)
-        return ite(fast, corrected, ordinary)
-    return ordinary
+        result = ite(fast, corrected, ordinary)
+    else:
+        result = ordinary
+    number_sort = REC("PythonNumber", (("is_int", BOOL), ("integer", INT), ("floating", FLOAT64)))
+    return mkrec(number_sort, (not_(in_float), int_total, result))
 
 
 def theory_lemmas(elem: Sort) -> list[Axiom]:

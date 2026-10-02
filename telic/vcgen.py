@@ -36,6 +36,7 @@ from typing import Union
 from . import ir, irjson
 from . import logic as L
 from .program import FuncRef, Program, in_place, reaches_unchecked, unchecked_constructor
+from .py_number import PyNumber
 
 # ---------------------------------------------------------------------------
 # Symbolic values
@@ -58,6 +59,13 @@ class ListVal:
 
     def at(self, i: L.Term) -> L.Term:
         return L.select(self.arr, L.add(self.off, i))
+
+    def python_number_at(self, i: L.Term) -> PyNumber:
+        if isinstance(self.ty.elem, ir.TPythonNumber):
+            return as_py_number(self.at(i))
+        numeric = py_numeric_state(self)
+        index = L.add(self.off, i)
+        return PyNumber(L.select(numeric.tags, index), L.select(numeric.ints, index), L.select(numeric.floats, index))
 
 
 @dataclass(frozen=True)
@@ -99,7 +107,7 @@ class TypedView:
     fields: tuple[tuple[str, ir.Type, tuple[L.Term, ...]], ...] = ()
 
 
-Val = Union[L.Term, ListVal, OptVal, DictVal]
+Val = Union[L.Term, PyNumber, ListVal, OptVal, DictVal]
 NONE_V = L.Const("None", L.Sort("None"))
 # the objects of a class a function has written a field of (a ghost set, not heap:
 # callees and other tasks do not add to it)
@@ -117,7 +125,11 @@ def suspends(e: ir.Expr) -> bool:
 
 def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
     """How a value of ``ty`` is represented in logic, as named components."""
+    if isinstance(ty, ir.TPythonNumber):
+        return [("", sort_of(ty))]
     if isinstance(ty, ir.TList):
+        if isinstance(ty.elem, ir.TPythonNumber):
+            return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT)]
         return [
             ("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT),
             ("py_tags", L.ARRAY(L.BOOL)), ("py_ints", L.ARRAY(L.INT)), ("py_floats", L.ARRAY(L.FLOAT64)),
@@ -136,8 +148,10 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
 
 def arity(ty: ir.Type) -> int:
     """How many logical components a value of ``ty`` has."""
+    if isinstance(ty, ir.TPythonNumber):
+        return 1
     if isinstance(ty, ir.TList):
-        return 6
+        return 3 if isinstance(ty.elem, ir.TPythonNumber) else 6
     if isinstance(ty, (ir.TOption, ir.TDict)):
         return 2
     return 1
@@ -145,8 +159,11 @@ def arity(ty: ir.Type) -> int:
 
 def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
     #@ requires len(comps) == arity(ty)
+    if isinstance(ty, ir.TPythonNumber):
+        return comps[0]
     if isinstance(ty, ir.TList):
-        return ListVal(comps[0], comps[1], comps[2], ty, PyNumericList(comps[3], comps[4], comps[5]))
+        numeric = None if isinstance(ty.elem, ir.TPythonNumber) else PyNumericList(comps[3], comps[4], comps[5])
+        return ListVal(comps[0], comps[1], comps[2], ty, numeric)
     if isinstance(ty, ir.TOption):
         return OptVal(comps[0], comps[1], ty)
     if isinstance(ty, ir.TDict):
@@ -157,6 +174,8 @@ def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
 def py_numeric_state(v: ListVal) -> PyNumericList:
     if v.py_numeric is not None:
         return v.py_numeric
+    if isinstance(v.ty.elem, ir.TPythonNumber):
+        raise TypeError("tagged Python lists store tags in their element records")
     if isinstance(v.ty.elem, ir.TInt):
         return PyNumericList(L.const_array(L.ARRAY(L.BOOL), L.TRUE), v.arr, L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64)))
     if isinstance(v.ty.elem, ir.TReal) and v.ty.elem.bits == 64:
@@ -164,9 +183,18 @@ def py_numeric_state(v: ListVal) -> PyNumericList:
     return PyNumericList(L.const_array(L.ARRAY(L.BOOL), L.FALSE), L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64)))
 
 
-def py_numeric_store(v: ListVal, index: L.Term, value: L.Term) -> tuple[L.Term, PyNumericList]:
+def py_numeric_store(v: ListVal, index: L.Term, value: Val) -> tuple[L.Term, PyNumericList | None]:
     """Update the Python numeric-list view at the same physical array index."""
+    if isinstance(v.ty.elem, ir.TPythonNumber):
+        number = as_py_number(value)
+        return L.store(v.arr, index, L.mkrec(sort_of(ir.TPythonNumber()), number.parts())), None
     state = py_numeric_state(v)
+    if isinstance(value, PyNumber):
+        return (
+            L.store(v.arr, index, value.as_float()),
+            PyNumericList(L.store(state.tags, index, value.is_int), L.store(state.ints, index, value.integer), L.store(state.floats, index, value.floating)),
+        )
+    assert isinstance(value, L.Term)
     if not isinstance(v.ty.elem, ir.TReal) or v.ty.elem.bits != 64:
         return L.store(v.arr, index, value), state
     if value.sort == L.INT:
@@ -180,6 +208,37 @@ def py_numeric_store(v: ListVal, index: L.Term, value: L.Term) -> tuple[L.Term, 
     )
 
 
+def as_py_number(v: Val) -> PyNumber:
+    if isinstance(v, PyNumber):
+        return v
+    if v.sort.name == "Rec" and v.sort.rec == "PythonNumber":
+        return PyNumber(L.field(v, "is_int"), L.field(v, "integer"), L.field(v, "floating"))  # type: ignore[arg-type]
+    if v.sort == L.INT:
+        return PyNumber(L.TRUE, v, L.fval(0.0, L.FLOAT64))  # type: ignore[union-attr]
+    if v.sort in (L.FLOAT32, L.FLOAT64):  # type: ignore[union-attr]
+        return PyNumber(L.FALSE, L.ZERO, L.to_float(v, L.FLOAT64))  # type: ignore[arg-type]
+    raise TypeError(f"not a Python number: {v}")
+
+
+def py_numeric_compare(a: PyNumber, b: PyNumber, op: str) -> L.Term:
+    both_int = L.and_(a.is_int, b.is_int)
+    a_int = L.and_(a.is_int, L.not_(b.is_int))
+    b_int = L.and_(L.not_(a.is_int), b.is_int)
+    both_float = L.and_(L.not_(a.is_int), L.not_(b.is_int))
+    if op == "eq":
+        int_int = L.eq(a.integer, b.integer)
+        int_float = L.xcmp("fp.eq", a.integer, b.floating)
+        float_int = L.xcmp("fp.eq", a.floating, b.integer)
+        float_float = L.App("fp.eq", (a.floating, b.floating), L.BOOL)
+        return L.or_(L.and_(both_int, int_int), L.and_(a_int, int_float), L.and_(b_int, float_int), L.and_(both_float, float_float))
+    int_int = L.lt(a.integer, b.integer)
+    int_float = L.xcmp("fp.lt", a.integer, b.floating)
+    float_int = L.xcmp("fp.lt", a.floating, b.integer)
+    float_float = L.App("fp.lt", (a.floating, b.floating), L.BOOL)
+    lt = L.or_(L.and_(both_int, int_int), L.and_(a_int, int_float), L.and_(b_int, float_int), L.and_(both_float, float_float))
+    return lt if op == "lt" else L.or_(lt, py_numeric_compare(a, b, "eq"))
+
+
 def val_type(v: Val) -> ir.Type | None:
     return v.ty if isinstance(v, (ListVal, OptVal, DictVal)) else None
 
@@ -189,6 +248,8 @@ def sort_of(ty: ir.Type) -> L.Sort:
         return L.INT
     if isinstance(ty, ir.TReal):
         return L.FLOAT32 if ty.bits == 32 else L.FLOAT64
+    if isinstance(ty, ir.TPythonNumber):
+        return L.REC("PythonNumber", (("is_int", L.BOOL), ("integer", L.INT), ("floating", L.FLOAT64)))
     if isinstance(ty, ir.TBool):
         return L.BOOL
     if isinstance(ty, ir.TStr):
@@ -224,7 +285,11 @@ def _sort_tag(s: L.Sort) -> str:
 
 
 def flatten(v: Val) -> tuple[L.Term, ...]:
+    if isinstance(v, PyNumber):
+        return (L.mkrec(sort_of(ir.TPythonNumber()), v.parts()),)
     if isinstance(v, ListVal):
+        if isinstance(v.ty.elem, ir.TPythonNumber):
+            return (v.arr, v.off, v.len)
         p = py_numeric_state(v)
         return (v.arr, v.off, v.len, p.tags, p.ints, p.floats)
     if isinstance(v, OptVal):
@@ -235,6 +300,8 @@ def flatten(v: Val) -> tuple[L.Term, ...]:
 
 
 def ite_val(c: L.Term, a: Val, b: Val) -> Val:
+    if isinstance(a, PyNumber) or isinstance(b, PyNumber):
+        return as_py_number(a).choose(c, as_py_number(b))
     ty = val_type(a)
     if ty is not None:
         return pack(ty, [L.ite(c, x, y) for x, y in zip(flatten(a), flatten(b))])
@@ -247,6 +314,8 @@ def rec_equal(a: L.Term, b: L.Term) -> L.Term:
     s = a.sort
     if s.name != "Rec":
         return L.eq(a, b)
+    if s.rec == "PythonNumber":
+        return py_numeric_compare(as_py_number(a), as_py_number(b), "eq")
     if str(s.rec).startswith("Opt_"):
         sa, sb = L.field(a, "some"), L.field(b, "some")
         return L.and_(L.eq(sa, sb), L.implies(sa, rec_equal(L.field(a, "val"), L.field(b, "val"))))
@@ -277,6 +346,13 @@ def coerce(v: Val, ty: ir.Type | None) -> Val:
     present ``x``). Frontends need not insert the wrapping themselves. An
     empty literal (``[]``, ``{}``) takes the type of the variable it is
     stored in."""
+    if isinstance(ty, ir.TPythonNumber):
+        if isinstance(v, PyNumber):
+            return L.mkrec(sort_of(ty), v.parts())
+        if isinstance(v, L.Term) and v.sort == L.INT:
+            return L.mkrec(sort_of(ty), (L.TRUE, v, L.fval(0.0, L.FLOAT64)))
+        if isinstance(v, L.Term) and v.sort in (L.FLOAT32, L.FLOAT64):
+            return L.mkrec(sort_of(ty), (L.FALSE, L.ZERO, L.to_float(v, L.FLOAT64)))
     if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList) and ty.elem != ir.NONE:
         return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty)
     if isinstance(v, DictVal) and v.ty.key == ir.NONE and isinstance(ty, ir.TDict) and ty.key != ir.NONE:
@@ -285,7 +361,7 @@ def coerce(v: Val, ty: ir.Type | None) -> Val:
     if isinstance(ty, ir.TOption) and not isinstance(v, OptVal):
         if v is NONE_V:
             return OptVal(L.FALSE, default_term(sort_of(ty.inner)), ty)
-        return OptVal(L.TRUE, v, ty)  # type: ignore[arg-type]
+        return OptVal(L.TRUE, coerce(v, ty.inner), ty)  # type: ignore[arg-type]
     return v
 
 
@@ -484,6 +560,8 @@ class VCGen:
         if isinstance(ty, ir.TList):
             arr = L.Const(f"{base}@{n}.arr", sort_of(ty))
             ln = len_ if len_ is not None else L.Const(f"{base}@{n}.len", L.INT)
+            if isinstance(ty.elem, ir.TPythonNumber):
+                return ListVal(arr, L.ZERO, ln, ty)
             return ListVal(
                 arr, L.ZERO, ln, ty,
                 PyNumericList(
@@ -499,6 +577,8 @@ class VCGen:
 
     def param_val(self, name: str, ty: ir.Type) -> Val:
         if isinstance(ty, ir.TList):
+            if isinstance(ty.elem, ir.TPythonNumber):
+                return ListVal(L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty)
             return ListVal(
                 L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty,
                 PyNumericList(
@@ -1564,7 +1644,7 @@ class VCGen:
 
         def bind(body_st: State, k: L.Term) -> None:
             self.require_python_float_element(seq, k, self.ctx(body_st), s.loc)
-            body_st.env[s.elem] = seq.at(k)
+            body_st.env[s.elem] = self.python_list_value(seq, k)
             body_st.env[s.idx] = k
             self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
 
@@ -1601,15 +1681,19 @@ class VCGen:
         return i
 
     def require_python_float_element(self, xs: ListVal, i: L.Term, ctx: Ctx, loc: ir.Loc) -> None:
-        if self.module.language != "python" or not isinstance(xs.ty.elem, ir.TReal) or xs.ty.elem.bits != 64:
-            return
-        numeric = py_numeric_state(xs)
-        tag = L.select(numeric.tags, L.add(xs.off, i))
-        self.oblige("numeric", ctx, L.not_(tag), loc, "Python list element is a float, not an integer")
+        return
+
+    def python_list_value(self, xs: ListVal, i: L.Term) -> Val:
+        if self.module.language == "python" and (isinstance(xs.ty.elem, ir.TPythonNumber) or isinstance(xs.ty.elem, ir.TReal) and xs.ty.elem.bits == 64):
+            return xs.python_number_at(i)
+        return xs.at(i)
 
     def ev(self, e: ir.Expr, ctx: Ctx) -> Val:
         m = getattr(self, "ev_" + type(e).__name__)
-        return m(e, ctx)
+        value = m(e, ctx)
+        if isinstance(e.ty, ir.TPythonNumber) and isinstance(value, L.Term) and value.sort.name == "Rec":
+            return as_py_number(value)
+        return value
 
     def ev_Lit(self, e: ir.Lit, ctx: Ctx) -> Val:
         v = e.value
@@ -1645,6 +1729,8 @@ class VCGen:
 
     def ev_Unary(self, e: ir.Unary, ctx: Ctx) -> Val:
         a = self.ev(e.arg, ctx)
+        if isinstance(a, PyNumber) and e.op == "neg":
+            return PyNumber(a.is_int, L.neg(a.integer), L.fneg(a.floating))
         assert not isinstance(a, ListVal)
         if e.op == "neg":
             return L.neg(a)
@@ -1662,6 +1748,48 @@ class VCGen:
             return {"and": L.and_, "or": L.or_}[op](a, b) if op != "implies" else L.implies(a, b)
         a = self.ev(e.left, ctx)
         b = self.ev(e.right, ctx)
+        if isinstance(a, PyNumber) or isinstance(b, PyNumber):
+            x, y = as_py_number(a), as_py_number(b)
+            if op in ("eq", "ne", "lt", "le", "gt", "ge"):
+                cmp = py_numeric_compare(x, y, "eq" if op in ("eq", "ne") else "lt" if op in ("lt", "gt") else "le")
+                if op in ("gt", "ge"):
+                    cmp = py_numeric_compare(y, x, "lt" if op == "gt" else "le")
+                return L.not_(cmp) if op == "ne" else cmp
+            both_int = L.and_(x.is_int, y.is_int)
+            if op in ("add", "sub", "mul", "rdiv", "py_rdiv"):
+                # Python converts integer operands only when the other operand
+                # is a float. int/int true division instead divides exact
+                # integers before rounding the quotient to binary64.
+                mixed = L.not_(both_int)
+                conversion_limit = L.IntV((1 << 1024) - (1 << 970))
+                x_fits = L.lt(L.abs_(x.integer), conversion_limit)
+                y_fits = L.lt(L.abs_(y.integer), conversion_limit)
+                conversions_fit = L.and_(
+                    L.implies(L.and_(x.is_int, L.not_(y.is_int)), x_fits),
+                    L.implies(L.and_(y.is_int, L.not_(x.is_int)), y_fits),
+                )
+                if op in ("add", "sub", "mul"):
+                    self.oblige("overflow", ctx, L.implies(mixed, conversions_fit), e.loc, "integer converted to float does not overflow")
+                if op in ("rdiv", "py_rdiv"):
+                    nonzero = L.or_(
+                        L.and_(y.is_int, L.ne(y.integer, L.ZERO)),
+                        L.and_(L.not_(y.is_int), L.not_(L.App("fp.isZero", (y.floating,), L.BOOL))),
+                    )
+                    self.oblige("div", ctx, nonzero, e.loc, "divisor of '/' is non-zero")
+                    self.oblige("overflow", ctx, L.implies(mixed, conversions_fit), e.loc, "integer converted to float does not overflow")
+            if op == "add":
+                return PyNumber(both_int, L.add(x.integer, y.integer), L.add(x.as_float(), y.as_float()))
+            if op == "sub":
+                return PyNumber(both_int, L.sub(x.integer, y.integer), L.sub(x.as_float(), y.as_float()))
+            if op == "mul":
+                return PyNumber(both_int, L.mul(x.integer, y.integer), L.mul(x.as_float(), y.as_float()))
+            if op in ("rdiv", "py_rdiv"):
+                exact_quotient = L.to_float(L.rdiv(L.to_real(x.integer), L.to_real(y.integer)), L.FLOAT64)
+                self.oblige("overflow", ctx, L.implies(both_int, L.is_finite(exact_quotient)), e.loc, "integer division result fits in a float")
+                negative_zero = L.and_(both_int, L.eq(x.integer, L.ZERO), L.lt(y.integer, L.ZERO))
+                exact_quotient = L.ite(negative_zero, L.fneg(L.fval(0.0, L.FLOAT64)), exact_quotient)
+                quotient = L.ite(both_int, exact_quotient, L.rdiv(x.as_float(), y.as_float()))
+                return PyNumber(L.FALSE, L.ZERO, quotient)
         if self.module.language == "typescript":
             if isinstance(a, L.Term) and a.sort == L.INT:
                 self.oblige("integer", ctx, self.js_safe_integer(a), e.left.loc, "integer operand is within JavaScript's safe range")
@@ -1736,6 +1864,8 @@ class VCGen:
         raise VCError(f"unknown operator {op}", e.loc)
 
     def equal(self, a: Val, b: Val) -> L.Term:
+        if isinstance(a, PyNumber) or isinstance(b, PyNumber):
+            return py_numeric_compare(as_py_number(a), as_py_number(b), "eq")
         if isinstance(a, ListVal) or isinstance(b, ListVal):
             assert isinstance(a, ListVal) and isinstance(b, ListVal)
             i = L.Const(f"eq!{next(self.counter)}", L.INT)
@@ -1775,7 +1905,7 @@ class VCGen:
         assert not isinstance(i, ListVal)
         j = self.index_of(seq, i, e.wrap, ctx, e.loc, _expr_name(e.seq))
         self.require_python_float_element(seq, j, ctx, e.loc)
-        x = seq.at(j)
+        x = self.python_list_value(seq, j)
         self.assume_held(x, e.ty, ctx)
         self.require_js_safe_value(x, e.ty, ctx, e.loc, "array element is a safe integer")
         return x
@@ -1819,11 +1949,22 @@ class VCGen:
         if e.ty.elem == ir.NONE:
             base = ListVal(base.arr, base.off, base.len, e.ty)
         arr = base.arr
+        tagged = isinstance(ty.elem, ir.TPythonNumber)
+        numeric = py_numeric_state(base) if isinstance(ty.elem, ir.TReal) and ty.elem.bits == 64 else None
         for i, x in enumerate(e.elems):
             v = self.ev(x, ctx)
             assert not isinstance(v, ListVal)
-            arr = L.store(arr, L.IntV(i), v)
-        return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty)
+            if tagged:
+                number = as_py_number(v)
+                arr = L.store(arr, L.IntV(i), L.mkrec(sort_of(ir.TPythonNumber()), number.parts()))
+            elif numeric is not None:
+                number = as_py_number(v)
+                idx = L.IntV(i)
+                arr = L.store(arr, idx, number.as_float())
+                numeric = PyNumericList(L.store(numeric.tags, idx, number.is_int), L.store(numeric.ints, idx, number.integer), L.store(numeric.floats, idx, number.floating))
+            else:
+                arr = L.store(arr, L.IntV(i), v)
+        return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty, numeric)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
         if not ctx.spec and self._effectful(e.body):
@@ -1852,7 +1993,7 @@ class VCGen:
             seq = self.ev(e.seq, ctx)
             assert isinstance(seq, ListVal)
             self.require_python_float_element(seq, i, sub, e.loc)
-            sub.bound[e.elem] = seq.at(i)
+            sub.bound[e.elem] = self.python_list_value(seq, i)
         body = self.ev(e.body, sub)
         assert not isinstance(body, ListVal)
         if e.kind == "forall":
@@ -1883,23 +2024,25 @@ class VCGen:
                 has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
             return DictVal(vals, has, e.ty)
         args = [self.ev(a, ctx) for a in e.args]
+        if name == "py_number":
+            return as_py_number(args[0])
+        if name == "py_is_kind":
+            value, kind = args
+            assert isinstance(e.args[1], ir.Lit)
+            wants_int = e.args[1].value == "int"
+            if isinstance(value, PyNumber):
+                return value.is_int if wants_int else L.not_(value.is_int)
+            if isinstance(value, L.Term):
+                return L.BoolV(value.sort == L.INT if wants_int else value.sort in (L.FLOAT32, L.FLOAT64))
+            return L.FALSE
         if name == "py_mixed_list":
-            assert isinstance(e.ty, ir.TList) and isinstance(e.ty.elem, ir.TReal) and e.ty.elem.bits == 64
-            arr: L.Term = L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64))
-            tags: L.Term = L.const_array(L.ARRAY(L.BOOL), L.FALSE)
-            ints: L.Term = L.const_array(L.ARRAY(L.INT), L.ZERO)
-            floats: L.Term = L.const_array(L.ARRAY(L.FLOAT64), L.fval(0.0, L.FLOAT64))
+            assert isinstance(e.ty, ir.TList) and isinstance(e.ty.elem, ir.TPythonNumber)
+            arr: L.Term = L.const_array(sort_of(e.ty), default_term(sort_of(e.ty.elem)))
             for i, value in enumerate(args):
-                assert isinstance(value, L.Term)
                 idx = L.IntV(i)
-                if value.sort == L.INT:
-                    arr = L.store(arr, idx, L.to_float(value, L.FLOAT64))
-                    tags = L.store(tags, idx, L.TRUE)
-                    ints = L.store(ints, idx, value)
-                else:
-                    arr = L.store(arr, idx, L.to_float(value, L.FLOAT64))
-                    floats = L.store(floats, idx, L.to_float(value, L.FLOAT64))
-            return ListVal(arr, L.ZERO, L.IntV(len(args)), e.ty, PyNumericList(tags, ints, floats))
+                number = as_py_number(value)
+                arr = L.store(arr, idx, L.mkrec(sort_of(ir.TPythonNumber()), number.parts()))
+            return ListVal(arr, L.ZERO, L.IntV(len(args)), e.ty)
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
@@ -2055,6 +2198,13 @@ class VCGen:
             assert isinstance(xs, ListVal) and isinstance(ys, ListVal)
             n = next(self.counter)
             arr = L.Const(f"cat@{n}.arr", sort_of(xs.ty))
+            if isinstance(xs.ty.elem, ir.TPythonNumber):
+                ln = L.add(xs.len, ys.len)
+                i = L.Const(f"i!{n}", L.INT)
+                k = L.Const(f"k!{n}", L.INT)
+                ctx.assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, xs.len)), L.eq(L.select(arr, i), xs.at(i))), patterns=((L.select(arr, i),),)))
+                ctx.assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(xs.len, k), L.lt(k, ln)), L.eq(L.select(arr, k), ys.at(L.sub(k, xs.len)))), patterns=((L.select(arr, k),),)))
+                return ListVal(arr, L.ZERO, ln, xs.ty)
             px, py = py_numeric_state(xs), py_numeric_state(ys)
             tags = L.Const(f"cat@{n}.py_tags", L.ARRAY(L.BOOL))
             ints = L.Const(f"cat@{n}.py_ints", L.ARRAY(L.INT))
@@ -2082,10 +2232,21 @@ class VCGen:
             return ListVal(arr, L.ZERO, ln, e.ty)
         if name == "list_repeat":
             xs, k = args
-            assert isinstance(xs, ListVal) and isinstance(e.args[0], ir.ListLit)
-            width = len(e.args[0].elems)
+            assert isinstance(xs, ListVal)
+            literal = e.args[0]
+            if isinstance(literal, ir.ListLit):
+                width = len(literal.elems)
+            elif isinstance(literal, ir.Builtin) and literal.name == "py_mixed_list":
+                width = len(literal.args)
+            else:
+                raise VCError("list repetition requires a list literal", e.loc)
             n = next(self.counter)
             arr, assume = self.defined_symbol(ctx, f"rep@{n}.arr", sort_of(xs.ty))
+            if isinstance(xs.ty.elem, ir.TPythonNumber):
+                i = L.Const(f"i!{n}", L.INT)
+                ln = L.mul(L.IntV(width), L.max_(k, L.ZERO))  # type: ignore[arg-type]
+                assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), L.eq(L.select(arr, i), xs.at(L.App("emod", (i, L.IntV(width)), L.INT)))), patterns=((L.select(arr, i),),)))
+                return ListVal(arr, L.ZERO, ln, xs.ty)
             state = py_numeric_state(xs)
             tags, assume_tags = self.defined_symbol(ctx, f"rep@{n}.py_tags", L.ARRAY(L.BOOL))
             ints, assume_ints = self.defined_symbol(ctx, f"rep@{n}.py_ints", L.ARRAY(L.INT))
@@ -2144,18 +2305,52 @@ class VCGen:
             assert isinstance(xs, ListVal)
             return xs.len
         if name == "abs":
+            if isinstance(args[0], PyNumber):
+                x = args[0]
+                return PyNumber(x.is_int, L.abs_(x.integer), L.fabs(x.floating))
             return L.abs_(args[0])  # type: ignore[arg-type]
         if name in ("min", "max", "py_min", "py_max"):
             is_min = name in ("min", "py_min")
             python_order = name.startswith("py_")
+            if python_order and any(isinstance(a, PyNumber) for a in args):
+                out = as_py_number(args[0])
+                for item in args[1:]:
+                    candidate = as_py_number(item)
+                    take_candidate = py_numeric_compare(candidate, out, "lt") if is_min else py_numeric_compare(out, candidate, "lt")
+                    out = out.choose(L.not_(take_candidate), candidate)
+                return out
             out = args[0]
             for a in args[1:]:
                 assert isinstance(out, L.Term) and isinstance(a, L.Term)
-                take_out = L.le(out, a) if is_min else L.le(a, out)
-                if python_order:
-                    take_out = L.lt(out, a) if is_min else L.lt(a, out)
-                out = L.ite(take_out, out, a)
+                keep_out = L.le(out, a) if is_min else L.le(a, out)
+                out = L.ite(keep_out, out, a)
             return coerce(out, e.ty)
+        if name in ("js_min", "js_max"):
+            is_min = name == "js_min"
+            out = args[0]
+            if isinstance(out, L.Term) and out.sort == L.INT:
+                for a in args[1:]:
+                    assert isinstance(a, L.Term)
+                    keep_out = L.le(out, a) if is_min else L.le(a, out)
+                    out = L.ite(keep_out, out, a)
+                return out
+            assert isinstance(out, L.Term)
+            out = L.to_float(out, L.FLOAT64)
+            assert isinstance(out, L.Term)
+            for a in args[1:]:
+                assert isinstance(a, L.Term)
+                a = L.to_float(a, L.FLOAT64)
+                nan = L.or_(L.App("fp.isNaN", (out,), L.BOOL), L.App("fp.isNaN", (a,), L.BOOL))
+                zeros = L.and_(L.App("fp.isZero", (out,), L.BOOL), L.App("fp.isZero", (a,), L.BOOL))
+                if is_min:
+                    ordinary = L.ite(L.le(out, a), out, a)
+                    zero = L.ite(L.App("fp.isNegative", (out,), L.BOOL), out, a)
+                else:
+                    ordinary = L.ite(L.le(a, out), out, a)
+                    zero = L.ite(L.App("fp.isNegative", (out,), L.BOOL), a, out)
+                selected = L.ite(zeros, zero, ordinary)
+                out = L.ite(nan, L.App("fp.nan", (), out.sort), selected)
+            return out
         if name.startswith("py_sum_mixed_cpython_"):
             major, minor = (int(x) for x in name.removeprefix("py_sum_mixed_cpython_").split("_", 1))
             compensated = (major, minor) >= (3, 12)
@@ -2198,42 +2393,63 @@ class VCGen:
             (xs,) = args
             assert isinstance(xs, ListVal)
             es = sort_of(xs.ty.elem)
-            if name.startswith("py_sum_cpython_") and self.module.language == "python" and es == L.FLOAT64:
+            if name.startswith("py_sum_cpython_") and self.module.language == "python" and (es == L.FLOAT64 or isinstance(xs.ty.elem, ir.TPythonNumber)):
                 major, minor = (int(x) for x in name.removeprefix("py_sum_cpython_").split("_", 1))
-                numeric = py_numeric_state(xs)
                 start, end = xs.off, L.add(xs.off, xs.len)
                 state_name = f"py_numeric_sum_state_cpython_{major}_{minor}"
                 sum_name = f"seqsum_py_numeric_cpython_{major}_{minor}"
+                values = xs.arr
+                if not isinstance(xs.ty.elem, ir.TPythonNumber):
+                    values, assume_values = self.defined_symbol(ctx, f"sum@{next(self.counter)}.tagged", L.ARRAY(sort_of(ir.TPythonNumber())))
+                    j = L.Const(f"sum_value_index!{next(self.counter)}", L.INT)
+                    value = L.mkrec(sort_of(ir.TPythonNumber()), (L.FALSE, L.ZERO, L.select(xs.arr, j)))
+                    assume_values(L.Quant("forall", (j,), L.eq(L.select(values, j), value), patterns=((L.select(values, j),),)))
                 state_sort = L.REC(
                     f"PyNumericSumState_cpython_{major}_{minor}",
                     (("in_float", L.BOOL), ("int_total", L.INT), ("fast", L.BOOL), ("ordinary", L.FLOAT64), ("hi", L.FLOAT64), ("lo", L.FLOAT64)),
                 )
-                state = L.Fn(state_name, (numeric.tags, numeric.ints, numeric.floats, start, end), state_sort)
-                max_float_integer = L.IntV((1 << 1024) - (1 << 970) - 1)
+                state = L.Fn(state_name, (values, start, end), state_sort)
+                conversion_limit = L.IntV((1 << 1024) - (1 << 970))
                 i = L.Const(f"{e.loc.line}.sum_index!{next(self.counter)}", L.INT)
-                prefix = L.Fn(state_name, (numeric.tags, numeric.ints, numeric.floats, start, i), state_sort)
-                safe_prefix = L.Quant(
-                    "forall", (i,),
-                    L.implies(
-                        L.and_(L.le(start, i), L.le(i, end), L.not_(L.field(prefix, "in_float"))),
-                        L.le(L.abs_(L.field(prefix, "int_total")), max_float_integer),
-                    ),
-                    patterns=((L.field(prefix, "int_total"),),),
-                )
-                safe_items = L.Quant(
-                    "forall", (i,),
-                    L.implies(
-                        L.and_(L.le(start, i), L.lt(i, end), L.select(numeric.tags, i)),
-                        L.le(L.abs_(L.select(numeric.ints, i)), max_float_integer),
-                    ),
-                    patterns=((L.select(numeric.ints, i),),),
-                )
-                self.oblige("overflow", ctx, L.and_(safe_prefix, safe_items), e.loc, "integer values converted by sum fit in a float")
+                prefix = L.Fn(state_name, (values, start, i), state_sort)
+                item = L.select(values, i)
+                is_int, integer = L.field(item, "is_int"), L.field(item, "integer")
+                def safe_at(index: L.Term) -> L.Term:
+                    prev = L.Fn(state_name, (values, start, index), state_sort)
+                    current = L.select(values, index)
+                    tag = L.field(current, "is_int")
+                    value = L.field(current, "integer")
+                    return L.and_(
+                        L.implies(L.and_(L.not_(L.field(prev, "in_float")), L.not_(tag)), L.lt(L.abs_(L.field(prev, "int_total")), conversion_limit)),
+                        L.implies(L.and_(L.field(prev, "in_float"), tag), L.lt(L.abs_(value), conversion_limit)),
+                    )
+
                 if isinstance(start, L.IntV) and isinstance(xs.len, L.IntV):
-                    return L.python_numeric_sum_literal(numeric.tags, numeric.ints, numeric.floats, start.value, start.value + xs.len.value, major, minor)
+                    in_float, int_total = L.FALSE, L.ZERO
+                    checks = []
+                    for offset in range(max(0, xs.len.value)):
+                        item = L.select(values, L.IntV(start.value + offset))
+                        tag, integer = L.field(item, "is_int"), L.field(item, "integer")
+                        checks.append(L.implies(L.and_(L.not_(in_float), L.not_(tag)), L.lt(L.abs_(int_total), conversion_limit)))
+                        checks.append(L.implies(L.and_(in_float, tag), L.lt(L.abs_(integer), conversion_limit)))
+                        start_int = L.and_(L.not_(in_float), tag)
+                        int_total = L.ite(start_int, L.add(int_total, integer), int_total)
+                        in_float = L.or_(in_float, L.not_(tag))
+                    transition_safe = L.and_(*checks)
+                else:
+                    transition_safe = L.Quant(
+                        "forall", (i,),
+                        L.implies(L.and_(L.le(start, i), L.lt(i, end)), safe_at(i)),
+                        patterns=((L.field(prefix, "int_total"),),),
+                    )
+                self.oblige("overflow", ctx, transition_safe, e.loc, "integer values converted by sum fit in a float")
+                if isinstance(start, L.IntV) and isinstance(xs.len, L.IntV):
+                    result = L.python_numeric_sum_literal(values, start.value, start.value + xs.len.value, major, minor)
+                    return result if isinstance(xs.ty.elem, ir.TPythonNumber) else L.field(result, "floating")
                 self.theory_fns.add(state_name)
                 self.theory_fns.add(sum_name)
-                return L.Fn(sum_name, (numeric.tags, numeric.ints, numeric.floats, start, end), L.FLOAT64)
+                result = L.Fn(sum_name, (values, start, end), sort_of(ir.TPythonNumber()))
+                return result if isinstance(xs.ty.elem, ir.TPythonNumber) else L.field(result, "floating")
             if name.startswith("py_sum_cpython_") and es == L.FLOAT64:
                 major, minor = (int(x) for x in name.removeprefix("py_sum_cpython_").split("_", 1))
                 if (major, minor) >= (3, 12):
@@ -2274,6 +2490,22 @@ class VCGen:
             hi2 = norm(hi, n)
             return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty, xs.py_numeric)
         (x,) = args[:1]
+        if isinstance(x, PyNumber):
+            if name == "to_real":
+                converted = x.as_float()
+                self.oblige("overflow", ctx, L.implies(x.is_int, L.is_finite(converted)), e.loc, "integer converted to float does not overflow")
+                return converted
+            if name == "trunc":
+                xf = x.as_float()
+                exact = L.App("fp.to_real", (xf,), L.REAL)
+                rounded = L.ite(L.le(L.ZERO, exact), L.floor(exact), L.neg(L.floor(L.neg(exact))))
+                return L.ite(x.is_int, x.integer, rounded)
+            if name == "floor":
+                xf = x.as_float()
+                self.oblige("finite", ctx, L.is_finite(xf), e.loc, "number is finite where it is rounded to an integer")
+                exact = L.App("fp.to_real", (xf,), L.REAL)
+                return L.ite(x.is_int, x.integer, L.floor(exact))
+            x = x.as_float()
         assert not isinstance(x, ListVal)
         if name in ("js_floor", "js_ceil", "js_trunc", "js_round"):
             real_x = L.App("fp.to_real", (x,), L.REAL)
@@ -2422,11 +2654,29 @@ class VCGen:
         assert isinstance(elem_lit, ir.Lit)
         elem = str(elem_lit.value)
         body, cond = e.args[2], (e.args[3] if len(e.args) > 3 else None)
+        if cond is None and isinstance(body, ir.Var) and body.name == elem and (seq.py_numeric is not None or isinstance(seq.ty.elem, ir.TPythonNumber)):
+            return ListVal(seq.arr, seq.off, seq.len, e.ty, seq.py_numeric)
         n = next(self.counter)
         pure = all(self._pure(x) for x in (body, cond) if x is not None)
         arr, assume = self.defined_symbol(ctx, f"comp@{n}.arr", sort_of(e.ty), pure)
+        filtered_state = None
         if cond is None:
             ln: L.Term = seq.len
+        elif pure:
+            prefix, assume_prefix = self.defined_symbol(ctx, f"comp@{n}.prefix", L.ARRAY(L.INT), pure)
+            j = L.Const(f"j!{n}", L.INT)
+            sub_j = ctx.sub(None, spec=True, quiet=True)
+            sub_j.bound[elem] = self.python_list_value(seq, j)
+            cj = self.ev(cond, sub_j)
+            assert isinstance(cj, L.Term)
+            assume_prefix(L.eq(L.select(prefix, L.ZERO), L.ZERO))
+            step = L.eq(
+                L.select(prefix, L.add(j, L.ONE)),
+                L.add(L.select(prefix, j), L.ite(cj, L.ONE, L.ZERO)),
+            )
+            assume_prefix(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, seq.len)), step), patterns=((L.select(prefix, L.add(j, L.ONE)),),)))
+            ln = L.select(prefix, seq.len)
+            filtered_state = (prefix, j, sub_j, cj)
         else:
             ln, _ = self.defined_symbol(ctx, f"comp@{n}.len", L.INT, pure)
             assume(L.and_(L.le(L.ZERO, ln), L.le(ln, seq.len)))
@@ -2434,14 +2684,32 @@ class VCGen:
             # Values unknown; obligations and effects as for any element.
             self.each_element(e, seq, ctx)
             return ListVal(arr, L.ZERO, ln, e.ty)
+        numeric_output: PyNumericList | None = None
         i = L.Const(f"{elem}!{n}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
         sub = ctx.sub(rng, spec=True)
-        sub.bound[elem] = seq.at(i)
+        sub.bound[elem] = self.python_list_value(seq, i)
         if not ctx.spec and any(isinstance(x, ir.Builtin) and x.name == "opaque_op" for p in (body, cond) if p is not None for x in ir.walk_expr(p)):
             self.note(e.loc, "operations on values from unchecked code do not raise")
         if cond is None:
             b = self.ev(body, sub)
+            if isinstance(b, PyNumber):
+                if isinstance(e.ty.elem, ir.TPythonNumber):
+                    record = L.mkrec(sort_of(ir.TPythonNumber()), b.parts())
+                    arr = self.same_comp(arr, record, seq, i, ctx)
+                    assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), record)), patterns=((L.select(arr, i),),)))
+                    self.comp_bodies[arr] = (json.dumps([elem, irjson.without_locs(irjson.expr(body))], sort_keys=True, default=str), ctx.binders if isinstance(arr, L.Fn) else ())
+                    return ListVal(arr, L.ZERO, ln, e.ty)
+                arr = self.same_comp(arr, b.as_float(), seq, i, ctx)
+                assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b.as_float())), patterns=((L.select(arr, i),),)))
+                nt, at = self.defined_symbol(ctx, f"comp@{n}.py_tags", L.ARRAY(L.BOOL), pure)
+                ni, ai = self.defined_symbol(ctx, f"comp@{n}.py_ints", L.ARRAY(L.INT), pure)
+                nf, af = self.defined_symbol(ctx, f"comp@{n}.py_floats", L.ARRAY(L.FLOAT64), pure)
+                for out, value, setter in ((nt, b.is_int, at), (ni, b.integer, ai), (nf, b.floating, af)):
+                    setter(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(out, i), value)), patterns=((L.select(out, i),),)))
+                numeric_output = PyNumericList(nt, ni, nf)
+                self.comp_bodies[arr] = (json.dumps([elem, irjson.without_locs(irjson.expr(body))], sort_keys=True, default=str), ctx.binders if isinstance(arr, L.Fn) else ())
+                return ListVal(arr, L.ZERO, ln, e.ty, numeric_output)
             arr = self.same_comp(arr, b, seq, i, ctx)
             assume(L.Quant("forall", (i,), L.implies(rng, L.eq(L.select(arr, i), b)), patterns=((L.select(arr, i),),)))  # type: ignore[arg-type]
             key = json.dumps([elem, irjson.without_locs(irjson.expr(body))], sort_keys=True, default=str)
@@ -2449,15 +2717,14 @@ class VCGen:
         else:
             c = self.ev(cond, sub)
             self.ev(body, sub.sub(c))  # type: ignore[arg-type]
-            k = L.Const(f"k!{n}", L.INT)
-            j = L.Const(f"j!{n}", L.INT)
-            sub_j = ctx.sub(None, spec=True, quiet=True)
-            sub_j.bound[elem] = seq.at(j)
+            assert filtered_state is not None
+            prefix, j, sub_j, cj = filtered_state
             bj = self.ev(body, sub_j)
-            cj = self.ev(cond, sub_j)
-            # every element comes from some accepted source element
-            assume(L.Quant("forall", (k,), L.implies(L.and_(L.le(L.ZERO, k), L.lt(k, ln)), L.exists([j], L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj, L.eq(L.select(arr, k), bj)))), patterns=((L.select(arr, k),),)))  # type: ignore[arg-type]
-        return ListVal(arr, L.ZERO, ln, e.ty)
+            bj_value = L.mkrec(sort_of(ir.TPythonNumber()), bj.parts()) if isinstance(bj, PyNumber) and isinstance(e.ty.elem, ir.TPythonNumber) else bj.as_float() if isinstance(bj, PyNumber) else bj
+            rank = L.select(prefix, j)
+            selected = L.and_(L.le(L.ZERO, j), L.lt(j, seq.len), cj)
+            assume(L.Quant("forall", (j,), L.implies(selected, L.eq(L.select(arr, rank), bj_value)), patterns=((L.select(arr, rank),),)))  # type: ignore[arg-type]
+        return ListVal(arr, L.ZERO, ln, e.ty, numeric_output)
 
     def same_comp(self, arr: L.Term, b: L.Term, seq: ListVal, i: L.Const, ctx: Ctx) -> L.Term:
         """The array of an earlier comprehension computing the same elements
@@ -2526,7 +2793,7 @@ class VCGen:
         elem, _, idx = str(elem_lit.value).partition(",")  # "x" or "x,i": the element and its index
         i = L.Const(f"{elem}!{next(self.counter)}", L.INT)
         rng = L.and_(L.le(L.ZERO, i), L.lt(i, seq.len))
-        binds: dict[str, Val] = {elem: seq.at(i)}
+        binds: dict[str, Val] = {elem: self.python_list_value(seq, i)}
         if idx:
             binds[idx] = i
         self.run_each(e.loc, e.args[0], rng, binds, e.args[2], e.args[3] if len(e.args) > 3 else None, ctx)
@@ -2587,7 +2854,7 @@ class VCGen:
                 seq = self.ev(e.seq, ctx)
                 assert isinstance(seq, ListVal)
                 self.require_python_float_element(seq, i, ctx, e.loc)
-                binds[e.elem] = seq.at(i)
+                binds[e.elem] = self.python_list_value(seq, i)
             self.run_each(e.loc, e.seq, L.and_(L.le(lo, i), L.lt(i, hi)), binds, e.body, None, ctx)  # type: ignore[arg-type]
         return L.Const(f"{e.kind}@{n}", L.BOOL)
 
@@ -3310,7 +3577,7 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
                 c = L.Const(f"{p.name}.off", L.INT)
                 params.append(c)
         if isinstance(v, ListVal):
-            env[p.name] = ListVal(v.arr, L.Const(f"{p.name}.off", L.INT), v.len, v.ty)
+            env[p.name] = ListVal(v.arr, L.Const(f"{p.name}.off", L.INT), v.len, v.ty, v.py_numeric)
     # Object fields the body reads are parameters of the definition too.
     g.heap_init(env)
     for key in program.def_heap_keys(ref.key):
@@ -3325,9 +3592,12 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
         raise VCError(f"'{ref.fn.name}' never returns a value", ref.fn.loc)
     body = exits[-1].value
     assert body is not None and not isinstance(body, ListVal)
+    if isinstance(body, PyNumber):
+        body = L.mkrec(sort_of(ir.TPythonNumber()), body.parts()) if isinstance(ref.fn.ret, ir.TPythonNumber) else body.as_float()
     for ex in reversed(exits[:-1]):
         assert ex.value is not None and not isinstance(ex.value, ListVal)
-        body = L.ite(L.and_(*ex.facts), ex.value, body)
+        branch = (L.mkrec(sort_of(ir.TPythonNumber()), ex.value.parts()) if isinstance(ref.fn.ret, ir.TPythonNumber) else ex.value.as_float()) if isinstance(ex.value, PyNumber) else ex.value
+        body = L.ite(L.and_(*ex.facts), branch, body)
     # Outside its precondition a function has no meaning; giving it a fixed
     # default there keeps the definition total and well-founded (a recursive
     # equation that does not terminate could otherwise be inconsistent).

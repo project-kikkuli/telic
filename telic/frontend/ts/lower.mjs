@@ -2704,7 +2704,7 @@ class FunctionLowerer {
           let xs = args.map((a) => this.unwrap(this.expr(a)));
           if (xs.length < 2 || !xs.every((x) => isNum(x.ty))) return this.extern(`Math.${m}`, xs, REAL, loc);
           const t = xs.some((x) => x.ty.k === "real") ? REAL : INT;
-          return { e: "Builtin", ty: t, loc, name: m, args: xs.map((x) => this.coerce(x, t)) };
+          return { e: "Builtin", ty: t, loc, name: `js_${m}`, args: xs.map((x) => this.coerce(x, t)) };
         }
         return this.extern(`Math.${m}`, args.map((a) => this.expr(a)), REAL, loc);
       }

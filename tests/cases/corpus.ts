@@ -15,6 +15,13 @@ export function absVal(x: number): number {
 }
 
 // expect: refuted
+export function mathMinPropagatesNaN(x: number): number {
+  //@ requires x !== x
+  //@ ensures result === 1.0
+  return Math.min(x, 1.0);
+}
+
+// expect: refuted
 export function absBad(x: number): number {
   //@ ensures result >= 0
   if (x < -1) return -x;

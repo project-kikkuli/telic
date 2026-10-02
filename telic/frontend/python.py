@@ -774,7 +774,7 @@ class PythonFrontend:
                     return ir.TClass(name)
             return ir.TOpaque(ast.unparse(ann))  # e.g. datetime.date
         if isinstance(ann, ast.Name):
-            simple = {"int": ir.INT, "float": ir.REAL, "bool": ir.BOOL, "str": ir.STR}
+            simple = {"int": ir.INT, "float": ir.TPythonNumber(), "bool": ir.BOOL, "str": ir.STR}
             if ann.id in simple:
                 return simple[ann.id]
             if ann.id in self.module.records:
@@ -1192,6 +1192,15 @@ class FunctionLowerer:
             return self.coerce(ir.Builtin(e.ty.inner, e.loc, "unwrap", (e,)), ty)
         if isinstance(ty, ir.TDict) and isinstance(e, ir.Builtin) and e.name == "dict_lit" and not e.args:
             return ir.Builtin(ty, e.loc, "dict_lit", ())
+        if isinstance(ty, ir.TPythonNumber) and isinstance(e.ty, (ir.TInt, ir.TReal)):
+            return ir.Builtin(ty, e.loc, "py_number", (e,))
+        if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TPythonNumber) and isinstance(e.ty, ir.TList) and ir.is_numeric(e.ty.elem):
+            if isinstance(e, ir.ListLit):
+                return ir.ListLit(ty, e.loc, tuple(self.coerce(x, ty.elem) for x in e.elems))
+            if isinstance(e.ty.elem, ir.TPythonNumber):
+                return dataclasses.replace(e, ty=ty)
+        if isinstance(e.ty, ir.TPythonNumber) and isinstance(ty, ir.TPythonNumber):
+            return e
         if isinstance(ty, ir.TReal) and isinstance(e.ty, ir.TInt):
             return ir.Builtin(ir.REAL, e.loc, "to_real", (e,))
         if isinstance(ty, ir.TList) and isinstance(e, ir.ListLit) and not e.elems:
@@ -2021,6 +2030,9 @@ class ExprLowerer:
         a, b = self.need(a), self.need(b)
         if not (ir.is_numeric(a.ty) and ir.is_numeric(b.ty)):
             raise self.err(f"arithmetic on {a.ty} and {b.ty}", node)
+        if isinstance(a.ty, ir.TPythonNumber) or isinstance(b.ty, ir.TPythonNumber):
+            ty = ir.TPythonNumber()
+            return self.fl.coerce(a, ty), self.fl.coerce(b, ty), ty
         if isinstance(a.ty, ir.TReal) or isinstance(b.ty, ir.TReal):
             return self.fl.coerce(a, ir.REAL), self.fl.coerce(b, ir.REAL), ir.REAL
         return a, b, ir.INT
@@ -2217,8 +2229,9 @@ class ExprLowerer:
                 if isinstance(expect, ir.TList):
                     return ir.ListLit(expect, loc, ())
                 return ir.ListLit(ir.TList(ir.NONE), loc, ())
-            if any(isinstance(e.ty, ir.TReal) for e in elems) and any(isinstance(e.ty, ir.TInt) for e in elems):
-                return ir.Builtin(ir.TList(ir.REAL), loc, "py_mixed_list", tuple(elems))
+            if any(isinstance(e.ty, (ir.TReal, ir.TPythonNumber)) for e in elems) and any(isinstance(e.ty, (ir.TInt, ir.TPythonNumber)) for e in elems):
+                tagged = tuple(self.fl.coerce(e, ir.TPythonNumber()) for e in elems)
+                return ir.Builtin(ir.TList(ir.TPythonNumber()), loc, "py_mixed_list", tagged)
             t = elems[0].ty
             if any(isinstance(e.ty, ir.TReal) for e in elems) and all(ir.is_numeric(e.ty) for e in elems):
                 t = ir.REAL
@@ -2322,9 +2335,10 @@ class ExprLowerer:
             if b.ty != a.ty:
                 raise self.err(f"cannot concatenate {a.ty} and {b.ty}", n)
             return ir.Builtin(a.ty, loc, "list_concat", (a, b))
-        if isinstance(op, ast.Mult) and (isinstance(a, ir.ListLit) or isinstance(b, ir.ListLit)):
-            lst, k = (a, b) if isinstance(a, ir.ListLit) else (b, a)
-            if not lst.elems or not isinstance(k.ty, ir.TInt):
+        if isinstance(op, ast.Mult) and (isinstance(a, ir.ListLit) or isinstance(b, ir.ListLit) or isinstance(a, ir.Builtin) and a.name == "py_mixed_list" or isinstance(b, ir.Builtin) and b.name == "py_mixed_list"):
+            lst, k = (a, b) if isinstance(a, (ir.ListLit, ir.Builtin)) and (isinstance(a, ir.ListLit) or a.name == "py_mixed_list") else (b, a)
+            elems = lst.elems if isinstance(lst, ir.ListLit) else lst.args
+            if not elems or not isinstance(k.ty, ir.TInt):
                 raise self.err(f"'*' repeats a non-empty list literal an int number of times, not {a.ty} and {b.ty}", n)
             return ir.Builtin(lst.ty, loc, "list_repeat", (lst, k))
         if isinstance(op, ast.Add) and isinstance(a.ty, ir.TStr):
@@ -2337,7 +2351,8 @@ class ExprLowerer:
             return ir.Binary(t, loc, name, a, b)
         if isinstance(op, ast.Div):
             a, b, _ = self.numeric_pair(a, b, n)
-            return ir.Binary(ir.REAL, loc, "py_rdiv", self.fl.coerce(a, ir.REAL), self.fl.coerce(b, ir.REAL))
+            tagged = ir.TPythonNumber()
+            return ir.Binary(tagged, loc, "py_rdiv", self.fl.coerce(a, tagged), self.fl.coerce(b, tagged))
         if isinstance(op, ast.FloorDiv):
             a, b, t = self.numeric_pair(a, b, n)
             if t == ir.INT:
@@ -2634,14 +2649,16 @@ class ExprLowerer:
                 raise self.err(f"{name}() over a list is not supported; write a loop", n)
             if len(args) < 2 or not all(ir.is_numeric(a.ty) for a in args):
                 raise self.err(f"{name}() needs two or more numbers", n)
-            t = ir.REAL if any(isinstance(a.ty, ir.TReal) for a in args) else ir.INT
-            return ir.Builtin(t, loc, f"py_{name}", tuple(self.fl.coerce(a, t) for a in args))
+            t = ir.TPythonNumber() if any(isinstance(a.ty, ir.TPythonNumber) for a in args) else ir.REAL if any(isinstance(a.ty, ir.TReal) for a in args) else ir.INT
+            if isinstance(t, ir.TPythonNumber):
+                args = [self.fl.coerce(a, t) for a in args]
+            return ir.Builtin(t, loc, f"py_{name}", tuple(args))
         if name == "sum":
             (x,) = self._args(n, 1)
             if not (isinstance(x.ty, ir.TList) and ir.is_numeric(x.ty.elem)):
                 raise self.err("sum() needs a list of numbers", n)
             total = ir.sum_of(x, loc)
-            if isinstance(x.ty.elem, ir.TReal) and sys.implementation.name == "cpython":
+            if isinstance(x.ty.elem, (ir.TReal, ir.TPythonNumber)) and sys.implementation.name == "cpython":
                 return ir.Builtin(total.ty, loc, f"py_sum_cpython_{sys.version_info.major}_{sys.version_info.minor}", total.args)
             return total
         if name == "float":
@@ -2650,12 +2667,14 @@ class ExprLowerer:
                 return ir.Builtin(ir.REAL, loc, "py_float_parse", (x, ir.Lit(ir.BOOL, loc, self.fl.try_depth > 0)))
             if not ir.is_numeric(x.ty):
                 return self.extern("float", [x], None, loc, ir.REAL)
+            if isinstance(x.ty, ir.TPythonNumber):
+                return ir.Builtin(ir.REAL, loc, "to_real", (x,))
             return self.fl.coerce(x, ir.REAL)
         if name == "int":
             (x,) = self._args(n, 1)
             if isinstance(x.ty, ir.TInt):
                 return x
-            if isinstance(x.ty, ir.TReal):
+            if isinstance(x.ty, (ir.TReal, ir.TPythonNumber)):
                 return ir.Builtin(ir.INT, loc, "trunc", (x,))
             if x.ty == ir.STR and not n.keywords:
                 return ir.Builtin(ir.INT, loc, "py_int_parse", (x, ir.Lit(ir.BOOL, loc, self.fl.try_depth > 0)))
@@ -2713,6 +2732,8 @@ class ExprLowerer:
             x = self.expr(n.args[0])
             # isinstance(x, (A, B)) is isinstance(x, A) or isinstance(x, B): one predicate per class
             classes = n.args[1].elts if isinstance(n.args[1], ast.Tuple) and n.args[1].elts else [n.args[1]]
+            if len(classes) == 1 and isinstance(classes[0], ast.Name) and classes[0].id in ("int", "float"):
+                return ir.Builtin(ir.BOOL, loc, "py_is_kind", (x, ir.Lit(ir.STR, loc, classes[0].id)))
             out = self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(classes[0]))], ir.BOOL, loc)
             for c in classes[1:]:
                 out = ir.Binary(ir.BOOL, loc, "or", out, self.opaque("isinstance", [x, ir.Lit(ir.STR, loc, ast.unparse(c))], ir.BOOL, loc))

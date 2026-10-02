@@ -300,10 +300,11 @@ let emod a b =
 
 let to_real a = match a.node with Num q when a.sort = Int -> real q | _ -> app "to_real" [| a |] Real
 
-let floor a =
+let rec floor a =
   match a.node with
   | Num q when a.sort = Real -> int_ (Q.floor q)
   | App ("to_real", [| x |]) -> x
+  | _ when List.mem a.sort [ Float32; Float64 ] -> floor (app "fp.to_real" [| a |] Real)
   | _ -> app "floor" [| a |] Int
 
 let is_int a =

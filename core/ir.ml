@@ -3,6 +3,7 @@
 type ty =
   | TInt
   | TReal
+  | TPythonNumber
   | TFloat32
   | TBool
   | TStr
@@ -108,6 +109,7 @@ let rec ty_of j =
   match to_str (member "k" j) with
   | "int" -> TInt
   | "real" -> TReal
+  | "python_number" -> TPythonNumber
   | "float32" -> TFloat32
   | "bool" -> TBool
   | "str" -> TStr

@@ -184,6 +184,8 @@ class Z3Encoder:
         assert isinstance(t, L.App)
         a = [self.term(x) for x in t.args]
         op = t.op
+        if op == "fp.nan":
+            return z3.FPVal(float("nan"), self.sort(t.sort), ctx=c)
         if op == "fp.add":
             return z3.fpAdd(z3.RNE(c), a[0], a[1], ctx=c)
         if op == "fp.sub":
@@ -403,6 +405,13 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
         n = enc.value(model, val.len)
         if not isinstance(n, int):
             return []
+        if isinstance(val.ty.elem, ir.TPythonNumber):
+            out = []
+            for i in range(max(0, min(n, 256))):
+                idx = L.add(val.off, L.IntV(i))
+                number = decode(enc, model, L.select(val.arr, idx))
+                out.append(number["integer"] if number["is_int"] is True else number["floating"])
+            return out
         return [decode(enc, model, L.select(val.arr, L.add(val.off, L.IntV(i)))) for i in range(max(0, min(n, 256)))]
     if isinstance(val, L.Term) and val.sort == L.OPAQUE:
         if enc.json_keys is not None:
