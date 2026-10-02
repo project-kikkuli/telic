@@ -158,3 +158,18 @@ def test_a_binary_built_from_other_sources_is_refused(monkeypatch):
     monkeypatch.setattr(engine, "source_hash", lambda: "not-these-sources")
     with pytest.raises(RuntimeError, match="stale.*make -C"):
         engine.binary()
+
+
+def test_a_replaced_binary_is_revalidated_at_the_same_path(tmp_path, monkeypatch):
+    exe = tmp_path / "telic-core"
+    monkeypatch.setenv("TELIC_CORE", str(exe))
+    monkeypatch.setattr(engine, "_FRESH", set())
+    monkeypatch.setattr(engine, "source_hash", lambda: "current-sources")
+    exe.write_text("#!/bin/sh\nprintf 'current-sources\\n'\n")
+    exe.chmod(0o755)
+    assert engine.binary() == str(exe)
+
+    exe.write_text("#!/bin/sh\nprintf 'stale-sources\\n'\n")
+    exe.chmod(0o755)
+    with pytest.raises(RuntimeError, match="stale.*make -C"):
+        engine.binary()
