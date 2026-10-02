@@ -191,6 +191,7 @@ def _storage_model(files: list[dict[str, str]]) -> dict[str, Any]:
     reads: list[dict[str, Any]] = []
     writes: list[dict[str, Any]] = []
     hook_keys: list[dict[str, Any]] = []
+    hook_implementations: list[dict[str, Any]] = []
     for item in files:
         path, text = item["path"], item["text"]
         if not re.search(r"\.(?:[cm]?[jt]sx?)$", path):
@@ -200,12 +201,33 @@ def _storage_model(files: list[dict[str, str]]) -> dict[str, Any]:
             (reads if match.group(1) == "getItem" else writes).append(record)
         for match in re.finditer(r"\buseLocalStorage(?:\s*<[^>]*>)?\s*\(\s*(['\"])(.*?)\1", text, re.S):
             hook_keys.append({"path": path, "line": text.count("\n", 0, match.start()) + 1, "key": match.group(2)})
+        for match in re.finditer(r"(?ms)^export\s+function\s+useLocalStorage\b(?P<body>[\s\S]*?)(?=^})", text):
+            body = match.group("body")
+            checks = {
+                "lazy_use_state": bool(re.search(r"useState(?:\s*<[^>]*>)?\s*\(\s*\(\s*\)\s*=>\s*\{", body)),
+                "storage_read": bool(re.search(r"localStorage\.getItem\s*\(\s*key\s*\)", body)),
+                "truthy_raw_json_branch": bool(re.search(r"\braw\s*\?\s*\(?\s*JSON\.parse\s*\(\s*raw\s*\)", body)),
+                "parse_read_catch_fallback": bool(re.search(r"catch\s*(?:\([^)]*\))?\s*\{[^{}]*\breturn\s+initial\b", body, re.S)),
+                "passive_effect_write": bool(re.search(r"useEffect\s*\(\s*\(\s*\)\s*=>\s*\{", body)),
+                "json_serialize": bool(re.search(r"JSON\.stringify\s*\(\s*value\s*\)", body)),
+                "storage_write": bool(re.search(r"localStorage\.setItem\s*\(\s*key\s*,", body)),
+            }
+            hook_implementations.append({
+                "path": path,
+                "line": text.count("\n", 0, match.start()) + 1,
+                "semantics_recognized": all(checks.values()),
+                "checks": checks,
+                "initializer": "getItem; truthy raw selects JSON.parse; missing or empty raw selects initial; read/parse throw selects initial" if all(checks.values()) else None,
+                "commit_effect": "JSON.stringify(value) then setItem(key, serialized); serialization/write exceptions propagate" if all(checks.values()) else None,
+                "cleanup": "none in the matched effect body" if all(checks.values()) else None,
+            })
     if not reads and not writes and not hook_keys:
         return {"reads": [], "writes": [], "keys": [], "reload": "no source-linked localStorage operation found"}
     return {
         "reads": reads,
         "writes": writes,
         "keys": hook_keys,
+        "hook_implementations": hook_implementations,
         "initializer_domain": ["missing key", "empty raw string", "arbitrary raw string", "getItem throws", "JSON.parse returns any JSON value", "JSON.parse throws"],
         "parse_catch": "source-defined only when present in the resolved hook body",
         "write_domain": ["setItem succeeds", "setItem throws"],

@@ -473,6 +473,9 @@ def test_notes_source_mount_and_storage_relation_keep_provider_identity_symbolic
     assert storage["typed_annotation_validates_storage"] is False
     assert "arbitrary raw string" in storage["initializer_domain"]
     assert "setItem throws" in storage["write_domain"]
+    hook = next(item for item in storage["hook_implementations"] if item["semantics_recognized"])
+    assert "empty raw selects initial" in hook["initializer"]
+    assert "exceptions propagate" in hook["commit_effect"]
     contexts = model["context_model"]
     assert {item["id"].rsplit("#", 1)[-1] for item in contexts["symbols"]} >= {
         "SettingsContext", "AuthContext", "ToastContext", "NotesContext",
