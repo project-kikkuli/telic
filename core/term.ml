@@ -92,6 +92,7 @@ and node =
   | StrV of string
   | App of string * term array
   | Fn of string * term array
+  | ArrayLambda of term * term
   | Quant of string * term array * term * term array list  (** kind, bound vars, body, patterns *)
 
 (* -- hash-consing ------------------------------------------------------ *)
@@ -109,6 +110,7 @@ module Key = struct
     | BoolV x, BoolV y -> x = y
     | StrV x, StrV y -> String.equal x y
     | App (o, xs), App (p, ys) | Fn (o, xs), Fn (p, ys) -> String.equal o p && Array.length xs = Array.length ys && Array.for_all2 ( == ) xs ys
+    | ArrayLambda (b, x), ArrayLambda (c, y) -> b == c && x == y
     | Quant (k, vs, b, ps), Quant (k', vs', b', ps') ->
       String.equal k k' && b == b' && Array.length vs = Array.length vs' && Array.for_all2 ( == ) vs vs'
       && List.length ps = List.length ps'
@@ -127,7 +129,8 @@ module Key = struct
       | StrV x -> Hashtbl.hash (4, x)
       | App (o, xs) -> Hashtbl.hash (5, o, ids xs)
       | Fn (o, xs) -> Hashtbl.hash (6, o, ids xs)
-      | Quant (k, vs, b, ps) -> Hashtbl.hash (7, k, ids vs, b.id, List.length ps)
+      | ArrayLambda (b, x) -> Hashtbl.hash (7, b.id, x.id)
+      | Quant (k, vs, b, ps) -> Hashtbl.hash (8, k, ids vs, b.id, List.length ps)
     in
     (h * 17) + Hashtbl.hash s
 end
@@ -384,12 +387,12 @@ let ite c a b =
   else if a.sort = Bool && a == ff && b == tt then not_ c
   else app "ite" [| c; a; b |] a.sort
 
-let rec select arr idx =
+let rec select_raw arr idx =
   match arr.node with
   | App ("K", [| v |]) -> v
   | App ("store", [| base; k; v |]) ->
     if k == idx then v
-    else if (match (k.node, idx.node) with Num _, Num _ -> true | _ -> false) && k.sort = Int then select base idx
+    else if (match (k.node, idx.node) with Num _, Num _ -> true | _ -> false) && k.sort = Int then select_raw base idx
     else app "select" [| arr; idx |] (elem_sort arr.sort)
   | _ -> app "select" [| arr; idx |] (elem_sort arr.sort)
 
@@ -411,7 +414,18 @@ let field obj name =
 let mkrec sort vals = match sort with Rec (n, _) -> app ("mk:" ^ n) (Array.of_list vals) sort | _ -> invalid_arg "mkrec"
 
 let rec occurs (v : term) (t : term) =
-  t == v || match t.node with App (_, xs) | Fn (_, xs) -> Array.exists (occurs v) xs | Quant (_, _, b, _) -> occurs v b | _ -> false
+  t == v || match t.node with
+  | App (_, xs) | Fn (_, xs) -> Array.exists (occurs v) xs
+  | ArrayLambda (binder, body) -> v != binder && occurs v body
+  | Quant (_, vs, b, _) -> not (Array.exists (( == ) v) vs) && occurs v b
+  | _ -> false
+
+let array_lambda binder body =
+  match binder.node with
+  | Const _ ->
+    let sort = Array (binder.sort, body.sort) in
+    mk (ArrayLambda (binder, body)) sort
+  | _ -> invalid_arg "array lambda binder must be a constant"
 
 let quant kind vs body pats = mk (Quant (kind, Array.of_list vs, body, pats)) Bool
 
@@ -515,7 +529,7 @@ let lit_of_int n sort = lit_q (Q.of_int n) sort
 
 (* -- traversal ---------------------------------------------------------- *)
 
-let children t = match t.node with App (_, xs) | Fn (_, xs) -> Array.to_list xs | Quant (_, _, b, _) -> [ b ] | _ -> []
+let children t = match t.node with App (_, xs) | Fn (_, xs) -> Array.to_list xs | ArrayLambda (_, b) | Quant (_, _, b, _) -> [ b ] | _ -> []
 
 (* does any subterm have sort [s]? *)
 let mentions_sort s (t : term) =
@@ -535,6 +549,7 @@ let consts (t : term) : term list =
   let rec go bound t =
     match t.node with
     | Const _ -> if not (List.memq t bound) && not (Hashtbl.mem out t.id) then (Hashtbl.add out t.id (); order := t :: !order)
+    | ArrayLambda (v, b) -> go (v :: bound) b
     | Quant (_, vs, b, _) -> go (Array.to_list vs @ bound) b
     | App (_, xs) | Fn (_, xs) -> Array.iter (go bound) xs
     | _ -> ()
@@ -557,7 +572,7 @@ let fns (t : term) : string list =
   List.rev !out
 
 (* [t] with each key of [m] (by id) replaced by its value; bound variables are not replaced *)
-let subst (m : (term * term) list) (t : term) : term =
+let rec subst (m : (term * term) list) (t : term) : term =
   let memo = Hashtbl.create 64 in
   let m0 = m in
   let rec go m t =
@@ -571,6 +586,20 @@ let subst (m : (term * term) list) (t : term) : term =
           match t.node with
           | App (op, xs) -> let ys = Array.map (go m) xs in if Array.for_all2 ( == ) xs ys then t else mk (App (op, ys)) t.sort
           | Fn (f, xs) -> let ys = Array.map (go m) xs in if Array.for_all2 ( == ) xs ys then t else mk (Fn (f, ys)) t.sort
+          | ArrayLambda (binder, body) ->
+            let inner = List.filter (fun (k, _) -> k != binder) m in
+            let replacements = List.concat_map (fun (_, v) -> consts v) inner in
+            let binder, body =
+              if List.exists (fun c -> c == binder) replacements then begin
+                let used = consts body @ replacements @ [ binder ] in
+                let stem = match binder.node with Const n -> n ^ "$alpha" | _ -> "lambda$alpha" in
+                let rec name i = let n = if i = 0 then stem else stem ^ string_of_int i in if List.exists (fun c -> c.node = Const n) used then name (i + 1) else n in
+                let fresh = const (name 0) binder.sort in
+                (fresh, subst [ (binder, fresh) ] body)
+              end else (binder, body)
+            in
+            let body' = go inner body in
+            if binder == (match t.node with ArrayLambda (b, _) -> b | _ -> assert false) && body' == body then t else array_lambda binder body'
           | Quant (k, vs, b, ps) ->
             let inner = List.filter (fun (k, _) -> not (Array.exists (fun v -> v == k) vs)) m in
             let b' = go inner b in
@@ -581,6 +610,13 @@ let subst (m : (term * term) list) (t : term) : term =
         r)
   in
   go m t
+
+let select arr idx =
+  match arr.node with
+  | ArrayLambda (binder, body) ->
+    if binder.sort <> idx.sort then invalid_arg "array lambda index sort mismatch";
+    subst [ (binder, idx) ] body
+  | _ -> select_raw arr idx
 
 (* regular languages of text the parsing builtins accept, by name (SMT-LIB
    syntax; the request carries them from telic/logic.py) *)

@@ -670,7 +670,7 @@ def children(t: Term) -> tuple[Term, ...]:
     if isinstance(t, ArrayLambda):
         return (t.body,)
     if isinstance(t, Quant):
-        return (t.body, *(term for pattern in t.patterns for term in pattern))
+        return (t.body,)
     return ()
 
 
@@ -702,9 +702,6 @@ def consts(t: Term) -> set[Const]:
             saved = set(bound)
             bound.update(x.vars)
             go(x.body)
-            for pattern in x.patterns:
-                for term in pattern:
-                    go(term)
             bound.clear()
             bound.update(saved)
         elif isinstance(x, ArrayLambda):
@@ -725,28 +722,6 @@ def fns(t: Term) -> set[str]:
     return {x.name for x in iter_terms(t) if isinstance(x, Fn)}
 
 
-def _term_names(t: Term) -> set[str]:
-    names: set[str] = set()
-    for x in iter_terms(t):
-        if isinstance(x, Const):
-            names.add(x.name)
-        elif isinstance(x, Quant):
-            names.update(v.name for v in x.vars)
-        elif isinstance(x, ArrayLambda):
-            names.add(x.binder.name)
-    return names
-
-
-def _fresh_binder(binder: Const, used: set[str]) -> Const:
-    stem = f"{binder.name}$alpha"
-    name, suffix = stem, 0
-    while name in used:
-        suffix += 1
-        name = f"{stem}{suffix}"
-    used.add(name)
-    return Const(name, binder.sort)
-
-
 def substitute(t: Term, m: dict[Term, Term]) -> Term:
     if t in m:
         return m[t]
@@ -759,50 +734,50 @@ def substitute(t: Term, m: dict[Term, Term]) -> Term:
         args = tuple(substitute(a, m) for a in t.args)
         return t if args == t.args else Fn(t.name, args, t.sort)
     if isinstance(t, ArrayLambda):
-        inner = {k: v for k, v in m.items() if k != t.binder and t.binder not in consts(k)}
+        inner = {k: v for k, v in m.items() if k != t.binder}
         body, binder = t.body, t.binder
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if binder in replacements:
-            used = _term_names(body) | {binder.name}
-            for key, value in inner.items():
-                used.update(_term_names(key))
-                used.update(_term_names(value))
-            renamed = _fresh_binder(binder, used)
+            used = consts(body) | replacements | {binder}
+            stem = f"{binder.name}$alpha"
+            name, suffix = stem, 0
+            while any(c.name == name for c in used):
+                suffix += 1
+                name = f"{stem}{suffix}"
+            renamed = Const(name, binder.sort)
             body = substitute(body, {binder: renamed})
             binder = renamed
         new_body = substitute(body, inner)
         return t if binder == t.binder and new_body is t.body else ArrayLambda(binder, new_body, t.sort)
     if isinstance(t, Quant):
-        inner = {
-            k: v for k, v in m.items()
-            if k not in t.vars and not any(var in consts(k) for var in t.vars)
-        }
+        inner = {k: v for k, v in m.items() if k not in t.vars}
         body, vars_ = t.body, t.vars
         renaming = {}
         replacements = set().union(*(consts(v) for v in inner.values())) if inner else set()
         if replacements.intersection(vars_):
-            used = _term_names(body) | {var.name for var in vars_}
-            for pattern in t.patterns:
-                for term in pattern:
-                    used.update(_term_names(term))
-            for key, value in inner.items():
-                used.update(_term_names(key))
-                used.update(_term_names(value))
+            used = consts(body) | replacements | set(vars_)
             renamed = []
+            renaming = {}
             for var in vars_:
                 if var not in replacements:
                     renamed.append(var)
                     continue
-                fresh = _fresh_binder(var, used)
+                stem, suffix = f"{var.name}$alpha", 0
+                name = stem
+                while any(c.name == name for c in used):
+                    suffix += 1
+                    name = f"{stem}{suffix}"
+                fresh = Const(name, var.sort)
+                used.add(fresh)
                 renaming[var] = fresh
                 renamed.append(fresh)
             if renaming:
                 body = substitute(body, renaming)
                 vars_ = tuple(renamed)
         body = substitute(body, inner)
-        patterns = tuple(tuple(substitute(substitute(p, renaming), inner) for p in ps) for ps in t.patterns)
-        if body is t.body and vars_ == t.vars and patterns == t.patterns:
+        if body is t.body and vars_ == t.vars:
             return t
+        patterns = tuple(tuple(substitute(substitute(p, renaming), inner) for p in ps) for ps in t.patterns)
         return Quant(t.kind, vars_, body, patterns=patterns)
     return t
 

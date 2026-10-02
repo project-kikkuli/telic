@@ -770,3 +770,12 @@ func sameCents(_ a: Money, _ b: Money) -> Bool {
     //@ ensures result
     return a == b
 }
+
+// expect: proved
+func arrayCopyIsIndependent(_ a: [Int]) -> Int {
+    //@ requires a.count > 0
+    //@ ensures result == a[0]
+    var b = a
+    b[0] = 0
+    return a[0]
+}

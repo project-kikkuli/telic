@@ -693,6 +693,13 @@ class Program:
                     exprs.extend(c.expr for c in st.invariants)
             for c in ref.fn.requires + ref.fn.ensures:
                 exprs.append(c.expr)
+            def has_container(t: ir.Type) -> bool:
+                if isinstance(t, (ir.TList, ir.TDict)):
+                    return True
+                return isinstance(t, ir.TOption) and has_container(t.inner)
+
+            if any(has_container(t) for t in [*(p.ty for p in ref.fn.params), *ref.fn.locals.values(), *(e.ty for e in exprs)]):
+                r.add("@heap")
             for e in exprs:
                 for sub in ir.walk_expr(e):
                     if isinstance(sub, ir.Field) and isinstance(sub.obj.ty, ir.TClass):
@@ -772,20 +779,21 @@ class Program:
         return any(reach(a.ty) for a in e.args)
 
     def def_heap_keys(self, key: str) -> list[str]:
-        """Heap components a definitional function's body reads, in a fixed
-        order; they become extra parameters of its logical definition."""
-        from .vcgen import components
+        """Shared heap parameters read by a definitional function."""
+        reads = self.heap_reads.get(key, ())
+        return ["@heap"] if "@heap" in reads or any(not x.startswith("@") for x in reads) else []
 
-        out = []
-        for cf in sorted(self.heap_reads.get(key, ())):
-            c, f = cf.split(".", 1)
-            decl = self.classes.get(c)
-            fty = decl.field_type(f) if decl else None
-            if fty is None:
-                continue
-            for suffix, _ in components(fty):
-                out.append(f"@{decl.field_owner(f)}.{f}" + (f".{suffix}" if suffix else ""))
-        return out
+    def field_storage_owner(self, cls: str, name: str) -> str:
+        """Return the runtime namespace for one field's storage.
+
+        Python and TypeScript objects use property names at runtime, so two
+        nominal views of the same object must resolve the same named slot.
+        Rust and Swift retain declaration ownership for their nominal fields.
+        """
+        module = self.class_module.get(cls)
+        if module is not None and module.language in ("python", "typescript"):
+            return "property"
+        return self.classes[cls].field_owner(name)
 
     def _predicates(self) -> None:
         scalar = (ir.TBool, ir.TInt, ir.TReal, ir.TStr)

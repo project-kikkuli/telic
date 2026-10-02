@@ -272,6 +272,15 @@ def py_tag_append(xs: list[float]) -> float:
 
 
 # expect: proved
+def py_dict_copy_is_independent(d: dict[str, int]) -> int:
+    #@ requires "x" in d
+    #@ ensures result == old(d["x"])
+    copied = d.copy()
+    copied["x"] = copied["x"] + 1
+    return d["x"]
+
+
+# expect: proved
 def py_tag_filtered_comprehension(xs: list[float]) -> float:
     #@ requires len(xs) > 0 and isinstance(xs[0], int) and xs[0] >= 0
     #@ ensures isinstance(result, int)
@@ -593,6 +602,21 @@ def stretch(s: Span, x: int) -> None:
 def bump_wallets(ws: list[Wallet]) -> None:
     for w in ws:
         w.cents = w.cents + 1
+
+
+# expect: proved
+def copied_wallets_share_items(ws: list[Wallet]) -> int:
+    #@ ensures result == 1
+    before = len(ws)
+    copied = ws.copy()
+    copied.append(Wallet())
+    if len(ws) != before:
+        return 0
+    if before > 0:
+        copied[0].cents = 7
+        if ws[0].cents != 7:
+            return 0
+    return 1
 
 
 # expect: proved

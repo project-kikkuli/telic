@@ -89,6 +89,17 @@ def _named(n: Any) -> list[Any]:
     return [c for c in n.children if c.is_named and c.type not in ("line_comment", "block_comment")]
 
 
+def _walk_nodes(n: Any):
+    """Yield a syntax node and its descendants without relying on parser helpers."""
+    if n is None:
+        return
+    stack = [n]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.children))
+
+
 def _text(n: Any) -> str:
     return n.text.decode("utf8")
 
@@ -814,7 +825,8 @@ class RustFrontend:
                 size = _array_len(tn)
                 if size is not None and isinstance(t, ir.TList):
                     lens[pname] = size
-                params.append(ir.Param(pname, t))
+                is_view = isinstance(t, ir.TList) and any(n.type == "slice_type" for n in _walk_nodes(tn))
+                params.append(ir.Param(pname, t, view=is_view))
         rt = f.child_by_field_name("return_type")
         ret, rk = self.ty(rt, owner) if rt is not None else (ir.NONE, None)
         info = FnInfo(key, f, params, ret, rk if ret == ir.INT or isinstance(ret, ir.TOption) or _is_result(ret) else None, kinds, self_mode, owner, mut_params, ekinds, mod, file, dict(self.cur_generics), trait_method, decl, lens)
@@ -3230,6 +3242,8 @@ class ExprLowerer:
             inb = ir.Binary(ir.BOOL, loc, "and", ir.Binary(ir.BOOL, loc, "le", ir.Lit(ir.INT, loc, 0), i), ir.Binary(ir.BOOL, loc, "lt", i, length))
             ot = ir.TOption(t.elem)
             return self.kinded(ir.Ite(ot, loc, inb, ir.Builtin(ot, loc, "some", (ir.Index(t.elem, loc, recv, i, wrap=False),)), ir.Lit(ot, loc, None)), ek)
+        if m in ("clone", "to_vec") and isinstance(t, ir.TList):
+            return ir.Builtin(t, loc, "list_copy", (recv,))
         if m in ("clone", "to_vec", "iter", "into_iter", "as_slice", "to_owned"):
             return recv
         if self.spec:

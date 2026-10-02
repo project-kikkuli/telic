@@ -22,8 +22,24 @@ def decode(v: Any, module: Any, memo: dict | None = None) -> Any:
     memo = {} if memo is None else memo
     if isinstance(v, list):
         return [decode(x, module, memo) for x in v]
+    if isinstance(v, dict) and "__list_ref__" in v:
+        return memo[("list", v["__list_ref__"])]
+    if isinstance(v, dict) and "__list__" in v:
+        key = ("list", v["__list__"])
+        out: list[Any] = []
+        memo[key] = out
+        out.extend(decode(x, module, memo) for x in v["items"])
+        return out
+    if isinstance(v, dict) and "__dict_ref__" in v:
+        return memo[("dict", v["__dict_ref__"])]
+    if isinstance(v, dict) and "__map__" in v:
+        key = ("dict", v["__map__"])
+        out: dict[Any, Any] = {}
+        memo[key] = out
+        out.update((decode(k, module, memo), decode(x, module, memo)) for k, x in v["entries"])
+        return out
     if isinstance(v, dict) and "__object__" in v:
-        key = (v["__object__"], v.get("ref"))
+        key = ("object", v.get("ref"))
         obj = memo.get(key)
         if obj is None:
             cls = getattr(module, v["__object__"])
@@ -320,9 +336,11 @@ def _shrunk(req: dict, fn: Any, mod: Any, ContractViolation: Any, found: dict) -
         return found
     raw = req.get("args", [])
     was = list(STAND_IN)
-    small, _ = shrink(fn, [decode(a, mod, {}) for a in raw], found, mod, ContractViolation, req["func"])
+    memo: dict = {}
+    decoded = [decode(a, mod, memo) for a in raw]
+    small, _ = shrink(fn, decoded, found, mod, ContractViolation, req["func"])
     shown = ", ".join(show(a) for a in small)
-    if shown != ", ".join(show(a) for a in [decode(a, mod, {}) for a in raw]):
+    if shown != ", ".join(show(a) for a in decoded):
         found["shrunk_repr"] = shown
     STAND_IN[:] = was
     return found

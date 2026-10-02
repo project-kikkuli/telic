@@ -6,6 +6,7 @@
    assume its @ensures), loops are cut by their invariants. *)
 
 open Term
+open Ir
 module SM = Map.Make (String)
 
 exception Vc_error of string * Ir.loc
@@ -16,16 +17,16 @@ let depth x = fn "struct.depth" [| x |] Int
 
 (* -- values ------------------------------------------------------------ *)
 
-type lv = { arr : term; off : term; len : term; py_tags : term; py_ints : term; py_floats : term; lty : Ir.ty }
-type ov = { some : term; v : term; oty : Ir.ty }  (** an optional: present iff [some] *)
-type dv = { vals : term; has : term; dty : Ir.ty }  (** a finite map: [has k] says whether k is a key *)
-
 type value =
   | T of term
   | L of lv
   | O of ov
   | D of dv
   | NoneV
+
+and lv = { arr : term; off : term; len : term; py_tags : term; py_ints : term; py_floats : term; ref : term; view : term; lty : Ir.ty }
+and ov = { some : term; v : value; oty : Ir.ty }  (** an optional: present iff [some] *)
+and dv = { vals : term; has : term; ref : term; dty : Ir.ty }  (** a finite map: [has k] says whether k is a key *)
 
 let at (arr, off) i = select arr (add off i)
 
@@ -64,38 +65,48 @@ and sort_tag = function Rec (n, _) -> n | Array (_, e) -> "Arr" ^ sort_tag e | s
 let complex = function Ir.TList _ | TDict _ | TOption _ -> true | _ -> false
 
 (* how a value of [ty] is represented in logic, as named components *)
-let components (ty : Ir.ty) : (string * sort) list =
+let rec components (ty : Ir.ty) : (string * sort) list =
   match ty with
-  | TList TPythonNumber -> [ ("arr", Array (Int, sort_of TPythonNumber)); ("off", Int); ("len", Int) ]
-  | TList e -> [ ("arr", Array (Int, sort_of e)); ("off", Int); ("len", Int); ("py_tags", Array (Int, Bool)); ("py_ints", Array (Int, Int)); ("py_floats", Array (Int, Float64)) ]
+  | TList TPythonNumber -> [ ("arr", Array (Int, sort_of TPythonNumber)); ("off", Int); ("len", Int); ("ref", Int); ("view", Bool) ]
+  | TList e -> [ ("arr", Array (Int, sort_of e)); ("off", Int); ("len", Int); ("py_tags", Array (Int, Bool)); ("py_ints", Array (Int, Int)); ("py_floats", Array (Int, Float64)); ("ref", Int); ("view", Bool) ]
   | TOption inner ->
-    if complex inner then raise (Vc_error ("optional containers are not supported yet", Ir.noloc));
-    [ ("some", Bool); ("val", sort_of inner) ]
+    ("some", Bool) :: List.map (fun (n, s) -> ((if n = "" then "val" else "val." ^ n), s)) (components inner)
   | TDict (k, v) ->
-    if complex v then raise (Vc_error ("dict values that are containers are not supported yet", Ir.noloc));
     let ks = sort_of k in
-    [ ("vals", Array (ks, sort_of v)); ("has", Array (ks, Bool)) ]
+    [ ("vals", Array (ks, sort_of v)); ("has", Array (ks, Bool)); ("ref", Int) ]
   | t -> [ ("", sort_of t) ]
 
-let pack (ty : Ir.ty) comps =
+let rec pack (ty : Ir.ty) comps =
   match (ty, comps) with
-  | TList TPythonNumber, [ a; o; l ] -> L { arr = a; off = o; len = l; py_tags = const_array (Array (Int, Bool)) ff; py_ints = const_array (Array (Int, Int)) zero; py_floats = const_array (Array (Int, Float64)) (fval 0.0); lty = ty }
-  | TList _, [ a; o; l; tags; ints; floats ] -> L { arr = a; off = o; len = l; py_tags = tags; py_ints = ints; py_floats = floats; lty = ty }
-  | TOption _, [ s; v ] -> O { some = s; v; oty = ty }
-  | TDict _, [ v; h ] -> D { vals = v; has = h; dty = ty }
+  | TList TPythonNumber, [ a; o; l; r; view ] -> L { arr = a; off = o; len = l; py_tags = const_array (Array (Int, Bool)) ff; py_ints = const_array (Array (Int, Int)) zero; py_floats = const_array (Array (Int, Float64)) (fval 0.0); ref = r; view; lty = ty }
+  | TList _, [ a; o; l; tags; ints; floats; r; view ] -> L { arr = a; off = o; len = l; py_tags = tags; py_ints = ints; py_floats = floats; ref = r; view; lty = ty }
+  | TOption inner, s :: rest -> O { some = s; v = pack inner rest; oty = ty }
+  | TDict _, [ v; h; r ] -> D { vals = v; has = h; ref = r; dty = ty }
   | _, [ t ] -> T t
   | _ -> invalid_arg "pack"
 
-let flatten = function T t -> [ t ] | L l when l.lty = TList TPythonNumber -> [ l.arr; l.off; l.len ] | L l -> [ l.arr; l.off; l.len; l.py_tags; l.py_ints; l.py_floats ] | O o -> [ o.some; o.v ] | D d -> [ d.vals; d.has ] | NoneV -> []
+let rec flatten = function T t -> [ t ] | L l when l.lty = TList TPythonNumber -> [ l.arr; l.off; l.len; l.ref; l.view ] | L l -> [ l.arr; l.off; l.len; l.py_tags; l.py_ints; l.py_floats; l.ref; l.view ] | O o -> o.some :: flatten o.v | D d -> [ d.vals; d.has; d.ref ] | NoneV -> []
 
-let list_value arr off len (lty : Ir.ty) =
+let list_value ?(view = ff) arr off len ref (lty : Ir.ty) =
   let tags, ints, floats =
     match lty with
     | Ir.TList Ir.TInt -> (const_array (Array (Int, Bool)) tt, arr, const_array (Array (Int, Float64)) (fval 0.0))
     | Ir.TList (Ir.TReal | Ir.TFloat32) -> (const_array (Array (Int, Bool)) ff, const_array (Array (Int, Int)) zero, arr)
     | _ -> (const_array (Array (Int, Bool)) ff, const_array (Array (Int, Int)) zero, const_array (Array (Int, Float64)) (fval 0.0))
   in
-  { arr; off; len; py_tags = tags; py_ints = ints; py_floats = floats; lty }
+  { arr; off; len; py_tags = tags; py_ints = ints; py_floats = floats; ref; view; lty }
+
+let wrap_reference ty ref h =
+  match ty with
+  | TList elem ->
+    let tag = Printf.sprintf "heap_view_%d" ref.id in
+    L { arr = const (tag ^ ".arr") (Array (Int, sort_of elem)); off = zero; len = Heap.read_len h ref;
+        py_tags = const (tag ^ ".tags") (Array (Int, Bool)); py_ints = const (tag ^ ".ints") (Array (Int, Int));
+        py_floats = const (tag ^ ".floats") (Array (Int, Float64)); ref; view = ff; lty = ty }
+  | TDict (key, value) ->
+    D { vals = const (Printf.sprintf "heap_view_%d.vals" ref.id) (Array (sort_of key, sort_of value));
+        has = const (Printf.sprintf "heap_view_%d.has" ref.id) (Array (sort_of key, Bool)); ref; dty = ty }
+  | _ -> T ref
 
 let numeric_store l index value =
   match l.lty with
@@ -105,21 +116,21 @@ let numeric_store l index value =
     { l with arr = store l.arr index (as_float_to Float64 value); py_tags = store l.py_tags index ff; py_floats = store l.py_floats index (as_float_to Float64 value) }
   | _ -> { l with arr = store l.arr index value }
 
-let ite_val c a b =
+let rec ite_val c a b =
   match (a, b) with
-  | L x, L y -> L { arr = ite c x.arr y.arr; off = ite c x.off y.off; len = ite c x.len y.len; py_tags = ite c x.py_tags y.py_tags; py_ints = ite c x.py_ints y.py_ints; py_floats = ite c x.py_floats y.py_floats; lty = x.lty }
-  | O x, O y -> O { some = ite c x.some y.some; v = ite c x.v y.v; oty = x.oty }
-  | D x, D y -> D { vals = ite c x.vals y.vals; has = ite c x.has y.has; dty = x.dty }
+  | L x, L y -> L { arr = ite c x.arr y.arr; off = ite c x.off y.off; len = ite c x.len y.len; py_tags = ite c x.py_tags y.py_tags; py_ints = ite c x.py_ints y.py_ints; py_floats = ite c x.py_floats y.py_floats; ref = ite c x.ref y.ref; view = ite c x.view y.view; lty = x.lty }
+  | O x, O y -> O { some = ite c x.some y.some; v = ite_val c x.v y.v; oty = x.oty }
+  | D x, D y -> D { vals = ite c x.vals y.vals; has = ite c x.has y.has; ref = ite c x.ref y.ref; dty = x.dty }
   | T x, T y -> T (ite c x y)
   | NoneV, NoneV -> NoneV
   | _ -> raise (Vc_error ("branches disagree on a value's shape", Ir.noloc))
 
-let value_equal a b =
+let rec value_equal a b =
   match (a, b) with
   | T x, T y -> x == y
-  | L x, L y -> x.arr == y.arr && x.off == y.off && x.len == y.len && x.py_tags == y.py_tags && x.py_ints == y.py_ints && x.py_floats == y.py_floats
-  | O x, O y -> x.some == y.some && x.v == y.v
-  | D x, D y -> x.vals == y.vals && x.has == y.has
+  | L x, L y -> x.ref == y.ref
+  | O x, O y -> x.some == y.some && value_equal x.v y.v
+  | D x, D y -> x.ref == y.ref
   | NoneV, NoneV -> true
   | _ -> false
 
@@ -136,17 +147,27 @@ let rec default_term (s : sort) =
   | Opaque -> const "opaque!default" Opaque
   | Unit -> zero
 
+let rec default_value (ty : Ir.ty) =
+  pack ty (List.map (fun (_, s) -> default_term s) (components ty))
+
+let rec valid_container_facts v (ty : Ir.ty) =
+  match (ty, v) with
+  | TList _, L l -> [ le zero l.len ]
+  | TOption inner, O o ->
+    let facts = valid_container_facts o.v inner in
+    if facts = [] then [] else [ implies o.some (and_ facts) ]
+  | _ -> []
+
 (* lift a plain value into an optional slot: None -> absent, x -> present x *)
 let coerce v (ty : Ir.ty option) =
   match (ty, v) with
   (* an empty [] / {} takes the type of the variable it is stored in *)
-  | Some (TList e as lty), L l when l.lty = TList TNone && e <> TNone -> L (list_value (const_array (Array (Int, sort_of e)) (default_term (sort_of e))) zero l.len lty)
+  | Some (TList e as lty), L l when l.lty = TList TNone && e <> TNone -> L (list_value ~view:l.view (const_array (Array (Int, sort_of e)) (default_term (sort_of e))) zero l.len l.ref lty)
   | Some (TDict (k, vt) as dty), D d when (match d.dty with TDict (TNone, _) -> true | _ -> false) && k <> TNone ->
     let ks = sort_of k and vs = sort_of vt in
-    D { vals = const_array (Array (ks, vs)) (default_term vs); has = const_array (Array (ks, Bool)) ff; dty }
-  | Some (TOption inner as oty), NoneV -> O { some = ff; v = default_term (sort_of inner); oty }
-  | Some (TOption _ as oty), T t -> O { some = tt; v = t; oty }
-  | Some (TOption _), (L _ | D _) -> raise (Vc_error ("optional containers are not supported yet", Ir.noloc))
+    D { vals = const_array (Array (ks, vs)) (default_term vs); has = const_array (Array (ks, Bool)) ff; ref = d.ref; dty }
+  | Some (TOption inner as oty), NoneV -> O { some = ff; v = default_value inner; oty }
+  | Some (TOption _ as oty), ((T _ | L _ | D _ | O _) as value) -> O { some = tt; v = value; oty }
   | _ -> v
 
 let rec ty_str (t : Ir.ty) =
@@ -214,6 +235,7 @@ type finfo = {
 type classinfo = {
   cname : string;
   cmod : string;  (** the module the class lives in (its invariants resolve there) *)
+  language : string;
   cfields : (string * Ir.ty) list;
   cinvs : Ir.clause list;
   init : string option;  (** key of Cls.__init__, its own or inherited *)
@@ -231,6 +253,7 @@ type program = {
   allocates : (string, unit) Hashtbl.t;
   hands_out : (string, unit) Hashtbl.t;  (** may hand a checked object to unchecked code *)
   def_heap : (string, string list) Hashtbl.t;  (** definitional key -> heap keys its body reads *)
+  field_slots : (string * string * int) list;
   by_name : (string, classinfo) Hashtbl.t;  (** classes by name *)
   hkeys : (string * string, (string * sort) list option) Hashtbl.t;  (** heap_keys, memoized (None: not modelled) *)
 }
@@ -347,7 +370,11 @@ let fresh g base (ty : Ir.ty) ?len () =
   | TList e ->
     let arr = const (Printf.sprintf "%s@%d.arr" base n) (Array (Int, sort_of e)) in
     let ln = match len with Some l -> l | None -> const (Printf.sprintf "%s@%d.len" base n) Int in
-    L { arr; off = zero; len = ln; py_tags = const (Printf.sprintf "%s@%d.py_tags" base n) (Array (Int, Bool)); py_ints = const (Printf.sprintf "%s@%d.py_ints" base n) (Array (Int, Int)); py_floats = const (Printf.sprintf "%s@%d.py_floats" base n) (Array (Int, Float64)); lty = ty }
+    L { arr; off = zero; len = ln; py_tags = const (Printf.sprintf "%s@%d.py_tags" base n) (Array (Int, Bool)); py_ints = const (Printf.sprintf "%s@%d.py_ints" base n) (Array (Int, Int)); py_floats = const (Printf.sprintf "%s@%d.py_floats" base n) (Array (Int, Float64)); ref = const (Printf.sprintf "%s@%d.ref" base n) Int; view = ff; lty = ty }
+  | TDict _ ->
+    let ks = match ty with TDict (k, _) -> sort_of k | _ -> Int in
+    let vt = match ty with TDict (_, v) -> sort_of v | _ -> Int in
+    D { vals = const (Printf.sprintf "%s@%d.vals" base n) (Array (ks, vt)); has = const (Printf.sprintf "%s@%d.has" base n) (Array (ks, Bool)); ref = const (Printf.sprintf "%s@%d.ref" base n) Int; dty = ty }
   | TNone -> NoneV
   | t -> (
     match components t with
@@ -356,7 +383,8 @@ let fresh g base (ty : Ir.ty) ?len () =
 
 let param_val name (ty : Ir.ty) =
   match ty with
-  | TList e -> L { arr = const (name ^ ".arr") (Array (Int, sort_of e)); off = zero; len = const (name ^ ".len") Int; py_tags = const (name ^ ".py_tags") (Array (Int, Bool)); py_ints = const (name ^ ".py_ints") (Array (Int, Int)); py_floats = const (name ^ ".py_floats") (Array (Int, Float64)); lty = ty }
+  | TList e -> L { arr = const (name ^ ".arr") (Array (Int, sort_of e)); off = zero; len = const (name ^ ".len") Int; py_tags = const (name ^ ".py_tags") (Array (Int, Bool)); py_ints = const (name ^ ".py_ints") (Array (Int, Int)); py_floats = const (name ^ ".py_floats") (Array (Int, Float64)); ref = const (name ^ ".ref") Int; view = ff; lty = ty }
+  | TDict (k, v) -> D { vals = const (name ^ ".vals") (Array (sort_of k, sort_of v)); has = const (name ^ ".has") (Array (sort_of k, Bool)); ref = const (name ^ ".ref") Int; dty = ty }
   | TNone -> NoneV
   | t -> (
     match components t with
@@ -376,6 +404,8 @@ let ends_with x s = String.length s >= String.length x && String.sub s (String.l
 let is_heap k = String.length k > 0 && k.[0] = '@'
 let heap_env env = SM.filter (fun k _ -> is_heap k) env
 
+let current_heap ctx = match SM.find_opt "@heap" (cur_env ctx) with Some (T h) -> Some h | _ -> None
+
 (* -- the heap: one map per class field (per component), keyed by reference *)
 
 let field_type g cls fname =
@@ -385,6 +415,70 @@ let field_type g cls fname =
 
 (* subclasses keep inherited fields where the base class does *)
 let field_owner g cls fname = match class_of g cls with Some c -> (match List.assoc_opt fname c.owner with Some o -> o | None -> cls) | None -> cls
+
+let field_slot g cls fname =
+  let owner = match class_of g cls with
+    | Some c when c.language = "python" || c.language = "typescript" -> "property"
+    | Some c -> field_owner g cls fname
+    | None -> raise (Vc_error ("unknown class " ^ cls, Ir.noloc))
+  in
+  match List.find_opt (fun (namespace, name, _) -> namespace = owner && name = fname) g.prog.field_slots with
+  | Some (_, _, slot) -> int_ slot
+  | None -> raise (Vc_error (Printf.sprintf "missing field slot %s.%s" owner fname, Ir.noloc))
+
+let record_field_slot g schema fname =
+  let record_owner = "record:" ^ schema in
+  let namespace = if List.exists (fun (owner, name, _) -> owner = record_owner && name = fname) g.prog.field_slots then record_owner else "property" in
+  match List.find_opt (fun (owner, name, _) -> owner = namespace && name = fname) g.prog.field_slots with
+  | Some (_, _, slot) -> int_ slot
+  | None -> raise (Vc_error (Printf.sprintf "missing record field slot %s.%s" schema fname, Ir.noloc))
+
+let rec project_record g h name fields ref =
+  mkrec (sort_of (TRecord (name, fields)))
+    (List.map (fun (fname, fty) ->
+       term_of Ir.noloc (unbox_value g (Heap.read_field h ref (record_field_slot g name fname)) fty h)) fields)
+
+and unbox_value g boxed ty h =
+  match ty with
+  | TOption inner ->
+    let some = not_ (eq (field boxed "tag") (int_ 0)) in
+    O { some; v = unbox_value g boxed inner h; oty = ty }
+  | TList elem ->
+    let ref = Heap.unbox boxed ty in
+    let i = const (Printf.sprintf "heap.unbox.list.%d.%d" ref.id h.id) Int in
+    let arr = array_lambda i (term_of Ir.noloc (unbox_value g (Heap.read_list h ref i) elem h)) in
+    let len = Heap.read_len h ref in
+    let tags, ints, floats =
+      if elem = TInt then
+        (const_array (Array (Int, Bool)) tt, arr, const_array (Array (Int, Float64)) (fval 0.0))
+      else if elem = TReal && g.info.language <> "python" then
+        (const_array (Array (Int, Bool)) ff, const_array (Array (Int, Int)) zero, arr)
+      else if g.info.language = "python" && elem = TReal then begin
+        let j = const (Printf.sprintf "heap.unbox.tags.%d.%d" ref.id h.id) Int in
+        let pybox = Heap.read_list h ref j in
+        let tag = field pybox "tag" and py = field pybox "python_number" in
+        let is_py = eq tag (int_ Heap.python_number_tag) in
+        let is_int = or_ [ eq tag (int_ Heap.integer_tag); eq tag (int_ Heap.boolean_tag); and_ [ is_py; field py "is_int" ] ] in
+        let int_value = ite (eq tag (int_ Heap.boolean_tag)) (ite (field pybox "boolean") one zero) (ite is_py (field py "integer") (field pybox "integer")) in
+        let float_value = ite is_py (field py "floating") (field pybox "real") in
+        (array_lambda j is_int, array_lambda j int_value, array_lambda j float_value)
+      end else
+        (const_array (Array (Int, Bool)) ff, const_array (Array (Int, Int)) zero, const_array (Array (Int, Float64)) (fval 0.0))
+    in
+    L { arr; off = zero; len; py_tags = tags; py_ints = ints; py_floats = floats; ref; view = ff; lty = ty }
+  | TDict (key_ty, value_ty) ->
+    let ref = Heap.unbox boxed ty in
+    let key_index = const (Printf.sprintf "heap.unbox.dict.%d.%d" ref.id h.id) (sort_of key_ty) in
+    let key, _ = Heap.canonical_key key_index key_ty g.info.language in
+    let vals = array_lambda key_index (term_of Ir.noloc (unbox_value g (Heap.read_dict h ref key) value_ty h)) in
+    let has = array_lambda key_index (Heap.has_dict h ref key) in
+    D { vals; has; ref; dty = ty }
+  | TRecord (name, fields) -> T (project_record g h name fields (Heap.unbox boxed ty))
+  | _ -> T (Heap.unbox boxed ty)
+
+let class_tag g cls =
+  let names = List.map (fun c -> c.cname) g.prog.classes |> List.sort_uniq compare in
+  match List.find_index (( = ) cls) names with Some i -> int_ (i + 1) | None -> int_ 0
 
 (* A field telic cannot model has no maps: only code that reads or writes it
    ([strict]) fails. *)
@@ -415,11 +509,115 @@ let mro g cls =
 
 let in_hierarchy g cls = (match class_of g cls with Some c -> c.cbases <> [] | None -> false) || List.exists (fun c -> List.mem cls c.cbases) g.prog.classes
 
-let heap_read g env cls fname r =
-  pack (field_type g cls fname) (List.map (fun (k, _) -> match SM.find_opt k env with Some (T m) -> select m r | _ -> raise (Vc_error ("heap map " ^ k ^ " missing", Ir.noloc))) (heap_keys ~strict:true g cls fname))
+let rec accepts_view g h ty boxed =
+  let cell ref = Heap.cell_at h ref in
+  let compatible_class cls c =
+    let actual = List.map (fun c -> c.cname) g.prog.classes in
+    List.filter_map (fun actual -> if List.mem cls (mro g actual) then Some (eq (field c "class") (class_tag g actual)) else None) actual
+  in
+  let raw_ok = Heap.accepts boxed ty in
+  match ty with
+  | TOption inner ->
+    let none = eq (field boxed "tag") (int_ 0) in
+    or_ [ none; accepts_view g h inner boxed ]
+  | TList _ | TDict _ | TRecord _ | TClass _ ->
+    let ref = Heap.unbox boxed ty in
+    let c = cell ref in
+    let allocated = field c "allocated" in
+    let kind = field c "kind" in
+    let representation, contents = match ty with
+      | TList elem ->
+        let i = const (Printf.sprintf "heap.list.type.%d.%d" ref.id h.id) Int in
+        let item = Heap.read_list h ref i in
+        (eq kind (int_ 1), quant "forall" [ i ]
+           (implies (and_ [ le zero i; lt i (Heap.read_len h ref) ]) (accepts_view g h elem item)) [ [| item |] ])
+      | TDict (_, elem) ->
+        let key = const (Printf.sprintf "heap.dict.type.%d.%d" ref.id h.id) Heap.key in
+        let item = Heap.read_dict h ref key in
+        (eq kind (int_ 2), quant "forall" [ key ] (implies (Heap.has_dict h ref key) (accepts_view g h elem item)) [ [| item |] ])
+      | TRecord (name, fields) ->
+        let structural = g.info.language = "typescript" in
+        (or_ [ eq kind (int_ 3); if structural then eq kind (int_ 4) else ff ],
+         and_ (List.map (fun (fname, fty) -> accepts_view g h fty (Heap.read_field h ref (record_field_slot g name fname))) fields))
+      | TClass cls ->
+        let structural = g.info.language = "typescript" in
+        let class_kind = and_ [ eq kind (int_ 4); or_ (compatible_class cls c) ] in
+        (or_ [ class_kind; if structural then eq kind (int_ 3) else ff ], tt)
+      | _ -> (ff, ff)
+    in
+    and_ [ raw_ok; allocated; representation; contents ]
+  | _ -> raw_ok
 
-let heap_write g (env : value SM.t) cls fname r v =
-  List.fold_left2 (fun env (k, _) comp -> match SM.find_opt k env with Some (T m) -> SM.add k (T (store m r comp)) env | _ -> env) env (heap_keys ~strict:true g cls fname) (flatten v)
+let dict_views g h d =
+  match d.dty with
+  | TDict (key_ty, value_ty) ->
+    let key_index = const (Printf.sprintf "heap.dict.key.%d.%d" d.ref.id h.id) (sort_of key_ty) in
+    let key, _ = Heap.canonical_key key_index key_ty g.info.language in
+    let has = array_lambda key_index (Heap.has_dict h d.ref key) in
+    let boxed = Heap.read_dict h d.ref key in
+    let item = match value_ty with
+      | TRecord (name, fields) -> project_record g h name fields (Heap.unbox boxed value_ty)
+      | TOption inner ->
+        let some = not_ (eq (field boxed "tag") (int_ 0)) in
+        let value = match inner with
+          | TRecord (name, fields) -> project_record g h name fields (Heap.unbox boxed inner)
+          | _ -> Heap.unbox boxed inner
+        in
+        mkrec (field_sort value_ty) [ some; value ]
+      | _ -> Heap.unbox boxed value_ty
+    in
+    { d with vals = array_lambda key_index item; has }
+  | _ -> d
+
+let refresh_list_view g _st h l =
+  let elem = match l.lty with TList t -> t | _ -> TNone in
+  let i = const (Printf.sprintf "heap.view.i.%d.%d" l.ref.id h.id) Int in
+  let boxed = Heap.read_list h l.ref i in
+  let item =
+    match elem with
+    | TRecord (name, fields) -> project_record g h name fields (Heap.unbox boxed elem)
+    | _ -> Heap.unbox boxed elem
+  in
+  let arr = array_lambda i item in
+  let tags, ints, floats =
+    if g.info.language = "python" && elem = TReal then begin
+      let tags_i = const (Printf.sprintf "heap.view.tags.i.%d.%d" l.ref.id h.id) Int in
+      let ints_i = const (Printf.sprintf "heap.view.ints.i.%d.%d" l.ref.id h.id) Int in
+      let floats_i = const (Printf.sprintf "heap.view.floats.i.%d.%d" l.ref.id h.id) Int in
+      let tag = field boxed "tag" in
+      let py = field boxed "python_number" in
+      let is_python = eq tag (int_ Heap.python_number_tag) in
+      let is_int = or_ [ eq tag (int_ Heap.integer_tag); eq tag (int_ Heap.boolean_tag); and_ [ is_python; field py "is_int" ] ] in
+      let int_value = ite (eq tag (int_ Heap.boolean_tag)) (ite (field boxed "boolean") one zero) (ite is_python (field py "integer") (field boxed "integer")) in
+      let float_value = ite is_python (field py "floating") (field boxed "real") in
+      (array_lambda tags_i is_int, array_lambda ints_i int_value, array_lambda floats_i float_value)
+    end else (l.py_tags, l.py_ints, l.py_floats)
+  in
+  { l with arr; len = ite l.view l.len (Heap.read_len h l.ref); py_tags = tags; py_ints = ints; py_floats = floats }
+
+let rec refresh_value g st h = function
+  | L l -> L (refresh_list_view g st h l)
+  | D d -> D (dict_views g h d)
+  | O o -> O { o with v = refresh_value g st h o.v }
+  | value -> value
+
+let set_current_heap g ctx h =
+  match ctx.state with
+  | Some st ->
+    let env = SM.add "@heap" (T h) st.env in
+    st.env <- SM.mapi (fun _ value -> refresh_value g st h value) env
+  | None -> raise (Fallback "heap mutation outside a live state")
+
+let list_len ctx l = match current_heap ctx with Some h -> ite l.view l.len (Heap.read_len h l.ref) | None -> l.len
+
+let heap_read g env cls fname r =
+  let ty = field_type g cls fname in
+  match SM.find_opt "@heap" env with
+  | Some (T h) ->
+    let boxed = Heap.read_field h r (field_slot g cls fname) in
+    unbox_value g boxed ty h
+  | _ ->
+    pack ty (List.map (fun (k, _) -> match SM.find_opt k env with Some (T m) -> select m r | _ -> raise (Vc_error ("heap map " ^ k ^ " missing", Ir.noloc))) (heap_keys ~strict:true g cls fname))
 
 let all_heap_keys g = List.concat_map (fun c -> List.concat_map (fun (f, _) -> List.map fst (heap_keys g c.cname f)) c.cfields) g.prog.classes
 let same_scc g a b = a = b || List.mem b (finfo_of g a).scc
@@ -444,6 +642,143 @@ let require_python_float_at g ctx l index loc =
   match (g.info.language, l.lty) with
   | "python", Ir.TList Ir.TReal -> oblige g "numeric" ctx (not_ (select l.py_tags index)) loc "Python list element is a float, not an integer"
   | _ -> ()
+
+let check_heap_kind g ctx ref kind loc what =
+  match current_heap ctx with
+  | None -> ()
+  | Some h ->
+    let c = Heap.cell_at h ref in
+    let valid = and_ [ field c "allocated"; eq (field c "kind") (int_ kind) ] in
+    oblige g "type" ctx valid loc what;
+    assume ctx valid
+
+let read_list_item g ctx l index loc =
+  match current_heap ctx with
+  | None -> T (at (l.arr, l.off) index)
+  | Some h ->
+    check_heap_kind g ctx l.ref 1 loc "list access refers to an allocated list";
+    let boxed = Heap.read_list h l.ref (add l.off index) in
+    let elem = match l.lty with TList t -> t | _ -> TNone in
+    let valid = accepts_view g h elem boxed in
+    oblige g "type" ctx valid loc "list element matches its typed view";
+    assume ctx valid;
+    unbox_value g boxed elem h
+
+let allocate_heap_cell g ctx ref cell loc =
+  match current_heap ctx with
+  | None -> raise (Fallback "heap allocation without a live heap")
+  | Some h ->
+    let h, fresh = Heap.allocate h cell ref in
+    List.iter (fun fact -> oblige g "allocation" ctx fact loc "new container has a fresh heap reference"; assume ctx fact) fresh;
+    set_current_heap g ctx h
+
+let value_ref loc = function L l -> l.ref | D d -> d.ref | T t -> t | _ -> raise (Vc_error ("expected a heap reference", loc))
+
+let rec box_value g ctx loc ty value =
+  match ty, value with
+  | TNone, NoneV -> Heap.box zero TNone
+  | TRecord (name, fields), T raw when raw.sort <> Int ->
+    let ref = const (Printf.sprintf "record@%d.ref" (next g)) Int in
+    let initial = const_array (Array (Int, Heap.value)) (Heap.box zero TNone) in
+    let slots = List.fold_left (fun contents (field_name, field_ty) ->
+      let source = field raw field_name in
+      let field_value = match field_ty with
+        | TOption inner -> O { some = field source "some"; v = T (field source "val"); oty = field_ty }
+        | _ -> T source
+      in
+      let slot = record_field_slot g name field_name in
+      store contents slot (box_value g ctx loc field_ty field_value)) initial fields
+    in
+    let current = match current_heap ctx with Some h -> h | None -> raise (Fallback "record allocation requires a shared heap") in
+    let allocated, fresh = Heap.allocate current (Heap.record_cell slots) ref in
+    List.iter (fun fact -> oblige g "allocation" ctx fact loc "record has a fresh heap reference"; assume ctx fact) fresh;
+    set_current_heap g ctx allocated;
+    Heap.box ref ty
+  | TRecord _, T raw -> Heap.box raw ty
+  | TOption inner, O o ->
+    let present = box_value g ctx loc inner o.v in
+    let absent = Heap.box zero TNone in
+    ite o.some present absent
+  | TOption _, NoneV -> Heap.box zero TNone
+  | _, T raw when g.info.language = "python" ->
+    let runtime_ty = match raw.sort with
+      | Bool -> TBool
+      | Int -> TInt
+      | Float32 -> TFloat32
+      | Float64 -> TReal
+      | Rec ("PythonNumber", _) -> TPythonNumber
+      | _ -> ty
+    in
+    Heap.box raw runtime_ty
+  | _, v -> Heap.box (value_ref loc v) ty
+
+let box_projection_item g (l : lv) index =
+  match l.lty with
+  | TList TReal when g.info.language = "python" ->
+    let raw = ite (select l.py_tags index)
+      (Heap.box (select l.py_ints index) TInt)
+      (Heap.box (select l.py_floats index) TReal)
+    in raw
+  | TList (TOption inner) ->
+    let raw = select l.arr index in
+    let some = field raw "some" in
+    let value = field raw "val" in
+    (match inner with TRecord _ | TList _ | TDict _ -> raise (Fallback "nested optional list materialization requires boxed element witnesses") | _ -> ());
+    ite some (Heap.box value inner) (Heap.box zero TNone)
+  | TList (TRecord _) -> raise (Fallback "record list materialization requires boxed element witnesses")
+  | TList (TList _ | TDict _) -> raise (Fallback "nested list materialization requires boxed element witnesses")
+  | TList elem -> Heap.box (select l.arr index) elem
+  | _ -> raise (Fallback "list materialization requires a list value")
+
+let allocate_list_sequence g ctx loc (l : lv) boxed =
+  allocate_heap_cell g ctx l.ref (Heap.list_cell l.len boxed) loc;
+  match current_heap ctx, ctx.state with
+  | Some h, Some st -> L (refresh_list_view g st h l)
+  | _ -> raise (Fallback "list result allocation requires a shared heap")
+
+let allocate_list_value g ctx loc (l : lv) =
+  let i = const (Printf.sprintf "heap.list.output.%d.index" (next g)) Int in
+  let boxed = array_lambda i (box_projection_item g l i) in
+  allocate_list_sequence g ctx loc l boxed
+
+let copy_list_value g ctx loc (l : lv) off len =
+  match current_heap ctx, ctx.state with
+  | Some h, Some st ->
+    let ref = const (Printf.sprintf "list.copy@%d.ref" (next g)) Int in
+    let i = const (Printf.sprintf "list.copy@%d.i" (next g)) Int in
+    let seq = array_lambda i (Heap.read_list h l.ref (add off i)) in
+    allocate_heap_cell g ctx ref (Heap.list_cell len seq) loc;
+    let copied = { l with ref; off = zero; len; view = ff } in
+    (match current_heap ctx with Some current -> L (refresh_list_view g st current copied) | None -> assert false)
+  | _ -> raise (Fallback "list value copy requires the shared heap")
+
+let copy_dict_value g ctx loc (d : dv) =
+  match current_heap ctx with
+  | Some h ->
+    let ref = const (Printf.sprintf "dict.copy@%d.ref" (next g)) Int in
+    allocate_heap_cell g ctx ref (Heap.cell_at h d.ref) loc;
+    (match current_heap ctx with Some current -> D (dict_views g current { d with ref }) | None -> assert false)
+  | None -> raise (Fallback "dictionary value copy requires the shared heap")
+
+let rec copy_value g ctx loc = function
+  | L l -> copy_list_value g ctx loc l l.off (list_len ctx l)
+  | D d -> copy_dict_value g ctx loc d
+  | O { v = (L _ | D _); _ } when g.info.language = "swift" ->
+    raise (Fallback "copy of an optional Swift container requires a conditional heap transition")
+  | O o -> O { o with v = copy_value g ctx loc o.v }
+  | value -> value
+
+let box_stored_value g ctx loc ty value =
+  let value = if g.info.language = "swift" then copy_value g ctx loc value else value in
+  box_value g ctx loc ty value
+
+let heap_write g ctx (env : value SM.t) cls fname r v =
+  let boxed = box_stored_value g ctx Ir.noloc (field_type g cls fname) v in
+  let env = cur_env ctx in
+  match current_heap ctx with
+  | Some h -> SM.add "@heap" (T (Heap.write_field h r (field_slot g cls fname) boxed)) env
+  | _ ->
+    List.fold_left2 (fun env (k, _) comp -> match SM.find_opt k env with Some (T m) -> SM.add k (T (store m r comp)) env | _ -> env) env (heap_keys ~strict:true g cls fname) (flatten v)
 
 let note g (loc : Ir.loc) text = if not (List.mem (loc.line, text) g.assumptions) then g.assumptions <- (loc.line, text) :: g.assumptions
 let note_assumed g loc text = note g loc ("assumed: " ^ text)
@@ -528,11 +863,11 @@ let rec alloc_facts g v (ty : Ir.ty) env =
   | TEnum (_, ms, _), T t -> [ le zero t; lt t (int_ (List.length ms)) ]
   (* an enum field of a record (a union's tag) is one of its members *)
   | TRecord (_, fs), T t -> List.concat_map (fun (n, (ft : Ir.ty)) -> match ft with TEnum _ | TRecord _ -> alloc_facts g (T (field t n)) ft env | _ -> []) fs
-  | TOption (TEnum (_, ms, _)), O o -> [ implies o.some (and_ [ le zero o.v; lt o.v (int_ (List.length ms)) ]) ]
+  | TOption (TEnum (_, ms, _)), O o -> [ implies o.some (and_ [ le zero (term_of Ir.noloc o.v); lt (term_of Ir.noloc o.v) (int_ (List.length ms)) ]) ]
   | TClass _, T t ->
     let self_ = match SM.find_opt "self" g.entry with Some (T s) -> s == t | _ -> false in
     if is_init g && self_ then [] else [ select (alloc_of env) t ]
-  | TOption (TClass _), O o -> [ implies o.some (select (alloc_of env) o.v) ]
+  | TOption (TClass _), O o -> [ implies o.some (select (alloc_of env) (term_of Ir.noloc o.v)) ]
   | TList (TClass _), L l ->
     let i = const (Printf.sprintf "i!%d" (next g)) Int in
     [ quant "forall" [ i ] (implies (and_ [ le zero i; lt i l.len ]) (select (alloc_of env) (at (l.arr, l.off) i))) [ [| at (l.arr, l.off) i |] ] ]
@@ -613,6 +948,7 @@ let rec first_select_on r (t : term) =
   match t.node with
   | App ("select", [| _; i |]) when i == r -> Some t
   | App (_, xs) | Fn (_, xs) -> Array.fold_left (fun acc x -> match acc with Some _ -> acc | None -> first_select_on r x) None xs
+  | ArrayLambda (_, body) -> first_select_on r body
   | Quant (_, _, b, _) -> first_select_on r b
   | _ -> None
 
@@ -621,7 +957,32 @@ let rec ev g ctx (e : Ir.expr) : value =
   let tm x = term_of loc x in
   match e.e with
   | Lit _ -> lit_value e
-  | Var n -> lookup ctx n loc
+  | Var n ->
+    let value = lookup ctx n loc in
+    (match current_heap ctx with
+     | None -> value
+     | Some h ->
+       let value = refresh_value g ctx h value in
+       let check_list l =
+         let i = const (Printf.sprintf "heap.view.check.%d.%d" l.ref.id h.id) Int in
+         let elem = match l.lty with TList t -> t | _ -> TNone in
+         let boxed = Heap.read_list h l.ref (add l.off i) in
+         let valid = quant "forall" [ i ] (implies (and_ [ le zero i; lt i l.len ]) (accepts_view g h elem boxed)) [ [| boxed |] ] in
+         oblige g "type" ctx valid loc "list contents match their typed view";
+         assume ctx valid
+       in
+       let check_dict d = match d.dty with
+         | TDict (_, value_ty) ->
+           let key = const (Printf.sprintf "heap.dict.check.%d.%d" d.ref.id h.id) Heap.key in
+           let boxed = Heap.read_dict h d.ref key in
+           let valid = quant "forall" [ key ] (implies (Heap.has_dict h d.ref key) (accepts_view g h value_ty boxed)) [ [| boxed |] ] in
+           oblige g "type" ctx valid loc "dictionary values match their typed view";
+           assume ctx valid
+         | _ -> ()
+       in
+       let rec check = function L l -> check_list l | D d -> check_dict d | O o -> check o.v | _ -> () in
+       check value;
+       value)
   | Result -> ( match ctx.result with Some r -> r | None -> raise (Vc_error ("'result' is not available here", loc)))
   | Old x -> (
     match ctx.old_env with
@@ -715,24 +1076,66 @@ let rec ev g ctx (e : Ir.expr) : value =
   | Index (s, i, wrap) -> (
     match ev g ctx s with
     | D d ->
-      let k = tm (ev g ctx i) in
-      oblige g "key" ctx (select d.has k) loc (Printf.sprintf "key looked up in '%s' is present" (expr_name s));
-      let v = T (select d.vals k) in
+      let raw_key = tm (ev g ctx i) in
+      let key_ty = match d.dty with TDict (k, _) -> k | _ -> TNone in
+      let k, admissible = Heap.canonical_key raw_key key_ty g.info.language in
+      oblige g "key" ctx admissible loc "dictionary key uses supported source equality";
+      assume ctx admissible;
+      let v = match current_heap ctx with
+        | Some h ->
+          check_heap_kind g ctx d.ref 2 loc "dictionary access refers to an allocated dictionary";
+          oblige g "key" ctx (Heap.has_dict h d.ref k) loc (Printf.sprintf "key looked up in '%s' is present" (expr_name s));
+          let boxed = Heap.read_dict h d.ref k in
+          let value_ty = match d.dty with TDict (_, v) -> v | _ -> TNone in
+          let valid = accepts_view g h value_ty boxed in
+          oblige g "type" ctx valid loc "dictionary value matches its typed view";
+          assume ctx valid;
+          unbox_value g boxed value_ty h
+        | None ->
+          oblige g "key" ctx (select d.has raw_key) loc (Printf.sprintf "key looked up in '%s' is present" (expr_name s));
+          T (select d.vals raw_key)
+      in
       assume_held g ctx v e.ty;
       v
     | L l ->
       let i = tm (ev g ctx i) in
-      let j = index_of g (l.arr, l.off, l.len) i wrap ctx loc (expr_name s) in
+      let len = list_len ctx l in
+      let j = index_of g (l.arr, l.off, len) i wrap ctx loc (expr_name s) in
       require_python_float_at g ctx l (add l.off j) loc;
-      let v = T (at (l.arr, l.off) j) in
+      let v = read_list_item g ctx l j loc in
       assume_held g ctx v e.ty;
       v
     | _ -> raise (Vc_error ("indexing a non-list", loc)))
   | Field (o, f) -> (
-    let obj = tm (ev g ctx o) in
+    let obj_value = ev g ctx o in
+    let obj = tm obj_value in
     match o.ty with
+    | TRecord (schema, fields) when obj.sort = Int ->
+      let h = match current_heap ctx with Some h -> h | None -> raise (Fallback "record field read requires the shared heap") in
+      let cell = Heap.cell_at h obj in
+      let record_kind = eq (field cell "kind") (int_ 3) in
+      let structural = if g.info.language = "typescript" then eq (field cell "kind") (int_ 4) else ff in
+      let valid = and_ [ field cell "allocated"; or_ [ record_kind; structural ] ] in
+      oblige g "type" ctx valid loc "record field access uses an allocated compatible value";
+      assume ctx valid;
+      if not (List.mem_assoc f fields) then raise (Vc_error (Printf.sprintf "record has no field '%s'" f, loc));
+      let boxed = Heap.read_field h obj (record_field_slot g schema f) in
+          let accepted = accepts_view g h e.ty boxed in
+      oblige g "type" ctx accepted loc (Printf.sprintf "record field can be viewed as %s" (ty_str e.ty));
+      assume ctx accepted;
+      unbox_value g boxed e.ty h
     | TClass cls ->
       let env = match ctx.state with Some st -> st.env | None -> ctx.env in
+      (match SM.find_opt "@heap" env with
+       | Some (T h) ->
+         let cell = Heap.cell_at h obj in
+         let compatible = List.filter_map (fun actual -> if List.mem cls (mro g actual) then Some (eq (field cell "class") (class_tag g actual)) else None) (List.map (fun c -> c.cname) g.prog.classes) in
+         let class_match = and_ [ eq (field cell "kind") (int_ 4); or_ compatible ] in
+         let structural = if g.info.language = "typescript" then eq (field cell "kind") (int_ 3) else ff in
+         let valid = and_ [ field cell "allocated"; or_ [ class_match; structural ] ] in
+         oblige g "type" ctx valid loc "field access uses an allocated compatible object";
+         assume ctx valid
+       | _ -> ());
       let v = heap_read g env cls f obj in
       (* the heap holds only allocated objects *)
       (match (ctx.state, e.ty) with
@@ -741,14 +1144,14 @@ let rec ev g ctx (e : Ir.expr) : value =
       v
     | _ -> (
       let raw = field obj f in
-      match e.ty with TOption _ -> O { some = field raw "some"; v = field raw "val"; oty = e.ty } | _ -> T raw))
+      match e.ty with TOption _ -> O { some = field raw "some"; v = T (field raw "val"); oty = e.ty } | _ -> T raw))
   | RecordLit fs ->
     let ftys = match e.ty with TRecord (_, ftys) -> ftys | _ -> raise (Vc_error ("record literal of a non-record type", loc)) in
     let vals =
       List.map
         (fun ((_, fty), (_, x)) ->
           match coerce (ev g ctx x) (Some fty) with
-          | O o -> mkrec (field_sort fty) [ o.some; o.v ]
+          | O o -> mkrec (field_sort fty) [ o.some; term_of loc o.v ]
           | v -> tm v)
         (zip ftys fs)
     in
@@ -758,8 +1161,16 @@ let rec ev g ctx (e : Ir.expr) : value =
     let ty = match e.ty with TList TNone -> Ir.TList TInt | t -> t in
     let base = match fresh g "lit" ty ~len:zero () with L l -> l | _ -> assert false in
     let arr = ref base.arr in
-    List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) elems;
-    L (list_value !arr zero (int_ (List.length elems)) e.ty)
+    let values = ref [] in
+    List.iteri (fun i x ->
+      let value = ev g ctx x in
+      values := !values @ [ value ];
+      arr := store !arr (int_ i) (tm value)) elems;
+    let seq = ref (const_array (Array (Int, Heap.value)) (Heap.box zero TNone)) in
+    let elem_ty = match ty with TList t -> t | _ -> TNone in
+    List.iteri (fun i value -> seq := store !seq (int_ i) (box_stored_value g ctx loc elem_ty value)) !values;
+    allocate_heap_cell g ctx base.ref (Heap.list_cell (int_ (List.length elems)) !seq) loc;
+    L (list_value !arr zero (int_ (List.length elems)) base.ref e.ty)
   | Quant q when (not ctx.spec) && effectful g q.body ->
     (* an unknown truth value; the body's obligations and effects for every element *)
     let n = next g in
@@ -826,8 +1237,8 @@ and equal g a b =
     let same = forall [ i ] (implies (and_ [ le zero i; lt i x.len ]) (eq (at (x.arr, x.off) i) (at (y.arr, y.off) i))) in
     and_ [ eq x.len y.len; same ]
   | O o, NoneV | NoneV, O o -> not_ o.some
-  | O x, O y -> and_ [ eq x.some y.some; implies x.some (eq x.v y.v) ]
-  | O o, T t | T t, O o -> and_ [ o.some; eq o.v t ]
+  | O x, O y -> and_ [ eq x.some y.some; implies x.some (equal g x.v y.v) ]
+  | O o, T t | T t, O o -> and_ [ o.some; equal g o.v (T t) ]
   | D _, _ | _, D _ -> raise (Vc_error ("comparing whole dicts with == is not supported", Ir.noloc))
   | T x, T y -> rec_equal x y
   | NoneV, NoneV -> tt
@@ -878,7 +1289,7 @@ and builtin g ctx (e : Ir.expr) name args =
   | "py_mixed_list" ->
     let arr = ref (const_array (Array (Int, sort_of TPythonNumber)) (default_term (sort_of TPythonNumber))) in
     List.iteri (fun i x -> arr := store !arr (int_ i) (tm (ev g ctx x))) args;
-    L (list_value !arr zero (int_ (List.length args)) e.ty)
+    L (list_value !arr zero (int_ (List.length args)) (const (Printf.sprintf "py_mixed_list@%d.ref" (next g)) Int) e.ty)
   | "py_number" ->
     let x = List.hd args in
     let v = tm (ev g ctx x) in
@@ -899,8 +1310,9 @@ and builtin g ctx (e : Ir.expr) name args =
      | TNone -> NoneV
      | t ->
        let r = fresh g "comprehension" t () in
-       (match r with L l -> assume ctx (le zero l.len) | _ -> ());
-       r)
+       (match r with
+        | L l -> assume ctx (le zero l.len); allocate_list_value g ctx loc l
+        | _ -> r))
   | "range_list" ->
     let lo, hi = match args with [ a; b ] -> (tm (ev g ctx a), tm (ev g ctx b)) | _ -> raise (Vc_error ("range_list takes two bounds", loc)) in
     let n = next g in
@@ -908,7 +1320,8 @@ and builtin g ctx (e : Ir.expr) name args =
     let k = const (Printf.sprintf "i!%d" n) Int in
     let ln = max_ (Term.sub hi lo) zero in
     assume ctx (quant "forall" [ k ] (implies (and_ [ le zero k; lt k ln ]) (eq (select arr k) (add lo k))) [ [| select arr k |] ]);
-    L (list_value arr zero ln e.ty)
+    let value = list_value arr zero ln (const (Printf.sprintf "range@%d.ref" n) Int) e.ty in
+    allocate_list_value g ctx loc value
   | "list_repeat" ->
     let xs, k = match args with [ a; b ] -> (ev g ctx a, tm (ev g ctx b)) | _ -> raise (Vc_error ("list_repeat takes a list and a count", loc)) in
     let xs = match xs with L l -> l | _ -> raise (Vc_error ("list_repeat of a non-list", loc)) in
@@ -919,13 +1332,21 @@ and builtin g ctx (e : Ir.expr) name args =
     in
     let n = next g in
     let arr, assume = defined_symbol ctx (Printf.sprintf "rep@%d.arr" n) (sort_of xs.lty) in
+    let repeat_ref = const (Printf.sprintf "rep@%d.ref" n) Int in
+    let materialize_repeat len =
+      let h = match current_heap ctx with Some h -> h | None -> raise (Fallback "list repetition requires the shared heap") in
+      let i = const (Printf.sprintf "rep@%d.heap_index" n) Int in
+      let source = if width = 0 then zero else add xs.off (emod i (int_ width)) in
+      let item = if width = 0 then Heap.box zero TNone else Heap.read_list h xs.ref source in
+      allocate_list_sequence g ctx loc (list_value arr zero len repeat_ref xs.lty) (array_lambda i item)
+    in
     if xs.lty = TList TPythonNumber then begin
       let i = const (Printf.sprintf "i!%d" n) Int in
       let ln = mul (int_ width) (max_ k zero) in
       let src_i = add xs.off (emod i (int_ width)) in
       let rng = and_ [ le zero i; lt i ln ] in
       assume ctx (quant "forall" [ i ] (implies rng (eq (select arr i) (select xs.arr src_i))) [ [| select arr i |] ]);
-      L (list_value arr zero ln xs.lty)
+      materialize_repeat ln
     end else begin
     let tags, assume_tags = defined_symbol ctx (Printf.sprintf "rep@%d.py_tags" n) (Array (Int, Bool)) in
     let ints, assume_ints = defined_symbol ctx (Printf.sprintf "rep@%d.py_ints" n) (Array (Int, Int)) in
@@ -938,31 +1359,43 @@ and builtin g ctx (e : Ir.expr) name args =
     List.iter2 (fun out (src, define) ->
       define ctx (quant "forall" [ i ] (implies rng (eq (select out i) (select src src_i))) [ [| select out i |] ])
     ) [ tags; ints; floats ] [ (xs.py_tags, assume_tags); (xs.py_ints, assume_ints); (xs.py_floats, assume_floats) ];
-    L { arr; off = zero; len = ln; py_tags = tags; py_ints = ints; py_floats = floats; lty = xs.lty }
+      materialize_repeat ln
     end
   | "threw" -> threw g ctx (List.hd args)
   | "dict_lit" when (match e.ty with TDict (TNone, _) -> true | _ -> false) ->
-    D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; dty = e.ty }
+    let ref = const (Printf.sprintf "dict@%d.ref" (next g)) Int in
+    allocate_heap_cell g ctx ref (Heap.dict_cell ()) loc;
+    D { vals = const_array (Array (Int, Int)) zero; has = const_array (Array (Int, Bool)) ff; ref; dty = e.ty }
   | "dict_lit" ->
     let kt, vt = match e.ty with TDict (k, v) -> (k, v) | _ -> raise (Vc_error ("dict literal of a non-dict type", loc)) in
     let ks = sort_of kt and vs = sort_of vt in
     let vals = ref (const_array (Array (ks, vs)) (default_term vs)) and has = ref (const_array (Array (ks, Bool)) ff) in
+    let ref = const (Printf.sprintf "dict@%d.ref" (next g)) Int in
+    allocate_heap_cell g ctx ref (Heap.dict_cell ()) loc;
     let rec pairs = function
       | k :: v :: rest ->
-        let k = tm (ev g ctx k) in
-        let v = tm (coerce (ev g ctx v) (Some vt)) in
-        vals := store !vals k v;
-        has := store !has k tt;
+        let raw_key = tm (ev g ctx k) in
+        let key, admissible = Heap.canonical_key raw_key kt g.info.language in
+        oblige g "key" ctx admissible loc "dictionary key uses supported source equality";
+        assume ctx admissible;
+        let value = coerce (ev g ctx v) (Some vt) in
+        let raw_value = term_of loc value in
+        vals := store !vals raw_key raw_value;
+        has := store !has raw_key tt;
+        let boxed_value = box_stored_value g ctx loc vt value in
+        (match current_heap ctx with Some h -> set_current_heap g ctx (Heap.write_dict h ref key (Heap.box raw_key kt) boxed_value) | None -> ());
         pairs rest
       | _ -> ()
     in
     pairs args;
-    D { vals = !vals; has = !has; dty = e.ty }
+    D { vals = !vals; has = !has; ref; dty = e.ty }
   | _ -> (
     (match (name, ctx.state) with "await", Some st when not ctx.spec -> check_objects g ~guard:ctx.guard st.facts st.env loc "at the await" | _ -> ());
     let vals = List.map (ev g ctx) args in
     let lst = function L l -> l | _ -> raise (Vc_error ("builtin on a non-list: " ^ name, loc)) in
     let dct = function D d -> d | _ -> raise (Vc_error ("builtin on a non-dict: " ^ name, loc)) in
+    let copy_list (l : lv) off len = match copy_list_value g ctx loc l off len with L copied -> copied | _ -> assert false in
+    let copy_dict (d : dv) = copy_dict_value g ctx loc d in
     let dval d = match d.dty with TDict (_, v) -> v | _ -> assert false in
     let dkey d = match d.dty with TDict (k, _) -> k | _ -> assert false in
     let flat_rest = List.concat_map flatten (List.tl vals) in
@@ -973,7 +1406,7 @@ and builtin g ctx (e : Ir.expr) name args =
       match o with
       | O o ->
         oblige g "none" ctx o.some loc (Printf.sprintf "'%s' is not None here" (expr_name (List.hd args)));
-        T o.v
+        o.v
       | NoneV ->
         oblige g "none" ctx ff loc (Printf.sprintf "'%s' is not None here" (expr_name (List.hd args)));
         raise (Vc_error ("value is always None here", loc))
@@ -1074,23 +1507,40 @@ and builtin g ctx (e : Ir.expr) name args =
           floats := store !floats index x
         end
       ) items;
-      L { arr = !arr; off = zero; len = int_ (List.length items); py_tags = !tags; py_ints = !ints; py_floats = !floats; lty = e.ty }
+      L { arr = !arr; off = zero; len = int_ (List.length items); py_tags = !tags; py_ints = !ints; py_floats = !floats; ref = const (Printf.sprintf "mixed@%d.ref" n) Int; view = ff; lty = e.ty }
     | ("dict_keys" | "dict_values"), [ d ] ->
       let d = dct d in
       let n = next g in
-      let keys = const (Printf.sprintf "keys@%d" n) (Array (Int, sort_of (dkey d))) in
-      let ln = const (Printf.sprintf "keys@%d.len" n) Int in
-      let i = const (Printf.sprintf "i!%d" n) Int in
-      let rng = and_ [ le zero i; lt i ln ] in
-      assume_ (le zero ln);
-      assume_ (quant "forall" [ i ] (implies rng (select d.has (select keys i))) [ [| select keys i |] ]);
-      if name = "dict_keys" then L (list_value keys zero ln (TList (dkey d)))
-      else begin
-        let vs = const (Printf.sprintf "values@%d" n) (Array (Int, sort_of (dval d))) in
-        let j = const (Printf.sprintf "j!%d" n) Int in
-        assume_ (quant "forall" [ j ] (implies (and_ [ le zero j; lt j ln ]) (eq (select vs j) (select d.vals (select keys j)))) [ [| select vs j |] ]);
-        L (list_value vs zero ln (TList (dval d)))
-      end
+      let out_ty = if name = "dict_keys" then dkey d else dval d in
+      (match current_heap ctx with
+       | Some h ->
+         check_heap_kind g ctx d.ref 2 loc "dictionary iteration refers to an allocated dictionary";
+         let cell = Heap.cell_at h d.ref in
+         let history_len = field cell "key_count" and len = field cell "len" in
+         let seq = const (Printf.sprintf "dict_%s@%d.seq" name n) (Array (Int, Heap.value)) in
+         let j = const (Printf.sprintf "dict_%s@%d.history" name n) Int in
+         let live = select (field cell "key_live") j in
+         let rank = Heap.dict_rank h d.ref j in
+         let key = select (field cell "keys") j in
+         let item = if name = "dict_keys" then Heap.dict_original_key h d.ref j else Heap.read_dict h d.ref key in
+         assume_ (quant "forall" [ j ]
+           (implies (and_ [ le zero j; lt j history_len; live ]) (eq (select seq rank) item))
+           [ [| select seq rank |] ]);
+         let ref = const (Printf.sprintf "dict_%s@%d.ref" name n) Int in
+         allocate_heap_cell g ctx ref (Heap.list_cell len seq) loc;
+         let h = match current_heap ctx with Some h -> h | None -> h in
+         let view = list_value (const (Printf.sprintf "dict_%s@%d.arr" name n) (Array (Int, sort_of out_ty))) zero len ref (TList out_ty) in
+         let view = match ctx.state with Some st -> refresh_list_view g st h view | None -> view in
+         L view
+       | None ->
+         let keys = const (Printf.sprintf "keys@%d" n) (Array (Int, sort_of (dkey d))) in
+         let ln = const (Printf.sprintf "keys@%d.len" n) Int in
+         let i = const (Printf.sprintf "i!%d" n) Int in
+         let rng = and_ [ le zero i; lt i ln ] in
+         assume_ (le zero ln);
+         assume_ (quant "forall" [ i ] (implies rng (select d.has (select keys i))) [ [| select keys i |] ]);
+         let arr = const (Printf.sprintf "dict_%s@%d.arr" name n) (Array (Int, sort_of out_ty)) in
+         L (list_value arr zero ln (const (Printf.sprintf "dict_%s@%d.ref" name n) Int) (TList out_ty)))
     | "checked", [ v; lo; hi; _ ] ->
       let tyname = match List.nth args 3 with { e = Lit (LStr t); _ } -> t | _ -> "integer" in
       let v = tm v in
@@ -1103,16 +1553,25 @@ and builtin g ctx (e : Ir.expr) name args =
       assume_ (and_ [ le (tm lo) v; le v (tm hi) ]);
       T v
     | "same_len", [ xs; r ] -> let a = lst xs and b = lst r in L { b with len = a.len }
-    | "list_copy", [ xs ] -> L (lst xs)
+    | "list_copy", [ xs ] -> let l = lst xs in L (copy_list l l.off (list_len ctx l))
     | "list_concat", [ xs; ys ] ->
       let a = lst xs and b = lst ys in
       let n = next g in
       let arr = const (Printf.sprintf "cat@%d.arr" n) a.arr.sort in
       let ln = add a.len b.len in
       let i = const (Printf.sprintf "i!%d" n) Int and k = const (Printf.sprintf "k!%d" n) Int in
+      let ref = const (Printf.sprintf "cat@%d.ref" n) Int in
+      let materialize_concat l =
+        let h = match current_heap ctx with Some h -> h | None -> raise (Fallback "list concatenation requires the shared heap") in
+        let j = const (Printf.sprintf "cat@%d.heap_index" n) Int in
+        let left = Heap.read_list h a.ref (add a.off j) in
+        let right = Heap.read_list h b.ref (add b.off (sub j a.len)) in
+        let item = ite (lt j a.len) left right in
+        allocate_list_sequence g ctx loc l (array_lambda j item)
+      in
       assume_ (quant "forall" [ i ] (implies (and_ [ le zero i; lt i a.len ]) (eq (select arr i) (at (a.arr, a.off) i))) [ [| select arr i |] ]);
       assume_ (quant "forall" [ k ] (implies (and_ [ le a.len k; lt k ln ]) (eq (select arr k) (at (b.arr, b.off) (sub k a.len)))) [ [| select arr k |] ]);
-      if a.lty = TList TPythonNumber then L (list_value arr zero ln a.lty)
+      if a.lty = TList TPythonNumber then materialize_concat (list_value arr zero ln ref a.lty)
       else begin
       let tags = const (Printf.sprintf "cat@%d.py_tags" n) (Array (Int, Bool)) in
       let ints = const (Printf.sprintf "cat@%d.py_ints" n) (Array (Int, Int)) in
@@ -1127,27 +1586,68 @@ and builtin g ctx (e : Ir.expr) name args =
         let body = implies (and_ [ le a.len k; lt k ln ]) (eq (select out k) (select src (add b.off (sub k a.len)))) in
         assume_ (quant "forall" [ k ] body [ [| select out k |] ])
       ) outs right;
-      L { arr; off = zero; len = ln; py_tags = tags; py_ints = ints; py_floats = floats; lty = a.lty }
+      materialize_concat { arr; off = zero; len = ln; py_tags = tags; py_ints = ints; py_floats = floats; ref; view = ff; lty = a.lty }
       end
-    | "dict_copy", [ d ] -> d
+    | "dict_copy", [ d ] -> copy_dict (dct d)
     | "dict_set", [ d; k; v ] ->
       let d = dct d in
-      let v = tm (coerce v (Some (dval d))) in
-      D { d with vals = store d.vals (tm k) v; has = store d.has (tm k) tt }
-    | "dict_remove", [ d; k ] -> let d = dct d in D { d with has = store d.has (tm k) ff }
+      let raw_key = tm k and kt = dkey d in
+      let key, valid = Heap.canonical_key raw_key kt g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      let value = coerce v (Some (dval d)) in
+      let raw_value = tm value in
+      let boxed_value = box_stored_value g ctx loc (dval d) value in
+      (match current_heap ctx with Some h -> set_current_heap g ctx (Heap.write_dict h d.ref key (Heap.box raw_key kt) boxed_value) | None -> ());
+      (match current_heap ctx with Some h -> D (dict_views g h d) | None -> D { d with vals = store d.vals raw_key raw_value; has = store d.has raw_key tt })
+    | "dict_remove", [ d; k ] ->
+      let d = dct d in
+      let key, valid = Heap.canonical_key (tm k) (dkey d) g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      (match current_heap ctx with Some h -> set_current_heap g ctx (Heap.delete_dict h d.ref key) | None -> ());
+      (match current_heap ctx with Some h -> D (dict_views g h d) | None -> D { d with has = store d.has (tm k) ff })
     | "dict_del", [ d; k ] ->
       let d = dct d in
-      oblige g "key" ctx (select d.has (tm k)) loc (Printf.sprintf "key being deleted from '%s' is present" (expr_name (List.hd args)));
-      D { d with has = store d.has (tm k) ff }
+      let key, valid = Heap.canonical_key (tm k) (dkey d) g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      (match current_heap ctx with
+       | Some h ->
+         oblige g "key" ctx (Heap.has_dict h d.ref key) loc (Printf.sprintf "key being deleted from '%s' is present" (expr_name (List.hd args)));
+         set_current_heap g ctx (Heap.delete_dict h d.ref key)
+       | None -> oblige g "key" ctx (select d.has (tm k)) loc (Printf.sprintf "key being deleted from '%s' is present" (expr_name (List.hd args))));
+      (match current_heap ctx with Some h -> D (dict_views g h d) | None -> D { d with has = store d.has (tm k) ff })
     | ("dict_has" | "dict_get_opt" | "dict_get_or"), d :: k :: rest -> (
       let d = dct d in
-      let has = select d.has (tm k) and v = select d.vals (tm k) in
+      let raw_key = tm k in
+      let canonical, valid = Heap.canonical_key raw_key (dkey d) g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      let has, v = match current_heap ctx with
+        | Some h ->
+          check_heap_kind g ctx d.ref 2 loc "dictionary lookup refers to an allocated dictionary";
+          let has = Heap.has_dict h d.ref canonical in
+          let boxed = Heap.read_dict h d.ref canonical in
+          let vt = dval d in
+          let valid = accepts_view g h vt boxed in
+          oblige g "type" ctx valid loc "dictionary value matches its typed view";
+          assume ctx valid;
+          (has, unbox_value g boxed vt h)
+        | None -> (select d.has raw_key, T (select d.vals raw_key))
+      in
       match (name, rest) with
       | "dict_has", _ -> T has
       | "dict_get_opt", _ -> O { some = has; v; oty = TOption (dval d) }
-      | _, [ dflt ] -> T (ite has v (tm (coerce dflt (Some (dval d)))))
+      | _, [ dflt ] -> ite_val has v (coerce dflt (Some (dval d)))
       | _ -> raise (Vc_error ("dict_get_or needs a default", loc)))
-    | "len", [ xs ] -> T (lst xs).len
+    | "len", [ xs ] ->
+      (match xs, current_heap ctx with
+       | L l, Some _ -> T (list_len ctx l)
+       | D d, Some h -> T (Heap.read_len h d.ref)
+       | L l, None -> T l.len
+       | D d, None -> T (fn "dict.len" [| d.ref |] Int)
+       | _ -> raise (Vc_error ("len on a non-container", loc)))
     | "abs", [ T v ] when v.sort = py_num_sort ->
       let tag, integer, floating = py_parts v in
       T (mkrec py_num_sort [ tag; abs_ integer; fabs floating ])
@@ -1313,15 +1813,31 @@ and builtin g ctx (e : Ir.expr) name args =
       T (exists [ i ] (and_ [ le zero i; lt i l.len; eq (at (l.arr, l.off) i) (tm v) ]))
     | "slice", [ xs; lo; hi ] ->
       let l = lst xs in
-      let n = l.len in
+      let n = list_len ctx l in
       let norm b default = match b with NoneV -> default | b -> let b = tm b in ite (lt b zero) (max_ (add b n) zero) (min_ b n) in
       let lo2 = norm lo zero and hi2 = norm hi n in
-      if (match (lo, hi) with NoneV, NoneV -> true | _ -> false) then L l else L { l with off = add l.off lo2; len = max_ (sub hi2 lo2) zero }
-    | "list_append", [ xs; v ] -> let l = lst xs in L { (numeric_store l (add l.off l.len) (tm v)) with len = add l.len one }
+      if (match (lo, hi) with NoneV, NoneV -> true | _ -> false) && g.info.language = "rust" then L { l with view = tt }
+      else
+        let len = max_ (sub hi2 lo2) zero in
+        if g.info.language = "rust" then L { l with off = add l.off lo2; len; view = tt }
+        else L (copy_list l (add l.off lo2) len)
+    | "list_append", [ xs; v ] ->
+      let l = lst xs in
+      let ty = match l.lty with TList t -> t | _ -> TNone in
+      let value = coerce v (Some ty) in
+      let index = list_len ctx l in
+      let boxed_value = box_stored_value g ctx loc ty value in
+      (match current_heap ctx with Some h -> set_current_heap g ctx (Heap.append_list h l.ref boxed_value) | None -> ());
+      L { (numeric_store l (add l.off index) (tm value)) with len = add index one }
     | "list_set", [ xs; i; v ] ->
       let l = lst xs in
-      let j = index_of g (l.arr, l.off, l.len) (tm i) true ctx loc (expr_name (List.hd args)) in
-      L (numeric_store l (add l.off j) (tm v))
+      let len = list_len ctx l in
+      let j = index_of g (l.arr, l.off, len) (tm i) true ctx loc (expr_name (List.hd args)) in
+      let ty = match l.lty with TList t -> t | _ -> TNone in
+      let value = coerce v (Some ty) in
+      let boxed_value = box_stored_value g ctx loc ty value in
+      (match current_heap ctx with Some h -> set_current_heap g ctx (Heap.write_list h l.ref (add l.off j) boxed_value) | None -> ());
+      L (numeric_store l (add l.off j) (tm value))
     | "str_concat", _ -> T (app "str.++" (Array.of_list (List.map tm vals)) Str)
     | "str_len", [ s ] -> T (app "str.len" [| tm s |] Int)
     | "str_contains", [ a; b ] -> T (app "str.contains" [| tm a; tm b |] Bool)
@@ -1643,12 +2159,13 @@ and comprehension g ctx (e : Ir.expr) seq =
   let rng = and_ [ le zero i; lt i seq.len ] in
   let sub = sub_ctx ~cond:rng { ctx with spec = true } in
   let sub = { sub with bound = SM.add elem (T (at (seq.arr, seq.off) i)) sub.bound } in
-  let result = L (list_value arr zero ln e.ty) in
+  let result = L (list_value arr zero ln (const (Printf.sprintf "comp@%d.ref" n) Int) e.ty) in
   let comp_arr = ref arr in
+  if under then raise (Fallback "comprehension allocation depends on quantified variables");
   if not is_pure then begin
     (* values unknown; obligations and effects as for any element *)
     each_element g ctx e seq;
-    result
+    (match result with L l -> allocate_list_value g ctx loc l | _ -> assert false)
   end
   else begin
     (match cond with
@@ -1670,7 +2187,7 @@ and comprehension g ctx (e : Ir.expr) seq =
                (implies (and_ [ le zero j; lt j seq.len; cj ]) (eq (select arr rank) bj))
                [ [| select arr rank |] ])
         | None -> raise (Fallback "filtered comprehension rank")));
-    L (list_value !comp_arr zero ln e.ty)
+    allocate_list_value g ctx loc (list_value !comp_arr zero ln (const (Printf.sprintf "comp@%d.ref" (next g)) Int) e.ty)
   end
 
 (* how a checked value [v] of type [ty] looks through the operations telic
@@ -1911,6 +2428,7 @@ and new_object g ctx loc cls args =
   g.created <- r :: g.created;
   assume ctx (not_ (select alloc r));
   st.env <- SM.add "@alloc" (T (store alloc r tt)) st.env;
+  allocate_heap_cell g ctx r (Heap.class_cell (class_tag g cls)) loc;
   let check_invariants () =
     List.iter
       (fun ((inv : Ir.clause), t) ->
@@ -1926,7 +2444,7 @@ and new_object g ctx loc cls args =
     if not (String.length k >= String.length own && String.sub k (String.length k - String.length own) (String.length own) = own) then check_invariants ();
     T r
   | None -> (
-    List.iter (fun ((f, _), v) -> st.env <- heap_write g st.env cls f r v) (zip c.cfields vals);
+    List.iter (fun ((f, _), v) -> st.env <- heap_write g ctx st.env cls f r v) (zip c.cfields vals);
     match c.post_init with
     | Some k ->
       ignore (call g ~new_self:true (finfo_of g k) [ T r ] [ None ] ctx loc);
@@ -1945,10 +2463,8 @@ and call g ?(new_self = false) (callee : finfo) (args : value list) (arg_exprs :
     | Some st -> List.map (fun (a_e, a) -> match (a_e, a) with Some { Ir.e = Var n; _ }, (L _ | D _) -> (match SM.find_opt n st.env with Some v -> v | None -> a) | _ -> a) (zip arg_exprs args)
     | None -> args
   in
+  let args = if g.info.language = "swift" && not ctx.spec then List.map (copy_value g ctx loc) args else args in
   let muts = callee.mutated in
-  let list_vars = List.filter_map (fun (a_e, (_, pty)) -> match (a_e, pty) with Some { Ir.e = Var n; _ }, (Ir.TList _ | TDict _) -> Some n | _ -> None) (zip arg_exprs fn.params) in
-  if muts <> [] && List.length list_vars <> List.length (List.sort_uniq compare list_vars) then
-    raise (Vc_error (Printf.sprintf "the same list is passed twice to '%s', which mutates a list parameter; the two parameters would alias" fn.name, loc));
   List.iter
     (fun ((p, _), a_e) ->
       let is_var = match a_e with Some { Ir.e = Var _; _ } -> true | _ -> false in
@@ -2013,25 +2529,20 @@ and call_effects g ?(new_self = false) ?(returned = true) (callee : finfo) args 
   let muts = callee.mutated in
   let post = ref SM.empty in
   let heap_pre = heap_env st.env in
+  havoc_call g callee args ctx;
   List.iter
     (fun ((p, pty), a_e) ->
       match a_e with
       | Some { Ir.e = Var n; _ } when List.mem p muts -> (
         match SM.find_opt n st.env with
         | Some (D _) ->
-          let nd = fresh g n pty () in
-          st.env <- SM.add n nd st.env;
-          post := SM.add p nd !post
+          post := SM.add p (SM.find n st.env) !post
         | Some (L old) ->
-          let keep = if List.mem p callee.appends then None else Some old.len in
-          let nv = match fresh g n pty ?len:keep () with L l -> l | _ -> assert false in
-          let nv = match keep with Some k -> { nv with off = old.off; len = k } | None -> assume ctx (le zero nv.len); nv in
-          st.env <- SM.add n (L nv) st.env;
-          post := SM.add p (L nv) !post
+          let _ = old in
+          post := SM.add p (SM.find n st.env) !post
         | _ -> raise (Vc_error ("mutated argument is not a list", loc)))
       | _ -> ())
     (zip fn.params arg_exprs);
-  havoc_call g callee args ctx;
   List.iteri
     (fun i ((_, pty), a) ->
       match (pty, a) with
@@ -2071,6 +2582,7 @@ and havoc_call g (callee : finfo) args ctx =
     let alloc_pre = alloc_of st.env in
     let names = List.map fst callee.fn.params in
     let writes = try Hashtbl.find g.prog.heap_writes callee.key with Not_found -> [] in
+    let heap = match current_heap ctx with Some h -> h | None -> raise (Fallback "call effects require the shared heap") in
     List.iter
       (fun (cls_field, targets) ->
         let k = String.index cls_field '.' in
@@ -2079,24 +2591,100 @@ and havoc_call g (callee : finfo) args ctx =
           List.filter_map
             (fun t ->
               match List.find_index (( = ) t) names with
-              | Some i -> ( match List.nth_opt args i with Some (T x) -> Some x | Some _ -> raise (Fallback "write through an optional object") | None -> None)
+              | Some i -> ( match List.nth_opt args i with Some (T x) -> Some x | Some _ -> raise (Fallback "write through a non-class object") | None -> None)
               | None -> None)
             targets
         in
-        List.iter
-          (fun (key, srt) ->
-            match SM.find_opt key st.env with
-            | Some (T old) ->
-              let nw = const (Printf.sprintf "%s@%d" (String.sub key 1 (String.length key - 1)) (next g)) srt in
-              st.env <- SM.add key (T nw) st.env;
-              if not (List.mem "*" targets) then begin
-                let r = const (Printf.sprintf "r!%d" (next g)) Int in
-                let untouched = and_ (select alloc_pre r :: List.map (fun x -> ne r x) refs) in
-                assume ctx (quant "forall" [ r ] (implies untouched (eq (select nw r) (select old r))) [ [| select nw r |] ])
-              end
-            | _ -> ())
-          (heap_keys g c f))
+        let slot = field_slot g c f in
+        let ty = field_type g c f in
+        if List.mem "*" targets then begin
+          let next_heap = const (Printf.sprintf "heap.call.%d" (next g)) Heap.heap in
+          let r = const (Printf.sprintf "heap.call.ref.%d" (next g)) Int in
+          let ccell = Heap.cell_at heap r in
+          let values = const (Printf.sprintf "heap.call.field.%d" (next g)) (Array (Int, Heap.value)) in
+          let applicable =
+            List.filter_map (fun actual ->
+              if List.mem c (mro g actual) then Some (eq (field ccell "class") (class_tag g actual)) else None)
+              (List.map (fun cls -> cls.cname) g.prog.classes)
+          in
+          let changed = store (field ccell "fields") slot (select values r) in
+          let replacement = Heap.replace_record ccell [ ("fields", changed) ] in
+          let structural = if g.info.language = "typescript" then eq (field ccell "kind") (int_ 3) else ff in
+          let allowed = and_ [ field ccell "allocated"; or_ [ and_ [ eq (field ccell "kind") (int_ 4); or_ applicable ]; structural ] ] in
+          assume ctx (quant "forall" [ r ] (implies allowed (accepts_view g heap ty (select values r))) [ [| select values r |] ]);
+          assume ctx (quant "forall" [ r ]
+            (eq (select next_heap r) (ite allowed replacement ccell)) [ [| select next_heap r |] ]);
+          st.env <- SM.add "@heap" (T next_heap) st.env
+        end else
+          List.iter (fun r ->
+            let value = const (Printf.sprintf "heap.call.field.%d" (next g)) Heap.value in
+            let current = match current_heap ctx with Some h -> h | None -> assert false in
+            assume ctx (accepts_view g current ty value);
+            st.env <- SM.add "@heap" (T (Heap.write_field current r slot value)) st.env)
+            refs)
       writes;
+    List.iteri (fun i (p, ty) ->
+      if List.mem p callee.mutated then
+        match List.nth_opt args i with
+        | Some (L l) ->
+          let current = match current_heap ctx with Some h -> h | None -> assert false in
+          let cell = Heap.cell_at current l.ref in
+          let seq = const (Printf.sprintf "heap.call.list.%d.seq" (next g)) (Array (Int, Heap.value)) in
+          let old_len = Heap.read_len current l.ref in
+          let fresh_len = const (Printf.sprintf "heap.call.list.%d.len" (next g)) Int in
+          if List.mem p callee.appends then assume ctx (implies (not_ l.view) (le old_len fresh_len));
+          assume ctx (implies (not_ l.view) (le zero fresh_len));
+          let cell_len = ite l.view old_len fresh_len in
+          let i = const (Printf.sprintf "heap.call.list.%d.index" (next g)) Int in
+          let elem = match ty with TList elem -> elem | _ -> TNone in
+          let touched = ite l.view (and_ [ le l.off i; lt i (add l.off l.len) ]) (and_ [ le zero i; lt i fresh_len ]) in
+          assume ctx (quant "forall" [ i ] (implies touched (accepts_view g current elem (select seq i))) [ [| select seq i |] ]);
+          let outside_view = or_ [ lt i l.off; le (add l.off l.len) i ] in
+          assume ctx (quant "forall" [ i ]
+            (implies (and_ [ l.view; le zero i; lt i old_len; outside_view ]) (eq (select seq i) (Heap.read_list current l.ref i)))
+            [ [| select seq i |] ]);
+          let changes = [ ("seq", seq); ("len", cell_len) ] in
+          let next_heap = store current l.ref (Heap.replace_record cell changes) in
+          st.env <- SM.add "@heap" (T next_heap) st.env;
+          if List.mem p callee.appends then assume ctx (le zero cell_len)
+        | Some (D d) ->
+          let current = match current_heap ctx with Some h -> h | None -> assert false in
+          let cell = Heap.cell_at current d.ref in
+          let suffix = string_of_int (next g) in
+          let count = const ("heap.call.dict." ^ suffix ^ ".key_count") Int in
+          let len = const ("heap.call.dict." ^ suffix ^ ".len") Int in
+          let live = const ("heap.call.dict." ^ suffix ^ ".key_live") (Array (Int, Bool)) in
+          let keys = const ("heap.call.dict." ^ suffix ^ ".keys") (Array (Int, Heap.key)) in
+          let positions = const ("heap.call.dict." ^ suffix ^ ".key_position") (Array (Heap.key, Int)) in
+          let has = const ("heap.call.dict." ^ suffix ^ ".has") (Array (Heap.key, Bool)) in
+          let map = const ("heap.call.dict." ^ suffix ^ ".map") (Array (Heap.key, Heap.value)) in
+          let history = const ("heap.call.dict." ^ suffix ^ ".original_keys") (Array (Int, Heap.value)) in
+          let j = const ("heap.call.dict." ^ suffix ^ ".slot") Int in
+          let key = select keys j in
+          assume ctx (and_ [ le zero len; le len count; le zero count;
+            eq len (fn "seqcount_bool" [| live; zero; count; tt |] Int);
+            quant "forall" [ j ] (implies (and_ [ le zero j; lt j count; select live j ])
+              (and_ [ select has (select keys j); eq (select positions (select keys j)) j ])) [ [| select live j |] ];
+            quant "forall" [ j ] (implies (and_ [ le zero j; lt j count ])
+              (accepts_view g current (match ty with TDict (key_ty, _) -> key_ty | _ -> TNone) (select history j))) [ [| select history j |] ];
+            quant "forall" [ j ] (implies (and_ [ le zero j; lt j count; select live j ])
+              (let raw = Heap.unbox (select history j) (match ty with TDict (key_ty, _) -> key_ty | _ -> TNone) in
+               let canonical, admissible = Heap.canonical_key raw (match ty with TDict (key_ty, _) -> key_ty | _ -> TNone) g.info.language in
+               and_ [ admissible; eq canonical (select keys j) ])) [ [| select keys j |] ] ]);
+          let typed_key = const ("heap.call.dict." ^ suffix ^ ".typed_key") Heap.key in
+          let value_ty = match ty with TDict (_, value_ty) -> value_ty | _ -> TNone in
+          assume ctx (quant "forall" [ typed_key ]
+            (implies (select has typed_key) (accepts_view g current value_ty (select map typed_key))) [ [| select map typed_key |] ]);
+          assume ctx (quant "forall" [ typed_key ]
+            (implies (select has typed_key)
+              (and_ [ le zero (select positions typed_key); lt (select positions typed_key) count;
+                select live (select positions typed_key);
+                eq (select keys (select positions typed_key)) typed_key ])) [ [| select has typed_key |] ]);
+          let changes = [ ("map", map); ("has", has); ("keys", keys); ("key_live", live);
+            ("key_position", positions); ("seq", history); ("key_count", count); ("len", len) ] in
+          st.env <- SM.add "@heap" (T (store current d.ref (Heap.replace_record cell changes))) st.env
+        | _ -> ()) callee.fn.params;
+    (match current_heap ctx with Some h -> set_current_heap g ctx h | None -> ());
     if Hashtbl.mem g.prog.allocates callee.key then begin
       let na = const (Printf.sprintf "alloc@%d" (next g)) (Array (Int, Bool)) in
       let r = const (Printf.sprintf "r!%d" (next g)) Int in
@@ -2237,15 +2825,17 @@ let rec block g stmts (st : state) : state = List.fold_left (fun st s -> if st.a
 
 and stmt g (s : Ir.stmt) (st : state) : state =
   match s with
-  | Assign (_, name, v) ->
-    let x = coerce (ev g (state_ctx g st) v) (Hashtbl.find_opt g.info.fn.locals name) in
+  | Assign (loc, name, v) ->
+    let ctx = state_ctx g st in
+    let x = coerce (ev g ctx v) (Hashtbl.find_opt g.info.fn.locals name) in
+    let x = if g.info.language = "swift" then copy_value g ctx loc x else x in
     st.env <- SM.add name x st.env;
     st
   | FieldAssign (loc, obj, cls, f, v) ->
     let ctx = state_ctx g st in
     let r = term_of loc (ev g ctx obj) in
     let x = coerce (ev g ctx v) (Some (field_type g cls f)) in
-    st.env <- heap_write g st.env cls f r x;
+    st.env <- heap_write g ctx st.env cls f r x;
     let params = List.filter_map (fun (p, (ty : Ir.ty)) -> match (ty, SM.find_opt p g.entry) with Ir.TClass _, Some (T pr) -> Some pr | _ -> None) g.info.fn.params in
     if not (List.memq r params || List.memq r g.created || List.mem cls g.lc_written) then g.lc_written <- cls :: g.lc_written;
     if has_invariants g cls && not (List.memq r (checked_params g cls)) then begin
@@ -2258,24 +2848,57 @@ and stmt g (s : Ir.stmt) (st : state) : state =
     match SM.find_opt name st.env with
     | Some (D d) ->
       let ctx = state_ctx g st in
-      let k = term_of loc (ev g ctx k) in
-      if strict then oblige g "key" ctx (select d.has k) loc (Printf.sprintf "key being deleted from '%s' is present" name);
-      st.env <- SM.add name (D { d with has = store d.has k ff }) st.env;
+      let raw = term_of loc (ev g ctx k) in
+      let key_ty = match d.dty with TDict (kt, _) -> kt | _ -> TNone in
+      let key, valid = Heap.canonical_key raw key_ty g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      (match current_heap ctx with
+       | Some h ->
+         check_heap_kind g ctx d.ref 2 loc "dictionary deletion refers to an allocated dictionary";
+         if strict then oblige g "key" ctx (Heap.has_dict h d.ref key) loc (Printf.sprintf "key being deleted from '%s' is present" name);
+         set_current_heap g ctx (Heap.delete_dict h d.ref key)
+       | None ->
+         if strict then oblige g "key" ctx (select d.has raw) loc (Printf.sprintf "key being deleted from '%s' is present" name));
+      (match current_heap ctx with
+       | Some _ -> ()
+       | None -> st.env <- SM.add name (D { d with has = store d.has raw ff }) st.env);
       st
     | _ -> raise (Vc_error ("del on a non-dict", loc)))
   | IndexAssign (loc, name, i, v, wrap) -> (
     match SM.find_opt name st.env with
     | Some (D d) ->
       let ctx = state_ctx g st in
-      let k = term_of loc (ev g ctx i) in
-      let vt = match d.dty with TDict (_, vt) -> vt | _ -> assert false in
-      let x = term_of loc (coerce (ev g ctx v) (Some vt)) in
-      st.env <- SM.add name (D { d with vals = store d.vals k x; has = store d.has k tt }) st.env;
+      let raw_key = term_of loc (ev g ctx i) in
+      let kt, vt = match d.dty with TDict (kt, vt) -> (kt, vt) | _ -> assert false in
+      let key, valid = Heap.canonical_key raw_key kt g.info.language in
+      oblige g "key" ctx valid loc "dictionary key uses supported source equality";
+      assume ctx valid;
+      let value = coerce (ev g ctx v) (Some vt) in
+      let x = term_of loc value in
+      let boxed_value = box_stored_value g ctx loc vt value in
+      (match current_heap ctx with
+       | Some h ->
+         check_heap_kind g ctx d.ref 2 loc "dictionary assignment refers to an allocated dictionary";
+         set_current_heap g ctx (Heap.write_dict h d.ref key (Heap.box raw_key kt) boxed_value)
+       | None -> ());
+      (match current_heap ctx with
+       | Some _ -> ()
+       | None -> st.env <- SM.add name (D { d with vals = store d.vals raw_key x; has = store d.has raw_key tt }) st.env);
       st
     | Some (L l) ->
       let ctx = state_ctx g st in
-      let j = index_of g (l.arr, l.off, l.len) (term_of loc (ev g ctx i)) wrap ctx loc name in
-      let x = term_of loc (ev g ctx v) in
+      let len = list_len ctx l in
+      let j = index_of g (l.arr, l.off, len) (term_of loc (ev g ctx i)) wrap ctx loc name in
+      let value_ty = match l.lty with TList t -> t | _ -> TNone in
+      let value = coerce (ev g ctx v) (Some value_ty) in
+      let x = term_of loc value in
+      let boxed_value = box_stored_value g ctx loc value_ty value in
+      (match current_heap ctx with
+       | Some h ->
+         check_heap_kind g ctx l.ref 1 loc "list assignment refers to an allocated list";
+         set_current_heap g ctx (Heap.write_list h l.ref (add l.off j) boxed_value)
+       | None -> ());
       let l = match SM.find_opt name st.env with Some (L l) -> l | _ -> l in
       st.env <- SM.add name (L (numeric_store l (add l.off j) x)) st.env;
       st
@@ -2283,9 +2906,19 @@ and stmt g (s : Ir.stmt) (st : state) : state =
   | Append (loc, name, v) -> (
     match SM.find_opt name st.env with
     | Some (L _) ->
-      let x = term_of loc (ev g (state_ctx g st) v) in
       let l = match SM.find_opt name st.env with Some (L l) -> l | _ -> assert false in
-      st.env <- SM.add name (L { (numeric_store l (add l.off l.len) x) with len = add l.len one }) st.env;
+      let ctx = state_ctx g st in
+      let value_ty = match l.lty with TList t -> t | _ -> TNone in
+      let value = coerce (ev g ctx v) (Some value_ty) in
+      let x = term_of loc value in
+      let len = list_len ctx l in
+      let boxed_value = box_stored_value g ctx loc value_ty value in
+      (match current_heap ctx with
+       | Some h ->
+         check_heap_kind g ctx l.ref 1 loc "append refers to an allocated list";
+         set_current_heap g ctx (Heap.append_list h l.ref boxed_value)
+       | None -> ());
+      st.env <- SM.add name (L { (numeric_store l (add l.off len) x) with len = add len one }) st.env;
       st
     | _ -> raise (Vc_error ("append to a non-list", loc)))
   | If (loc, c, a, b) ->
@@ -2672,20 +3305,61 @@ let run g =
     (fun c -> List.iter (fun (f, _) -> List.iter (fun (k, srt) -> if not (SM.mem k st.env) then st.env <- SM.add k (T (const (String.sub k 1 (String.length k - 1)) srt)) st.env) (heap_keys g c.cname f)) c.cfields)
     g.prog.classes;
   st.env <- SM.add "@alloc" (T (const "alloc" (Array (Int, Bool)))) st.env;
+  st.env <- SM.add "@heap" (T (const "heap.entry" Heap.heap)) st.env;
   List.iter (fun c -> if has_invariants g c.cname then st.env <- SM.add (written_key c.cname) (T no_writes) st.env) g.prog.classes;
   List.iter
     (fun (p, ty) ->
-      let v = param_val p ty in
+      let v = match param_val p ty with
+        | L l when List.mem p fn.view_params -> L { l with view = tt }
+        | value -> value
+      in
+      let v = match v, SM.find_opt "@heap" st.env with
+        | value, Some (T h) -> refresh_value g st h value
+        | _ -> v
+      in
       st.env <- SM.add p v st.env;
       g.inputs <- (p, v) :: g.inputs;
-      (match v with L l -> Dynarray.add_last st.facts (le zero l.len) | _ -> ());
-      (match (ty, v) with
-       | TList TReal, L l ->
+      (match v with
+       | L l ->
+         let h = match SM.find "@heap" st.env with T h -> h | _ -> assert false in
+         let c = Heap.cell_at h l.ref in
+         Dynarray.add_last st.facts (and_ [ field c "allocated"; eq (field c "kind") (int_ 1); implies (not_ l.view) (eq l.len (Heap.read_len h l.ref)); le zero l.len ]);
+         let i = const (p ^ ".heap_index") Int in
+         let boxed = Heap.read_list h l.ref (add l.off i) in
+         let item = at (l.arr, l.off) i in
+         let elem = match ty with TList elem -> elem | _ -> TNone in
+         let projected, compatible = match elem with
+           | TRecord (schema, fields) ->
+             let ref = Heap.unbox boxed elem in
+             let record = Heap.cell_at h ref in
+             let record_kind = eq (field record "kind") (int_ 3) in
+             let structural = if g.info.language = "typescript" then eq (field record "kind") (int_ 4) else ff in
+             (project_record g h schema fields ref,
+              and_ [ Heap.accepts boxed elem; field record "allocated"; or_ [ record_kind; structural ] ])
+           | _ -> (Heap.unbox boxed elem, Heap.accepts boxed elem)
+         in
+         Dynarray.add_last st.facts (quant "forall" [ i ]
+           (implies (and_ [ le zero i; lt i l.len ]) (and_ [ compatible; eq projected item ]))
+           [ [| boxed |] ])
+       | D d ->
+         let h = match SM.find "@heap" st.env with T h -> h | _ -> assert false in
+         let c = Heap.cell_at h d.ref in
+         Dynarray.add_last st.facts (and_ [ field c "allocated"; eq (field c "kind") (int_ 2) ])
+       | T r when (match ty with TClass _ -> true | _ -> false) ->
+         let h = match SM.find "@heap" st.env with T h -> h | _ -> assert false in
+         let cls = match ty with TClass c -> c | _ -> assert false in
+         let cell = Heap.cell_at h r in
+         let compatible = List.filter_map (fun actual -> if List.mem cls (mro g actual) then Some (eq (field cell "class") (class_tag g actual)) else None) (List.map (fun c -> c.cname) g.prog.classes) in
+         Dynarray.add_last st.facts (and_ [ field cell "allocated"; eq (field cell "kind") (int_ 4); or_ compatible ])
+       | _ -> ());
+       (match (ty, v) with
+        | TList TReal, L l ->
          let i = const (p ^ ".numeric_index") Int in
          let expected = ite (select l.py_tags i) (as_float_to Float64 (select l.py_ints i)) (select l.py_floats i) in
          Dynarray.add_last st.facts (quant "forall" [ i ] (implies (and_ [ le zero i; lt i l.len ]) (eq (select l.arr i) expected)) [ [| select l.arr i |] ])
-       | _ -> ());
-      List.iter (Dynarray.add_last st.facts) (alloc_facts g v ty st.env))
+        | _ -> ());
+       List.iter (Dynarray.add_last st.facts) (valid_container_facts v ty);
+       List.iter (Dynarray.add_last st.facts) (alloc_facts g v ty st.env))
     fn.params;
   g.entry <- st.env;
   let suspending = ref false in

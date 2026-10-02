@@ -36,7 +36,6 @@ from ..lifecycle import build as build_lifecycle
 
 PY_ASSUMPTIONS = [
     "a float argument annotated float is a binary64 value",
-    "distinct list arguments do not alias each other",
     "print() and logging calls have no effect on program state",
 ]
 
@@ -1305,7 +1304,6 @@ class FunctionLowerer:
             if s.value is None:
                 return
             val = self.coerce(self.expr(s.value, ty), ty)
-            self._no_alias(s.target.id, val, s)
             self._check_assignable(s.target.id, ty, val, s)
             yield ir.Assign(loc, s.target.id, val)
             return
@@ -1461,15 +1459,10 @@ class FunctionLowerer:
     def _assign(self, target: ast.expr, value: ast.expr, s: ast.stmt, loc: ir.Loc):
         if isinstance(target, ast.Name):
             name = target.id
-            if name in self.env and isinstance(self.env[name], ir.TList) and any(
-                p.name == name for p in self.fn.params
-            ):
-                raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it or copy it to a new name)", s)
             known = self.env.get(name)
             val = self.expr(value, known)
             if known is not None:
                 val = self.coerce(val, known)
-            self._no_alias(name, val, s)
             self.declare(name, val.ty, s)
             ty = self.env[name]
             val = self.coerce(val, ty)
@@ -1654,8 +1647,6 @@ class FunctionLowerer:
 
     def _assign_tmp(self, name: str, tmp: str, s: ast.stmt, loc: ir.Loc):
         ty = self.env[tmp]
-        if isinstance(ty, ir.TList) and any(p.name == name for p in self.fn.params):
-            raise LowerError(f"rebinding list parameter '{name}' is not supported (mutate it, or copy it to a new name)", s)
         self.declare(name, ty, s)
         yield ir.Assign(loc, name, self.coerce(ir.Var(ty, loc, tmp), self.env[name]))
 

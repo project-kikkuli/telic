@@ -33,21 +33,35 @@ VARIANT_TIMEOUT_S = 5.0
 PKG_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
-def _encode_any(v: Any) -> Any:
+def _encode_any(v: Any, seen: set | None = None) -> Any:
     """Encode a decoded model value whose static type is not at hand."""
+    seen = set() if seen is None else seen
+    ref = getattr(v, "telic_ref", None)
+    if ref is not None and isinstance(v, list):
+        key = ("list", ref)
+        if key in seen:
+            return {"__list_ref__": ref}
+        seen.add(key)
+        return {"__list__": ref, "items": [_encode_any(x, seen) for x in v]}
+    if ref is not None and isinstance(v, dict):
+        key = ("dict", ref)
+        if key in seen:
+            return {"__dict_ref__": ref}
+        seen.add(key)
+        return {"__map__": ref, "entries": [[_encode_any(k, seen), _encode_any(x, seen)] for k, x in v.items()]}
     if isinstance(v, dict) and ("__enum__" in v or "__opaque__" in v or "__json__" in v):
         return v
     if isinstance(v, dict) and "__record__" in v:
-        return {"__record__": v["__record__"], "fields": {k: _encode_any(x) for k, x in v["fields"].items()}}
+        return {"__record__": v["__record__"], "fields": {k: _encode_any(x, seen) for k, x in v["fields"].items()}}
     if isinstance(v, dict) and "__class__" in v:
-        fields = None if v.get("__stub__") else {k: _encode_any(x) for k, x in v.items() if not k.startswith("__")}
+        fields = None if v.get("__stub__") else {k: _encode_any(x, seen) for k, x in v.items() if not k.startswith("__")}
         return {"__object__": ir.source_name(v["__class__"]), "ref": v.get("__ref__"), "fields": fields}
     if isinstance(v, Fraction):
         return {"__real__": [v.numerator, v.denominator]}
     if isinstance(v, list):
-        return [_encode_any(x) for x in v]
+        return [_encode_any(x, seen) for x in v]
     if isinstance(v, dict):
-        return {"__dict__": [[k, _encode_any(x)] for k, x in v.items()]}
+        return {"__dict__": [[_encode_any(k, seen), _encode_any(x, seen)] for k, x in v.items()]}
     return v
 
 
@@ -59,7 +73,23 @@ def _anything(ty: ir.Type) -> bool:
     return isinstance(ty, ir.TOpaque) and ty.why in ANYTHING
 
 
-def encode_value(v: Any, ty: ir.Type) -> Any:
+def encode_value(v: Any, ty: ir.Type, seen: set | None = None) -> Any:
+    seen = set() if seen is None else seen
+    ref = getattr(v, "telic_ref", None)
+    if ref is not None and isinstance(v, list):
+        key = ("list", ref)
+        if key in seen:
+            return {"__list_ref__": ref}
+        seen.add(key)
+        elem = ty.elem if isinstance(ty, ir.TList) else None
+        return {"__list__": ref, "items": [encode_value(x, elem, seen) if elem is not None else _encode_any(x, seen) for x in v]}
+    if ref is not None and isinstance(v, dict):
+        key = ("dict", ref)
+        if key in seen:
+            return {"__dict_ref__": ref}
+        seen.add(key)
+        kt, vt = (ty.key, ty.val) if isinstance(ty, ir.TDict) else (None, None)
+        return {"__map__": ref, "entries": [[encode_value(k, kt, seen) if kt is not None else _encode_any(k, seen), encode_value(x, vt, seen) if vt is not None else _encode_any(x, seen)] for k, x in v.items()]}
     if isinstance(ty, ir.TPythonNumber):
         if isinstance(v, dict) and "is_int" in v:
             return v.get("integer", 0) if v.get("is_int") else v.get("floating", 0.0)
@@ -72,25 +102,25 @@ def encode_value(v: Any, ty: ir.Type) -> Any:
     if isinstance(v, dict) and "__enum__" in v:
         return v
     if isinstance(v, dict) and "__record__" in v and isinstance(ty, ir.TRecord):
-        return encode_value(v["fields"], ty)
+        return encode_value(v["fields"], ty, seen)
     if isinstance(ty, ir.TOpaque):
         return {"__opaque__": True, "any": _anything(ty)}
     if isinstance(ty, ir.TList) and isinstance(ty.elem, (ir.TClass, ir.TEnum)):
-        return [_encode_any(x) for x in (v or [])]
+        return [_encode_any(x, seen) for x in (v or [])]
     if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TRecord):
-        return [encode_value(x, ty.elem) for x in (v or [])]
+        return [encode_value(x, ty.elem, seen) for x in (v or [])]
     if isinstance(ty, ir.TOption):
-        return None if v is None else encode_value(v, ty.inner)
+        return None if v is None else encode_value(v, ty.inner, seen)
     if isinstance(ty, ir.TClass):
         if isinstance(v, dict) and "__class__" in v:
-            return _encode_any(v)
+            return _encode_any(v, seen)
         return {"__object__": ir.source_name(ty.name), "ref": v, "fields": None}
     if isinstance(ty, ir.TDict):
-        return {"__dict__": [[encode_value(k, ty.key), encode_value(x, ty.val)] for k, x in (v or {}).items()]}
+        return {"__dict__": [[encode_value(k, ty.key, seen), encode_value(x, ty.val, seen)] for k, x in (v or {}).items()]}
     if isinstance(ty, ir.TList):
-        return [encode_value(x, ty.elem) for x in (v or [])]
+        return [encode_value(x, ty.elem, seen) for x in (v or [])]
     if isinstance(ty, ir.TRecord):
-        fields = {n: encode_value((v or {}).get(n), t) for n, t in ty.fields}
+        fields = {n: encode_value((v or {}).get(n), t, seen) for n, t in ty.fields}
         tag = fields.get(ty.tag)
         if ty.variants and isinstance(tag, dict) and "member" in tag:
             keep = dict(ty.variants).get(tag["member"], ())
@@ -122,7 +152,7 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
         return "None" if lang == "python" else "nil" if lang == "swift" else "null"
     if isinstance(v, dict) and "__object__" in v:
         names = {} if names is None else names
-        key = (v["__object__"], v["ref"])
+        key = ("object", v["ref"])
         if key in names:
             return names[key]
         # objects are numbered as they are shown: the solver's own references are arbitrary
@@ -144,6 +174,34 @@ def format_value(v: Any, ty: ir.Type | None = None, lang: str = "python", names:
     if isinstance(v, dict) and "__dict__" in v:
         inner = ", ".join(f"{format_value(k, None, lang)}: {format_value(x, None, lang)}" for k, x in v["__dict__"])
         return "{" + inner + "}"
+    if isinstance(v, dict) and "__list_ref__" in v:
+        names = {} if names is None else names
+        return names.get(("list", v["__list_ref__"]), f"list#{v['__list_ref__']}")
+    if isinstance(v, dict) and "__dict_ref__" in v:
+        names = {} if names is None else names
+        return names.get(("dict", v["__dict_ref__"]), f"dict#{v['__dict_ref__']}")
+    if isinstance(v, dict) and "__list__" in v:
+        names = {} if names is None else names
+        key = ("list", v["__list__"])
+        if key in names:
+            return names[key]
+        num = sum(1 for k in names if isinstance(k, tuple) and k and k[0] == "#")
+        tag = label or f"list#{num}"
+        names[("#", key)] = num
+        names[key] = tag
+        inner = ", ".join(format_value(x, None, lang, names) for x in v["items"])
+        return f"{tag}=[{inner}]"
+    if isinstance(v, dict) and "__map__" in v:
+        names = {} if names is None else names
+        key = ("dict", v["__map__"])
+        if key in names:
+            return names[key]
+        num = sum(1 for k in names if isinstance(k, tuple) and k and k[0] == "#")
+        tag = label or f"dict#{num}"
+        names[("#", key)] = num
+        names[key] = tag
+        inner = ", ".join(f"{format_value(k, None, lang, names)}: {format_value(x, None, lang, names)}" for k, x in v["entries"])
+        return f"{tag}={{{inner}}}"
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return format_value(Fraction(n, d), ir.REAL, lang)
@@ -205,9 +263,10 @@ def call_text(fn: ir.Function, model: dict[str, Any], lang: str, names: bool = T
         head = re.sub(r"\$default$", "", re.sub(r"\([^()]*\)(#\d+)?$", "", head))
         head = head[: -len(".init")] if head.endswith(".init") else head
     shown: dict = {}  # object reference -> how it is referred to
+    graph_seen: set = set()
 
     def fmt(p: ir.Param) -> str:
-        return format_value(encode_value(model.get(p.name), p.ty), p.ty, lang, shown, label=p.name)
+        return format_value(encode_value(model.get(p.name), p.ty, graph_seen), p.ty, lang, shown, label=p.name)
 
     if "." in fn.name and params and isinstance(params[0].ty, ir.TClass) and params[0].ty.name == fn.name.split(".")[0]:
         # a method: show it called on the receiver
@@ -538,7 +597,8 @@ def replay_verdicts(program: Program, rep) -> None:
             confirmed, summary, violation = classify(v.ob, out, fn, lang)
             v.replay = Replay(ran="harness_error" not in out, confirmed=confirmed, summary=summary, returned=out.get("returned_repr"), violation=violation, runtime="swiftc", timed_out=cut_short(out))
             continue
-        args = [encode_value(v.model.get(p.name), p.ty) for p in fn.params]
+        graph_seen: set = set()
+        args = [encode_value(v.model.get(p.name), p.ty, graph_seen) for p in fn.params]
         try:
             if lang == "python":
                 out = run_python(full, fn.name, args, limit, extra={"shrink": True})

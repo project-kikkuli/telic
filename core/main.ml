@@ -49,6 +49,14 @@ let read_terms (j : Json.t) : term array =
          | Json.List [ Json.String "a"; Json.String op; s; xs ] -> app op (ids xs) !sorts.(Json.to_int s)
          | Json.List [ Json.String "f"; Json.String n; s; xs ] -> fn n (ids xs) !sorts.(Json.to_int s)
          | Json.List [ Json.String "q"; Json.String k; vs; b; ps ] -> quant k (Array.to_list (ids vs)) ta.(Json.to_int b) (List.map ids (Json.to_list ps))
+         | Json.Assoc [ ("array_lambda", Json.Assoc fields) ] ->
+           if List.sort compare (List.map fst fields) <> [ "binder"; "body"; "sort" ] then raise (Json.Error "invalid array lambda fields");
+           let field name = try List.assoc name fields with Not_found -> raise (Json.Error ("array lambda missing " ^ name)) in
+           let binder = ta.(Json.to_int (field "binder")) and body = ta.(Json.to_int (field "body")) in
+           let sort = !sorts.(Json.to_int (field "sort")) in
+           (match binder.node, sort with
+            | Const _, Array (index, elem) when binder.sort = index && body.sort = elem -> array_lambda binder body
+            | _ -> raise (Json.Error "array lambda binder, body, and array sort do not match"))
          | _ -> failwith ("unknown term " ^ Json.to_string enc)))
     tl;
   ta
@@ -93,6 +101,7 @@ let rec wterm w (t : term) =
       | StrV s -> Json.List [ Json.String "s"; Json.String s ]
       | App (op, xs) -> Json.List [ Json.String "a"; Json.String op; Json.Int (wsort w t.sort); ids xs ]
       | Fn (n, xs) -> Json.List [ Json.String "f"; Json.String n; Json.Int (wsort w t.sort); ids xs ]
+      | ArrayLambda (binder, body) -> Json.Assoc [ ("array_lambda", Json.Assoc [ ("binder", Json.Int (wterm w binder)); ("body", Json.Int (wterm w body)); ("sort", Json.Int (wsort w t.sort)) ]) ]
       | Quant (k, vs, b, ps) -> Json.List [ Json.String "q"; Json.String k; ids vs; Json.Int (wterm w b); Json.List (List.map ids ps) ]
     in
     let i = w.nt in
@@ -160,7 +169,9 @@ let solve_job z (jb : job) : Smt.result =
                 let arr = Smt.term_text l.arr and off = Smt.term_text l.off in
                 let es = List.init n (fun i -> Printf.sprintf "(select %s (+ %s %d))" arr off i) in
                 let vals = Smt.get_values_raw z es in
-                (name, Json.List (List.map (Smt.value_json (elem_sort l.arr.sort)) vals))
+                let items = Json.List (List.map (Smt.value_json (elem_sort l.arr.sort)) vals) in
+                let ref = match Smt.get_values_raw z [ Smt.term_text l.ref ] with [ v ] -> Smt.value_json Int v | _ -> Json.Null in
+                (name, Json.Assoc [ ("__list__", ref); ("items", items) ])
               | Vc.NoneV | Vc.O _ | Vc.D _ -> (name, Json.Null))
             jb.probes
         in
@@ -227,6 +238,13 @@ let job_key salt (jb : job) : string =
         | StrV s -> "s" ^ String.escaped s
         | App (op, xs) -> "a" ^ op ^ "(" ^ kids xs ^ ")"
         | Fn (n, xs) -> "f" ^ n ^ "(" ^ kids xs ^ ")"
+        | ArrayLambda (binder, body) ->
+          let used = Term.consts body in
+          let rec fresh i =
+            let name = if i = 0 then "$array_lambda_index" else "$array_lambda_index" ^ string_of_int i in
+            if List.exists (fun c -> c.node = Const name) used then fresh (i + 1) else const name binder.sort
+          in
+          "lambda(" ^ sort_name binder.sort ^ ")" ^ h (Term.subst [ (binder, fresh 0) ] body)
         | Quant (k, vs, b, ps) -> "q" ^ k ^ "(" ^ kids vs ^ ")" ^ h b ^ "[" ^ String.concat ";" (List.map kids ps) ^ "]"
       in
       let d = Digest.to_hex (Digest.string (node ^ ":" ^ Smt.sort_smt t.sort)) in
@@ -396,7 +414,17 @@ let () =
   let input = In_channel.input_all stdin in
   let req = Json.parse input in
   let heap_abi = Json.member "heap_abi" req in
-  (match Json.member "version" heap_abi with Json.Int 1 -> () | _ -> raise (Json.Error "unsupported heap ABI version"));
+  (match Json.member "version" heap_abi with Json.Int version when version = Heap.abi_version -> () | _ -> raise (Json.Error "unsupported heap ABI version"));
+  let tag_json tags = Json.Assoc (List.map (fun (name, tag) -> (name, Json.Int tag)) tags) in
+  let rec sort_json = function
+    | Term.Array (index, elem) -> Json.List [ Json.String "Array"; sort_json index; sort_json elem ]
+    | Term.Rec (name, fields) -> Json.List [ Json.String "Rec"; Json.String name; Json.List (List.map (fun (field, sort) -> Json.List [ Json.String field; sort_json sort ]) fields) ]
+    | sort -> Json.String (Term.sort_name sort)
+  in
+  let expected_sorts = Json.Assoc [ ("number", sort_json Heap.number); ("key", sort_json Heap.key); ("box", sort_json Heap.value); ("cell", sort_json Heap.cell); ("heap", sort_json Heap.heap) ] in
+  List.iter
+    (fun (field, expected) -> if Json.member field heap_abi <> expected then raise (Json.Error ("incompatible heap ABI " ^ field)))
+    [ ("language_tags", tag_json Heap.language_tags); ("value_tags", tag_json Heap.value_tags); ("cell_tags", tag_json Heap.cell_tags); ("sorts", expected_sorts) ];
   (match Json.member "records" heap_abi with
    | Json.Assoc records ->
      if not (List.mem_assoc "number" records && List.mem_assoc "box" records && List.mem_assoc "key" records && List.mem_assoc "cell" records) then
@@ -468,6 +496,7 @@ let () =
         {
           Vc.cname = Json.to_str (Json.member "name" c);
           cmod = Json.to_str (Json.member "module" c);
+          language = (match Json.member "language" c with Json.String s -> s | _ -> "python");
           cfields = List.map (function Json.List [ Json.String f; t ] -> (f, Ir.ty_of t) | _ -> failwith "class field") (Json.to_list (Json.member "fields" c));
           cinvs = List.map Ir.clause_of (Json.to_list (Json.member "invariants" c));
           init = opt "init";
@@ -490,11 +519,16 @@ let () =
   (match Json.member "allocates" req with Json.List l -> List.iter (fun k -> Hashtbl.replace allocates (Json.to_str k) ()) l | _ -> ());
   let def_heap = Hashtbl.create 16 in
   (match Json.member "def_heap" req with Json.Assoc kvs -> List.iter (fun (k, v) -> Hashtbl.replace def_heap k (List.map Json.to_str (Json.to_list v))) kvs | _ -> ());
+  let field_slots =
+    match Json.member "field_slots" heap_abi with
+    | Json.List slots -> List.map (function Json.List [ Json.String owner; Json.String name; Json.Int slot ] -> (owner, name, slot) | _ -> raise (Json.Error "invalid heap field slot")) slots
+    | _ -> raise (Json.Error "missing heap field slots")
+  in
   let by_name = Hashtbl.create 64 in
   List.iter (fun (c : Vc.classinfo) -> if not (Hashtbl.mem by_name c.cname) then Hashtbl.add by_name c.cname c) classes;
   let hands_out = Hashtbl.create 16 in
   (match Json.member "hands_out" req with Json.List l -> List.iter (fun k -> Hashtbl.replace hands_out (Json.to_str k) ()) l | _ -> ());
-  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; hands_out; def_heap; by_name; hkeys = Hashtbl.create 256 } in
+  let prog = { Vc.funcs; classes; resolve_tbl; heap_writes; allocates; hands_out; def_heap; field_slots; by_name; hkeys = Hashtbl.create 256 } in
   let timeout = match Json.member "timeout_ms" req with Json.Int t -> t | _ -> 60000 in
   let budget = (timeout, match Json.member "rlimit" req with Json.Int r -> r | _ -> 2_000_000) in
   let jobs_n = match Json.member "jobs" req with Json.Int j when j > 0 -> j | _ -> Domain.recommended_domain_count () in

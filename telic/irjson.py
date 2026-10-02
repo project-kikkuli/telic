@@ -152,7 +152,7 @@ def function(f: ir.Function) -> dict[str, Any]:
         "name": f.name,
         "loc": loc(f.loc),
         "end_line": f.end_line,
-        "params": [[p.name, ty(p.ty)] for p in f.params],
+        "params": [[p.name, ty(p.ty), p.view] for p in f.params],
         "ret": ty(f.ret),
         "requires": [clause(c) for c in f.requires],
         "ensures": [clause(c) for c in f.ensures],
@@ -225,6 +225,14 @@ class TermWriter:
             enc = ["a", t.op, self.sort(t.sort), [self.term(a) for a in t.args]]
         elif isinstance(t, L.Fn):
             enc = ["f", t.name, self.sort(t.sort), [self.term(a) for a in t.args]]
+        elif isinstance(t, L.ArrayLambda):
+            enc = {
+                "array_lambda": {
+                    "binder": self.term(t.binder),
+                    "body": self.term(t.body),
+                    "sort": self.sort(t.sort),
+                }
+            }
         elif isinstance(t, L.Quant):
             enc = ["q", t.kind, [self.term(v) for v in t.vars], self.term(t.body), [[self.term(x) for x in p] for p in t.patterns]]
         else:  # pragma: no cover
@@ -252,7 +260,21 @@ class TermReader:
         for enc in table["terms"]:
             self.terms.append(self._build(enc))
 
-    def _build(self, enc: list[Any]) -> L.Term:
+    def _build(self, enc: Any) -> L.Term:
+        if isinstance(enc, dict) and set(enc) == {"array_lambda"}:
+            node = enc["array_lambda"]
+            if not isinstance(node, dict) or set(node) != {"binder", "body", "sort"}:
+                raise ValueError("malformed array lambda")
+            binder = self.terms[node["binder"]]
+            body = self.terms[node["body"]]
+            sort = self.sorts[node["sort"]]
+            if not isinstance(binder, L.Const):
+                raise ValueError("array lambda binder must be a constant")
+            if sort.name != "Array" or L.index_sort(sort) != binder.sort or sort.elem != body.sort:
+                raise ValueError("array lambda binder, body, and sort do not match")
+            return L.ArrayLambda(binder, body, sort)
+        if not isinstance(enc, list):
+            raise ValueError(f"malformed term encoding: {enc!r}")
         tag = enc[0]
         if tag == "c":
             return L.Const(enc[1], self.sorts[enc[2]])

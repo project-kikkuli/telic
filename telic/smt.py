@@ -16,6 +16,18 @@ from . import logic as L
 from .vcgen import ListVal, Obligation, Val
 
 
+class ModelList(list):
+    def __init__(self, ref: Any):
+        super().__init__()
+        self.telic_ref = ref
+
+
+class ModelDict(dict):
+    def __init__(self, ref: Any):
+        super().__init__()
+        self.telic_ref = ref
+
+
 @dataclass
 class Theory:
     """Definitions and lemmas that obligations may refer to."""
@@ -314,15 +326,20 @@ class Z3Encoder:
         return out
 
 
-def _object(enc: Z3Encoder, model: z3.ModelRef, cls: str, ref: Any, fields: tuple) -> dict[str, Any]:
+def _object(enc: Z3Encoder, model: z3.ModelRef, cls: str, ref: Any, fields: tuple, graph: dict | None = None) -> dict[str, Any]:
     """An object held in a list or dict, with its fields as the model's heap has them."""
     from .vcgen import pack
 
     if not fields or not isinstance(ref, int):
         return {"__class__": cls, "__ref__": ref, "__stub__": True}
+    key = ("object", ref)
+    if graph is not None and key in graph:
+        return graph[key]
     out: dict[str, Any] = {"__class__": cls, "__ref__": ref}
+    if graph is not None:
+        graph[key] = out
     for fname, fty, arrays in fields:
-        out[fname] = decode(enc, model, pack(fty, [L.select(a, L.IntV(ref)) for a in arrays]))
+        out[fname] = decode(enc, model, pack(fty, [L.select(a, L.IntV(ref)) for a in arrays]), graph=graph)
     return out
 
 
@@ -380,7 +397,7 @@ def array_entries(v: z3.ExprRef) -> tuple[list[tuple[Any, Any]], Any]:
             return entries, None
 
 
-def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any:
+def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None, graph: dict | None = None) -> Any:
     from .vcgen import DictVal, ObjVal, OptVal, TypedView
     from . import ir
 
@@ -390,31 +407,49 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
             i = enc.value(model, val.val)
             return {"__enum__": ty.name, "member": ty.members[i] if isinstance(i, int) and 0 <= i < len(ty.members) else ty.members[0]}
         if isinstance(ty, ir.TRecord):
-            return {"__record__": ty.name, "fields": decode(enc, model, val.val)}
+            return {"__record__": ty.name, "fields": decode(enc, model, val.val, graph=graph)}
         if isinstance(ty, ir.TList) and isinstance(ty.elem, ir.TRecord) and isinstance(val.val, ListVal):
-            return [{"__record__": ty.elem.name, "fields": x} for x in decode(enc, model, val.val)]
+            items = decode(enc, model, val.val, graph=graph)
+            for i, item in enumerate(items):
+                items[i] = {"__record__": ty.elem.name, "fields": item}
+            return items
         if isinstance(ty, ir.TList) and isinstance(val.val, ListVal):
-            items = enc.list_value(model, val.val)
+            items = decode(enc, model, val.val, graph=graph)
             if isinstance(ty.elem, ir.TEnum):
-                return [{"__enum__": ty.elem.name, "member": ty.elem.members[i] if isinstance(i, int) and 0 <= i < len(ty.elem.members) else ty.elem.members[0]} for i in items]
+                for index, i in enumerate(items):
+                    items[index] = {"__enum__": ty.elem.name, "member": ty.elem.members[i] if isinstance(i, int) and 0 <= i < len(ty.elem.members) else ty.elem.members[0]}
+                return items
             if isinstance(ty.elem, ir.TClass):
-                return [_object(enc, model, ty.elem.name, r, val.fields) for r in items]
+                for index, r in enumerate(items):
+                    items[index] = _object(enc, model, ty.elem.name, r, val.fields, graph)
+                return items
         if isinstance(ty, ir.TDict) and isinstance(ty.val, ir.TClass):
-            return {k: _object(enc, model, ty.val.name, r, val.fields) for k, r in decode(enc, model, val.val).items()}
-        return decode(enc, model, val.val)
+            items = decode(enc, model, val.val, graph=graph)
+            for k, r in list(items.items()):
+                items[k] = _object(enc, model, ty.val.name, r, val.fields, graph)
+            return items
+        return decode(enc, model, val.val, graph=graph)
 
     if isinstance(val, ListVal):
+        ref = enc.value(model, val.ref) if val.ref is not None else None
+        key = ("list", ref)
+        if graph is not None and key in graph:
+            return graph[key]
         n = enc.value(model, val.len)
         if not isinstance(n, int):
             return []
+        out: list[Any] = ModelList(ref)
+        if graph is not None:
+            graph[key] = out
         if isinstance(val.ty.elem, ir.TPythonNumber):
-            out = []
             for i in range(max(0, min(n, 256))):
                 idx = L.add(val.off, L.IntV(i))
-                number = decode(enc, model, L.select(val.arr, idx))
+                number = decode(enc, model, L.select(val.arr, idx), graph=graph)
                 out.append(number["integer"] if number["is_int"] is True else number["floating"])
             return out
-        return [decode(enc, model, L.select(val.arr, L.add(val.off, L.IntV(i)))) for i in range(max(0, min(n, 256)))]
+        for i in range(max(0, min(n, 256))):
+            out.append(decode(enc, model, L.select(val.arr, L.add(val.off, L.IntV(i))), graph=graph))
+        return out
     if isinstance(val, L.Term) and val.sort == L.OPAQUE:
         if enc.json_keys is not None:
             return {"__json__": unchecked_json(enc, enc.json_model or model, val, 0)}
@@ -422,16 +457,29 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
     if isinstance(val, OptVal):
         if enc.value(model, val.some) is not True:
             return None
-        return decode(enc, model, val.val)
+        return decode(enc, model, val.val, graph=graph)
     if isinstance(val, ObjVal):
+        ref = enc.value(model, val.ref)
+        key = ("object", ref)
+        if graph is not None and key in graph:
+            return graph[key]
         out: dict[str, Any] = {"__class__": val.cls, "__ref__": enc.value(model, val.ref)}
+        if graph is not None:
+            graph[key] = out
         if val.fields is None:
             out["__stub__"] = True
             return out
         for fname, fv in val.fields:  # noqa
-            out[fname] = decode(enc, model, fv)
+            out[fname] = decode(enc, model, fv, graph=graph)
         return out
     if isinstance(val, DictVal):
+        ref = enc.value(model, val.ref) if val.ref is not None else None
+        key = ("dict", ref)
+        if graph is not None and key in graph:
+            return graph[key]
+        out: dict[Any, Any] = ModelDict(ref)
+        if graph is not None:
+            graph[key] = out
         has = model.eval(enc.term(val.has), model_completion=True)
         entries, default = array_entries(has)
         keys = [k for k, x in entries if x is True]
@@ -443,17 +491,19 @@ def decode(enc: Z3Encoder, model: z3.ModelRef, val: Val, rec_fields=None) -> Any
             for k in cands:
                 if k not in keys and enc.value(model, L.select(val.has, _lit(k, ks))) is True:
                     keys.append(k)
-        return {k: enc.value(model, L.select(val.vals, _lit(k, val.has.sort.index))) for k in keys}
+        for k in keys:
+            out[k] = decode(enc, model, L.select(val.vals, _lit(k, val.has.sort.index)), graph=graph)
+        return out
     if not isinstance(val, L.Term):
         return str(val)
     if val.sort.name == "Rec" and str(val.sort.rec).startswith("Opt_"):
         if enc.value(model, L.field(val, "some")) is not True:
             return None
-        return decode(enc, model, L.field(val, "val"))
+        return decode(enc, model, L.field(val, "val"), graph=graph)
     if val.sort.name == "Rec":
         out = {}
         for fname, _ in val.sort.fields:
-            out[fname] = decode(enc, model, L.field(val, fname))
+            out[fname] = decode(enc, model, L.field(val, fname), graph=graph)
         return out
     return enc.value(model, val)
 
@@ -682,7 +732,8 @@ def _refutation(ob: Obligation, enc: "Z3Encoder", s: z3.Solver, terms: list[L.Te
         enc.key_candidates.setdefault(sname, []).append(default)
     if any(_has_opaque(v) for _, v in ob.inputs):
         _json_hints(enc, s, m, terms)
-    model = {name: decode(enc, m, v) for name, v in ob.inputs}
+    graph: dict = {}
+    model = {name: decode(enc, m, v, graph=graph) for name, v in ob.inputs}
     too_big = any(isinstance(v, ListVal) and isinstance(enc.value(m, v.len), int) and enc.value(m, v.len) > 256 for _, v in ob.inputs)
     state: dict[str, Any] = {}
     input_consts = set()

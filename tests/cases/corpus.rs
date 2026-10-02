@@ -652,3 +652,12 @@ pub fn clamped(x: u32) -> u32 {
     //@ ensures result <= 10
     units::clamp(x, 10)
 }
+
+// expect: proved
+pub fn to_vec_copies(xs: &[i32]) -> i32 {
+    //@ requires !xs.is_empty()
+    //@ ensures result == xs[0]
+    let mut copied = xs.to_vec();
+    copied[0] = 0;
+    xs[0]
+}

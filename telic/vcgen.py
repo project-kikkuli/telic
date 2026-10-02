@@ -34,6 +34,7 @@ from fractions import Fraction
 from typing import Union
 
 from . import ir, irjson
+from . import heap as H
 from . import logic as L
 from .program import FuncRef, Program, in_place, reaches_unchecked, unchecked_constructor
 from .py_number import PyNumber
@@ -56,6 +57,12 @@ class ListVal:
     len: L.Term
     ty: ir.TList
     py_numeric: PyNumericList | None = None
+    ref: L.Term | None = None
+    view: L.Term | None = None
+
+    def __post_init__(self) -> None:
+        if self.ref is None:
+            object.__setattr__(self, "ref", L.Fn("telic.list.ref", (self.arr,), L.INT))
 
     def at(self, i: L.Term) -> L.Term:
         return L.select(self.arr, L.add(self.off, i))
@@ -73,7 +80,7 @@ class OptVal:
     """An optional: present iff ``some``; ``val`` is meaningful only then."""
 
     some: L.Term
-    val: L.Term
+    val: "Val"
     ty: ir.TOption
 
 
@@ -84,6 +91,11 @@ class DictVal:
     vals: L.Term
     has: L.Term
     ty: ir.TDict
+    ref: L.Term | None = None
+
+    def __post_init__(self) -> None:
+        if self.ref is None:
+            object.__setattr__(self, "ref", L.Fn("telic.dict.ref", (self.vals, self.has), L.INT))
 
 
 @dataclass(frozen=True)
@@ -129,20 +141,22 @@ def components(ty: ir.Type) -> list[tuple[str, L.Sort]]:
         return [("", sort_of(ty))]
     if isinstance(ty, ir.TList):
         if isinstance(ty.elem, ir.TPythonNumber):
-            return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT)]
+            return [("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT), ("ref", L.INT), ("view", L.BOOL)]
         return [
             ("arr", L.ARRAY(sort_of(ty.elem))), ("off", L.INT), ("len", L.INT),
             ("py_tags", L.ARRAY(L.BOOL)), ("py_ints", L.ARRAY(L.INT)), ("py_floats", L.ARRAY(L.FLOAT64)),
+            ("ref", L.INT), ("view", L.BOOL),
         ]
     if isinstance(ty, ir.TOption):
-        if isinstance(ty.inner, (ir.TList, ir.TDict, ir.TOption)):
-            raise VCError(f"optional {ty.inner} is not supported yet")
-        return [("some", L.BOOL), ("val", sort_of(ty.inner))]
+        return [("some", L.BOOL)] + [
+            (f"val.{name}" if name else "val", sort)
+            for name, sort in components(ty.inner)
+        ]
     if isinstance(ty, ir.TDict):
         if isinstance(ty.val, (ir.TList, ir.TDict, ir.TOption)):
             raise VCError(f"dict values of type {ty.val} are not supported yet")
         k = sort_of(ty.key)
-        return [("vals", L.ARRAY(sort_of(ty.val), k)), ("has", L.ARRAY(L.BOOL, k))]
+        return [("vals", L.ARRAY(sort_of(ty.val), k)), ("has", L.ARRAY(L.BOOL, k)), ("ref", L.INT)]
     return [("", sort_of(ty))]
 
 
@@ -151,9 +165,11 @@ def arity(ty: ir.Type) -> int:
     if isinstance(ty, ir.TPythonNumber):
         return 1
     if isinstance(ty, ir.TList):
-        return 3 if isinstance(ty.elem, ir.TPythonNumber) else 6
-    if isinstance(ty, (ir.TOption, ir.TDict)):
-        return 2
+        return 5 if isinstance(ty.elem, ir.TPythonNumber) else 8
+    if isinstance(ty, ir.TOption):
+        return len(components(ty))
+    if isinstance(ty, ir.TDict):
+        return 3
     return 1
 
 
@@ -163,11 +179,11 @@ def pack(ty: ir.Type, comps: list[L.Term]) -> Val:
         return comps[0]
     if isinstance(ty, ir.TList):
         numeric = None if isinstance(ty.elem, ir.TPythonNumber) else PyNumericList(comps[3], comps[4], comps[5])
-        return ListVal(comps[0], comps[1], comps[2], ty, numeric)
+        return ListVal(comps[0], comps[1], comps[2], ty, numeric, comps[-2], comps[-1])
     if isinstance(ty, ir.TOption):
-        return OptVal(comps[0], comps[1], ty)
+        return OptVal(comps[0], pack(ty.inner, comps[1:]), ty)
     if isinstance(ty, ir.TDict):
-        return DictVal(comps[0], comps[1], ty)
+        return DictVal(comps[0], comps[1], ty, comps[2])
     return comps[0]
 
 
@@ -288,14 +304,16 @@ def flatten(v: Val) -> tuple[L.Term, ...]:
     if isinstance(v, PyNumber):
         return (L.mkrec(sort_of(ir.TPythonNumber()), v.parts()),)
     if isinstance(v, ListVal):
+        assert v.ref is not None
         if isinstance(v.ty.elem, ir.TPythonNumber):
-            return (v.arr, v.off, v.len)
+            return (v.arr, v.off, v.len, v.ref, v.view if v.view is not None else L.FALSE)
         p = py_numeric_state(v)
-        return (v.arr, v.off, v.len, p.tags, p.ints, p.floats)
+        return (v.arr, v.off, v.len, p.tags, p.ints, p.floats, v.ref, v.view if v.view is not None else L.FALSE)
     if isinstance(v, OptVal):
-        return (v.some, v.val)
+        return (v.some, *flatten(v.val))
     if isinstance(v, DictVal):
-        return (v.vals, v.has)
+        assert v.ref is not None
+        return (v.vals, v.has, v.ref)
     return (v,)
 
 
@@ -341,6 +359,19 @@ def default_term(s: L.Sort) -> L.Term:
     raise VCError(f"no default value for {s}")
 
 
+def default_value(ty: ir.Type) -> Val:
+    return pack(ty, [default_term(s) for _, s in components(ty)])
+
+
+def valid_container_facts(v: Val, ty: ir.Type) -> list[L.Term]:
+    if isinstance(ty, ir.TList) and isinstance(v, ListVal):
+        return [L.le(L.ZERO, v.len)]
+    if isinstance(ty, ir.TOption) and isinstance(v, OptVal):
+        facts = valid_container_facts(v.val, ty.inner)
+        return [L.implies(v.some, L.and_(*facts))] if facts else []
+    return []
+
+
 def coerce(v: Val, ty: ir.Type | None) -> Val:
     """Lift a plain value into an optional slot (``None`` -> absent, ``x`` ->
     present ``x``). Frontends need not insert the wrapping themselves. An
@@ -354,13 +385,13 @@ def coerce(v: Val, ty: ir.Type | None) -> Val:
         if isinstance(v, L.Term) and v.sort in (L.FLOAT32, L.FLOAT64):
             return L.mkrec(sort_of(ty), (L.FALSE, L.ZERO, L.to_float(v, L.FLOAT64)))
     if isinstance(v, ListVal) and v.ty.elem == ir.NONE and isinstance(ty, ir.TList) and ty.elem != ir.NONE:
-        return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty)
+        return ListVal(L.const_array(sort_of(ty), default_term(sort_of(ty.elem))), L.ZERO, v.len, ty, ref=v.ref, view=v.view)
     if isinstance(v, DictVal) and v.ty.key == ir.NONE and isinstance(ty, ir.TDict) and ty.key != ir.NONE:
         ks, vs = sort_of(ty.key), sort_of(ty.val)
-        return DictVal(L.const_array(L.ARRAY(vs, ks), default_term(vs)), L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE), ty)
+        return DictVal(L.const_array(L.ARRAY(vs, ks), default_term(vs)), L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE), ty, v.ref)
     if isinstance(ty, ir.TOption) and not isinstance(v, OptVal):
         if v is NONE_V:
-            return OptVal(L.FALSE, default_term(sort_of(ty.inner)), ty)
+            return OptVal(L.FALSE, default_value(ty.inner), ty)
         return OptVal(L.TRUE, coerce(v, ty.inner), ty)  # type: ignore[arg-type]
     return v
 
@@ -561,7 +592,7 @@ class VCGen:
             arr = L.Const(f"{base}@{n}.arr", sort_of(ty))
             ln = len_ if len_ is not None else L.Const(f"{base}@{n}.len", L.INT)
             if isinstance(ty.elem, ir.TPythonNumber):
-                return ListVal(arr, L.ZERO, ln, ty)
+                return ListVal(arr, L.ZERO, ln, ty, ref=L.Const(f"{base}@{n}.ref", L.INT))
             return ListVal(
                 arr, L.ZERO, ln, ty,
                 PyNumericList(
@@ -569,6 +600,7 @@ class VCGen:
                     L.Const(f"{base}@{n}.py_ints", L.ARRAY(L.INT)),
                     L.Const(f"{base}@{n}.py_floats", L.ARRAY(L.FLOAT64)),
                 ),
+                L.Const(f"{base}@{n}.ref", L.INT),
             )
         comps = components(ty)
         if len(comps) == 1:
@@ -576,21 +608,16 @@ class VCGen:
         return pack(ty, [L.Const(f"{base}@{n}.{suffix}", srt) for suffix, srt in comps])
 
     def param_val(self, name: str, ty: ir.Type) -> Val:
-        if isinstance(ty, ir.TList):
-            if isinstance(ty.elem, ir.TPythonNumber):
-                return ListVal(L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty)
-            return ListVal(
-                L.Const(f"{name}.arr", sort_of(ty)), L.ZERO, L.Const(f"{name}.len", L.INT), ty,
-                PyNumericList(
-                    L.Const(f"{name}.py_tags", L.ARRAY(L.BOOL)),
-                    L.Const(f"{name}.py_ints", L.ARRAY(L.INT)),
-                    L.Const(f"{name}.py_floats", L.ARRAY(L.FLOAT64)),
-                ),
-            )
         comps = components(ty)
         if len(comps) == 1:
             return L.Const(name, comps[0][1])
         return pack(ty, [L.Const(f"{name}.{suffix}", srt) for suffix, srt in comps])
+
+    @staticmethod
+    def apply_param_view(value: Val, param: ir.Param) -> Val:
+        if isinstance(value, ListVal):
+            return ListVal(value.arr, value.off if param.view else L.ZERO, value.len, value.ty, value.py_numeric, value.ref, L.TRUE if param.view else L.FALSE)
+        return value
 
     # -- the heap -----------------------------------------------------------
     # Objects are integer references. Each field of each class is a map from
@@ -608,7 +635,7 @@ class VCGen:
         fty = decl.field_type(fname)
         if fty is None:
             raise VCError(f"{cls} has no field '{fname}'")
-        owner = decl.field_owner(fname)
+        owner = self.program.field_storage_owner(cls, fname)
         try:
             comps = components(fty)
         except VCError:
@@ -623,6 +650,231 @@ class VCGen:
                 for key, srt in self.heap_keys(cname, fname):
                     env.setdefault(key, L.Const(key[1:], srt))
         env.setdefault("@alloc", L.Const("alloc", L.ARRAY(L.BOOL)))
+        env.setdefault("@heap", L.Const("heap.entry", H.HEAP))
+
+    def set_heap(self, ctx: Ctx, heap: L.Term) -> None:
+        ctx.env["@heap"] = heap
+        if ctx.state is not None:
+            ctx.state.env["@heap"] = heap
+        self.refresh_heap_views(ctx.env, heap)
+        if ctx.state is not None and ctx.state.env is not ctx.env:
+            self.refresh_heap_views(ctx.state.env, heap)
+
+    def refresh_heap_views(self, env: dict[str, Val], heap: L.Term) -> None:
+        for name, value in list(env.items()):
+            if name.startswith("@") or name == SEGMENT:
+                continue
+            env[name] = self.heap_view(value, heap)
+
+    def heap_view(self, value: Val, heap: L.Term) -> Val:
+        if isinstance(value, ListVal):
+            assert value.ref is not None
+            ref = value.ref
+            view = value.view if value.view is not None else L.FALSE
+            heap_len = H.read_len(heap, ref)
+            length = value.len if isinstance(view, L.BoolV) and view.value else heap_len if isinstance(view, L.BoolV) else L.ite(view, value.len, heap_len)
+            index = L.Const(f"list.view.{next(self.counter)}.index", L.INT)
+            boxed = H.read_list(heap, ref, index)
+            loc = ir.Loc(self.fn.loc.line)
+            arr = L.array_lambda(index, H.unbox(boxed, value.ty.elem, None, loc))
+            numeric = value.py_numeric
+            if self.module.language == "python" and isinstance(value.ty.elem, ir.TReal) and value.ty.elem.bits == 64:
+                tag = L.field(boxed, "tag")
+                py = L.field(boxed, "python_number")
+                is_number = L.eq(tag, L.IntV(H.VALUE_TAGS["python_number"]))
+                is_integer = L.or_(L.eq(tag, L.IntV(H.VALUE_TAGS["integer"])), L.eq(tag, L.IntV(H.VALUE_TAGS["boolean"])))
+                integer = L.ite(
+                    L.eq(tag, L.IntV(H.VALUE_TAGS["boolean"])),
+                    L.ite(L.field(boxed, "boolean"), L.ONE, L.ZERO),
+                    L.field(boxed, "integer"),
+                )
+                numeric = PyNumericList(
+                    L.array_lambda(index, L.ite(is_number, L.field(py, "is_int"), is_integer)),
+                    L.array_lambda(index, L.ite(is_number, L.field(py, "integer"), integer)),
+                    L.array_lambda(index, L.ite(is_number, L.field(py, "floating"), L.field(boxed, "real"))),
+                )
+            return ListVal(arr, value.off, length, value.ty, numeric, ref, view)
+        if isinstance(value, DictVal):
+            assert value.ref is not None
+            key_value = L.Const(f"dict.view.{next(self.counter)}.key", sort_of(value.ty.key))
+            canonical_key, _ = H.key(key_value, value.ty.key, self.module.language)
+            cell = H.cell(heap, value.ref)
+            has = L.array_lambda(key_value, L.select(L.field(cell, "has"), canonical_key))
+            boxed = H.read_dict(heap, value.ref, canonical_key)
+            vals = L.array_lambda(key_value, H.unbox(boxed, value.ty.val, None, ir.Loc(self.fn.loc.line)))
+            return DictVal(vals, has, value.ty, value.ref)
+        if isinstance(value, OptVal):
+            return OptVal(value.some, self.heap_view(value.val, heap), value.ty)
+        return value
+
+    def list_ref(self, value: ListVal) -> L.Term:
+        assert value.ref is not None
+        return value.ref
+
+    def copy_container(self, value: Val, ctx: Ctx) -> Val:
+        if isinstance(value, ListVal):
+            return self.copy_list_value(value, ctx)
+        if isinstance(value, DictVal):
+            ref = self.fresh_heap_copy(value.ref, ctx)
+            return DictVal(value.vals, value.has, value.ty, ref)
+        return value
+
+    def fresh_heap_copy(self, source: L.Term, ctx: Ctx) -> L.Term:
+        n = next(self.counter)
+        ref = L.Const(f"cell.copy@{n}.ref", L.INT)
+        heap, facts = H.allocate(ctx.env["@heap"], H.blank_cell(), ref)
+        for fact in facts:
+            ctx.assume(fact)
+        contents = H.with_fields(H.cell(ctx.env["@heap"], source), {"allocated": L.TRUE})
+        self.set_heap(ctx, L.store(heap, ref, contents))
+        return ref
+
+    def copy_list_value(self, source: ListVal, ctx: Ctx) -> ListVal:
+        self.check_heap_kind(ctx, self.list_ref(source), H.CELL_TAGS["list"], ir.Loc(self.fn.loc.line), "list copy")
+        n = next(self.counter)
+        ref = L.Const(f"list.copy@{n}.ref", L.INT)
+        old_heap = ctx.env["@heap"]
+        heap, facts = H.allocate(old_heap, H.blank_cell(), ref)
+        for fact in facts:
+            ctx.assume(fact)
+        seq = L.Const(f"list.copy@{n}.seq", L.ARRAY(H.BOX))
+        i = L.Const(f"list.copy@{n}.index", L.INT)
+        src_index = L.add(source.off, i)
+        in_bounds = L.and_(L.le(L.ZERO, i), L.lt(i, source.len))
+        ctx.assume(L.Quant("forall", (i,), L.implies(in_bounds, L.eq(L.select(seq, i), H.read_list(old_heap, self.list_ref(source), src_index))), patterns=((L.select(seq, i),),)))
+        original = H.with_fields(H.cell(old_heap, self.list_ref(source)), {
+            "allocated": L.TRUE, "len": source.len, "seq": seq,
+        })
+        self.set_heap(ctx, L.store(heap, ref, original))
+        arr = L.Const(f"list.copy@{n}.arr", sort_of(source.ty))
+        numeric = None
+        numeric_parts = None if isinstance(source.ty.elem, ir.TPythonNumber) else py_numeric_state(source)
+        arrays = [(arr, source.arr)]
+        if numeric_parts is not None:
+            tags = L.Const(f"list.copy@{n}.py_tags", L.ARRAY(L.BOOL))
+            ints = L.Const(f"list.copy@{n}.py_ints", L.ARRAY(L.INT))
+            floats = L.Const(f"list.copy@{n}.py_floats", L.ARRAY(L.FLOAT64))
+            numeric = PyNumericList(tags, ints, floats)
+            arrays.extend(((tags, numeric_parts.tags), (ints, numeric_parts.ints), (floats, numeric_parts.floats)))
+        for target, source_arr in arrays:
+            ctx.assume(L.Quant("forall", (i,), L.implies(in_bounds, L.eq(L.select(target, i), L.select(source_arr, src_index))), patterns=((L.select(target, i),),)))
+        return ListVal(arr, L.ZERO, source.len, source.ty, numeric, ref)
+
+    def check_heap_kind(self, ctx: Ctx, ref: L.Term, kind: int, loc: ir.Loc, label: str) -> None:
+        heap = ctx.env.get("@heap")
+        if not isinstance(heap, L.Term):
+            return
+        current = H.cell(heap, ref)
+        valid = L.and_(L.field(current, "allocated"), L.eq(L.field(current, "kind"), L.IntV(kind)))
+        self.oblige("type", ctx, valid, loc, f"{label} refers to an allocated {('list' if kind == H.CELL_TAGS['list'] else 'dict' if kind == H.CELL_TAGS['dict'] else 'object')}")
+        ctx.assume(valid)
+
+    def list_len(self, value: ListVal, ctx: Ctx) -> L.Term:
+        heap = ctx.env.get("@heap")
+        if not isinstance(heap, L.Term):
+            return value.len
+        view = value.view if value.view is not None else L.FALSE
+        if isinstance(view, L.BoolV):
+            return value.len if view.value else H.read_len(heap, self.list_ref(value))
+        return L.ite(view, value.len, H.read_len(heap, self.list_ref(value)))
+
+    def read_list_value(self, seq: ListVal, index: L.Term, ctx: Ctx, loc: ir.Loc) -> Val:
+        self.check_heap_kind(ctx, self.list_ref(seq), H.CELL_TAGS["list"], loc, "list access")
+        current = ctx.env.get("@heap")
+        if not isinstance(current, L.Term):
+            return self.python_list_value(seq, index)
+        boxed = H.read_list(current, self.list_ref(seq), L.add(seq.off, index))
+        valid = H.accepts(boxed, seq.ty.elem)
+        self.oblige("type", ctx, valid, loc, f"list element can be viewed as {seq.ty.elem}")
+        ctx.assume(valid)
+        value = H.unbox(boxed, seq.ty.elem, ctx, loc)
+        if isinstance(seq.ty.elem, ir.TPythonNumber):
+            return as_py_number(value)
+        return value
+
+    def dict_key(self, value: Val, ty: ir.Type, ctx: Ctx, loc: ir.Loc) -> L.Term:
+        key, valid = H.key(value, ty, self.module.language)
+        self.oblige("key", ctx, valid, loc, "dictionary key has supported finite equality")
+        ctx.assume(valid)
+        return key
+
+    def read_dict_value(self, d: DictVal, key: L.Term, ctx: Ctx, loc: ir.Loc) -> Val:
+        self.check_heap_kind(ctx, d.ref, H.CELL_TAGS["dict"], loc, "dictionary access")
+        boxed = H.read_dict(ctx.env["@heap"], d.ref, key)
+        valid = H.accepts(boxed, d.ty.val)
+        self.oblige("type", ctx, valid, loc, f"dictionary value can be viewed as {d.ty.val}")
+        ctx.assume(valid)
+        return H.unbox(boxed, d.ty.val, ctx, loc)
+
+    def allocate_dict(self, pairs: list[tuple[Val, Val]], ty: ir.TDict, ctx: Ctx, loc: ir.Loc) -> DictVal:
+        n = next(self.counter)
+        ref = L.Const(f"dict@{n}.ref", L.INT)
+        heap, facts = H.allocate(ctx.env["@heap"], H.dict_cell(self.module.language), ref)
+        for fact in facts:
+            ctx.assume(fact)
+        self.set_heap(ctx, heap)
+        vals = L.const_array(L.ARRAY(sort_of(ty.val), sort_of(ty.key)), default_term(sort_of(ty.val)))
+        has = L.const_array(L.ARRAY(L.BOOL, sort_of(ty.key)), L.FALSE)
+        result = DictVal(vals, has, ty, ref)
+        for key_value, value in pairs:
+            key = self.dict_key(key_value, ty.key, ctx, loc)
+            boxed = H.box(coerce(value, ty.val), ty.val, self.module.language)
+            original_key = H.box(key_value, ty.key, self.module.language)
+            self.set_heap(ctx, H.write_dict(ctx.env["@heap"], ref, key, boxed, original_key))
+            vals = L.store(vals, key_value, coerce(value, ty.val))
+            has = L.store(has, key_value, L.TRUE)
+        return DictVal(vals, has, ty, ref)
+
+    def allocate_list(self, values: list[Val], ty: ir.TList, ctx: Ctx, loc: ir.Loc) -> ListVal:
+        n = next(self.counter)
+        ref = L.Const(f"list@{n}.ref", L.INT)
+        boxed = [H.box(v, ty.elem, self.module.language) for v in values]
+        current = ctx.env.get("@heap")
+        if not isinstance(current, L.Term):
+            raise VCError("mutable list allocation requires the shared heap", loc)
+        allocated, facts = H.allocate(current, H.list_cell(boxed, self.module.language), ref)
+        for fact in facts:
+            ctx.assume(fact)
+        self.set_heap(ctx, allocated)
+        old = self.fresh("list.literal", ty, L.IntV(len(values)))
+        assert isinstance(old, ListVal)
+        if isinstance(ty.elem, ir.TPythonNumber):
+            arr = L.const_array(sort_of(ty), default_term(sort_of(ty.elem)))
+            for i, value in enumerate(values):
+                arr = L.store(arr, L.IntV(i), L.mkrec(sort_of(ty.elem), as_py_number(value).parts()))
+            return ListVal(arr, L.ZERO, L.IntV(len(values)), ty, ref=ref)
+        return ListVal(old.arr, L.ZERO, L.IntV(len(values)), ty, old.py_numeric, ref)
+
+    def allocate_list_projection(
+        self,
+        arr: L.Term,
+        length: L.Term,
+        ty: ir.TList,
+        ctx: Ctx,
+        numeric: PyNumericList | None = None,
+    ) -> ListVal:
+        """Allocate a new list whose logical array is a typed view of its heap sequence."""
+        n = next(self.counter)
+        ref = L.Const(f"list.derived@{n}.ref", L.INT)
+        index = L.Const(f"list.derived@{n}.index", L.INT)
+        item: Val = L.select(arr, index)
+        if isinstance(ty.elem, ir.TPythonNumber):
+            item = as_py_number(item)
+        elif self.module.language == "python" and isinstance(ty.elem, ir.TReal) and ty.elem.bits == 64:
+            state = numeric or PyNumericList(
+                L.const_array(L.ARRAY(L.BOOL), L.FALSE),
+                L.const_array(L.ARRAY(L.INT), L.ZERO),
+                arr,
+            )
+            item = PyNumber(L.select(state.tags, index), L.select(state.ints, index), L.select(state.floats, index))
+        boxed = L.array_lambda(index, H.box(item, ty.elem, self.module.language))
+        contents = H.with_fields(H.list_cell([]), {"len": length, "seq": boxed})
+        heap, facts = H.allocate(ctx.env["@heap"], contents, ref)
+        for fact in facts:
+            ctx.assume(fact)
+        self.set_heap(ctx, heap)
+        result = ListVal(arr, L.ZERO, length, ty, numeric, ref)
+        return self.heap_view(result, ctx.env["@heap"])
 
     def has_invariants(self, cls: str) -> bool:
         return any(self.program.classes[c].invariants for c in self.program.mro(cls))
@@ -731,14 +983,93 @@ class VCGen:
         ctx.assume(L.implies(L.not_(L.or_(*exempt)), L.and_(*ts)) if exempt else L.and_(*ts))
 
     def heap_read(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term) -> Val:
-        keys = self.heap_keys(cls, fname, strict=True)
         fty = self.program.classes[cls].field_type(fname)
         assert fty is not None
-        return pack(fty, [L.select(env[k], ref) for k, _ in keys])  # type: ignore[arg-type]
+        owner = self.program.field_storage_owner(cls, fname)
+        try:
+            slot = H.field_slot(self.program, owner, fname)
+        except KeyError as exc:
+            raise VCError(str(exc), self.fn.loc) from exc
+        heap = env.get("@heap")
+        if not isinstance(heap, L.Term):
+            raise VCError("class field has no shared heap", self.fn.loc)
+        boxed = H.read_field(heap, ref, slot)
+        value = H.unbox(boxed, fty, None, ir.Loc(self.fn.loc.line))
+        return self.heap_typed_value(value, fty, ref_heap=heap)
 
     def heap_write(self, env: dict[str, Val], cls: str, fname: str, ref: L.Term, v: Val) -> None:
-        for (k, _), comp in zip(self.heap_keys(cls, fname, strict=True), flatten(v)):
-            env[k] = L.store(env[k], ref, comp)  # type: ignore[arg-type]
+        fty = self.program.classes[cls].field_type(fname)
+        assert fty is not None
+        owner = self.program.field_storage_owner(cls, fname)
+        try:
+            slot = H.field_slot(self.program, owner, fname)
+        except KeyError as exc:
+            raise VCError(str(exc), self.fn.loc) from exc
+        heap = env.get("@heap")
+        if not isinstance(heap, L.Term):
+            raise VCError("class field has no shared heap", self.fn.loc)
+        heap = H.write_field(heap, ref, slot, H.box(coerce(v, fty), fty, self.module.language))
+        env["@heap"] = heap
+        self.refresh_heap_views(env, heap)
+
+    def havoc_class_field(
+        self,
+        env: dict[str, Val],
+        cls: str,
+        fname: str,
+        targets: set[str],
+        refs: dict[str, Val],
+        alloc_pre: L.Term,
+        alloc_post: L.Term,
+        ctx: Ctx,
+    ) -> None:
+        fty = self.program.classes[cls].field_type(fname)
+        assert fty is not None
+        owner = self.program.field_storage_owner(cls, fname)
+        try:
+            slot = H.field_slot(self.program, owner, fname)
+        except KeyError as exc:
+            raise VCError(str(exc), self.fn.loc) from exc
+        old = env["@heap"]
+        assert isinstance(old, L.Term)
+        new = L.Const(f"heap.{cls}.{fname}@{next(self.counter)}", H.HEAP)
+        r = L.Const(f"field.effect.{next(self.counter)}.ref", H.REF)
+        old_cell = H.cell(old, r)
+        new_cell = H.cell(new, r)
+        target_refs = [refs[name] for name in targets if name in refs and isinstance(refs[name], L.Term)]
+        allocated = L.field(old_cell, "allocated")
+        if "*" in targets:
+            affected = L.and_(allocated, L.eq(L.field(old_cell, "kind"), L.IntV(H.CELL_TAGS["class"])))
+        elif "@new" in targets:
+            affected = L.and_(L.select(alloc_post, r), L.not_(L.select(alloc_pre, r)))
+        else:
+            affected = L.or_(*(L.eq(r, target) for target in target_refs))
+        next_fields = L.field(new_cell, "fields")
+        expected = H.with_fields(old_cell, {
+            "fields": L.store(L.field(old_cell, "fields"), L.IntV(slot), L.select(next_fields, L.IntV(slot)))
+        })
+        ctx.assume(L.Quant("forall", (r,), L.implies(
+            affected,
+            L.and_(L.eq(new_cell, expected), H.accepts(L.select(next_fields, L.IntV(slot)), fty)),
+        )))
+        ctx.assume(L.Quant("forall", (r,), L.implies(L.not_(affected), L.eq(new_cell, old_cell))))
+        env["@heap"] = new
+        self.refresh_heap_views(env, new)
+
+    def heap_typed_value(self, value: Val, ty: ir.Type, ref_heap: L.Term) -> Val:
+        if isinstance(ty, ir.TOption) and isinstance(value, OptVal):
+            return OptVal(value.some, self.heap_typed_value(value.val, ty.inner, ref_heap), ty)
+        if isinstance(ty, ir.TList):
+            assert isinstance(value, L.Term)
+            array = default_term(L.ARRAY(sort_of(ty.elem)))
+            view = ListVal(array, L.ZERO, H.read_len(ref_heap, value), ty, ref=value, view=L.FALSE)
+            return self.heap_view(view, ref_heap)
+        if isinstance(ty, ir.TDict):
+            assert isinstance(value, L.Term)
+            values = default_term(L.ARRAY(sort_of(ty.val), sort_of(ty.key)))
+            has = default_term(L.ARRAY(L.BOOL, sort_of(ty.key)))
+            return self.heap_view(DictVal(values, has, ty, value), ref_heap)
+        return value
 
     def heap_env(self, env: dict[str, Val]) -> dict[str, Val]:
         return {k: v for k, v in env.items() if k.startswith("@")}
@@ -883,13 +1214,57 @@ class VCGen:
             if self.has_invariants(cname):
                 env[WRITTEN + cname] = NO_WRITES
         for p in fn.params:
-            v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
+            v = self.apply_param_view(self.input_override.get(p.name) or self.param_val(p.name, p.ty), p)
             if isinstance(p.ty, ir.TReal) and isinstance(v, L.Term) and v.sort == L.INT:
                 v = L.to_float(v, sort_of(p.ty))
+            if isinstance(v, (ListVal, DictVal, OptVal)):
+                v = self.heap_view(v, env["@heap"])
             env[p.name] = v
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
             if isinstance(v, ListVal):
-                facts.append(L.le(L.ZERO, v.len))
+                assert isinstance(env.get("@heap"), L.Term)
+                ref = self.list_ref(v)
+                entry_cell = H.cell(env["@heap"], ref)
+                facts.extend((L.field(entry_cell, "allocated"), L.eq(L.field(entry_cell, "kind"), L.IntV(H.CELL_TAGS["list"]))))
+                facts.extend((L.eq(v.len, H.read_len(env["@heap"], ref)), L.le(L.ZERO, H.read_len(env["@heap"], ref))))
+                if isinstance(p.ty.elem, (ir.TInt, ir.TReal, ir.TBool, ir.TStr, ir.TPythonNumber, ir.TClass, ir.TOpaque, ir.TNone)):
+                    i = L.Const(f"{p.name}.heap_index", L.INT)
+                    item = self.python_list_value(v, i)
+                    boxed = H.read_list(env["@heap"], ref, i)
+                    if isinstance(item, PyNumber):
+                        projected = as_py_number(H.unbox(boxed, ir.TPythonNumber(), None, ir.Loc(fn.loc.line)))
+                        same = py_numeric_compare(item, projected, "eq")
+                    else:
+                        same = L.eq(H.unbox(boxed, p.ty.elem, None, ir.Loc(fn.loc.line)), item)
+                    agrees_with_view = L.and_(H.accepts(boxed, p.ty.elem), same)
+                    in_bounds = L.and_(L.le(L.ZERO, i), L.lt(i, v.len))
+                    facts.append(L.Quant(
+                        "forall", (i,),
+                        L.implies(in_bounds, agrees_with_view),
+                        patterns=((boxed,),),
+                    ))
+                if isinstance(p.ty.elem, ir.TRecord):
+                    i = L.Const(f"{p.name}.record_index", L.INT)
+                    boxed = H.read_list(env["@heap"], ref, i)
+                    record_ref = H.unbox(boxed, p.ty.elem, None, ir.Loc(fn.loc.line))
+                    in_bounds = L.and_(L.le(L.ZERO, i), L.lt(i, v.len))
+                    record_cell = H.cell(env["@heap"], record_ref)
+                    typed_record = L.and_(
+                        H.accepts(boxed, p.ty.elem),
+                        L.field(record_cell, "allocated"),
+                        L.eq(L.field(record_cell, "kind"), L.IntV(H.CELL_TAGS["record"])),
+                    )
+                    owner = H.record_field_owner(self.module.language, p.ty.elem.name)
+                    for field_name, field_ty in p.ty.elem.fields:
+                        slot = H.field_slot(self.program, owner, field_name)
+                        field_box = H.read_field(env["@heap"], record_ref, slot)
+                        projected = L.field(L.select(v.arr, i), field_name)
+                        typed_record = L.and_(
+                            typed_record,
+                            H.accepts(field_box, field_ty),
+                            L.eq(H.unbox(field_box, field_ty, None, ir.Loc(fn.loc.line)), projected),
+                        )
+                    facts.append(L.Quant("forall", (i,), L.implies(in_bounds, typed_record)))
                 if self.module.language == "python" and isinstance(p.ty, ir.TList) and isinstance(p.ty.elem, ir.TReal) and p.ty.elem.bits == 64:
                     numeric = py_numeric_state(v)
                     i = L.Const(f"{p.name}.numeric_index", L.INT)
@@ -897,6 +1272,38 @@ class VCGen:
                     facts.append(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, v.len)), L.eq(L.select(v.arr, i), expected)), patterns=((L.select(v.arr, i),),)))
                 if self.module.language == "typescript":
                     facts.append(L.le(v.len, L.IntV(4294967295)))
+            if isinstance(v, DictVal):
+                entry_cell = H.cell(env["@heap"], v.ref)
+                facts.extend((L.field(entry_cell, "allocated"), L.eq(L.field(entry_cell, "kind"), L.IntV(H.CELL_TAGS["dict"]))))
+                key_value = L.Const(f"{p.name}.heap_key", H.KEY)
+                heap_has = L.select(L.field(entry_cell, "has"), key_value)
+                heap_value = H.read_dict(env["@heap"], v.ref, key_value)
+                typed_value = H.accepts(heap_value, p.ty.val)
+                if isinstance(p.ty.key, ir.TStr):
+                    key_kind = L.eq(L.field(key_value, "tag"), L.IntV(2))
+                elif isinstance(p.ty.key, (ir.TBool, ir.TInt, ir.TReal, ir.TPythonNumber)):
+                    key_kind = L.eq(L.field(key_value, "tag"), L.IntV(1))
+                else:
+                    key_kind = L.FALSE
+                in_domain = L.and_(key_kind, heap_has)
+                facts.append(L.Quant("forall", (key_value,), L.implies(heap_has, key_kind), patterns=((heap_has,),)))
+                facts.append(L.Quant("forall", (key_value,), L.implies(in_domain, typed_value), patterns=((heap_value,),)))
+            if isinstance(p.ty, ir.TClass):
+                object_cell = H.cell(env["@heap"], v)
+                facts.extend((
+                    L.field(object_cell, "allocated"),
+                    L.eq(L.field(object_cell, "kind"), L.IntV(H.CELL_TAGS["class"])),
+                ))
+                declared = {}
+                for owner_cls in self.program.mro(p.ty.name):
+                    declared.update(dict(self.program.classes[owner_cls].fields))
+                for fname, field_ty in declared.items():
+                    try:
+                        slot = H.field_slot(self.program, self.program.field_storage_owner(p.ty.name, fname), fname)
+                    except KeyError as exc:
+                        raise VCError(str(exc), fn.loc) from exc
+                    facts.append(H.accepts(H.read_field(env["@heap"], v, slot), field_ty))
+            facts.extend(valid_container_facts(v, p.ty))
             facts.extend(self.alloc_facts(v, p.ty, env))
         self.entry = dict(env)
         if any(suspends(x) for st_ in ir.walk_stmts(fn.body) for e in ir.stmt_exprs(st_) for x in ir.walk_expr(e)):
@@ -951,7 +1358,7 @@ class VCGen:
         env: dict[str, Val] = {}
         self.heap_init(env)
         for p in self.fn.params:
-            v = self.input_override.get(p.name) or self.param_val(p.name, p.ty)
+            v = self.apply_param_view(self.input_override.get(p.name) or self.param_val(p.name, p.ty), p)
             env[p.name] = v
             self.inputs.append((p.name, self.input_view(v, p.ty, env, 2)))
         return self.inputs
@@ -1113,7 +1520,10 @@ class VCGen:
     def stmt(self, s: ir.Stmt, st: State) -> State:
         if isinstance(s, ir.Assign):
             ctx = self.ctx(st)
-            st.env[s.name] = coerce(self.ev(s.value, ctx), self.fn.locals.get(s.name))
+            value = coerce(self.ev(s.value, ctx), self.fn.locals.get(s.name))
+            if self.module.language == "swift" and isinstance(value, (ListVal, DictVal)):
+                value = self.copy_container(value, ctx)
+            st.env[s.name] = value
             if self.writes_in_place(s):
                 self.havoc_unchecked(ctx, keep=frozenset({s.name}))
             return st
@@ -1134,9 +1544,12 @@ class VCGen:
             assert isinstance(d, DictVal)
             ctx = self.ctx(st)
             k = self.ev(s.key, ctx)
+            key = self.dict_key(k, d.ty.key, ctx, s.loc)
+            present = L.select(L.field(H.cell(ctx.env["@heap"], d.ref), "has"), key)
             if s.strict:
-                self.oblige("key", ctx, L.select(d.has, k), s.loc, f"key being deleted from '{s.name}' is present")  # type: ignore[arg-type]
-            st.env[s.name] = DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
+                self.oblige("key", ctx, present, s.loc, f"key being deleted from '{s.name}' is present")
+            self.set_heap(ctx, H.delete_dict(ctx.env["@heap"], d.ref, key))
+            st.env[s.name] = DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty, d.ref)  # type: ignore[arg-type]
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.IndexAssign) and isinstance(st.env.get(s.name), DictVal):
@@ -1145,7 +1558,9 @@ class VCGen:
             ctx = self.ctx(st)
             k = self.ev(s.idx, ctx)
             v = coerce(self.ev(s.value, ctx), d.ty.val)
-            st.env[s.name] = DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
+            key = self.dict_key(k, d.ty.key, ctx, s.loc)
+            self.set_heap(ctx, H.write_dict(ctx.env["@heap"], d.ref, key, H.box(v, d.ty.val, self.module.language), H.box(k, d.ty.key, self.module.language)))
+            st.env[s.name] = DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty, d.ref)  # type: ignore[arg-type]
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.IndexAssign):
@@ -1154,8 +1569,10 @@ class VCGen:
             ctx = self.ctx(st)
             i = self.index_of(lst, self.ev(s.idx, ctx), s.wrap, ctx, s.loc, s.name)
             v = self.ev(s.value, ctx)
+            boxed = H.box(v, lst.ty.elem, self.module.language)
+            self.set_heap(ctx, H.write_list(ctx.env["@heap"], self.list_ref(lst), L.add(lst.off, i), boxed))
             arr, numeric = py_numeric_store(lst, L.add(lst.off, i), v)
-            st.env[s.name] = ListVal(arr, lst.off, lst.len, lst.ty, numeric)
+            st.env[s.name] = ListVal(arr, lst.off, self.list_len(lst, ctx), lst.ty, numeric, self.list_ref(lst), lst.view)
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.Append):
@@ -1163,8 +1580,10 @@ class VCGen:
             assert isinstance(lst, ListVal)
             ctx = self.ctx(st)
             v = self.ev(s.value, ctx)
+            boxed = H.box(v, lst.ty.elem, self.module.language)
+            self.set_heap(ctx, H.append_list(ctx.env["@heap"], self.list_ref(lst), boxed))
             arr, numeric = py_numeric_store(lst, L.add(lst.off, lst.len), v)
-            st.env[s.name] = ListVal(arr, lst.off, L.add(lst.len, L.ONE), lst.ty, numeric)
+            st.env[s.name] = ListVal(arr, lst.off, self.list_len(lst, ctx), lst.ty, numeric, self.list_ref(lst), lst.view)
             self.wrote_view(s.name, ctx)
             return st
         if isinstance(s, ir.If):
@@ -1308,6 +1727,7 @@ class VCGen:
             elif isinstance(s, ir.Assign) and isinstance(self.fn.locals.get(s.name), ir.TList):
                 appends.add(s.name)
             elif isinstance(s, ir.FieldAssign):
+                names.add("@heap")
                 names.update(k for k, _ in self.heap_keys(s.cls, s.field))
                 if self.has_invariants(s.cls):
                     names.add(WRITTEN + s.cls)
@@ -1315,6 +1735,7 @@ class VCGen:
                 for sub in ir.walk_expr(e):
                     if isinstance(sub, ir.New):
                         names.add("@alloc")
+                        names.add("@heap")
                         for cls_field in self.program.heap_writes.get(self._init_key(sub.cls) or "", {}):
                             c, f = cls_field.split(".", 1)
                             names.update(k for k, _ in self.heap_keys(c, f))
@@ -1328,6 +1749,7 @@ class VCGen:
                                 names.update(k for k, _ in self.heap_keys(c, f))
                     if suspends(sub):
                         names.add(SEGMENT)
+                        names.add("@heap")
                         names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Extern):
                         for a in sub.args:
@@ -1339,6 +1761,7 @@ class VCGen:
                             appends.update(self.shared)
                         if extern_heap and self.program.extern_touches_heap(sub):
                             names.add("@alloc")
+                            names.add("@heap")
                             names.update(k for c, d in self.program.classes.items() for f, _ in d.fields for k, _ in self.heap_keys(c, f))
                     if isinstance(sub, ir.Call):
                         tgt = self.program.resolve(self.module, sub.func)
@@ -1347,6 +1770,7 @@ class VCGen:
                         if tgt.key in self.program.allocates:
                             names.add("@alloc")
                         for cls_field in self.program.heap_writes.get(tgt.key, {}):
+                            names.add("@heap")
                             c, f = cls_field.split(".", 1)
                             names.update(k for k, _ in self.heap_keys(c, f))
                         for p, a in zip(tgt.fn.params, sub.args):
@@ -1644,7 +2068,7 @@ class VCGen:
 
         def bind(body_st: State, k: L.Term) -> None:
             self.require_python_float_element(seq, k, self.ctx(body_st), s.loc)
-            body_st.env[s.elem] = self.python_list_value(seq, k)
+            body_st.env[s.elem] = self.read_list_value(seq, k, self.ctx(body_st), s.loc)
             body_st.env[s.idx] = k
             self.assume_held(body_st.env[s.elem], seq.ty.elem, self.ctx(body_st))
 
@@ -1667,7 +2091,7 @@ class VCGen:
         raise VCError(f"'{name}' may be used before it is assigned", loc)
 
     def index_of(self, lst: ListVal, i: L.Term, wrap: bool, ctx: Ctx, loc: ir.Loc, what: str) -> L.Term:
-        n = lst.len
+        n = self.list_len(lst, ctx)
         if self.module.language == "typescript" and i.sort == L.INT:
             self.oblige("integer", ctx, self.js_safe_integer(i), loc, "array index is within JavaScript's safe integer range")
         if wrap:
@@ -1895,8 +2319,12 @@ class VCGen:
         seq = self.ev(e.seq, ctx)
         if isinstance(seq, DictVal):
             k = self.ev(e.idx, ctx)
-            self.oblige("key", ctx, L.select(seq.has, k), e.loc, f"key looked up in '{_expr_name(e.seq)}' is present")  # type: ignore[arg-type]
-            v = L.select(seq.vals, k)  # type: ignore[arg-type]
+            key = self.dict_key(k, seq.ty.key, ctx, e.loc)
+            self.check_heap_kind(ctx, seq.ref, H.CELL_TAGS["dict"], e.loc, "dictionary access")
+            has = L.select(L.field(H.cell(ctx.env["@heap"], seq.ref), "has"), key)
+            self.oblige("key", ctx, has, e.loc, f"key looked up in '{_expr_name(e.seq)}' is present")
+            ctx.assume(has)
+            v = self.read_dict_value(seq, key, ctx, e.loc)
             self.assume_held(v, e.ty, ctx)
             self.require_js_safe_value(v, e.ty, ctx, e.loc, "dictionary value is a safe integer")
             return v
@@ -1905,7 +2333,7 @@ class VCGen:
         assert not isinstance(i, ListVal)
         j = self.index_of(seq, i, e.wrap, ctx, e.loc, _expr_name(e.seq))
         self.require_python_float_element(seq, j, ctx, e.loc)
-        x = self.python_list_value(seq, j)
+        x = self.read_list_value(seq, j, ctx, e.loc)
         self.assume_held(x, e.ty, ctx)
         self.require_js_safe_value(x, e.ty, ctx, e.loc, "array element is a safe integer")
         return x
@@ -1913,6 +2341,27 @@ class VCGen:
     def ev_Field(self, e: ir.Field, ctx: Ctx) -> Val:
         obj = self.ev(e.obj, ctx)
         assert not isinstance(obj, (ListVal, OptVal, DictVal))
+        if isinstance(e.obj.ty, ir.TRecord) and isinstance(obj, L.Term) and obj.sort == L.INT:
+            heap = ctx.env.get("@heap")
+            if not isinstance(heap, L.Term):
+                raise VCError("record reference has no shared heap", e.loc)
+            current = H.cell(heap, obj)
+            valid = L.and_(L.field(current, "allocated"), L.eq(L.field(current, "kind"), L.IntV(H.CELL_TAGS["record"])))
+            self.oblige("type", ctx, valid, e.loc, "record field refers to an allocated record")
+            ctx.assume(valid)
+            field_ty = next((ty for name, ty in e.obj.ty.fields if name == e.name), None)
+            if field_ty is None:
+                raise VCError(f"record has no field '{e.name}'", e.loc)
+            owner = H.record_field_owner(ctx.module.language, e.obj.ty.name)
+            try:
+                slot = H.field_slot(self.program, owner, e.name)
+            except KeyError as exc:
+                raise VCError(str(exc), e.loc) from exc
+            boxed = H.read_field(heap, obj, slot)
+            accepted = H.accepts(boxed, e.ty)
+            self.oblige("type", ctx, accepted, e.loc, f"record field can be viewed as {e.ty}")
+            ctx.assume(accepted)
+            return H.unbox(boxed, e.ty, ctx, e.loc)
         if isinstance(e.obj.ty, ir.TClass):
             env = ctx.env if ctx.state is None else ctx.state.env
             v = self.heap_read(env, e.obj.ty.name, e.name, obj)
@@ -1944,27 +2393,11 @@ class VCGen:
         assert isinstance(e.ty, ir.TList)
         # an empty [] of unknown type is a placeholder until it is stored (see coerce)
         ty = ir.TList(ir.INT) if e.ty.elem == ir.NONE else e.ty
-        base = self.fresh("lit", ty, len_=L.ZERO)
-        assert isinstance(base, ListVal)
-        if e.ty.elem == ir.NONE:
-            base = ListVal(base.arr, base.off, base.len, e.ty)
-        arr = base.arr
-        tagged = isinstance(ty.elem, ir.TPythonNumber)
-        numeric = py_numeric_state(base) if isinstance(ty.elem, ir.TReal) and ty.elem.bits == 64 else None
+        values: list[Val] = []
         for i, x in enumerate(e.elems):
             v = self.ev(x, ctx)
-            assert not isinstance(v, ListVal)
-            if tagged:
-                number = as_py_number(v)
-                arr = L.store(arr, L.IntV(i), L.mkrec(sort_of(ir.TPythonNumber()), number.parts()))
-            elif numeric is not None:
-                number = as_py_number(v)
-                idx = L.IntV(i)
-                arr = L.store(arr, idx, number.as_float())
-                numeric = PyNumericList(L.store(numeric.tags, idx, number.is_int), L.store(numeric.ints, idx, number.integer), L.store(numeric.floats, idx, number.floating))
-            else:
-                arr = L.store(arr, L.IntV(i), v)
-        return ListVal(arr, L.ZERO, L.IntV(len(e.elems)), e.ty if e.ty.elem == ir.NONE else ty, numeric)
+            values.append(v)
+        return self.allocate_list(values, e.ty if e.ty.elem == ir.NONE else ty, ctx, e.loc)
 
     def ev_Quant(self, e: ir.Quant, ctx: Ctx) -> Val:
         if not ctx.spec and self._effectful(e.body):
@@ -2011,18 +2444,22 @@ class VCGen:
         if name == "await" and ctx.state is not None and not ctx.spec:
             self.check_objects(ctx.state, e.loc, "at the await", ctx.guard)
         if name == "dict_lit" and e.ty.key == ir.NONE:  # type: ignore[union-attr]
-            return DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), e.ty)  # type: ignore[arg-type]
+            empty_ty = ir.TDict(ir.NONE, ir.NONE)
+            base = DictVal(L.const_array(L.ARRAY(L.INT), L.ZERO), L.const_array(L.ARRAY(L.BOOL), L.FALSE), empty_ty, L.Const(f"dict@{next(self.counter)}.ref", L.INT))
+            heap = ctx.env["@heap"]
+            new_heap, facts = H.allocate(heap, H.dict_cell(self.module.language), base.ref)
+            for fact in facts:
+                ctx.assume(fact)
+            self.set_heap(ctx, new_heap)
+            return DictVal(base.vals, base.has, e.ty, base.ref)  # type: ignore[arg-type]
         if name == "dict_lit":
             assert isinstance(e.ty, ir.TDict)
-            ks = sort_of(e.ty.key)
-            vals: L.Term = L.const_array(L.ARRAY(sort_of(e.ty.val), ks), default_term(sort_of(e.ty.val)))
-            has: L.Term = L.const_array(L.ARRAY(L.BOOL, ks), L.FALSE)
+            pairs: list[tuple[Val, Val]] = []
             for ke, ve in zip(e.args[0::2], e.args[1::2]):
                 k = self.ev(ke, ctx)
                 v = coerce(self.ev(ve, ctx), e.ty.val)
-                vals = L.store(vals, k, v)  # type: ignore[arg-type]
-                has = L.store(has, k, L.TRUE)  # type: ignore[arg-type]
-            return DictVal(vals, has, e.ty)
+                pairs.append((k, v))
+            return self.allocate_dict(pairs, e.ty, ctx, e.loc)
         args = [self.ev(a, ctx) for a in e.args]
         if name == "py_number":
             return as_py_number(args[0])
@@ -2037,12 +2474,7 @@ class VCGen:
             return L.FALSE
         if name == "py_mixed_list":
             assert isinstance(e.ty, ir.TList) and isinstance(e.ty.elem, ir.TPythonNumber)
-            arr: L.Term = L.const_array(sort_of(e.ty), default_term(sort_of(e.ty.elem)))
-            for i, value in enumerate(args):
-                idx = L.IntV(i)
-                number = as_py_number(value)
-                arr = L.store(arr, idx, L.mkrec(sort_of(ir.TPythonNumber()), number.parts()))
-            return ListVal(arr, L.ZERO, L.IntV(len(args)), e.ty)
+            return self.allocate_list(args, e.ty, ctx, e.loc)
         if name in ("py_int_parse", "py_float_parse", "js_parse_int", "js_parse_float"):
             return self.parse_number(name, args[0], e, ctx)  # type: ignore[arg-type]
         if name == "some":
@@ -2165,18 +2597,23 @@ class VCGen:
             (d,) = args
             assert isinstance(d, DictVal)
             n = next(self.counter)
-            keys = L.Const(f"keys@{n}", L.ARRAY(sort_of(d.ty.key)))
-            ln = L.Const(f"keys@{n}.len", L.INT)
-            i = L.Const(f"i!{n}", L.INT)
-            rng = L.and_(L.le(L.ZERO, i), L.lt(i, ln))
-            ctx.assume(L.le(L.ZERO, ln))
-            ctx.assume(L.Quant("forall", (i,), L.implies(rng, L.select(d.has, L.select(keys, i))), patterns=((L.select(keys, i),),)))
+            cell = H.cell(ctx.env["@heap"], d.ref)
+            keys = L.field(cell, "keys")
+            live = L.field(cell, "key_live")
+            count = L.field(cell, "key_count")
+            ln = L.field(cell, "len")
+            history_index = L.Const(f"dict.history@{n}", L.INT)
+            rank = L.Fn("seqcount_bool", (live, L.ZERO, history_index, L.TRUE), L.INT)
+            present = L.and_(L.le(L.ZERO, history_index), L.lt(history_index, count), L.select(live, history_index))
             if name == "dict_keys":
-                return ListVal(keys, L.ZERO, ln, ir.TList(d.ty.key))
+                out = L.Const(f"keys@{n}", L.ARRAY(sort_of(d.ty.key)))
+                original = H.unbox(H.read_list(ctx.env["@heap"], d.ref, history_index), d.ty.key, ctx, e.loc)
+                ctx.assume(L.Quant("forall", (history_index,), L.implies(present, L.eq(L.select(out, rank), original)), patterns=((L.select(out, rank),),)))
+                return self.allocate_list_projection(out, ln, ir.TList(d.ty.key), ctx)
             vals = L.Const(f"values@{n}", L.ARRAY(sort_of(d.ty.val)))
-            j = L.Const(f"j!{n}", L.INT)
-            ctx.assume(L.Quant("forall", (j,), L.implies(L.and_(L.le(L.ZERO, j), L.lt(j, ln)), L.eq(L.select(vals, j), L.select(d.vals, L.select(keys, j)))), patterns=((L.select(vals, j),),)))
-            return ListVal(vals, L.ZERO, ln, ir.TList(d.ty.val))
+            original_value = H.unbox(H.read_dict(ctx.env["@heap"], d.ref, L.select(keys, history_index)), d.ty.val, ctx, e.loc)
+            ctx.assume(L.Quant("forall", (history_index,), L.implies(present, L.eq(L.select(vals, rank), original_value)), patterns=((L.select(vals, rank),),)))
+            return self.allocate_list_projection(vals, ln, ir.TList(d.ty.val), ctx)
 
         if name == "checked":  # fixed-width arithmetic: the result must fit the type
             v, lo, hi, tyname = args[0], args[1], args[2], e.args[3]
@@ -2259,43 +2696,57 @@ class VCGen:
                 assume(L.Quant("forall", (i,), L.implies(L.and_(L.le(L.ZERO, i), L.lt(i, ln)), relation), patterns=((L.select(out, i),),)))
             return ListVal(arr, L.ZERO, ln, xs.ty, PyNumericList(tags, ints, floats))
         if name == "dict_copy":
-            return args[0]  # dicts are values in the model; aliasing is excluded
+            (d,) = args
+            assert isinstance(d, DictVal)
+            ref = self.fresh_heap_copy(d.ref, ctx)
+            return DictVal(d.vals, d.has, d.ty, ref)
         if name == "list_append":
             xs, v = args
             assert isinstance(xs, ListVal)
+            boxed = H.box(v, xs.ty.elem, self.module.language)
+            self.set_heap(ctx, H.append_list(ctx.env["@heap"], self.list_ref(xs), boxed))
             arr, numeric = py_numeric_store(xs, L.add(xs.off, xs.len), v)  # type: ignore[arg-type]
-            return ListVal(arr, xs.off, L.add(xs.len, L.ONE), xs.ty, numeric)
+            return ListVal(arr, xs.off, self.list_len(xs, ctx), xs.ty, numeric, self.list_ref(xs), xs.view)
         if name == "list_set":
             xs, i, v = args
             assert isinstance(xs, ListVal)
             j = self.index_of(xs, i, True, ctx, e.loc, _expr_name(e.args[0]))  # type: ignore[arg-type]
+            self.set_heap(ctx, H.write_list(ctx.env["@heap"], self.list_ref(xs), L.add(xs.off, j), H.box(v, xs.ty.elem, self.module.language)))
             arr, numeric = py_numeric_store(xs, L.add(xs.off, j), v)  # type: ignore[arg-type]
-            return ListVal(arr, xs.off, xs.len, xs.ty, numeric)
+            return ListVal(arr, xs.off, self.list_len(xs, ctx), xs.ty, numeric, self.list_ref(xs), xs.view)
         if name == "list_copy":
             (xs,) = args
             assert isinstance(xs, ListVal)
-            return ListVal(xs.arr, xs.off, xs.len, xs.ty, xs.py_numeric)
+            return self.copy_list_value(xs, ctx)
         if name == "dict_set":
             d, k, v = args
             assert isinstance(d, DictVal)
             v = coerce(v, d.ty.val)
-            return DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty)  # type: ignore[arg-type]
+            key = self.dict_key(k, d.ty.key, ctx, e.loc)
+            self.set_heap(ctx, H.write_dict(ctx.env["@heap"], d.ref, key, H.box(v, d.ty.val, self.module.language), H.box(k, d.ty.key, self.module.language)))
+            return DictVal(L.store(d.vals, k, v), L.store(d.has, k, L.TRUE), d.ty, d.ref)  # type: ignore[arg-type]
         if name == "dict_remove":  # JS Map.delete: no key needed
             d, k = args
             assert isinstance(d, DictVal)
-            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
+            key = self.dict_key(k, d.ty.key, ctx, e.loc)
+            self.set_heap(ctx, H.delete_dict(ctx.env["@heap"], d.ref, key))
+            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty, d.ref)  # type: ignore[arg-type]
         if name == "dict_del":
             d, k = args
             assert isinstance(d, DictVal)
-            self.oblige("key", ctx, L.select(d.has, k), e.loc, f"key being deleted from '{_expr_name(e.args[0])}' is present")  # type: ignore[arg-type]
-            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty)  # type: ignore[arg-type]
+            key = self.dict_key(k, d.ty.key, ctx, e.loc)
+            has = L.select(L.field(H.cell(ctx.env["@heap"], d.ref), "has"), key)
+            self.oblige("key", ctx, has, e.loc, f"key being deleted from '{_expr_name(e.args[0])}' is present")
+            self.set_heap(ctx, H.delete_dict(ctx.env["@heap"], d.ref, key))
+            return DictVal(d.vals, L.store(d.has, k, L.FALSE), d.ty, d.ref)  # type: ignore[arg-type]
         if name in ("dict_has", "dict_get_opt", "dict_get_or"):
             d, k = args[0], args[1]
             assert isinstance(d, DictVal)
-            has = L.select(d.has, k)  # type: ignore[arg-type]
-            v = L.select(d.vals, k)  # type: ignore[arg-type]
+            key = self.dict_key(k, d.ty.key, ctx, e.loc)
+            has = L.select(L.field(H.cell(ctx.env["@heap"], d.ref), "has"), key)
             if name == "dict_has":
                 return has
+            v = self.read_dict_value(d, key, ctx, e.loc)
             if name == "dict_get_opt":
                 return OptVal(has, v, ir.TOption(d.ty.val))
             dflt = coerce(args[2], d.ty.val)
@@ -2303,7 +2754,8 @@ class VCGen:
         if name == "len":
             (xs,) = args
             assert isinstance(xs, ListVal)
-            return xs.len
+            self.check_heap_kind(ctx, self.list_ref(xs), H.CELL_TAGS["list"], e.loc, "len")
+            return self.list_len(xs, ctx)
         if name == "abs":
             if isinstance(args[0], PyNumber):
                 x = args[0]
@@ -2488,7 +2940,10 @@ class VCGen:
                 return xs
             lo2 = norm(lo, L.ZERO)
             hi2 = norm(hi, n)
-            return ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty, xs.py_numeric)
+            sliced = ListVal(xs.arr, L.add(xs.off, lo2), L.max_(L.sub(hi2, lo2), L.ZERO), xs.ty, xs.py_numeric, self.list_ref(xs), L.TRUE)
+            if self.module.language == "rust":
+                return sliced
+            return self.copy_list_value(sliced, ctx)
         (x,) = args[:1]
         if isinstance(x, PyNumber):
             if name == "to_real":
@@ -3031,6 +3486,11 @@ class VCGen:
         self.created.add(r)
         ctx.assume(L.not_(L.select(alloc, r)))  # type: ignore[arg-type]
         env["@alloc"] = L.store(alloc, r, L.TRUE)  # type: ignore[arg-type]
+        class_tag = dict(H.layout(self.program).class_tags)[e.cls]
+        heap, facts = H.allocate(env["@heap"], H.class_cell(class_tag), r)
+        for fact in facts:
+            ctx.assume(fact)
+        self.set_heap(ctx, heap)
         if init is not None:
             self.call(self.program.ref(init), [r] + args, [None] + list(e.args), ctx, e.loc, new_self=True)
             if not init.endswith(f"::{e.cls}.__init__"):
@@ -3066,8 +3526,6 @@ class VCGen:
             args = [ctx.state.env.get(a_e.name, a) if isinstance(a_e, ir.Var) and isinstance(a, (ListVal, DictVal)) else a for a_e, a in zip(arg_exprs, args)]
         muts = self.program.mutated.get(callee.key, set())
         list_vars = [a_e.name for a_e, p in zip(arg_exprs, fn.params) if isinstance(a_e, ir.Var) and isinstance(p.ty, (ir.TList, ir.TDict))]
-        if muts and len(list_vars) != len(set(list_vars)):
-            raise VCError(f"the same list is passed twice to '{fn.name}', which mutates a list parameter; the two parameters would alias", loc)
         for p, a_e in zip(fn.params, arg_exprs):
             if p.name in muts and not isinstance(a_e, ir.Var) and not _fresh_expr(a_e):
                 raise VCError(f"'{fn.name}' mutates its list parameter '{p.name}'; pass a variable (or a copy) so the change is tracked", loc)
@@ -3110,6 +3568,9 @@ class VCGen:
             if ctx.state is not None:
                 for fact in self.alloc_facts(r, fn.ret, ctx.state.env):
                     ctx.assume(fact)
+                if isinstance(r, ListVal):
+                    cell = H.cell(ctx.state.env["@heap"], self.list_ref(r))
+                    ctx.assume(L.and_(L.field(cell, "allocated"), L.eq(L.field(cell, "kind"), L.IntV(H.CELL_TAGS["list"])), L.le(L.ZERO, L.field(cell, "len"))))
         post = dict(pmap)
         if ctx.state is not None and not ctx.spec:
             post.update(self.call_effects(callee, args, arg_exprs, ctx, new_self))
@@ -3134,22 +3595,47 @@ class VCGen:
         heap_pre = self.heap_env(env)
         for p, a_expr in zip(fn.params, arg_exprs):
             if p.name in muts and isinstance(a_expr, ir.Var) and isinstance(env[a_expr.name], DictVal):
-                nd = self.fresh(a_expr.name, p.ty)
-                env[a_expr.name] = nd
-                post[p.name] = nd
-                continue
-            if p.name in muts and isinstance(a_expr, ir.Var):
                 old = env[a_expr.name]
-                assert isinstance(old, ListVal)
-                keep = None if p.name in self.program.appends.get(callee.key, ()) else old.len
-                nv = self.fresh(a_expr.name, p.ty, len_=keep)
-                assert isinstance(nv, ListVal)
-                if keep is not None:
-                    nv = ListVal(nv.arr, old.off, keep, nv.ty)
-                else:
-                    ctx.assume(L.le(L.ZERO, nv.len))
-                env[a_expr.name] = nv
-                post[p.name] = nv
+                assert isinstance(old, DictVal)
+                ref = old.ref
+                cell = H.cell(env["@heap"], ref)
+                count = L.Const(f"{fn.name}.{p.name}.post.key_count", L.INT)
+                length = L.Const(f"{fn.name}.{p.name}.post.len", L.INT)
+                contents = H.with_fields(cell, {
+                    "map": L.Const(f"{fn.name}.{p.name}.post.map", L.ARRAY(H.BOX, H.KEY)),
+                    "has": L.Const(f"{fn.name}.{p.name}.post.has", L.ARRAY(L.BOOL, H.KEY)),
+                    "keys": L.Const(f"{fn.name}.{p.name}.post.keys", L.ARRAY(H.KEY)),
+                    "key_live": L.Const(f"{fn.name}.{p.name}.post.key_live", L.ARRAY(L.BOOL)),
+                    "key_position": L.Const(f"{fn.name}.{p.name}.post.key_position", L.ARRAY(L.INT, H.KEY)),
+                    "seq": L.Const(f"{fn.name}.{p.name}.post.original_keys", L.ARRAY(H.BOX)),
+                    "key_count": count,
+                    "len": length,
+                })
+                env["@heap"] = L.store(env["@heap"], ref, contents)
+                ctx.assume(L.and_(L.le(L.ZERO, length), L.le(length, count)))
+                post[p.name] = old
+                continue
+        if p.name in muts and isinstance(a_expr, ir.Var):
+            old = env[a_expr.name]
+            assert isinstance(old, ListVal)
+            heap = env["@heap"]
+            assert isinstance(heap, L.Term)
+            ref = self.list_ref(old)
+            cell = H.cell(heap, ref)
+            length = L.Const(f"{fn.name}.{p.name}.post.len", L.INT) if p.name in self.program.appends.get(callee.key, ()) else H.read_len(heap, ref)
+            contents = H.with_fields(cell, {
+                "seq": L.Const(f"{fn.name}.{p.name}.post.seq", L.ARRAY(H.BOX)),
+                "len": length,
+            })
+            env["@heap"] = L.store(heap, ref, contents)
+            if p.name in self.program.appends.get(callee.key, ()):
+                ctx.assume(L.le(L.ZERO, length))
+            env[a_expr.name] = ListVal(old.arr, old.off, L.field(contents, "len"), old.ty, old.py_numeric, ref, old.view)
+            for alias, view in list(env.items()):
+                if isinstance(view, ListVal) and view.ref == ref:
+                    length = L.ite(view.view if view.view is not None else L.FALSE, view.len, L.field(contents, "len"))
+                    env[alias] = ListVal(view.arr, view.off, length, view.ty, view.py_numeric, ref, view.view)
+            post[p.name] = env[a_expr.name]
         views = [a.name for p, a in zip(fn.params, arg_exprs) if p.name in muts and isinstance(a, ir.Var) and a.name in self.views]
         if callee.key in self.program.unchecked_writers or views:
             self.havoc_unchecked(ctx, keep=frozenset(views))
@@ -3354,26 +3840,16 @@ class VCGen:
         env = ctx.state.env
         alloc_pre = env["@alloc"]
         names = [p.name for p in callee.fn.params]
-        for cls_field, targets in self.program.heap_writes.get(callee.key, {}).items():
-            c, f = cls_field.split(".", 1)
-            refs = []
-            for t in targets:
-                if t in names:
-                    refs.append(args[names.index(t)])
-            for key, srt in self.heap_keys(c, f):
-                old = env[key]
-                new = L.Const(f"{key[1:]}@{next(self.counter)}", srt)
-                env[key] = new
-                if "*" in targets:
-                    continue
-                r = L.Const(f"r!{next(self.counter)}", L.INT)
-                untouched = L.and_(L.select(alloc_pre, r), *[L.ne(r, x) for x in refs])  # type: ignore[arg-type]
-                ctx.assume(L.Quant("forall", (r,), L.implies(untouched, L.eq(L.select(new, r), L.select(old, r))), patterns=((L.select(new, r),),)))  # type: ignore[arg-type]
         if callee.key in self.program.allocates:
             new_alloc = L.Const(f"alloc@{next(self.counter)}", L.ARRAY(L.BOOL))
             r = L.Const(f"r!{next(self.counter)}", L.INT)
             ctx.assume(L.Quant("forall", (r,), L.implies(L.select(alloc_pre, r), L.select(new_alloc, r)), patterns=((L.select(new_alloc, r),),)))  # type: ignore[arg-type]
             env["@alloc"] = new_alloc
+        alloc_post = env["@alloc"]
+        refs = {p.name: a for p, a in zip(callee.fn.params, args)}
+        for cls_field, targets in self.program.heap_writes.get(callee.key, {}).items():
+            c, f = cls_field.split(".", 1)
+            self.havoc_class_field(env, c, f, targets, refs, alloc_pre, alloc_post, ctx)
 
     def apply_def(self, callee: FuncRef, args: list[Val], heap: dict[str, Val] | None = None) -> L.Term:
         #@ requires callee.key in self.program.logic_names
@@ -3573,11 +4049,13 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
         for t in flatten(v):
             if isinstance(t, L.Const):
                 params.append(t)
+            elif isinstance(t, L.BoolV):
+                continue
             else:  # the zero offset of a list parameter becomes a real parameter
                 c = L.Const(f"{p.name}.off", L.INT)
                 params.append(c)
         if isinstance(v, ListVal):
-            env[p.name] = ListVal(v.arr, L.Const(f"{p.name}.off", L.INT), v.len, v.ty, v.py_numeric)
+            env[p.name] = ListVal(v.arr, L.Const(f"{p.name}.off", L.INT), v.len, v.ty, v.py_numeric, v.ref, v.view)
     # Object fields the body reads are parameters of the definition too.
     g.heap_init(env)
     for key in program.def_heap_keys(ref.key):
@@ -3605,7 +4083,7 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
     req = L.and_(*[g.ev(r.expr, rctx) for r in ref.fn.requires])
     inner = body
     if req != L.TRUE:
-        body = L.ite(req, body, default_value(sort_of(ref.fn.ret)))
+        body = L.ite(req, body, default_sort(sort_of(ref.fn.ret)))
     name = program.logic_names[ref.key]
     m = None
     if measure is not None:
@@ -3624,7 +4102,7 @@ def build_fundef(program: Program, ref: FuncRef, measure: ir.Expr | None) -> L.F
     )
 
 
-def default_value(s: L.Sort) -> L.Term:
+def default_sort(s: L.Sort) -> L.Term:
     if s == L.INT:
         return L.ZERO
     if s in (L.FLOAT32, L.FLOAT64):
@@ -3634,7 +4112,7 @@ def default_value(s: L.Sort) -> L.Term:
     if s == L.STR:
         return L.StrV("")
     if s.name == "Rec":
-        return L.mkrec(s, tuple(default_value(fs) for _, fs in s.fields))
+        return L.mkrec(s, tuple(default_sort(fs) for _, fs in s.fields))
     if s == L.OPAQUE:
         return L.Const("opaque!default", L.OPAQUE)
     raise VCError(f"no default value for {s}")

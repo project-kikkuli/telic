@@ -188,6 +188,10 @@ and pr_node p t =
   | App (op, xs) when String.length op > 3 && String.sub op 0 3 = "mk:" ->
     let rn = String.sub op 3 (String.length op - 3) in
     if Array.length xs = 0 then Buffer.add_string b (q_mk rn) else (Buffer.add_string b ("(" ^ q_mk rn); args xs; Buffer.add_char b ')')
+  | ArrayLambda (binder, body) ->
+    (match binder.node with
+     | Const name -> Buffer.add_string b (Printf.sprintf "(lambda ((%s %s)) " (q_const name) (sort_smt binder.sort)); pr p body; Buffer.add_char b ')'
+     | _ -> failwith "array lambda binder is not a constant")
   | App (op, xs) -> Buffer.add_string b ("(" ^ op_smt op); args xs; Buffer.add_char b ')'
   | Fn (n, xs) when Hashtbl.mem expanded n ->
     let params, body = Hashtbl.find expanded n in
@@ -255,13 +259,17 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
         Array.iter (fun v -> Hashtbl.replace bound v.id (); see_sort v.sort) vs;
         visit body;
         List.iter (Array.iter visit) pats
+      | ArrayLambda (binder, body) ->
+        Hashtbl.replace bound binder.id ();
+        see_sort binder.sort;
+        visit body
       | _ -> ()
     end
   in
   (* bound variables are known to the printer; which constants are free is
      decided per root, respecting binders (a hash-consed variable may be
      bound in one place and free in another) *)
-  let rec binders t = match t.node with Quant (_, vs, body, _) -> Array.iter (fun v -> Hashtbl.replace bound v.id ()) vs; binders body | App (_, xs) | Fn (_, xs) -> Array.iter binders xs | _ -> () in
+  let rec binders t = match t.node with Quant (_, vs, body, _) -> Array.iter (fun v -> Hashtbl.replace bound v.id ()) vs; binders body | ArrayLambda (binder, body) -> Hashtbl.replace bound binder.id (); binders body | App (_, xs) | Fn (_, xs) -> Array.iter binders xs | _ -> () in
   List.iter binders (roots @ def_bodies);
   List.iter (fun d -> see_sort d.fsort; List.iter (fun p -> see_sort p.sort) d.params) defs;
   List.iter visit roots;
@@ -302,7 +310,7 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
     match Hashtbl.find_opt has_bound t.id with
     | Some v -> v
     | None ->
-      let v = match t.node with Const _ -> Hashtbl.mem bound t.id | Quant _ -> true | App (_, xs) | Fn (_, xs) -> Array.exists hb xs | _ -> false in
+      let v = match t.node with Const _ -> Hashtbl.mem bound t.id | Quant _ | ArrayLambda _ -> true | App (_, xs) | Fn (_, xs) -> Array.exists hb xs | _ -> false in
       Hashtbl.add has_bound t.id v;
       v
   in
@@ -312,7 +320,7 @@ let script (defs : fundef list) (axioms : axiom list) (hyps : term list) (neg_go
     Hashtbl.replace refs t.id (1 + try Hashtbl.find refs t.id with Not_found -> 0);
     if not (Hashtbl.mem seen2 t.id) then begin
       Hashtbl.add seen2 t.id ();
-      (match t.node with App (_, xs) | Fn (_, xs) -> Array.iter count xs | _ -> ());
+      (match t.node with App (_, xs) | Fn (_, xs) -> Array.iter count xs | ArrayLambda (_, body) -> count body | _ -> ());
       order := t :: !order
     end
   in
@@ -384,6 +392,42 @@ let parse_sx (s : string) : sx list =
 
 (* a model value -> the JSON Python's decoder produces *)
 let rec value_json (sort : sort) (v : sx) : Json.t =
+  let fp_value =
+    let rec bits_of_atom width = function
+      | Atom s when String.length s > 2 && String.sub s 0 2 = "#x" ->
+        (try Some (Int64.of_string ("0x" ^ String.sub s 2 (String.length s - 2))) with _ -> None)
+      | Atom s when String.length s > 2 && String.sub s 0 2 = "#b" ->
+        let n = ref 0L in
+        for i = 2 to String.length s - 1 do n := Int64.logor (Int64.shift_left !n 1) (if s.[i] = '1' then 1L else 0L) done;
+        Some !n
+      | _ -> ignore width; None
+    in
+    let width, exponent, fraction = match sort with Float32 -> (32, 8, 23) | _ -> (64, 11, 52) in
+    let mask n = Int64.sub (Int64.shift_left 1L n) 1L in
+    let classify bits =
+      let exp = Int64.logand (Int64.shift_right_logical bits fraction) (mask exponent) in
+      let frac = Int64.logand bits (mask fraction) in
+      let exp_all = mask exponent in
+      if exp = exp_all then if frac = 0L then Some (if Int64.logand bits (Int64.shift_left 1L (width - 1)) = 0L then "Infinity" else "-Infinity") else Some "NaN"
+      else None
+    in
+    let to_json bits =
+      match classify bits with
+      | Some marker -> Json.Assoc [ ("__float__", Json.String marker) ]
+      | None ->
+        let f = if sort = Float32 then Int32.float_of_bits (Int64.to_int32 bits) else Int64.float_of_bits bits in
+        Json.Float f
+    in
+    match sort, v with
+    | (Float32 | Float64), Sx [ Sx [ Atom "_"; Atom "to_fp"; _; _ ]; bits ] -> Option.map to_json (bits_of_atom width bits)
+    | (Float32 | Float64), Sx [ Atom "fp"; sign; exp; frac ] ->
+      (match bits_of_atom 1 sign, bits_of_atom exponent exp, bits_of_atom (fraction + 1) frac with
+       | Some sign, Some exp, Some sig_with_hidden ->
+         let sig_bits = Int64.logand sig_with_hidden (mask fraction) in
+         Some (to_json (Int64.logor (Int64.shift_left sign (width - 1)) (Int64.logor (Int64.shift_left exp fraction) sig_bits)))
+       | _ -> None)
+    | _ -> None
+  in
   let num_q v =
     let rec q = function
       | Atom a -> (
@@ -403,7 +447,7 @@ let rec value_json (sort : sort) (v : sx) : Json.t =
   match sort with
   | Int | Unit -> ( match num_q v with Some q -> Json.Int q.n | None -> Json.Null)
   | Real -> ( match num_q v with Some q -> Json.Assoc [ ("__real__", Json.List [ Json.Int q.n; Json.Int q.d ]) ] | None -> Json.Null)
-  | Float32 | Float64 -> Json.Null  (* float obligations stay with the Python core *)
+  | Float32 | Float64 -> Option.value fp_value ~default:Json.Null
   | Bool -> ( match v with Atom "true" -> Json.Bool true | Atom "false" -> Json.Bool false | _ -> Json.Null)
   | Str -> ( match v with Str s -> Json.String s | _ -> Json.Null)
   | Opaque -> Json.Assoc [ ("__opaque__", Json.Bool true) ]

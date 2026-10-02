@@ -10,7 +10,7 @@ ifeq ($(shell uname -s),Darwin)
 PLATFORM_FLAGS := -ccopt -Wl,-U,_dup3 -ccopt -Wl,-U,_pipe2
 endif
 W := $(shell $(OCAMLOPT) -where)
-SRC := json.ml term.ml ir.ml vc.ml smt.ml main.ml
+SRC := json.ml term.ml ir.ml heap.ml vc.ml smt.ml main.ml
 
 # telic refuses a binary whose source_hash.ml does not match the sources
 telic-core: $(SRC)

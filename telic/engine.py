@@ -33,6 +33,14 @@ from .vcgen import ListVal, Obligation, Options, VCGen
 CORE_DIR = Path(__file__).resolve().parent.parent / "core"
 
 
+def _heap_sort(sort: L.Sort) -> Any:
+    if sort.name == "Array":
+        return ["Array", _heap_sort(L.index_sort(sort)), _heap_sort(sort.elem)]
+    if sort.name == "Rec":
+        return ["Rec", sort.rec, [[name, _heap_sort(field_sort)] for name, field_sort in sort.fields]]
+    return sort.name
+
+
 def binary() -> str | None:
     """The engine, refused if it was built from other sources than core/'s."""
     env = os.environ.get("TELIC_CORE")
@@ -133,6 +141,7 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
         {
             "name": cname,
             "module": program.class_module[cname].path,
+            "language": program.class_module[cname].language,
             "fields": [[f, irjson.ty(t)] for f, t in decl.fields],
             "invariants": [irjson.clause(c) for c in decl.invariants],
             "bases": list(decl.bases),
@@ -161,8 +170,16 @@ def _base(program: Program, theory, extra_by_key: dict[str, list[ir.Clause]], ti
             "resolve": resolve,
             "untrusted": sorted([c, i] for c, i in program.untrusted.get(key, ())),
         }
+    heap_abi = heap.layout(program).json()
+    heap_abi["sorts"] = {
+        "number": _heap_sort(heap.number_sort()),
+        "key": _heap_sort(heap.KEY),
+        "box": _heap_sort(heap.BOX),
+        "cell": _heap_sort(heap.CELL),
+        "heap": _heap_sort(heap.HEAP),
+    }
     req = {
-        "heap_abi": heap.layout(program).json(),
+        "heap_abi": heap_abi,
         "modules": [irjson.module(m) for m in program.modules],
         "program": info,
         "classes": classes,
@@ -252,10 +269,36 @@ def _value(v: Any) -> Any:
     if isinstance(v, dict) and "__real__" in v:
         n, d = v["__real__"]
         return Fraction(n, d)
+    if isinstance(v, dict) and "__float__" in v:
+        return {"NaN": float("nan"), "Infinity": float("inf"), "-Infinity": float("-inf")}[v["__float__"]]
     if isinstance(v, list):
         return [_value(x) for x in v]
     if isinstance(v, dict) and "__opaque__" not in v:
         return {k: _value(x) for k, x in v.items()}
+    return v
+
+
+class _ModelList(list):
+    def __init__(self, ref: Any):
+        super().__init__()
+        self.telic_ref = ref
+
+
+def _model_graph(v: Any, lists: dict[Any, _ModelList]) -> Any:
+    if isinstance(v, dict) and "__list__" in v:
+        ref = v["__list__"]
+        if ref is None:
+            return [_model_graph(x, lists) for x in v.get("items", [])]
+        if ref in lists:
+            return lists[ref]
+        out = _ModelList(ref)
+        lists[ref] = out
+        out.extend(_model_graph(x, lists) for x in v.get("items", []))
+        return out
+    if isinstance(v, list):
+        return [_model_graph(x, lists) for x in v]
+    if isinstance(v, dict):
+        return {k: _model_graph(x, lists) for k, x in v.items()}
     return v
 
 
@@ -313,7 +356,9 @@ def run(program: Program, theory, tasks: list[tuple[FuncRef, Options]], timeout_
                 exclude_axioms=set(o["exclude"]),
                 inferred=o["inferred"],
             )
-            entry = {"ob": ob, "key": o["key"], "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": {k: _value(v) for k, v in o["model"].items()}, "state": {k: _value(v) for k, v in o["state"].items()}}
+            lists: dict[Any, _ModelList] = {}
+            model = {k: _model_graph(_value(v), lists) for k, v in o["model"].items()}
+            entry = {"ob": ob, "key": o["key"], "status": o["status"], "seconds": o["seconds"], "reason": o["reason"], "model": model, "state": {k: _value(v) for k, v in o["state"].items()}}
             if o["status"] == "refuted" and not plain:
                 # Objects/optionals in the model: decode them with the Python backend.
                 res = solve(ob, theory, timeout_ms, rlimit)

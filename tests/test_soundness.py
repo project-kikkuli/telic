@@ -93,6 +93,8 @@ TRUE_HELPERS = {
     "t32.rs": {"set"},
     "t43.py": {"pos", "grow", "Counter.__init__", "Counter.bump"},
     "t43.ts": {"pos", "Counter.__init__", "Counter.bump", "<arrow:116:20>"},
+    "t55.py": {"A.__init__", "B.__init__"},
+    "t56.py": {"FieldA.__init__", "FieldB.__init__"},
     # a scheduled callback (timer, listener, promise, JSX handler) runs on a stack
     # of its own: the function that schedules it is proved; the callback is not
     "cb1.py": {"pos"},

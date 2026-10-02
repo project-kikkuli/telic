@@ -71,6 +71,26 @@ function decode(v, ty = null, memo = new Map()) {
   if (v === null || v === undefined) return undefined;
   if (Array.isArray(v)) return guard(v.map((x) => decode(x, ty && ty.k === "list" ? ty.elem : null, memo)));
   if (typeof v !== "object") return v;
+  if ("__list_ref__" in v) return memo.get(`list#${v.__list_ref__}`);
+  if ("__list__" in v) {
+    const key = `list#${v.__list__}`;
+    const out = guard([]);
+    memo.set(key, out);
+    out.push(...v.items.map((x) => decode(x, ty && ty.k === "list" ? ty.elem : null, memo)));
+    return out;
+  }
+  if ("__dict_ref__" in v) return memo.get(`dict#${v.__dict_ref__}`);
+  if ("__map__" in v) {
+    const key = `dict#${v.__map__}`;
+    const asObject = ty && ty.k === "dict" && ty.js === "object";
+    const out = asObject ? {} : new Map();
+    memo.set(key, out);
+    for (const [k, x] of v.entries) {
+      if (asObject) out[decode(k, ty.key, memo)] = decode(x, ty.val, memo);
+      else out.set(decode(k, ty && ty.key, memo), decode(x, ty && ty.val, memo));
+    }
+    return out;
+  }
   if ("__json__" in v) return structuredClone(v.__json__);
   if ("__real__" in v) return v.__real__[0] / v.__real__[1];
   if ("__float__" in v) return Number(v.__float__);
@@ -80,7 +100,7 @@ function decode(v, ty = null, memo = new Map()) {
     return E ? E[v.member] : v.member;
   }
   if ("__object__" in v) {
-    const key = `${v.__object__}#${v.ref}`;
+    const key = `object#${v.ref}`;
     if (memo.has(key)) {
       const o = memo.get(key);
       if (v.fields) for (const [k, x] of Object.entries(v.fields)) o[k] = decode(x, null, memo);

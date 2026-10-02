@@ -69,6 +69,7 @@ type func = {
   floc : loc;
   end_line : int;
   params : (string * ty) list;
+  view_params : string list;
   ret : ty;
   requires : clause list;
   ensures : clause list;
@@ -225,7 +226,8 @@ let func_of j =
     name = to_str (member "name" j);
     floc = loc_of (member "loc" j);
     end_line = to_int (member "end_line" j);
-    params = List.map (function List [ String n; t ] -> (n, ty_of t) | _ -> raise (Error "param")) (to_list (member "params" j));
+    params = List.map (function List [ String n; t; _ ] | List [ String n; t ] -> (n, ty_of t) | _ -> raise (Error "param")) (to_list (member "params" j));
+    view_params = List.filter_map (function List [ String n; _; Bool true ] -> Some n | _ -> None) (to_list (member "params" j));
     ret = ty_of (member "ret" j);
     requires = List.map clause_of (to_list (member "requires" j));
     ensures = List.map clause_of (to_list (member "ensures" j));

@@ -519,6 +519,7 @@ class Unsupported(Stmt):
 class Param:
     name: str
     ty: Type
+    view: bool = False
 
 
 @dataclass
